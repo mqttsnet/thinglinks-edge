@@ -51,6 +51,7 @@ run "Manager 容器化 根路径" scripts/verify-container.mjs
 run "Manager 容器化 子路径" scripts/verify-container.mjs /nodered
 run "docker-compose 部署"  scripts/verify-compose.mjs
 run "虚拟网关 云边上下行"  scripts/verify-cloud-gateway.mjs
+run "云对接整条链路"      scripts/verify-cloud-link.mjs
 
 echo ""
 echo "── 残留检查 ──"

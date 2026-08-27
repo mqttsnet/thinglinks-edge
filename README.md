@@ -47,7 +47,8 @@ is the slice being built out first.
 | **Network Isolation** | One network per instance — instances cannot reach each other |
 | **Restricted Docker Endpoint** | The Manager never touches the host socket; every Docker call passes a per-method regex allowlist |
 | **Runtime Mount Prefix** | One image serves `/` or any enterprise sub-path — no rebuild |
-| **Cloud-Edge Collaboration** | Virtual gateway, sub-device registration, micro-batching, offline spool and replay *(in progress)* |
+| **Cloud-Edge Collaboration** | Virtual gateway, sub-device registration, micro-batching, offline spool and replay — configured from the console, applied without a restart |
+| **Credentials Encrypted at Rest** | Instance and cloud credentials are encrypted with a key derived from `MASTER_KEY`; no API response ever returns plaintext |
 
 ## Tech Stack
 
@@ -152,7 +153,7 @@ thinglinks-edge/
 ## Verification
 
 Every change must leave the full regression green. `pnpm verify` runs unit tests,
-typecheck, build, and **11 real-container passes** against a live Docker daemon —
+typecheck, build, and **14 real-container passes** against a live Docker daemon —
 no mocked upstreams.
 
 ```bash
@@ -161,6 +162,7 @@ cd apps/manager && pnpm verify
 
 | Suite | Covers |
 | --- | --- |
+| `verify-authz` | Privilege-escalation attempts across roles, grant matrix, proxy and SSO |
 | `verify-container-guard` | Container-creation whitelist enforced against real Docker |
 | `verify-instance` | Instance creation, `settings.js` delivery, mount prefix — root and sub-path |
 | `verify-proxy` | Reverse proxy, static assets, WebSocket, passwordless entry — root and sub-path |
@@ -169,6 +171,8 @@ cd apps/manager && pnpm verify
 | `verify-isolation` | Instance-to-instance network isolation |
 | `verify-container` | Manager itself containerised — root and sub-path |
 | `verify-compose` | Compose deployment, read-only rootfs, restricted Docker endpoint |
+| `verify-cloud-gateway` | Envelope, signing, encryption, topics and reconnect against real Mosquitto |
+| `verify-cloud-link` | Config → runtime → broker end to end: credential encryption, offline spooling, replay |
 
 ## Security
 
