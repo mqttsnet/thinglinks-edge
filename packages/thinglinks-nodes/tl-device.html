@@ -1,0 +1,40 @@
+<script type="text/javascript">
+  RED.nodes.registerType('tl-device', {
+    category: 'ThingLinks',
+    color: '#1e4db7',
+    defaults: {
+      name: { value: '' },
+      deviceId: { value: '', required: true },
+      protocol: { value: '' },
+      address: { value: '' },
+      model: { value: '' },
+      manufacturer: { value: '' },
+    },
+    inputs: 1,
+    outputs: 1,
+    icon: 'font-awesome/fa-microchip',
+    paletteLabel: '设备',
+    label: function () { return this.name || this.deviceId || 'tl-device'; },
+  });
+</script>
+
+<script type="text/html" data-template-name="tl-device">
+  <div class="form-row"><label for="node-input-deviceId">设备标识</label>
+    <input type="text" id="node-input-deviceId" placeholder="plc-1"></div>
+  <div class="form-row"><label for="node-input-name">名称</label>
+    <input type="text" id="node-input-name" placeholder="1#注塑机"></div>
+  <div class="form-row"><label for="node-input-protocol">协议</label>
+    <input type="text" id="node-input-protocol" placeholder="modbus-tcp"></div>
+  <div class="form-row"><label for="node-input-address">地址</label>
+    <input type="text" id="node-input-address" placeholder="192.168.1.10:502"></div>
+  <div class="form-row"><label for="node-input-model">型号</label>
+    <input type="text" id="node-input-model"></div>
+  <div class="form-row"><label for="node-input-manufacturer">厂商</label>
+    <input type="text" id="node-input-manufacturer"></div>
+</script>
+
+<script type="text/html" data-help-name="tl-device">
+  <p>把一台现场设备登记进 ThingLinks Edge 台账。消息原样透传。</p>
+  <p><b>注意：</b>只有经过本节点的设备才会出现在平台的设备台账里。
+  用原生 modbus / opcua 节点直接采集的设备，平台看不见。</p>
+</script>

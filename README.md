@@ -1,132 +1,190 @@
 <div align="center">
 
-[![MQTTSNET Logo](./docs/images/logo.png)](http://www.mqttsnet.com)
+<a href="https://mqttsnet.com"><img src="./docs/images/logo.png" alt="ThingLinks" width="180"></a>
+
+# ThingLinks Edge
+
+**Edge Computing Gateway — One machine on site, one `docker compose up`**
+
+[English](README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
+
+[![Node.js](https://img.shields.io/badge/Node.js-24_LTS-339933?style=flat-square&logo=nodedotjs&logoColor=white)](https://nodejs.org/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?style=flat-square&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![Fastify](https://img.shields.io/badge/Fastify-5.x-000000?style=flat-square&logo=fastify&logoColor=white)](https://fastify.dev/)
+[![Vue](https://img.shields.io/badge/Vue-3.5-4FC08D?style=flat-square&logo=vuedotjs&logoColor=white)](https://vuejs.org/)
+[![Docker](https://img.shields.io/badge/Docker-Required-2496ED?style=flat-square&logo=docker&logoColor=white)](https://www.docker.com/)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square)](LICENSE)
+
+<br>
+
+[![Website](https://img.shields.io/badge/Website-mqttsnet.com-blue?style=for-the-badge)](https://mqttsnet.com)
+[![GitHub](https://img.shields.io/badge/GitHub-mqttsnet/thinglinks--edge-181717?style=for-the-badge&logo=github)](https://github.com/mqttsnet/thinglinks-edge)
 
 </div>
 
-# ThingLinks Multi Tenant Node-RED Docker Compose
+---
 
-## Deprecated 
+## About
 
-A collection of Docker container that will implement a Multi Tenant Node-RED environment.
+ThingLinks Edge is an **edge computing gateway platform** that runs on a single
+machine at the customer site. Its purpose is **cloud-edge collaboration**: bring
+field devices into the ThingLinks cloud, and bring cloud capabilities down to the
+field — so that acquisition, buffering and local logic keep working when the link
+to the cloud does not.
 
+Multi-instance Node-RED hosting is **one capability**, not the whole product. It
+is the slice being built out first.
 
+## Core Features
 
+| Feature | Description |
+| --- | --- |
+| **Instance Hosting** | Node-RED instances as sibling containers — upgrading the Manager never interrupts field acquisition |
+| **Built-in Reverse Proxy** | Single entry point, single certificate; instance ports are never published, so authentication is uniform by construction |
+| **Passwordless Editor Entry** | Open any instance editor from the console without re-entering instance credentials |
+| **Three-layer Health Probes** | Container / application / flow, combined into one verdict that catches "process alive but not working" |
+| **Network Isolation** | One network per instance — instances cannot reach each other |
+| **Restricted Docker Endpoint** | The Manager never touches the host socket; every Docker call passes a per-method regex allowlist |
+| **Runtime Mount Prefix** | One image serves `/` or any enterprise sub-path — no rebuild |
+| **Cloud-Edge Collaboration** | Virtual gateway, sub-device registration, micro-batching, offline spool and replay *(in progress)* |
 
-## Download
+## Tech Stack
 
-```
-$ git clone --recurse-submodules https://github.com/mqttsnet/thinglinks-multi-tenant-node-red.git
-```
+![Node.js](https://img.shields.io/badge/Node.js-24_LTS-339933?style=flat-square&logo=nodedotjs&logoColor=white)
+![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?style=flat-square&logo=typescript&logoColor=white)
+![Fastify](https://img.shields.io/badge/Fastify-5.x-000000?style=flat-square&logo=fastify&logoColor=white)
+![SQLite](https://img.shields.io/badge/SQLite-better--sqlite3-003B57?style=flat-square&logo=sqlite&logoColor=white)
+![Vue 3](https://img.shields.io/badge/Vue.js-3.5-4FC08D?style=flat-square&logo=vuedotjs&logoColor=white)
+![Naive UI](https://img.shields.io/badge/Naive%20UI-2.45-63E2B7?style=flat-square)
+![Vite](https://img.shields.io/badge/Vite-8.x-646CFF?style=flat-square&logo=vite&logoColor=white)
+![Node-RED](https://img.shields.io/badge/Node--RED-5.0-8F0000?style=flat-square&logo=nodered&logoColor=white)
+![pnpm](https://img.shields.io/badge/pnpm-10.x-F69220?style=flat-square&logo=pnpm&logoColor=white)
 
-## Pre-reqs
+## Quick Start
 
-Run the `setup.sh` script to create the required directories and set the right ownership/permissions.
+### Requirements
 
-If run with no arguments `setup.sh` will default to using the current machine's hostname with `.local` appended as it's root domain, otherwise it will take the first argument as the root domain. e.g.
+| Component | Version |
+| --- | --- |
+| Docker Engine | 24+ with Compose v2 |
+| Node.js | 24 LTS (development only) |
+| pnpm | 10.32+ (development only) |
 
-```
-$ ./setup.sh example.com
-```
+### Deploy
 
-And if you are running on a Docker Swarm deployment you will need to build the management app and the catalogue containers manually with.
-
-```
-$ docker build -t manager ./manager
-$ docker build -t catalogue ./catalogue
-```
-
-When running on a AMD64 based host everything should be fine, if you want to run on ARM64 then you  will need to rebuild the [verdaccio/verdaccio](https://github.com/verdaccio/verdaccio) and nginx-proxy containers as they only ship AMD64 versions.
-
-Until [this](https://github.com/nginx-proxy/nginx-proxy/pull/1470) pull-request is merged into nginx-proxy you will have to manually build forego and dockergen since the container directly downloads a pre-built AMD64 bit binaries.
-
-## Configure
-
-### DNS
-
-The `VIRTUAL_HOST` and `ROOT_DOMAIN` entries at the end of the docker-compose file will have been updated by the `setup.sh` script,  you will want to set up a wildcard DNS entry that points to the host machine.
-
-e.g. if you use a `ROOT_DOMAIN` of **example.com** then you should set up a DNS entry for \*.example.com that points to the docker host.
-
-For testing you can edit your local `/etc/hosts` file to point to the manager and application instances, eg:
-
-```
-192.168.1.100   manager.example.com  r1.example.com  r2.example.com
-```
-
-Where `192.168.1.100` is the IP address of the Docker host.
-
-### Avahi
-
-If you are running this on a small local lan then you may not have a DNS server to add the wildcard entry to, in this case you can 
-use the `hardillb/nginx-proxy-avahi-helper` container which will add mDNS CNAMES to the docker host machine (assuming it's running 
-the Avahi daemon) so you will be able to use a `.local` virtual domain to access Node-RED instances.
-
-You can run the `hardillb/nginx-proxy-avahi-helper` with the following command
-
-`docker run -d -v /var/run/docker.sock:/tmp/docker.sock -v /run/dbus/system_bus_socket:/run/dbus/system_bus_socket hardillb/nginx-proxy-avahi-helper`
-
-If you see AppArmor errors in the logs for this container then you need to add the `--priviledged` option to the command line.
-
-### HTTPS
-
-There are 3 options for setting up HTTPS support.
-
- - Set up a single wildcard certificate to match the wildcard DNS entry, this means you only have to manage a single certificate for all Node-RED instances. The certificate/key pair for example.com should be named `example.com.crt` and `example.com.key` and placed in the certs directory. Uncomment the line in the volumes section of the nginx service in docker-compose.yml
-
- - Add a certificate and key per instance to the certs directory with names matching the `VIRTUAL_HOST` entry e.g. for an instance named foo, `foo.example.com.crt` and `foo.example.com.key`
-
- - Use something like nginx-proxy/docker-letsencrypt-nginx-proxy-companion which will generate a LetsEncrypt certificate for each instance (as well and renewing it when needed).
-
-For both you will need to uncomment the `- "443:443"` line in the ports section of the nginx service in docker-compose.yml.
-
-You can check out more details [here](https://github.com/nginx-proxy/nginx-proxy#ssl-support)
-
-## Private Node Repository
-
-### npm
-
-The npm repository is available on port 4873 of the Docker host. You can publish new nodes to this repo under the scope of `@private` using the username `admin` and the password `mqttsnet`
-
-To add the scope to your local npm config run the following:
-
-```
-npm login --registry=http://example.com:4873 --scope=@private
+```bash
+cp .env.example .env        # at minimum, set EXTERNAL_URL and MASTER_KEY
+docker compose up -d
+docker compose logs manager | grep '\[init\]'   # the initial password is printed once
 ```
 
-Once this is setup you can publish any package with the scope `@private` to that repository with the normal `npm publish` command
+Open `EXTERNAL_URL` in a browser — the console is served by the Manager itself.
+`EXTERNAL_URL` is the single source of truth for every outward-facing URL, redirect
+and cookie policy; the process never guesses its own external address.
 
-You can access the web front end for the repository on port 4873 of the docker host (you can map this to a custom domain and port 80 by adding 
-a `VIRTUAL_HOST` environment variable to the registry entry in the docker_compose.yml file)
+### Development
 
-### Catalogue
+```bash
+pnpm install
 
-You can edit the `catalogue.json` file in the catalogue directory as required using the `build-catalogue.js` in the manager directory.
+# terminal 1 — backend
+cd apps/manager && pnpm build && \
+  EXTERNAL_URL=http://localhost:5173 DATA_DIR=/tmp/tle-dev \
+  MASTER_KEY=dev-key INITIAL_PASSWORD=initial-password-123 node dist/index.js
 
-`node build-catalogue.js example.com [keyword filter] > ../catalogue/catalogue.json`
-
-Where the first argument is the hostname of the docker host and `[keyword filter]` (defaults to `node-red`) is the name of the keyword to filter the entries in the repository on.
-
-
-## Start
-
-To start up the stack run
-```
-docker-compose up -d
+# terminal 2 — console
+cd apps/web-console && pnpm dev      # http://localhost:5173
 ```
 
-### Manager Application
+## Project Structure
 
-You can access the instance manager web app on http://manager.example.com
+```
+thinglinks-edge/
+├── apps/
+│   ├── manager/                  Control-plane service
+│   │   ├── src/
+│   │   │   ├── core/             Domain: config, crypto, db, auth, instances,
+│   │   │   │                     ports, health, container spec, docker client
+│   │   │   ├── http/             HTTP layer: app assembly, session, instances,
+│   │   │   │                     SSO, reverse proxy, console hosting
+│   │   │   └── index.ts          Entrypoint
+│   │   ├── scripts/              Real-container verification suite
+│   │   └── Dockerfile
+│   └── web-console/              Console frontend (Vue 3 + TypeScript + Naive UI)
+├── changelogs/                   One file per release
+├── docker-compose.yml            Single-machine deployment
+└── .env.example
+```
 
-![new.png](docs/images/new.png)
+## Verification
 
-![list.png](docs/images/list.png)
+Every change must leave the full regression green. `pnpm verify` runs unit tests,
+typecheck, build, and **11 real-container passes** against a live Docker daemon —
+no mocked upstreams.
 
-![logs.png](docs/images/logs.png)
+```bash
+cd apps/manager && pnpm verify
+```
 
-![flows.png](docs/images/flows.png)
+| Suite | Covers |
+| --- | --- |
+| `verify-container-guard` | Container-creation whitelist enforced against real Docker |
+| `verify-instance` | Instance creation, `settings.js` delivery, mount prefix — root and sub-path |
+| `verify-proxy` | Reverse proxy, static assets, WebSocket, passwordless entry — root and sub-path |
+| `verify-api` | Instance CRUD lifecycle and log decoding |
+| `verify-health` | Three-layer probes |
+| `verify-isolation` | Instance-to-instance network isolation |
+| `verify-container` | Manager itself containerised — root and sub-path |
+| `verify-compose` | Compose deployment, read-only rootfs, restricted Docker endpoint |
 
-### Instances
+## Security
 
-If you create an instance with the app name of `r1` then you would access that instance on http://r1.example.com  and so on.
+- Manager and instances both run **non-root** on a **read-only root filesystem**
+- The Manager **never mounts the host Docker socket**; it reaches Docker only
+  through a proxy that allowlists each endpoint by HTTP method
+- **One network per instance** — instances cannot reach each other or the proxy
+- Container creation passes a **hard whitelist**: no privileged mode, no host
+  namespaces, only platform-managed named volumes, instance port never published
+- A missing `MASTER_KEY` **refuses to start** rather than falling back to a default
+
+See the [security baseline](CONTRIBUTING.md) for the incident behind each of these rules.
+
+## Documentation
+
+For deployment guides, API references and architecture documentation, visit
+[mqttsnet.com](https://mqttsnet.com).
+
+New to this codebase? Read [CONTRIBUTING.md](CONTRIBUTING.md) first — its engineering
+discipline encodes every non-obvious behaviour we have already been bitten by.
+
+## Contributing
+
+See the [Contributor Guide](CONTRIBUTING.md). The engineering rules there are not
+style preferences — each one exists because breaking it caused a silent bug.
+
+## Contact
+
+- Business Cooperation: [mqttsnet@163.com](mailto:mqttsnet@163.com)
+- Issues: [GitHub Issues](https://github.com/mqttsnet/thinglinks-edge/issues)
+- Pull Requests: [GitHub PRs](https://github.com/mqttsnet/thinglinks-edge/pulls)
+
+> **Note:** This project is mirrored to multiple code hosting platforms. The **only
+> official channel** for bug reports, feature requests and discussions is
+> [GitHub Issues](https://github.com/mqttsnet/thinglinks-edge/issues).
+
+## Acknowledgments
+
+- [Node-RED](https://nodered.org) — Flow-based programming for the Internet of Things
+- [Fastify](https://fastify.dev) — Fast and low overhead web framework
+
+## License
+
+ThingLinks Edge is licensed under the [Apache License 2.0](LICENSE).
+
+---
+
+<div align="center">
+
+Copyright &copy; 2019-present [MqttsNet](https://mqttsnet.com). All rights reserved.
+
+</div>

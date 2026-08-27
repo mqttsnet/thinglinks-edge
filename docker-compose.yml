@@ -1,0 +1,135 @@
+# ThingLinks Edge —— 单机部署
+#
+#   cp .env.example .env      # 至少填 EXTERNAL_URL 与 MASTER_KEY
+#   docker compose up -d
+#   docker compose logs manager | grep '\[init\]'    # 首次启动打印一次初始口令
+#
+# Manager 以**兄弟容器**模式管理 Node-RED 实例：实例是宿主上的独立容器，
+# 不是 Manager 的子进程。升级 Manager（docker compose pull && up -d）
+# 不会中断现场采集 —— 产线不会为了升级管理台而停止采集。
+
+# EDGE_NAME_PREFIX 只为「同机并行跑两套」而存在（例如现场栈开着、同时跑验证）。
+# 默认值与固定命名完全一致，生产不需要设置它。
+services:
+  # 受限 docker 端点。Manager 不再接触宿主 socket —— 它只能通过这里，
+  # 而这里只放行下面白名单里的十几条 API。
+  #
+  # 为什么不是 tecnativa/docker-socket-proxy：那个按「分区」开关（POST=1 一把全开），
+  # 这个能按方法逐条正则白名单，和本项目 container-spec 的硬白名单是同一套思路。
+  #
+  # 正则用 YAML **单引号**标量：双引号标量会解释 \. \? 并报
+  # found unknown escape character。行尾的 $$ 是防御写法 —— compose 只在 $ 后面
+  # 跟标识符或 { 时才插值（实测 ^abc$FOO 到容器里会变成 ^abc），孤立的行尾 $ 本身安全。
+  docker-proxy:
+    image: wollomatic/socket-proxy:1.13.1
+    container_name: ${EDGE_NAME_PREFIX:-thinglinks-edge}-docker-proxy
+    restart: unless-stopped
+    command:
+      - -loglevel=info
+      - -listenip=0.0.0.0
+      - -allowfrom=${EDGE_NAME_PREFIX:-thinglinks-edge}-manager
+      - -allowhealthcheck
+      - -watchdoginterval=30
+      - -stoponwatchdog
+      - '-allowGET=^(/v1\.[0-9]+)?/(_ping|version|containers/json|containers/[a-zA-Z0-9][a-zA-Z0-9_.-]*/(json|logs|stats)|volumes/[a-zA-Z0-9][a-zA-Z0-9_.-]*|networks)(\?.*)?$$'
+      - '-allowPOST=^(/v1\.[0-9]+)?/(containers/create|containers/[a-zA-Z0-9][a-zA-Z0-9_.-]*/(start|stop|restart)|networks/create|networks/[a-zA-Z0-9][a-zA-Z0-9_.-]*/(connect|disconnect)|volumes/create)(\?.*)?$$'
+      - '-allowPUT=^(/v1\.[0-9]+)?/containers/[a-zA-Z0-9][a-zA-Z0-9_.-]*/archive(\?.*)?$$'
+      - '-allowDELETE=^(/v1\.[0-9]+)?/(containers/[a-zA-Z0-9][a-zA-Z0-9_.-]*|networks/[a-zA-Z0-9][a-zA-Z0-9_.-]*|volumes/[a-zA-Z0-9][a-zA-Z0-9_.-]*)(\?.*)?$$'
+    volumes:
+      # 只读挂载：代理自己也不需要写 socket 文件本身
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    # 访问 docker.sock 需要加入其属组。查本机取值： stat -c '%g' /var/run/docker.sock
+    # 特权集中在这个十几 MB 的 distroless 小程序上，而不是 Manager 那个 Node 应用
+    group_add:
+      - "${DOCKER_GID:-0}"
+    networks:
+      - edge-docker
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+
+  # 首次启动准备宿主数据根。Docker 自动创建缺失的 bind 源目录时属主是 root:root，
+  # 而 Manager 与 Node-RED 都以 uid 1000 运行 —— 不先摆平属主，第一次启动就写不进去，
+  # 且表现是「容器起来了但建实例失败」而不是明确的挂载错误。
+  # 以 root 跑一次即退出，Manager 等它成功后再起。
+  init-data:
+    image: alpine:3.22
+    container_name: ${EDGE_NAME_PREFIX:-thinglinks-edge}-init-data
+    user: "0:0"
+    command: >
+      sh -c 'mkdir -p /data-root/manager /data-root/instances
+      && chown -R 1000:1000 /data-root
+      && chmod 0770 /data-root/manager /data-root/instances'
+    volumes:
+      - ${EDGE_DATA_ROOT:-/data01/mqttsnet/thinglinks-edge}:/data-root
+    restart: "no"
+
+  manager:
+    build:
+      context: .
+      dockerfile: apps/manager/Dockerfile
+    image: thinglinks-edge-manager:0.1.0
+    container_name: ${EDGE_NAME_PREFIX:-thinglinks-edge}-manager
+    restart: unless-stopped
+
+    environment:
+      # 唯一真源：所有对外链接、跳转与 Cookie 策略都由它派生，程序绝不猜自己的外部地址
+      EXTERNAL_URL: ${EXTERNAL_URL:?必须设置，例如 http://192.168.10.20:8080}
+      # 实例凭据的加密主密钥。缺失时进程拒绝启动，不会静默回落默认值
+      MASTER_KEY: ${MASTER_KEY:?必须设置，可用 openssl rand -hex 32 生成}
+      # 显式给容器名，不要依赖回退。Manager 要把自己接入每个实例的独立网络，
+      # 未配置时它退回读 hostname；compose 不设 hostname 时那正好是容器短 id，
+      # network connect 也认，于是「碰巧能用」—— 但只要这里加了 hostname:，
+      # 或换了编排方式，接入就会失败，且表现是反代 502 而不是启动报错。
+      # 见 index.ts 的 resolveManagerContainer
+      MANAGER_CONTAINER: ${EDGE_NAME_PREFIX:-thinglinks-edge}-manager
+      INSTANCE_NETWORK: ${INSTANCE_NETWORK:-thinglinks-edge}
+      INSTANCE_PORT_MIN: ${INSTANCE_PORT_MIN:-30000}
+      INSTANCE_PORT_MAX: ${INSTANCE_PORT_MAX:-30999}
+      ALLOWED_IMAGE_TAGS: ${ALLOWED_IMAGE_TAGS:-5.0.4-24-minimal,4.1.13-22-minimal}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+      # 宿主持久化根。Manager 自己的库与全部实例数据都在这下面，排障只看这一处。
+      # 必须与下面 volumes 的挂载点同名 —— Manager 用容器内视角 mkdir，
+      # 而 daemon 用宿主视角解析实例的 Binds，路径一致才不需要翻译。
+      EDGE_DATA_ROOT: ${EDGE_DATA_ROOT:-/data01/mqttsnet/thinglinks-edge}
+      # 时区。Manager 自己和它创建的每个 Node-RED 实例都用这个值 ——
+      # 官方镜像默认 UTC，不设的话定时流程、班次判断、日志时间戳整体偏移且不报错
+      TZ: ${TZ:-Asia/Shanghai}
+      # 健康监测趋势曲线的采样间隔（秒）。0 关闭采样，界面会明说趋势未启用。
+      # 历史只存内存：重启即清零，换来的是不去磨盒子的 SD 卡
+      EDGE_METRICS_INTERVAL_SEC: ${EDGE_METRICS_INTERVAL_SEC:-10}
+      # 受限代理的地址。显式解析，配错了直接启动报错而不是悄悄回落到裸 socket
+      DOCKER_HOST: tcp://${EDGE_NAME_PREFIX:-thinglinks-edge}-docker-proxy:2375
+
+    ports:
+      # 默认只发布到回环：现场要外部可达时改成 "0.0.0.0:8080:8080"，
+      # 或（推荐）由前面的企业反代转发过来
+      - "${BIND_ADDR:-127.0.0.1}:${HOST_PORT:-8080}:8080"
+
+    volumes:
+      # 同名挂载：容器内路径 == 宿主路径。Manager 要 mkdir/删除实例数据目录（容器内视角），
+      # 同时要把同一路径写进实例容器的 Binds 交给 daemon 解析（宿主视角）。
+      # 两边同名就不存在翻译，也就不会出现「以为建好了、实际挂到别处」的静默错挂。
+      - ${EDGE_DATA_ROOT:-/data01/mqttsnet/thinglinks-edge}:${EDGE_DATA_ROOT:-/data01/mqttsnet/thinglinks-edge}
+      # 没有 docker.sock —— Manager 够不到宿主 docker 端点，只能走受限代理
+
+    networks:
+      - edge-docker
+
+    depends_on:
+      docker-proxy:
+        condition: service_started
+      init-data:
+        condition: service_completed_successfully
+
+    # 只读根文件系统：可写的地方只有数据目录与 tmpfs
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  # 只有 Manager 与代理在这张网上；实例各有各的网络，够不到代理
+  edge-docker:
+    name: ${EDGE_NAME_PREFIX:-thinglinks-edge}-docker

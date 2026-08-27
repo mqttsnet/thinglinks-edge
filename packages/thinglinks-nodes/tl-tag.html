@@ -1,0 +1,37 @@
+<script type="text/javascript">
+  RED.nodes.registerType('tl-tag', {
+    category: 'ThingLinks',
+    color: '#1a97f5',
+    defaults: {
+      name: { value: '' },
+      deviceId: { value: '', required: true },
+      tagId: { value: '', required: true },
+      unit: { value: '' },
+      dataType: { value: '' },
+    },
+    inputs: 1,
+    outputs: 1,
+    icon: 'font-awesome/fa-tag',
+    paletteLabel: '点位',
+    label: function () { return this.name || this.tagId || 'tl-tag'; },
+  });
+</script>
+
+<script type="text/html" data-template-name="tl-tag">
+  <div class="form-row"><label for="node-input-deviceId">所属设备</label>
+    <input type="text" id="node-input-deviceId" placeholder="plc-1"></div>
+  <div class="form-row"><label for="node-input-tagId">点位标识</label>
+    <input type="text" id="node-input-tagId" placeholder="temperature"></div>
+  <div class="form-row"><label for="node-input-name">名称</label>
+    <input type="text" id="node-input-name" placeholder="料筒温度"></div>
+  <div class="form-row"><label for="node-input-unit">量纲</label>
+    <input type="text" id="node-input-unit" placeholder="°C"></div>
+  <div class="form-row"><label for="node-input-dataType">数据类型</label>
+    <input type="text" id="node-input-dataType" placeholder="float"></div>
+</script>
+
+<script type="text/html" data-help-name="tl-tag">
+  <p>定义一个点位，并把流经的值上报为该点位的当前值。消息原样透传。</p>
+  <p><code>msg.payload</code> 是对象且含本点位标识时取那一项，否则整个 payload 作为值。
+  质量码取 <code>msg.quality</code>，默认 <code>good</code>。</p>
+</script>

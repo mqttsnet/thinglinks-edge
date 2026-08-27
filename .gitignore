@@ -1,4 +1,21 @@
-mongodb
-registry/storage
-docker-compose.yml
-custom-node-red/settings.js
+node_modules/
+dist/
+*.log
+
+# 本地数据与凭据 —— 永不提交
+data/
+*.db
+*.db-wal
+*.db-shm
+.master.key
+.env
+.env.*
+!.env.example
+
+# 编辑器
+.idea/
+.vscode/
+.DS_Store
+
+
+.claude

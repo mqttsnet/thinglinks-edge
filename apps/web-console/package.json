@@ -1,0 +1,25 @@
+{
+  "name": "@thinglinks-edge/web-console",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "typecheck": "vue-tsc --noEmit",
+    "lint": "vue-tsc --noEmit",
+    "test": "echo '(web-console 暂无单测)'",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "vue": "^3.5.41",
+    "vue-router": "^5.2.0",
+    "naive-ui": "^2.45.2"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.8",
+    "typescript": "^5.9.3",
+    "vite": "^8.2.2",
+    "vue-tsc": "^3.3.11"
+  }
+}

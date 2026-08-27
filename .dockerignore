@@ -1,0 +1,11 @@
+# 构建上下文是仓库根目录，这里排除的东西越多镜像构建越快
+.git
+.idea
+.claude
+node_modules
+**/node_modules
+**/dist
+tasks
+docs
+*.log
+.DS_Store
