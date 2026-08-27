@@ -63,7 +63,7 @@ test('掩码版本不含任何密文字段，只说明是否已设置', () => {
     assert.ok(!dump.includes(secret), `掩码版本里出现了明文 ${secret}`);
   }
   assert.deepEqual(red.secretsSet,
-    { password: true, signKey: true, encryptKey: true, encryptVector: true });
+    { password: true, signKey: true, encryptKey: true, encryptVector: true, tlsKey: false });
 });
 
 test('密文字段留空表示不变，只改地址不用重输口令', () => {

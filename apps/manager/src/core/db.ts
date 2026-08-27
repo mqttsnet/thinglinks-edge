@@ -147,6 +147,23 @@ const MIGRATIONS: string[] = [
     updated_by            TEXT    NOT NULL DEFAULT ''
   );
   `,
+  /*
+   * v5 —— 云连接的 TLS 材料（mqtts / wss + 证书）。
+   *
+   * 只有**私钥**带 `_enc`：CA 与客户端证书是公开材料，明文存着排障时能直接看；
+   * 私钥一旦泄漏，拿它就能冒充这台网关上行，与口令同级，必须加密。
+   *
+   * `tls_reject_unauthorized` 默认 1。默认值只能往严了给：默认放行的话，
+   * 现场十有八九不会去改，于是全网的 TLS 都成了「只加密不认人」。
+   */
+  `
+  ALTER TABLE cloud_config ADD COLUMN tls_mode                TEXT    NOT NULL DEFAULT 'system';
+  ALTER TABLE cloud_config ADD COLUMN tls_ca                  TEXT    NOT NULL DEFAULT '';
+  ALTER TABLE cloud_config ADD COLUMN tls_cert                TEXT    NOT NULL DEFAULT '';
+  ALTER TABLE cloud_config ADD COLUMN tls_key_enc             TEXT    NOT NULL DEFAULT '';
+  ALTER TABLE cloud_config ADD COLUMN tls_reject_unauthorized INTEGER NOT NULL DEFAULT 1;
+  ALTER TABLE cloud_config ADD COLUMN tls_servername          TEXT    NOT NULL DEFAULT '';
+  `,
 ];
 
 export function openDb(file: string): Db {
