@@ -58,9 +58,16 @@ test('哪些动作需要落到具体实例', () => {
 });
 
 test('每个动作至少归属一个角色 —— 否则谁都做不了', () => {
-  const all: Action[] = ['system:view', 'instance:list', 'instance:view', 'instance:operate', 'instance:create',
-    'instance:delete', 'field:view', 'replay:run', 'backup:run', 'user:manage'];
-  for (const a of all) {
+  /*
+   * 写成 Record<Action, true> 而不是数组：新增一个动作却忘了加进来会**编译不过**，
+   * 数组则只会让这条断言悄悄少覆盖一个动作 —— 而那正是「谁都做不了」的漏网方式。
+   */
+  const ALL: Record<Action, true> = {
+    'system:view': true, 'instance:list': true, 'instance:view': true, 'instance:operate': true,
+    'instance:create': true, 'instance:delete': true, 'field:view': true, 'replay:run': true,
+    'backup:run': true, 'cloud:view': true, 'cloud:manage': true, 'user:manage': true,
+  };
+  for (const a of Object.keys(ALL) as Action[]) {
     assert.ok(ROLES.some((r) => can(r, a)), `动作 ${a} 没有任何角色能做`);
   }
 });
@@ -68,7 +75,8 @@ test('每个动作至少归属一个角色 —— 否则谁都做不了', () => 
 test('describeRole 给前端用，但只是展示', () => {
   const d = describeRole('viewer');
   assert.equal(d.role, 'viewer');
-  assert.deepEqual(d.actions, ['field:view', 'instance:list', 'instance:view', 'system:view']);
+  assert.deepEqual(d.actions,
+    ['cloud:view', 'field:view', 'instance:list', 'instance:view', 'system:view']);
   assert.deepEqual(describeRole('nobody').actions, []);
 });
 
