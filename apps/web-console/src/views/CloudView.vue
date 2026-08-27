@@ -14,7 +14,8 @@ import {
   NAlert, NSpin, NTag, NInputNumber, useMessage, useDialog,
 } from 'naive-ui';
 import { api, ApiError } from '../api/client';
-import type { CloudConfigView, CloudStatus, SpoolMetrics, CipherFlag } from '../api/types';
+import type { CloudConfigView, CloudStatus, SpoolMetrics, CipherFlag, EdgeMetrics } from '../api/types';
+import { can } from '../api/permissions';
 import FieldHelp from '../components/FieldHelp.vue';
 
 const message = useMessage();
@@ -25,7 +26,40 @@ const saving = ref(false);
 const config = ref<CloudConfigView | null>(null);
 const status = ref<CloudStatus | null>(null);
 const spool = ref<SpoolMetrics | null>(null);
+/** 数据面明细。与 api.cloud() 的 spool 概要分开取：那边只够画一条提示，这边要画整张卡 */
+const metrics = ref<EdgeMetrics | null>(null);
+const replaying = ref(false);
 let timer: number | undefined;
+
+const canReplay = computed(() => can('replay:run'));
+
+/** 补传按钮为什么不能点。**必须说清楚** —— 一个灰着不解释的按钮等于没有 */
+const replayBlock = computed(() => {
+  const m = metrics.value;
+  if (!m) return '正在读取数据面状态';
+  if (!m.spool) return '未启用断网缓存，没有可补传的数据';
+  if (m.cloud !== 'configured') return '云连接未配置，补传无处可发';
+  if (m.spool.pending === 0) return '当前没有积压，不需要补传';
+  return '';
+});
+
+async function doReplay() {
+  replaying.value = true;
+  try {
+    const r = await api.replaySpool();
+    // 报实数而不是「已触发」：现场要的是「到底补出去几条」
+    message.success(
+      r.failed > 0
+        ? `补传 ${r.sent} 条，仍有 ${r.failed} 条失败`
+        : `补传完成，共 ${r.sent} 条`,
+    );
+    await refresh(true);
+  } catch (e) {
+    message.error(e instanceof ApiError ? e.message : '补传失败');
+  } finally {
+    replaying.value = false;
+  }
+}
 
 const form = ref({
   enabled: true,
@@ -60,6 +94,8 @@ async function refresh(quiet = false) {
     config.value = r.config;
     status.value = r.status;
     spool.value = r.spool;
+    // 单独一路，失败不影响上面的连接状态显示
+    metrics.value = await api.edgeMetrics().catch(() => null);
     // 只在非静默刷新时回填表单，否则用户正在输入的内容会被轮询冲掉
     if (!quiet && r.config) {
       form.value = {
@@ -178,6 +214,7 @@ function unlink() {
 }
 
 const mb = (n: number) => (n / 1024 / 1024).toFixed(1);
+const kb = (n: number) => (n / 1024).toFixed(1);
 const localTime = (iso: string | null) => (iso ? new Date(iso).toLocaleString() : '—');
 
 /**
@@ -226,6 +263,113 @@ const dbTime = (v: string | undefined) =>
           占用 {{ mb(spool.bytes) }} MB / {{ mb(spool.maxBytes) }} MB。
           链路恢复后会在实时数据之外的余量里自动补发。
         </NAlert>
+      </NCard>
+
+      <!-- 第一屏半：数据面明细。紧跟状态卡，回答「数据到底走没走出去」 -->
+      <NCard class="card" :bordered="false">
+        <div class="head">
+          <h3>
+            微批与积压
+            <FieldHelp>
+              <p>点位不是一条一发。<b>攒批</b>把同一时间窗内的点合成一条消息上行，
+                现场几千个点时能把消息数降两个数量级。</p>
+              <p>发不出去时（断网、云端拒绝）转入<b>断网缓存</b>落盘，
+                链路恢复后在实时数据之外的余量里自动补发。</p>
+              <p>这张卡回答的是「数据到底走没走出去」—— 连接是绿的但积压一直涨，
+                说明能连上却发不成功。</p>
+            </FieldHelp>
+          </h3>
+          <NButton
+            v-if="canReplay" size="small" :loading="replaying"
+            :disabled="replayBlock !== ''" :title="replayBlock"
+            @click="doReplay">立即补传</NButton>
+        </div>
+
+        <template v-if="metrics">
+          <h4 class="sec">
+            微批
+            <span class="lim mono">
+              {{ metrics.batch.limits.windowMs }}ms /
+              {{ metrics.batch.limits.maxPoints }} 点 /
+              {{ Math.round(metrics.batch.limits.maxBytes / 1024) }}KB
+            </span>
+            <FieldHelp>
+              <p>三个阈值<b>任一达到就立刻发出</b>，不是等三个都满。</p>
+              <p>时间窗保证低频点位不会一直压着不发；点数与字节上限保证高频时
+                单条消息不至于过大。</p>
+            </FieldHelp>
+          </h4>
+          <div class="kv">
+            <div>
+              <span class="lb">当前待发</span>
+              <span class="num">{{ metrics.batch.pending }} 点 · {{ kb(metrics.batch.pendingBytes) }} KB</span>
+            </div>
+            <div><span class="lb">累计发出</span><span class="num">{{ metrics.batch.batches }} 批 / {{ metrics.batch.points }} 点</span></div>
+            <div>
+              <span class="lb">
+                发送失败
+                <FieldHelp>
+                  <p>失败的点<b>不会丢</b>，会转入下面的断网缓存等待补传。</p>
+                  <p>这个数只增不减 —— 它记的是「历史上失败过多少点」，
+                    不是「现在还有多少没发出去」。后者看下面的「待补传」。</p>
+                </FieldHelp>
+              </span>
+              <span class="num" :class="{ bad: metrics.batch.failures > 0 }">{{ metrics.batch.failures }} 点</span>
+            </div>
+            <div><span class="lb">转入缓存</span><span class="num">{{ metrics.batch.spooled }} 批</span></div>
+          </div>
+
+          <template v-if="metrics.spool">
+            <h4 class="sec">
+              断网缓存
+              <span class="lim mono">{{ metrics.spool.policy }}</span>
+              <FieldHelp>
+                <p>写满之后怎么办由<b>写满策略</b>决定，部署时配置：
+                  丢最旧、丢最新、或拒绝新数据。</p>
+                <p>三种都会丢数据，区别只在丢哪一头 —— 现场要按业务性质选：
+                  趋势类丢最旧，告警类宁可拒绝新写入也不能丢历史。</p>
+              </FieldHelp>
+            </h4>
+            <div class="kv">
+              <div>
+                <span class="lb">待补传</span>
+                <span class="num" :class="{ warn: metrics.spool.pending > 0 }">{{ metrics.spool.pending }} 条</span>
+              </div>
+              <div>
+                <span class="lb">占用</span>
+                <span class="num" :class="{ bad: metrics.spool.usagePercent >= 90 }">
+                  {{ mb(metrics.spool.bytes) }} / {{ mb(metrics.spool.maxBytes) }} MB
+                  （{{ metrics.spool.usagePercent }}%）
+                </span>
+              </div>
+              <div><span class="lb">分段数</span><span class="num">{{ metrics.spool.segments }}</span></div>
+              <div><span class="lb">已补传</span><span class="num">{{ metrics.spool.replayed }} 条</span></div>
+            </div>
+
+            <NAlert v-if="metrics.spool.full" type="error" :bordered="false" style="margin-top:12px">
+              断网缓存<b>已写满</b>，正在按「{{ metrics.spool.policy }}」策略丢弃数据。
+              已丢弃：最旧 {{ metrics.spool.droppedOldest }} 条 ·
+              最新 {{ metrics.spool.droppedNewest }} 条 ·
+              拒绝写入 {{ metrics.spool.rejected }} 条。
+              请尽快恢复云链路，或扩大缓存上限。
+            </NAlert>
+            <NAlert
+              v-else-if="metrics.spool.droppedOldest + metrics.spool.droppedNewest + metrics.spool.rejected > 0"
+              type="warning" :bordered="false" style="margin-top:12px">
+              历史上曾因写满丢弃过数据：最旧 {{ metrics.spool.droppedOldest }} 条 ·
+              最新 {{ metrics.spool.droppedNewest }} 条 · 拒绝写入 {{ metrics.spool.rejected }} 条。
+            </NAlert>
+          </template>
+          <p v-else class="hint sec">
+            未启用断网缓存。发不出去的数据会<b>直接丢弃</b>并计入上面的「发送失败」，
+            断网期间的现场数据不会保留。
+          </p>
+
+          <NAlert v-if="metrics.batch.lastError" type="warning" :bordered="false" style="margin-top:12px">
+            数据面最近一次错误：{{ metrics.batch.lastError }}
+          </NAlert>
+        </template>
+        <p v-else class="hint">读取数据面状态失败，稍后自动重试。</p>
       </NCard>
 
       <!-- 第二屏：接入参数 -->
@@ -383,6 +527,17 @@ const dbTime = (v: string | undefined) =>
 .bar h2 { margin: 0; font-size: 23px; font-weight: 650; letter-spacing: -.02em; color: var(--primary); }
 .bar .sub { margin: 2px 0 0; color: var(--muted); font-size: 12.5px; }
 .card { border-radius: var(--r); box-shadow: var(--shadow); margin-bottom: 16px; }
+.head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+.head h3 { margin: 0; font-size: 14px; }
+h4.sec {
+  display: flex; align-items: center; gap: 8px;
+  margin: 18px 0 8px; font-size: 13px; color: var(--text-2);
+}
+.lim { font-size: 11.5px; color: var(--muted); font-weight: 400; }
+.num.warn { color: var(--warning); }
+.num.bad { color: var(--error); }
+.hint { font-size: 12px; color: var(--muted); line-height: 1.7; margin: 0; }
+.hint.sec { margin-top: 18px; }
 
 .st { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .spacer { margin-left: auto; }
