@@ -16,6 +16,7 @@ import {
 import {
   fetchModel, type ModelQueryRequest, type ModelQueryResponse, type ProductModel,
 } from './model-client.ts';
+import { tlsConnectOptions, DEFAULT_TLS, type TlsConfig } from './tls.ts';
 import {
   buildAddPayload, buildUpdatePayload, buildDeletePayload, chunk, summarizeAddResult,
   DEFAULT_BATCH_SIZE, TopoError,
@@ -32,10 +33,16 @@ export interface GatewayCredentials {
 }
 
 export interface GatewayOptions {
-  /** 形如 `mqtts://iot.thinglinks.cn:8883`，协议由地址本身决定 */
+  /** 形如 `mqtts://broker.thinglinks.mqttsnet.com:11884`，加不加密由地址的 scheme 决定 */
   brokerUrl: string;
   credentials: GatewayCredentials;
   cipher: CipherParams;
+  /**
+   * TLS 材料。缺省即 `system` 模式：走系统根证书、严格校验。
+   * 地址是明文协议时整块被忽略（`tlsConnectOptions` 自己判断），
+   * 不在这里再判一次 —— 同一条规则两处实现必然漂移。
+   */
+  tls?: TlsConfig;
   /** topic 首段的协议版本，当前 `v1` */
   protocolVersion?: string;
   /** 上行 QoS，默认 1。云侧不做去重，QoS2 的代价通常不值得 */
@@ -126,6 +133,9 @@ export class CloudGateway {
       reconnectPeriod: this.#o.reconnectPeriodMs ?? 5_000,
       connectTimeout: this.#o.connectTimeoutMs ?? 15_000,
       resubscribe: true,
+      // ca/cert/key/rejectUnauthorized/servername 原样交给 node:tls。
+      // 明文地址下这里是空对象，一个 TLS 字段都不会塞进去
+      ...tlsConnectOptions(this.#o.tls ?? DEFAULT_TLS, brokerUrl),
     };
 
     const client = (connectFn ?? mqtt.connect)(brokerUrl, opts);

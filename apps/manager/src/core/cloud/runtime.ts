@@ -17,6 +17,7 @@
  *      重试。所以拒绝只记录成 lastError，不拆连接。
  */
 import { CloudGateway, type GatewayState, type GatewayOptions } from './gateway.ts';
+import { isTlsScheme, type TlsMode } from './tls.ts';
 import type { CloudConfig } from './config-repo.ts';
 
 /** 对外的连接状态。比 GatewayState 多两档，用来区分「没配」和「配了但关着」 */
@@ -31,6 +32,14 @@ export interface CloudStatus {
   deviceIdentification: string;
   clientId: string;
   cipherFlag: number;
+  /** 链路是不是加密的。第一屏要能一眼看出来，别让人去反推地址的 scheme */
+  secure: boolean;
+  tlsMode: TlsMode;
+  /**
+   * 校验服务端证书。false 就是「只加密不认人」——
+   * 状态里如实标出来，否则这个降级只在保存那一刻可见，事后没人记得
+   */
+  rejectUnauthorized: boolean;
   lastError: string;
   lastErrorAt: string | null;
   connectedAt: string | null;
@@ -98,6 +107,7 @@ export class CloudRuntime {
         password: config.password,
       },
       cipher: config.cipher,
+      tls: config.tls,
       protocolVersion: config.protocolVersion,
       qos: config.qos,
       ...(this.#opts.connectFn ? { connectFn: this.#opts.connectFn } : {}),
@@ -169,6 +179,9 @@ export class CloudRuntime {
       deviceIdentification: c?.deviceIdentification ?? '',
       clientId: c?.clientId ?? '',
       cipherFlag: c?.cipher.cipherFlag ?? 0,
+      secure: c ? isTlsScheme(c.brokerUrl) : false,
+      tlsMode: c?.tls.mode ?? 'system',
+      rejectUnauthorized: c?.tls.rejectUnauthorized ?? true,
       lastError: this.#lastError,
       lastErrorAt: this.#lastErrorAt,
       connectedAt: this.#connectedAt,
