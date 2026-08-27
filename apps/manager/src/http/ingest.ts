@@ -21,7 +21,17 @@ import type { HttpContext } from './context.ts';
 const MAX_BATCH = 1000;
 
 export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
-  const { config, repo, db, guard, cloudSink, spool } = ctx;
+  const { config, repo, db, guard, cloudSink, spool, cloud } = ctx;
+
+  /*
+   * 「云连接配没配」以运行期为准。
+   *
+   * 不能看 cloudSink 在不在：接上 CloudRuntime 之后它是一个恒定的转发闭包，
+   * 永远为真，于是「未配置」这个状态就再也报不出来了 —— 界面会显示
+   * 「已配置」而数据其实一条都发不出去。没有运行期时（单测直接注入 sink）
+   * 才退回看 sink。
+   */
+  const cloudReady = () => (cloud ? cloud.configured : Boolean(cloudSink));
   const registry = new FieldRegistry(db);
 
   /*
@@ -38,7 +48,7 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
    */
   let draining = false;
   const drain = async () => {
-    if (!spool || !cloudSink || draining) return;
+    if (!spool || !cloudSink || !cloudReady() || draining) return;
     draining = true;
     try {
       await spool.replay(async (p) => { await cloudSink(p); },
@@ -211,16 +221,18 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
       return reply.code(202).send({
         accepted,
         batched: batcher.pending,
-        cloud: cloudSink ? 'queued' : 'not-configured',
+        cloud: cloudReady() ? 'queued' : 'not-configured',
       });
     } catch (e) { return fail(reply, e); }
   });
 
   /** 数据面指标（08 号文第 8 节要求控制台可见） */
   api.get(`${config.basePath}/api/edge/metrics`, async (req, reply) => {
-    if (!guard(req, reply, { csrf: false })) return;
+    if (!guard(req, reply, { csrf: false, need: 'field:view' })) return;
     return reply.send({
-      cloud: cloudSink ? 'configured' : 'not-configured',
+      cloud: cloudReady() ? 'configured' : 'not-configured',
+      // 连接明细只有装了运行期才有；没装时如实给 null，不编一个假状态
+      cloudStatus: cloud ? cloud.status() : null,
       batch: {
         limits: batcher.limits,
         pending: batcher.pending,
@@ -233,9 +245,9 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
 
   /** 手动触发一轮补传。正常情况下由每次成功发送自动带动，这个口子是给现场排障用的 */
   api.post(`${config.basePath}/api/edge/replay`, async (req, reply) => {
-    if (!guard(req, reply, { csrf: true })) return;
+    if (!guard(req, reply, { csrf: true, need: 'replay:run' })) return;
     if (!spool) return reply.code(400).send({ error: '未配置断网缓存' });
-    if (!cloudSink) return reply.code(503).send({ error: '云连接未配置，无法补传' });
+    if (!cloudSink || !cloudReady()) return reply.code(503).send({ error: '云连接未配置，无法补传' });
     const r = await spool.replay(async (p) => { await cloudSink(p); },
                                  { ratePerSec: 200, maxRecords: 1000 });
     return reply.send(r);
@@ -243,13 +255,13 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
 
   // ── 控制台读取（走管理会话，不是接入令牌）────────────────
   api.get(`${config.basePath}/api/field/devices`, async (req, reply) => {
-    if (!guard(req, reply, { csrf: false })) return;
+    if (!guard(req, reply, { csrf: false, need: 'field:view' })) return;
     const { instanceId } = req.query as { instanceId?: string };
     return reply.send({ devices: registry.devices(instanceId) });
   });
 
   api.get(`${config.basePath}/api/field/tags`, async (req, reply) => {
-    if (!guard(req, reply, { csrf: false })) return;
+    if (!guard(req, reply, { csrf: false, need: 'field:view' })) return;
     const { instanceId, nodeId } = req.query as { instanceId?: string; nodeId?: string };
     return reply.send({ tags: registry.tags(instanceId, nodeId) });
   });
@@ -263,7 +275,7 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
    * 让用户以为看到的是全部，是诚信问题（06 号文原话）。
    */
   api.get(`${config.basePath}/api/field/southbound`, async (req, reply) => {
-    if (!guard(req, reply, { csrf: false })) return;
+    if (!guard(req, reply, { csrf: false, need: 'field:view' })) return;
     const { instanceId } = req.query as { instanceId?: string };
     if (!instanceId) return reply.code(400).send({ error: '缺少 instanceId' });
 
@@ -281,7 +293,7 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
   });
 
   api.get(`${config.basePath}/api/field/summary`, async (req, reply) => {
-    if (!guard(req, reply, { csrf: false })) return;
+    if (!guard(req, reply, { csrf: false, need: 'field:view' })) return;
     const { instanceId } = req.query as { instanceId?: string };
     /*
      * 两类数字**必须分开返回**，不能相加：

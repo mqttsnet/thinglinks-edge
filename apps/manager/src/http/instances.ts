@@ -5,25 +5,35 @@ import type { HttpContext } from './context.ts';
 
 export function registerInstances(api: FastifyInstance, ctx: HttpContext): void {
   // guard / fail 统一取自上下文：鉴权与错误响应必须全站一致
-  const { config, service, guard, fail } = ctx;
+  const { config, service, guard, fail, users } = ctx;
+
+  /*
+   * 列表类接口必须按授权矩阵**逐条过滤**。
+   * 只在详情接口上判权是不够的 —— 列表把未授权实例的 id、名称、端口都摆出来了，
+   * 那本身就是信息泄漏，而且用户会去点一个必然 403 的东西。
+   */
+  const visible = <T extends { id: string }>(user: { username: string; role: string }, items: T[]): T[] =>
+    user.role === 'admin' ? items
+      : items.filter((i) => users.grantFor(user.username, i.id) !== undefined);
 
   api.get(`${config.basePath}/api/instances`, async (req, reply) => {
-    if (!guard(req, reply, { csrf: false })) return;
-    const list = await service.list();
+    const user = guard(req, reply, { csrf: false, need: 'instance:list' });
+    if (!user) return;
+    const list = visible(user, await service.list());
     return reply.send({
       instances: list.map((i) => ({ ...i, openUrl: `${config.basePath}/red/${i.id}/sso` })),
     });
   });
 
   api.get(`${config.basePath}/api/instances/:id`, async (req, reply) => {
-    if (!guard(req, reply, { csrf: false })) return;
+    if (!guard(req, reply, { csrf: false, need: 'instance:view', instance: (req.params as { id: string }).id })) return;
     const view = await service.get((req.params as { id: string }).id);
     return view ? reply.send({ instance: view }) : reply.code(404).send({ error: '实例不存在' });
   });
 
   /** 端口推荐 —— 只作建议，用户可自行填写 */
   api.get(`${config.basePath}/api/ports/recommend`, async (req, reply) => {
-    if (!guard(req, reply, { csrf: false })) return;
+    if (!guard(req, reply, { csrf: false, need: 'instance:create' })) return;
     const count = Number((req.query as { count?: string }).count ?? '20');
     if (!Number.isInteger(count) || count < 0 || count > 200) {
       return reply.code(400).send({ error: 'count 需为 0-200 的整数' });
@@ -31,8 +41,16 @@ export function registerInstances(api: FastifyInstance, ctx: HttpContext): void 
     return reply.send({ recommended: service.recommendPorts(count) });
   });
 
+  /** 可选的实例镜像版本 + 本机是否已有。前端据此标灰缺失版本，不再自己硬编码列表 */
+  api.get(`${config.basePath}/api/images`, async (req, reply) => {
+    // 这个列表只在「新建实例」弹窗里用，权限跟着建实例走；
+    // instance:view 是实例级动作、缺实例即拒，这里没有实例可指
+    if (!guard(req, reply, { csrf: false, need: 'instance:create' })) return;
+    return reply.send({ images: await service.imageOptions() });
+  });
+
   api.post(`${config.basePath}/api/instances`, async (req, reply) => {
-    const user = guard(req, reply, { csrf: true });
+    const user = guard(req, reply, { csrf: true, need: 'instance:create' });
     if (!user) return;
     const b = (req.body ?? {}) as Record<string, unknown>;
     try {
@@ -64,7 +82,7 @@ export function registerInstances(api: FastifyInstance, ctx: HttpContext): void 
 
   for (const action of ['start', 'stop'] as const) {
     api.post(`${config.basePath}/api/instances/:id/${action}`, async (req, reply) => {
-      const user = guard(req, reply, { csrf: true });
+      const user = guard(req, reply, { csrf: true, need: 'instance:operate', instance: (req.params as { id: string }).id });
       if (!user) return;
       try {
         await service[action]((req.params as { id: string }).id, user.username);
@@ -74,7 +92,7 @@ export function registerInstances(api: FastifyInstance, ctx: HttpContext): void 
   }
 
   api.delete(`${config.basePath}/api/instances/:id`, async (req, reply) => {
-    const user = guard(req, reply, { csrf: true });
+    const user = guard(req, reply, { csrf: true, need: 'instance:delete', instance: (req.params as { id: string }).id });
     if (!user) return;
     // 删数据卷必须显式指定，绝不默认删数据
     const removeData = (req.query as { removeData?: string }).removeData === 'true';
@@ -85,7 +103,7 @@ export function registerInstances(api: FastifyInstance, ctx: HttpContext): void 
   });
 
   api.post(`${config.basePath}/api/instances/:id/credentials/:username/reset`, async (req, reply) => {
-    const user = guard(req, reply, { csrf: true });
+    const user = guard(req, reply, { csrf: true, need: 'instance:operate', instance: (req.params as { id: string }).id });
     if (!user) return;
     const { id, username } = req.params as { id: string; username: string };
     try {
@@ -98,8 +116,10 @@ export function registerInstances(api: FastifyInstance, ctx: HttpContext): void 
   // ── 健康 ────────────────────────────────────────────────
 
   api.get(`${config.basePath}/api/health`, async (req, reply) => {
-    if (!guard(req, reply, { csrf: false })) return;
-    const [instances, host] = await Promise.all([service.healthAll(), service.hostStats()]);
+    const user = guard(req, reply, { csrf: false, need: 'instance:list' });
+    if (!user) return;
+    const [all, host] = await Promise.all([service.healthAll(), service.hostStats()]);
+    const instances = visible(user, all);
     const summary = {
       total: instances.length,
       healthy: instances.filter((i) => i.verdict === 'healthy').length,
@@ -110,14 +130,14 @@ export function registerInstances(api: FastifyInstance, ctx: HttpContext): void 
   });
 
   api.get(`${config.basePath}/api/instances/:id/health`, async (req, reply) => {
-    if (!guard(req, reply, { csrf: false })) return;
+    if (!guard(req, reply, { csrf: false, need: 'instance:view', instance: (req.params as { id: string }).id })) return;
     try {
       return reply.send({ health: await service.health((req.params as { id: string }).id) });
     } catch (e) { return fail(reply, e); }
   });
 
   api.get(`${config.basePath}/api/instances/:id/logs`, async (req, reply) => {
-    if (!guard(req, reply, { csrf: false })) return;
+    if (!guard(req, reply, { csrf: false, need: 'instance:view', instance: (req.params as { id: string }).id })) return;
     const tail = Number((req.query as { tail?: string }).tail ?? '200');
     try {
       const text = await service.logs((req.params as { id: string }).id, Math.min(Math.max(tail, 1), 2000));
@@ -135,7 +155,7 @@ export function registerInstances(api: FastifyInstance, ctx: HttpContext): void 
    * 鉴权与快照接口同一套 guard；GET 不校验 CSRF。
    */
   api.get(`${config.basePath}/api/instances/:id/logs/stream`, async (req, reply) => {
-    if (!guard(req, reply, { csrf: false })) return;
+    if (!guard(req, reply, { csrf: false, need: 'instance:view', instance: (req.params as { id: string }).id })) return;
     const { id } = req.params as { id: string };
     const tail = Number((req.query as { tail?: string }).tail ?? '200');
 

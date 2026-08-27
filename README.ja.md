@@ -12,7 +12,8 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?style=flat-square&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![Fastify](https://img.shields.io/badge/Fastify-5.x-000000?style=flat-square&logo=fastify&logoColor=white)](https://fastify.dev/)
 [![Vue](https://img.shields.io/badge/Vue-3.5-4FC08D?style=flat-square&logo=vuedotjs&logoColor=white)](https://vuejs.org/)
-[![Docker](https://img.shields.io/badge/Docker-Required-2496ED?style=flat-square&logo=docker&logoColor=white)](https://www.docker.com/)
+[![Docker Image](https://img.shields.io/docker/v/mqttsnet/thinglinks-edge?sort=semver&style=flat-square&logo=docker&logoColor=white&label=image&color=2496ED)](https://hub.docker.com/r/mqttsnet/thinglinks-edge)
+[![Docker Pulls](https://img.shields.io/docker/pulls/mqttsnet/thinglinks-edge?style=flat-square&logo=docker&logoColor=white&color=2496ED)](https://hub.docker.com/r/mqttsnet/thinglinks-edge)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square)](LICENSE)
 
 <br>
@@ -66,10 +67,28 @@ Node-RED マルチインスタンスのホスティングは**機能の一つ**�
 | コンポーネント | バージョン |
 | --- | --- |
 | Docker Engine | 24+（Compose v2 同梱） |
+| ホストアーキテクチャ | `x86_64` または `aarch64` —— 32 ビット ARM は**非対応** |
 | Node.js | 24 LTS（開発時のみ） |
 | pnpm | 10.32+（開発時のみ） |
 
+> **32 ビット ARM は公開していません。** 決定的な理由は下流にあります —— Node-RED
+> 公式イメージの 5.x 系は `amd64` / `arm64` のみで、`armv7` 上の Manager が起動できても
+> インスタンスは Node-RED 4.1.x に固定されてしまいます。ビルド側の負担も加わります
+> （`better-sqlite3` に 32 ビット ARM のビルド済みバイナリがない）。
+> そもそも適合しません：真に 32 ビット専用の SoC（i.MX6、AM335x、A20）は
+> 一般に 256MB〜1GB のメモリしかなく、Manager は実測 53 MiB、
+> 各インスタンスは約 104 MiB を必要とします。
+>
+> **Raspberry Pi ユーザーはほぼ影響を受けません**：Pi 3 / 3B+ / Zero 2 W はいずれも
+> 64 ビット対応で、32 ビット OS を入れた場合だけ `armv7` 扱いになります。
+> `uname -m` が `aarch64` なら動作し、`armv7l` では動作しません。
+
 ### デプロイ
+
+Manager イメージは Docker Hub で [`mqttsnet/thinglinks-edge`](https://hub.docker.com/r/mqttsnet/thinglinks-edge) として公開されています。
+`linux/amd64` と `linux/arm64` を含むマルチアーキテクチャのマニフェストなので、
+x86 産業用 PC でも ARM エッジボックスでも同じコマンドが使えます。
+現場のマシンでビルドは一切行われません。Docker さえあれば動きます。
 
 ```bash
 cp .env.example .env        # 最低限 EXTERNAL_URL と MASTER_KEY を設定
@@ -81,6 +100,11 @@ docker compose logs manager | grep '\[init\]'   # 初期パスワードは一度
 
 `EXTERNAL_URL` は外部向け URL・リダイレクト・Cookie ポリシーの**唯一の情報源**です。
 プロセスが自分の外部アドレスを推測することは決してありません。
+
+アップグレードは `.env` の `MANAGER_IMAGE` を新しいタグに変更してから
+`docker compose pull && docker compose up -d` を実行します。稼働中の Node-RED
+インスタンスは**中断されません** —— それらは Manager の子プロセスではなく
+兄弟コンテナだからです。管理コンソールの更新のために生産ラインを止める必要はありません。
 
 ### 開発
 
@@ -95,6 +119,16 @@ cd apps/manager && pnpm build && \
 # ターミナル 2 —— コンソール
 cd apps/web-console && pnpm dev      # http://localhost:5173
 ```
+
+公開イメージではなく**自分でビルドしたイメージ**でスタック全体を動かすには、
+ビルド用のオーバーライドファイルを重ねます：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+```
+
+`docker-compose.yml` 単体は意図的に「pull 専用」です —— 現場のマシンが使う形態だからです。
+
 
 ## ディレクトリ構成
 

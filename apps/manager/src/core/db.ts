@@ -103,6 +103,50 @@ const MIGRATIONS: string[] = [
   );
   CREATE INDEX idx_field_tag_instance ON field_tag(instance_id);
   `,
+  // v3 —— 用户与权限：角色约束 + 实例授权矩阵（T4.4）
+  `
+  CREATE TABLE instance_grant (
+    username    TEXT NOT NULL,
+    instance_id TEXT NOT NULL,
+    level       TEXT NOT NULL CHECK (level IN ('view', 'operate')),
+    granted_by  TEXT NOT NULL DEFAULT '',
+    granted_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (username, instance_id),
+    FOREIGN KEY (instance_id) REFERENCES instance(id) ON DELETE CASCADE
+  );
+  CREATE INDEX idx_grant_user ON instance_grant(username);
+
+  -- 停用而不是删除：删掉用户会让审计里的操作人失去指向
+  ALTER TABLE app_user ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0;
+  `,
+  /*
+   * v4 —— 云平台接入参数。
+   *
+   * 单行表（`id` 恒为 1）：一台边缘网关只接一个云平台租户。做成多行会引出
+   * 「哪一行生效」的问题，而上行必须有唯一出口，否则断网缓存与微批就没有落点。
+   *
+   * 口令、signKey、encryptKey、encryptVector 一律**加密入库**，与实例凭据同一套
+   * 主密钥派生。列名带 `_enc` 后缀是刻意的：看到敏感字段没这个后缀就知道写错了。
+   */
+  `
+  CREATE TABLE cloud_config (
+    id                    INTEGER PRIMARY KEY CHECK (id = 1),
+    enabled               INTEGER NOT NULL DEFAULT 0,
+    broker_url            TEXT    NOT NULL,
+    client_id             TEXT    NOT NULL,
+    device_identification TEXT    NOT NULL,
+    username              TEXT    NOT NULL DEFAULT '',
+    password_enc          TEXT    NOT NULL DEFAULT '',
+    cipher_flag           INTEGER NOT NULL DEFAULT 0,
+    sign_key_enc          TEXT    NOT NULL DEFAULT '',
+    encrypt_key_enc       TEXT    NOT NULL DEFAULT '',
+    encrypt_vector_enc    TEXT    NOT NULL DEFAULT '',
+    protocol_version      TEXT    NOT NULL DEFAULT 'v1',
+    qos                   INTEGER NOT NULL DEFAULT 1 CHECK (qos IN (0, 1, 2)),
+    updated_at            TEXT    NOT NULL DEFAULT (datetime('now')),
+    updated_by            TEXT    NOT NULL DEFAULT ''
+  );
+  `,
 ];
 
 export function openDb(file: string): Db {

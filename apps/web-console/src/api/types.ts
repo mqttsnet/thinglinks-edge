@@ -118,3 +118,26 @@ export interface CreateInstanceBody {
    */
   ports: PortRecord[];
 }
+
+export interface UpdateInfo {
+  enabled: boolean;
+  latest?: string;
+  url?: string;
+  outdated?: boolean;
+  checkedAt?: string;
+  /** 检查失败的原因。有它就说明**没查到**，不能当作「已是最新」 */
+  error?: string;
+}
+
+export interface VersionInfo {
+  version: string;
+  /** 面向使用者的本次变更说明（Markdown）。为空表示该版本没写，不弹窗 */
+  notes: string;
+  update: UpdateInfo;
+}
+
+export interface ImageOption {
+  tag: string;
+  /** 本机是否已拉取。false 时不能用于创建实例 */
+  present: boolean;
+}

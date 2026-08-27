@@ -12,7 +12,8 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?style=flat-square&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![Fastify](https://img.shields.io/badge/Fastify-5.x-000000?style=flat-square&logo=fastify&logoColor=white)](https://fastify.dev/)
 [![Vue](https://img.shields.io/badge/Vue-3.5-4FC08D?style=flat-square&logo=vuedotjs&logoColor=white)](https://vuejs.org/)
-[![Docker](https://img.shields.io/badge/Docker-Required-2496ED?style=flat-square&logo=docker&logoColor=white)](https://www.docker.com/)
+[![Docker Image](https://img.shields.io/docker/v/mqttsnet/thinglinks-edge?sort=semver&style=flat-square&logo=docker&logoColor=white&label=image&color=2496ED)](https://hub.docker.com/r/mqttsnet/thinglinks-edge)
+[![Docker Pulls](https://img.shields.io/docker/pulls/mqttsnet/thinglinks-edge?style=flat-square&logo=docker&logoColor=white&color=2496ED)](https://hub.docker.com/r/mqttsnet/thinglinks-edge)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square)](LICENSE)
 
 <br>
@@ -67,10 +68,27 @@ is the slice being built out first.
 | Component | Version |
 | --- | --- |
 | Docker Engine | 24+ with Compose v2 |
+| Host architecture | `x86_64` or `aarch64` — 32-bit ARM is **not** supported |
 | Node.js | 24 LTS (development only) |
 | pnpm | 10.32+ (development only) |
 
+> **32-bit ARM is not published.** The decisive reason is downstream: Node-RED's own
+> official images for 5.x are `amd64`/`arm64` only, so an `armv7` Manager would be
+> permanently stuck on Node-RED 4.1.x instances. Build-side costs compound it
+> (`better-sqlite3` has no 32-bit ARM prebuilt binary), and the fit is poor anyway —
+> genuinely 32-bit-only SoCs (i.MX6, AM335x, A20) ship with 256 MB–1 GB of RAM, while
+> the Manager needs ~53 MiB and each instance ~104 MiB.
+>
+> **Raspberry Pi users are probably unaffected**: the Pi 3, 3B+ and Zero 2 W are all
+> 64-bit-capable — only a 32-bit OS image puts them in the `armv7` bucket. Check with
+> `uname -m`: `aarch64` works, `armv7l` does not.
+
 ### Deploy
+
+The Manager image is published on Docker Hub as
+[`mqttsnet/thinglinks-edge`](https://hub.docker.com/r/mqttsnet/thinglinks-edge) — a multi-arch manifest covering
+`linux/amd64` and `linux/arm64`, so an x86 industrial PC and an ARM edge box run the
+exact same command. Nothing is compiled on the site machine; it only needs Docker.
 
 ```bash
 cp .env.example .env        # at minimum, set EXTERNAL_URL and MASTER_KEY
@@ -81,6 +99,11 @@ docker compose logs manager | grep '\[init\]'   # the initial password is printe
 Open `EXTERNAL_URL` in a browser — the console is served by the Manager itself.
 `EXTERNAL_URL` is the single source of truth for every outward-facing URL, redirect
 and cookie policy; the process never guesses its own external address.
+
+To upgrade, point `MANAGER_IMAGE` in `.env` at the new tag, then
+`docker compose pull && docker compose up -d`. Running Node-RED instances are **not**
+interrupted — they are sibling containers, not children of the Manager. A production
+line should never have to stop collecting data to upgrade the management console.
 
 ### Development
 
@@ -95,6 +118,16 @@ cd apps/manager && pnpm build && \
 # terminal 2 — console
 cd apps/web-console && pnpm dev      # http://localhost:5173
 ```
+
+To run the full stack from your own build instead of the published image, layer the
+build override on top of the deployment file:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+```
+
+`docker-compose.yml` alone is pull-only by design — that is what a site machine uses.
+
 
 ## Project Structure
 

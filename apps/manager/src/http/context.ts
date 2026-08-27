@@ -12,6 +12,10 @@ import type { InstanceService } from '../core/instance-service.ts';
 import { containerName } from '../core/container-spec.ts';
 import type { Db } from '../core/db.ts';
 import type { Spool } from '../core/spool/spool.ts';
+import type { CloudRuntime } from '../core/cloud/runtime.ts';
+import type { CloudConfigRepo } from '../core/cloud/config-repo.ts';
+import { UserRepo } from '../core/user-repo.ts';
+import { can, canInstance, isInstanceScoped, type Action } from '../core/authz.ts';
 import type { MetricsHistory } from '../core/metrics-history.ts';
 
 export const SID = 'tle_sid';
@@ -34,6 +38,13 @@ export interface ServerDeps {
    */
   cloudSink?: ((payload: unknown) => Promise<void>) | undefined;
   /**
+   * 云连接运行期。有它时「是否已配置」以它为准，而不是看 cloudSink 在不在 ——
+   * 配置可以热改，cloudSink 是个恒定的转发闭包，判断不了当前配没配。
+   */
+  cloud?: CloudRuntime | undefined;
+  /** 云对接参数仓储。留空表示这个部署不提供云配置界面（如单测装配） */
+  cloudConfig?: CloudConfigRepo | undefined;
+  /**
    * 断网缓存。云端出口失败时批次落这里，链路恢复后自动补传。
    * 留空则失败即丢（并计数）—— 那是**明示**的降级，不是默认行为。
    */
@@ -50,6 +61,8 @@ const defaultUpstream = (id: string) => `http://${containerName(id)}:1880`;
 export interface HttpContext {
   config: EdgeConfig;
   cloudSink: ((payload: unknown) => Promise<void>) | undefined;
+  cloud: CloudRuntime | undefined;
+  cloudConfig: CloudConfigRepo | undefined;
   spool: Spool | undefined;
   metrics: MetricsHistory | undefined;
   db: Db;
@@ -58,20 +71,37 @@ export interface HttpContext {
   service: InstanceService;
   upstreamFor: (instanceId: string) => string;
   currentUser: (req: { cookies: Record<string, string | undefined> }) => ReturnType<AuthService['resolve']>;
-  /** 需登录；改状态的接口额外校验 CSRF。返回 undefined 表示已就地回了错误响应 */
-  guard: (req: any, reply: any, opts: { csrf: boolean }) => ReturnType<AuthService['resolve']>;
+  /**
+   * 需登录 + 需授权。返回 undefined 表示已就地回了错误响应。
+   *
+   * `need` 是**必填**：新加路由时忘了声明权限会编译不过，而不是悄悄全放行。
+   * 「忘了加校验」是越权漏洞最常见的成因，靠自觉防不住。
+   *
+   * 动作落在具体实例上时（view / operate / delete）还要额外过授权矩阵，
+   * 传 `instance` 即可；不传而动作又是实例级的，会被当成越权拒掉。
+   */
+  guard: (
+    req: any, reply: any,
+    opts: { csrf: boolean; need: Action; instance?: string },
+  ) => ReturnType<AuthService['resolve']>;
+  /** 授权矩阵仓储，用户管理路由要用 */
+  users: UserRepo;
   fail: (reply: any, e: unknown) => unknown;
   instanceIdFromUrl: (url: string) => string | undefined;
 }
 
 export function createContext(deps: ServerDeps): HttpContext {
   const { config, auth } = deps;
+  const users = new UserRepo(deps.db);
   const currentUser = (req: { cookies: Record<string, string | undefined> }) =>
     auth.resolve(req.cookies[SID]);
 
   return {
     config,
+    users,
     cloudSink: deps.cloudSink,
+    cloud: deps.cloud,
+    cloudConfig: deps.cloudConfig,
     spool: deps.spool,
     metrics: deps.metrics,
     db: deps.db,
@@ -85,6 +115,27 @@ export function createContext(deps: ServerDeps): HttpContext {
       if (!user) { reply.code(401).send({ error: '未登录' }); return undefined; }
       if (opts.csrf && !AuthService.csrfOk(req.headers['x-csrf-token'], req.cookies[CSRF])) {
         reply.code(403).send({ error: 'CSRF 校验失败' }); return undefined;
+      }
+
+      if (isInstanceScoped(opts.need)) {
+        // 实例级动作必须指名实例；没指名说明路由写错了，按拒绝处理而不是放行
+        if (opts.instance === undefined) {
+          reply.code(403).send({ error: `权限不足：${opts.need} 需要指定实例` });
+          return undefined;
+        }
+        const grant = user.role === 'admin'
+          ? undefined
+          : users.grantFor(user.username, opts.instance);
+        if (!canInstance(user.role, opts.need, grant)) {
+          reply.code(403).send({ error: `权限不足：${opts.need} 于实例 ${opts.instance}` });
+          return undefined;
+        }
+        return user;
+      }
+
+      if (!can(user.role, opts.need)) {
+        reply.code(403).send({ error: `权限不足：${opts.need}` });
+        return undefined;
       }
       return user;
     },

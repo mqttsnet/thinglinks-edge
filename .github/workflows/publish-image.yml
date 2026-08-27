@@ -1,0 +1,126 @@
+# 打 git tag 即发布多架构镜像到 Docker Hub。
+#
+#   git tag 1.0.1 && git push origin 1.0.1
+#
+# 需要在仓库 Settings → Secrets and variables → Actions 里配两个 secret：
+#   DOCKERHUB_USERNAME   mqttsnet
+#   DOCKERHUB_TOKEN      Docker Hub 的 Access Token（Read & Write），不是账号密码
+#
+# 为什么用 token 而不是密码：token 可以单独吊销、可以限定权限范围，
+# 而账号密码一旦泄露连带整个 Docker Hub 账号。GitHub secret 也只能存 token 这类东西。
+name: Publish image
+
+on:
+  push:
+    tags:
+      # 本仓库的 tag 风格是不带 v 前缀的 1.0.1；两种都收，免得哪天手滑打成 v1.0.1 就不发布了
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+-*'
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+  workflow_dispatch:
+
+env:
+  IMAGE: mqttsnet/thinglinks-edge
+
+jobs:
+  # 先把「版本号对不上」这类错误挡在构建之前 —— 这类错误构建不会失败，
+  # 只会安静地推出一个自相矛盾的镜像，等现场用起来才发现。
+  guard:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: check
+        name: 校验 tag、package.json 与 changelog 三者一致
+        run: |
+          set -euo pipefail
+          PKG="$(node -p "require('./package.json').version")"
+          echo "package.json 版本：$PKG"
+
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${GITHUB_REF_NAME#v}"
+            echo "git tag：$TAG"
+            if [ "$TAG" != "$PKG" ]; then
+              echo "::error::git tag ($TAG) 与 package.json ($PKG) 不一致。"
+              echo "::error::镜像 tag 会是 $TAG，而控制台页脚显示 $PKG —— 现场对不上号。"
+              exit 1
+            fi
+          fi
+
+          # apps/manager/src/core/version.ts 用 v<版本>.zh-CN.md 去找升级说明。
+          # 文件缺失不会报错，只会「升级后不弹说明」—— 那种静默失败最难查。
+          NOTES="changelogs/v$PKG.zh-CN.md"
+          if [ ! -f "$NOTES" ]; then
+            echo "::error::缺少 $NOTES，升级后控制台将不显示本次变更说明。"
+            exit 1
+          fi
+
+          # 运行期版本常量也得跟上，否则 /api/version 报的是旧号
+          RT="$(sed -n "s/^export const VERSION = '\(.*\)';$/\1/p" apps/manager/src/core/version.ts)"
+          if [ "$RT" != "$PKG" ]; then
+            echo "::error::core/version.ts ($RT) 与 package.json ($PKG) 不一致。"
+            exit 1
+          fi
+
+          echo "version=$PKG" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: guard
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # 运行阶段有一句 `apk add tzdata`，异架构那份要靠 binfmt 模拟才能跑。
+      # 构建阶段本身不需要它 —— Dockerfile 里那个 --platform=$BUILDPLATFORM 让它留在原生架构。
+      - uses: docker/setup-qemu-action@v3
+
+      # 多架构清单必须用 docker-container 驱动，默认的 docker 驱动导不出 manifest list
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+          # latest=auto：预发布 tag（1.1.0-rc1）不会顶掉 latest。
+          # 现场那些没写 tag 就 docker pull 的人，永远只会拿到正式版。
+          flavor: |
+            latest=auto
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/manager/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            IMAGE_VERSION=${{ needs.guard.outputs.version }}
+            IMAGE_REVISION=${{ github.sha }}
+            IMAGE_CREATED=${{ github.event.repository.updated_at }}
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 把仓库里的 Overview 同步成 Docker Hub 的长描述，
+      # 免得镜像页和源码说明各说各话 —— 两处手工维护必然会漂移。
+      - uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ env.IMAGE }}
+          short-description: 'ThingLinks Edge — provision, proxy and monitor Node-RED instances on one edge gateway'
+          readme-filepath: ./docs/dockerhub-overview.md

@@ -40,7 +40,7 @@ export interface InstanceSpec {
    */
   ingestToken?: string | undefined;
   /**
-   * Manager 在实例网络上的地址（形如 `http://tle-mgr:8080/nodered`）。
+   * Manager 在实例网络上的地址（形如 `http://tle-mgr:19100/nodered`）。
    * Manager 跑在宿主上时解析不到容器名，此处留空 —— 节点会打一条警告后静默跳过回报。
    */
   managerUrl?: string | undefined;

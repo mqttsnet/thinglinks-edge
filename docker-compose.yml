@@ -31,13 +31,22 @@ services:
       - -allowhealthcheck
       - -watchdoginterval=30
       - -stoponwatchdog
-      - '-allowGET=^(/v1\.[0-9]+)?/(_ping|version|containers/json|containers/[a-zA-Z0-9][a-zA-Z0-9_.-]*/(json|logs|stats)|volumes/[a-zA-Z0-9][a-zA-Z0-9_.-]*|networks)(\?.*)?$$'
+      # images/json 与 images/<name>/json 是**只读**的：只能看本机有哪些镜像，
+      # 不能拉取（images/create 仍未放行）也不能删除。放行它是为了让 Manager
+      # 能在建实例前判断镜像在不在 —— 否则只能等 containers/create 回 404
+      # 名字里允许 / 与 :（nodered/node-red:5.0.4-…），但必须以 /json 结尾，只能查不能改
+      # 「No such image」，那句话对现场人员毫无指导意义。
+      - '-allowGET=^(/v1\.[0-9]+)?/(_ping|version|containers/json|containers/[a-zA-Z0-9][a-zA-Z0-9_.-]*/(json|logs|stats)|images/json|images/[a-zA-Z0-9][a-zA-Z0-9_.:@/-]*/json|volumes/[a-zA-Z0-9][a-zA-Z0-9_.-]*|networks)(\?.*)?$$'
       - '-allowPOST=^(/v1\.[0-9]+)?/(containers/create|containers/[a-zA-Z0-9][a-zA-Z0-9_.-]*/(start|stop|restart)|networks/create|networks/[a-zA-Z0-9][a-zA-Z0-9_.-]*/(connect|disconnect)|volumes/create)(\?.*)?$$'
       - '-allowPUT=^(/v1\.[0-9]+)?/containers/[a-zA-Z0-9][a-zA-Z0-9_.-]*/archive(\?.*)?$$'
       - '-allowDELETE=^(/v1\.[0-9]+)?/(containers/[a-zA-Z0-9][a-zA-Z0-9_.-]*|networks/[a-zA-Z0-9][a-zA-Z0-9_.-]*|volumes/[a-zA-Z0-9][a-zA-Z0-9_.-]*)(\?.*)?$$'
     volumes:
-      # 只读挂载：代理自己也不需要写 socket 文件本身
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # 只读挂载：代理自己也不需要写 socket 文件本身。
+      # 路径可配是为了 rootless Docker —— 它的 socket 在 $XDG_RUNTIME_DIR/docker.sock
+      # 而不是 /var/run。写死会让 rootless 环境挂上一个不存在的路径，
+      # 而 docker 会**自动建一个同名空目录**顶上去，于是代理启动后一直连不上，
+      # 报错却是「connection refused」，看不出根因是挂错了。
+      - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock:ro
     # 访问 docker.sock 需要加入其属组。查本机取值： stat -c '%g' /var/run/docker.sock
     # 特权集中在这个十几 MB 的 distroless 小程序上，而不是 Manager 那个 Node 应用
     group_add:
@@ -65,16 +74,23 @@ services:
     restart: "no"
 
   manager:
-    build:
-      context: .
-      dockerfile: apps/manager/Dockerfile
-    image: thinglinks-edge-manager:0.1.0
+    # 公开镜像：现场机器只要装了 docker，`docker compose up -d` 就直接拉起来跑 ——
+    # 不需要克隆源码，也不需要装 Node/pnpm。镜像是多架构清单（amd64 + arm64），
+    # x86 工控机和 ARM 盒子敲同一条命令，docker 自己挑对应那一份。
+    #
+    # 改了代码想跑自己编的镜像时，叠加构建覆盖文件（见 docker-compose.build.yml）：
+    #   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+    #
+    # 这里刻意钉死版本号而不用 latest：现场升级必须是一次**明确的**动作。
+    # latest 会让 `docker compose pull` 在任何时候悄悄换掉底下的东西，
+    # 而边缘现场最不能接受的就是「没人动过它，但它变了」。
+    image: ${MANAGER_IMAGE:-mqttsnet/thinglinks-edge:1.0.1}
     container_name: ${EDGE_NAME_PREFIX:-thinglinks-edge}-manager
     restart: unless-stopped
 
     environment:
       # 唯一真源：所有对外链接、跳转与 Cookie 策略都由它派生，程序绝不猜自己的外部地址
-      EXTERNAL_URL: ${EXTERNAL_URL:?必须设置，例如 http://192.168.10.20:8080}
+      EXTERNAL_URL: ${EXTERNAL_URL:?必须设置，例如 http://192.168.10.20:19100}
       # 实例凭据的加密主密钥。缺失时进程拒绝启动，不会静默回落默认值
       MASTER_KEY: ${MASTER_KEY:?必须设置，可用 openssl rand -hex 32 生成}
       # 显式给容器名，不要依赖回退。Manager 要把自己接入每个实例的独立网络，
@@ -95,6 +111,8 @@ services:
       # 时区。Manager 自己和它创建的每个 Node-RED 实例都用这个值 ——
       # 官方镜像默认 UTC，不设的话定时流程、班次判断、日志时间戳整体偏移且不报错
       TZ: ${TZ:-Asia/Shanghai}
+      # 升级检查。留空即完全不联网（默认）—— 见 .env.example 的说明
+      UPDATE_CHECK_URL: ${UPDATE_CHECK_URL:-}
       # 健康监测趋势曲线的采样间隔（秒）。0 关闭采样，界面会明说趋势未启用。
       # 历史只存内存：重启即清零，换来的是不去磨盒子的 SD 卡
       EDGE_METRICS_INTERVAL_SEC: ${EDGE_METRICS_INTERVAL_SEC:-10}
@@ -102,9 +120,9 @@ services:
       DOCKER_HOST: tcp://${EDGE_NAME_PREFIX:-thinglinks-edge}-docker-proxy:2375
 
     ports:
-      # 默认只发布到回环：现场要外部可达时改成 "0.0.0.0:8080:8080"，
+      # 默认只发布到回环：现场要外部可达时改成 "0.0.0.0:19100:19100"，
       # 或（推荐）由前面的企业反代转发过来
-      - "${BIND_ADDR:-127.0.0.1}:${HOST_PORT:-8080}:8080"
+      - "${BIND_ADDR:-127.0.0.1}:${HOST_PORT:-19100}:19100"
 
     volumes:
       # 同名挂载：容器内路径 == 宿主路径。Manager 要 mkdir/删除实例数据目录（容器内视角），

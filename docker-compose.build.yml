@@ -1,0 +1,20 @@
+# 本地源码构建覆盖文件 —— 只有开发者需要它。
+#
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#
+# 为什么单独拆一个文件，而不是在 docker-compose.yml 里同时写 build 和 image：
+# 主文件一旦带 build 段，`docker compose pull` 对该服务的行为就变得含糊
+# （它会认为这个服务归你自己构建），而现场升级走的正是 pull。
+# 主文件保持「纯拉取」，构建能力放在这里叠加，两条路径各自干净。
+#
+# image 与主文件写成同一个值：构建产物直接顶掉本地那份同名镜像，
+# 于是 `docker compose up -d`（不带 -f 覆盖）跑的就是你刚编的东西，
+# 不会出现「以为在测新代码、其实跑的是拉下来的旧镜像」。
+services:
+  manager:
+    build:
+      context: .
+      dockerfile: apps/manager/Dockerfile
+      args:
+        IMAGE_VERSION: dev
+    image: ${MANAGER_IMAGE:-mqttsnet/thinglinks-edge:1.0.1}

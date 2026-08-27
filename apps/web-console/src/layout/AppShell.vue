@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
-import { NButton, useMessage } from 'naive-ui';
+import { NButton, NModal, NAlert, useMessage } from 'naive-ui';
 import { api } from '../api/client';
+import ReleaseNotes from '../components/ReleaseNotes.vue';
 
 const router = useRouter();
 const route = useRoute();
@@ -24,9 +25,47 @@ const NAV = [
   { name: 'health', title: '健康监测', icon: 'M2 9h3l2-5 3 10 2-5h3' },
 ];
 
+/**
+ * 版本与升级说明。
+ *
+ * 弹的是「**已经**更新到了什么」，不是「有新版可用」。
+ * 现场做升级的人（实施/运维）和日常用系统的人（作业人员）常常不是同一个，
+ * 后者只会发现界面变了却不知道变了什么 —— 升级后的说明才是给他们看的。
+ *
+ * 只在版本号与上次看到的不同才弹，且看过即记住，不反复打扰。
+ */
+const SEEN_KEY = 'tle-seen-version';
+const version = ref('');
+const notes = ref('');
+const showNotes = ref(false);
+const update = ref<{ outdated?: boolean; latest?: string; url?: string } | null>(null);
+
 onMounted(async () => {
   try { username.value = (await api.me()).user.username; } catch { /* 守卫已处理 */ }
+
+  try {
+    const info = await api.version();
+    version.value = info.version;
+    if (info.update.enabled && info.update.outdated) update.value = info.update;
+
+    // 首次安装（没有记录过任何版本）不弹 —— 那不是「更新」，是刚装好
+    const seen = localStorage.getItem(SEEN_KEY);
+    if (seen === null) {
+      localStorage.setItem(SEEN_KEY, info.version);
+    } else if (seen !== info.version && info.notes.trim() !== '') {
+      notes.value = info.notes;
+      showNotes.value = true;
+    } else if (seen !== info.version) {
+      // 该版本没写使用者说明，不弹窗但也要记下，免得下次又判成「变了」
+      localStorage.setItem(SEEN_KEY, info.version);
+    }
+  } catch { /* 版本拿不到不影响使用 */ }
 });
+
+function dismissNotes() {
+  localStorage.setItem(SEEN_KEY, version.value);
+  showNotes.value = false;
+}
 
 async function signOut() {
   await api.logout().catch(() => undefined);
@@ -66,7 +105,12 @@ async function signOut() {
         </button>
       </nav>
 
-      <div class="foot">© 2024-present mqttsnet<br />All Rights Reserved.</div>
+      <div class="foot">
+        <span class="ver mono" :title="update?.outdated ? `有新版本 v${update.latest}` : ''">
+          v{{ version || '—' }}<i v-if="update?.outdated" class="dot" />
+        </span><br />
+        © 2024-present mqttsnet<br />All Rights Reserved.
+      </div>
     </aside>
 
     <main>
@@ -77,6 +121,19 @@ async function signOut() {
       </header>
       <div class="content"><RouterView /></div>
       <footer>Copyright © 2024-present mqttsnet All Rights Reserved.</footer>
+
+    <NModal v-model:show="showNotes" preset="card" style="max-width: 560px"
+            :title="`已更新到 v${version}`" :mask-closable="false" @close="dismissNotes">
+      <NAlert type="success" :bordered="false" style="margin-bottom: 14px">
+        管理台已升级。以下是本次更新对日常操作的影响。
+      </NAlert>
+      <ReleaseNotes :source="notes" />
+      <template #footer>
+        <div style="text-align: right">
+          <NButton type="primary" @click="dismissNotes">知道了</NButton>
+        </div>
+      </template>
+    </NModal>
     </main>
   </div>
 </template>
@@ -116,6 +173,12 @@ nav { padding: 4px 12px; display: flex; flex-direction: column; gap: 1px; flex: 
 .item:hover { background: var(--hover); color: var(--text); }
 .item.on { background: var(--l-primary); color: var(--primary); font-weight: 600; }
 .item svg { width: 17px; height: 17px; flex: none; }
+.ver { color: var(--text-2); font-size: 10.5px; }
+/* 有新版时在版本号后点一个小圆点：不打断操作，但看得见 */
+.dot {
+  display: inline-block; width: 5px; height: 5px; margin-left: 4px;
+  border-radius: 50%; background: var(--warning); vertical-align: 1px;
+}
 .foot {
   padding: 7px 18px 9px; font-size: 9.5px; line-height: 1.45; color: var(--muted);
   border-top: 1px solid var(--border);

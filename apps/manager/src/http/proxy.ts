@@ -10,10 +10,11 @@
 import type { FastifyInstance } from 'fastify';
 import httpProxy from '@fastify/http-proxy';
 import { AuthService } from '../core/auth.ts';
+import { canInstance } from '../core/authz.ts';
 import type { HttpContext } from './context.ts';
 
 export function registerProxy(app: FastifyInstance, ctx: HttpContext): void {
-  const { config, repo, upstreamFor, currentUser, instanceIdFromUrl } = ctx;
+  const { config, repo, upstreamFor, currentUser, instanceIdFromUrl, users } = ctx;
 
   app.register(httpProxy, {
     upstream: '',
@@ -42,13 +43,26 @@ export function registerProxy(app: FastifyInstance, ctx: HttpContext): void {
         reply.code(403).send({ error: 'Origin 不被允许' });
         return;
       }
-      if (!currentUser(req)) {
+      const user = currentUser(req);
+      if (!user) {
         reply.code(401).send({ error: '未登录' });
         return;
       }
       const id = instanceIdFromUrl(req.url ?? '');
       if (!id || !repo.get(id)) {
         reply.code(404).send({ error: '实例不存在' });
+        return;
+      }
+      /*
+       * 反代也必须过授权矩阵。
+       *
+       * 这里是**整个平台最大的越权面**：编辑器背后是完整的 Node-RED admin API，
+       * 拿到它等于拿到那台实例的一切。只在 /api 上判权而放过 /red，
+       * 等于把后门开在正门旁边。
+       */
+      if (!canInstance(user.role, 'instance:view',
+                       user.role === 'admin' ? undefined : users.grantFor(user.username, id))) {
+        reply.code(403).send({ error: `无权访问实例 ${id}` });
         return;
       }
       done();

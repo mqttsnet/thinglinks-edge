@@ -67,8 +67,14 @@ export class AuthService {
     const row = this.db.prepare('SELECT * FROM app_user WHERE username = ?').get(username) as
       Record<string, unknown> | undefined;
 
-    const ok = row !== undefined &&
+    /*
+     * 停用的账号一律按「用户名或口令错误」处理，**不单独提示「账号已停用」** ——
+     * 那等于告诉试探者这个用户名存在。口令校验照跑，避免响应时间上的差异泄漏。
+     */
+    const disabled = row !== undefined && Number(row['disabled'] ?? 0) === 1;
+    const passwordOk = row !== undefined &&
       verifyPassword(password, { hash: row['pwd_hash'] as string, salt: row['pwd_salt'] as string });
+    const ok = passwordOk && !disabled;
 
     if (!ok) {
       const f = this.failures.get(username) ?? { count: 0, until: 0 };
@@ -102,8 +108,11 @@ export class AuthService {
       return undefined;
     }
     s.lastSeen = Date.now();
-    const row = this.db.prepare('SELECT role, must_change_pwd FROM app_user WHERE username = ?')
-      .get(s.username) as { role: string; must_change_pwd: number } | undefined;
+    const row = this.db.prepare(
+      'SELECT role, must_change_pwd, disabled FROM app_user WHERE username = ?',
+    ).get(s.username) as { role: string; must_change_pwd: number; disabled: number } | undefined;
+    // 停用要**立即**生效，不能等会话自然过期 —— 否则「已停用」在现场是句空话
+    if (row && Number(row.disabled) === 1) return undefined;
     if (!row) return undefined;
     return { username: s.username, role: row.role, mustChangePassword: row.must_change_pwd === 1 };
   }

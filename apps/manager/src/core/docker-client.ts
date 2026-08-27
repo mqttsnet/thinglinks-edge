@@ -107,6 +107,51 @@ export class DockerClient {
       });
   }
 
+  /** 实例镜像仓库名，供上层拼完整镜像名 */
+  get imageRepo(): string {
+    return this.opts.imageRepo;
+  }
+
+  /**
+   * 本机是否已有该镜像。走只读的 images/<name>/json，不具备拉取能力。
+   *
+   * **只有 404 才算「没有」。** 其它错误（受限代理没放行 → 403、端点不通 → 网络错误）
+   * 必须抛出去：把它们一并当成「镜像不存在」，会让一个配置问题伪装成
+   * 「本机没有镜像」，照着提示去 docker pull 也解决不了，现场会卡死在这里。
+   */
+  async imagePresent(image: string): Promise<boolean> {
+    try {
+      await this.docker.getImage(image).inspect();
+      return true;
+    } catch (e) {
+      if ((e as { statusCode?: number }).statusCode === 404) return false;
+      throw new Error(
+        `无法查询镜像 ${image}：${(e as Error).message}。` +
+        '这不是镜像缺失，请检查 docker 端点是否放行了 images/<name>/json',
+      );
+    }
+  }
+
+  /**
+   * 建容器前先确认镜像在本机。
+   *
+   * **Docker API 不会自动拉取**（命令行的 `docker create` 会，容易让人误判）。
+   * 镜像缺失时 containers/create 回的是 `No such image`，那句话对现场人员
+   * 毫无指导意义 —— 这里换成能照着做的说明。
+   *
+   * 而且 Manager 本来也拉不了：受限代理没放行 images/create，
+   * 就算想「顺手帮用户拉一下」也做不到，且那样会让离线现场卡在无法排查的等待里。
+   */
+  async assertImagePresent(image: string): Promise<void> {
+    if (await this.imagePresent(image)) return;
+    throw new Error(
+      `本机没有镜像 ${image}，无法创建实例。\n` +
+      `有外网的机器：docker pull ${image}\n` +
+      `现场无外网：在有网机器上 docker pull 后 docker save ${image} -o image.tar，` +
+      `拷到现场执行 docker load -i image.tar`,
+    );
+  }
+
   /**
    * 备好实例数据目录。
    *
@@ -145,6 +190,7 @@ export class DockerClient {
     });
     assertSafeCreateOptions(options, { instanceDataRoot: this.opts.instanceDataRoot });
 
+    await this.assertImagePresent(options['Image'] as string);
     await this.ensureNetwork(spec.id);
     await this.ensureDataDir(spec.id);
 

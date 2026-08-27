@@ -16,6 +16,9 @@ import { registerMetrics } from './metrics.ts';
 import { registerSso } from './sso.ts';
 import { registerIngest } from './ingest.ts';
 import { registerBackup } from './backup.ts';
+import { registerCloud } from './cloud.ts';
+import { registerUsers } from './users.ts';
+import { registerVersion } from './version.ts';
 import { registerProxy } from './proxy.ts';
 import { registerConsole } from './console.ts';
 
@@ -54,11 +57,29 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     registerSso(api, ctx);
     registerIngest(api, ctx);
     registerBackup(api, ctx);
+    registerCloud(api, ctx);
+    registerUsers(api, ctx);
+    registerVersion(api, ctx);
   });
 
   registerProxy(app, ctx);
 
+  /*
+   * 存活探针。带前缀的那个是给外层反代/负载均衡探的。
+   *
+   * 同时再注册一个**不带前缀**的 /healthz：容器自身的 HEALTHCHECK 探的是
+   * 127.0.0.1:19100，那是容器内部视角，与 EXTERNAL_URL 里的挂载前缀毫无关系 ——
+   * 前缀是给外层反代用的。只注册带前缀的那个，会让挂在子路径下的部署
+   * （EXTERNAL_URL=https://portal.corp.com/nodered）里 HEALTHCHECK 恒定 404：
+   * 容器被判 unhealthy，而进程其实完全正常。Swarm 会照着这个判断反复重启它，
+   * Portainer 上则是一片红 —— 排查方向还会被带偏到「服务起不来」。
+   *
+   * basePath 为空时两者同路径，重复注册会让 Fastify 直接抛错，故加判断。
+   */
   app.get(`${ctx.config.basePath}/healthz`, async () => ({ ok: true }));
+  if (ctx.config.basePath !== '') {
+    app.get('/healthz', async () => ({ ok: true }));
+  }
 
   // 只有显式配了 webRoot 才托管。宿主开发态走 Vite，不该由 Manager 兜底 ——
   // 兜底会让「前端没构建」表现成一个陈旧页面，而不是一眼可见的连不上。

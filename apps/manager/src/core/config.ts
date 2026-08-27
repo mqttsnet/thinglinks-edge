@@ -106,7 +106,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): EdgeConfig {
   if (!raw) {
     throw new ConfigError(
       'EXTERNAL_URL 未配置。它是所有对外链接、跳转与 Cookie 策略的唯一真源，' +
-        '现场无域名时直接填 IP，例如 http://192.168.10.20:8080',
+        '现场无域名时直接填 IP，例如 http://192.168.10.20:19100',
     );
   }
 
@@ -143,7 +143,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): EdgeConfig {
     cookieSecure: url.protocol === 'https:',
     allowedOrigins: [url.origin, ...extraOrigins],
     listenAddr: env['LISTEN_ADDR']?.trim() || '127.0.0.1',
-    listenPort: parsePort(env['LISTEN_PORT'], 8080, 'LISTEN_PORT'),
+    listenPort: parsePort(env['LISTEN_PORT'], 19100, 'LISTEN_PORT'),
     dataRoot,
     dataDir: assertDataPath(env['DATA_DIR']?.trim() || `${dataRoot}/manager`, 'DATA_DIR'),
     instanceDataRoot: assertDataPath(
