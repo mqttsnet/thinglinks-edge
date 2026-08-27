@@ -6,6 +6,7 @@
  * 分开的好处是页面刷曲线不会把探针压力翻倍。
  */
 import type { FastifyInstance } from 'fastify';
+import { filterSeries } from '../core/metrics-history.ts';
 import type { HttpContext } from './context.ts';
 
 /**
@@ -21,10 +22,11 @@ const RANGES: Record<string, number> = {
 };
 
 export function registerMetrics(api: FastifyInstance, ctx: HttpContext): void {
-  const { config, guard, metrics } = ctx;
+  const { config, guard, metrics, users } = ctx;
 
   api.get(`${config.basePath}/api/metrics`, async (req, reply) => {
-    if (!guard(req, reply, { csrf: false, need: 'field:view' })) return;
+    const user = guard(req, reply, { csrf: false, need: 'field:view' });
+    if (!user) return;
 
     const key = (req.query as { range?: string }).range ?? '1h';
     const rangeSec = RANGES[key];
@@ -45,12 +47,20 @@ export function registerMetrics(api: FastifyInstance, ctx: HttpContext): void {
       });
     }
 
+    /*
+     * 只返回该用户看得见的实例。这是聚合接口，guard 按实例拦不住 ——
+     * 少了这一步，只读用户照样能从趋势图里读出未授权实例的名字与负载。
+     */
+    const visible = user.role === 'admin'
+      ? 'all' as const
+      : new Set(users.grants(user.username).map((g) => g.instanceId));
+
     return reply.send({
       enabled: true,
       range: key,
       rangeSec,
       intervalSec: metrics.fineStepSec,
-      ...metrics.query(rangeSec),
+      ...filterSeries(metrics.query(rangeSec), visible),
     });
   });
 }

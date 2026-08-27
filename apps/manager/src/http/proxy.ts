@@ -59,10 +59,26 @@ export function registerProxy(app: FastifyInstance, ctx: HttpContext): void {
        * 这里是**整个平台最大的越权面**：编辑器背后是完整的 Node-RED admin API，
        * 拿到它等于拿到那台实例的一切。只在 /api 上判权而放过 /red，
        * 等于把后门开在正门旁边。
+       *
+       * 读写要分开判，否则「只读」是假的：编辑器是同一个页面，
+       * 部署流程走的是 `POST /flows`、装节点走 `POST /nodes`、
+       * 手动触发 inject 走 `POST /inject/:id` —— 一律按写操作要求 operate。
+       * 只判 view 的话，给了「只读」授权的人照样能改别人产线的流程，
+       * 而界面上他看起来只是「能看」。
+       *
+       * WebSocket 升级本身是 GET（编辑器的 comms 通道，推运行时事件），
+       * 归读；真正的改动仍要走上面那些 POST。
        */
-      if (!canInstance(user.role, 'instance:view',
+      const method = (req.method ?? 'GET').toUpperCase();
+      const writing = method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS';
+      const need = writing ? 'instance:operate' : 'instance:view';
+      if (!canInstance(user.role, need,
                        user.role === 'admin' ? undefined : users.grantFor(user.username, id))) {
-        reply.code(403).send({ error: `无权访问实例 ${id}` });
+        reply.code(403).send({
+          error: writing
+            ? `只读授权：对实例 ${id} 只能查看，不能改动流程`
+            : `无权访问实例 ${id}`,
+        });
         return;
       }
       done();

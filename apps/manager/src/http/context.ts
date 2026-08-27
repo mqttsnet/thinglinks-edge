@@ -86,6 +86,18 @@ export interface HttpContext {
   ) => ReturnType<AuthService['resolve']>;
   /** 授权矩阵仓储，用户管理路由要用 */
   users: UserRepo;
+  /**
+   * 这个用户能不能看见某台实例。
+   *
+   * 与 `guard` 分工：guard 管**单台实例**的路由（拿得到 id，拦得住）；
+   * 这个用于**列表与聚合类**接口 —— 那类接口天然没有「某一台」可判，
+   * guard 拦不住，漏过滤就是把别人的实例名连同读数一起端出去。
+   */
+  canSeeInstance: (user: { username: string; role: string }, instanceId: string) => boolean;
+  /** 列表过滤的通用写法，省得每处各写一遍 filter */
+  visibleOnly: <T extends { instanceId: string }>(
+    user: { username: string; role: string }, items: T[],
+  ) => T[];
   fail: (reply: any, e: unknown) => unknown;
   instanceIdFromUrl: (url: string) => string | undefined;
 }
@@ -110,6 +122,11 @@ export function createContext(deps: ServerDeps): HttpContext {
     service: deps.service,
     upstreamFor: deps.upstreamFor ?? defaultUpstream,
     currentUser,
+    canSeeInstance: (user, instanceId) =>
+      user.role === 'admin' || users.grantFor(user.username, instanceId) !== undefined,
+    visibleOnly: (user, items) =>
+      user.role === 'admin' ? items
+        : items.filter((i) => users.grantFor(user.username, i.instanceId) !== undefined),
     guard: (req, reply, opts) => {
       const user = currentUser(req);
       if (!user) { reply.code(401).send({ error: '未登录' }); return undefined; }

@@ -228,6 +228,34 @@ export class MetricsHistory {
   }
 }
 
+/**
+ * 按可见实例裁剪一段序列（T4.4）。
+ *
+ * 趋势接口是**聚合**接口：一次返回全部实例的曲线，guard 无从按实例拦 ——
+ * 不裁剪就等于把未授权实例的名字、CPU、内存、状态一起端给了对方，
+ * 这与「A 用户无法访问未授权实例的任何接口」是同一条红线。
+ *
+ * 宿主读数不裁：那是整机的，与实例授权无关，且看板上必须有它才能判断
+ * 「是我这台实例的问题，还是机器已经压满了」。
+ */
+export function filterSeries(
+  series: MetricsSeries,
+  visible: 'all' | ReadonlySet<string>,
+): MetricsSeries {
+  if (visible === 'all') return series;
+  return {
+    ...series,
+    points: series.points.map((p) => {
+      const instances: Record<string, InstancePoint> = {};
+      for (const [id, point] of Object.entries(p.instances)) {
+        if (visible.has(id) && point) instances[id] = point;
+      }
+      return { ...p, instances };
+    }),
+    instanceIds: series.instanceIds.filter((id) => visible.has(id)),
+  };
+}
+
 /** 采样器的数据来源。用结构类型而非依赖 InstanceService，测试可直接塞假的 */
 export interface MetricsSource {
   hostStats(): Promise<HostStats>;

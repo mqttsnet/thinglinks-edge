@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  MetricsHistory, MetricsSampler, aggregate, collectSample,
+  MetricsHistory, MetricsSampler, aggregate, collectSample, filterSeries,
   type MetricSample, type MetricsSource,
 } from './metrics-history.ts';
 import type { HostStats } from './host-stats.ts';
@@ -168,4 +168,39 @@ test('探针抛错时采样器不崩，交给 onError', async () => {
   assert.equal(await sampler.tick(), false);
   assert.equal((errors[0] as Error).message, 'docker 不可达');
   assert.equal(history.query(3600).points.length, 0);
+});
+
+// ── 按授权裁剪（T4.4）─────────────────────────────────────
+
+const twoInstances = (): MetricsHistory => {
+  const h = new MetricsHistory();
+  h.record(sample(1000, {
+    instances: {
+      'line-a': { cpuPercent: 1, memUsedMb: 10, memPercent: 2, latencyMs: 3, verdict: 'healthy' },
+      'line-b': { cpuPercent: 9, memUsedMb: 90, memPercent: 20, latencyMs: 30, verdict: 'down' },
+    },
+  }));
+  return h;
+};
+
+test('只返回授权范围内的实例，未授权的连 id 都不出现', () => {
+  const s = filterSeries(twoInstances().query(3600, 1000), new Set(['line-a']));
+  assert.deepEqual(s.instanceIds, ['line-a']);
+  assert.deepEqual(Object.keys(s.points[0]?.instances ?? {}), ['line-a']);
+});
+
+test('宿主读数不裁剪 —— 那是整机的，与实例授权无关', () => {
+  const s = filterSeries(twoInstances().query(3600, 1000), new Set(['line-a']));
+  assert.equal(s.points[0]?.host.memPercent, 50);
+});
+
+test('一台都没授权时给空实例集，而不是全给', () => {
+  const s = filterSeries(twoInstances().query(3600, 1000), new Set<string>());
+  assert.deepEqual(s.instanceIds, []);
+  assert.deepEqual(Object.keys(s.points[0]?.instances ?? {}), []);
+});
+
+test("admin 传 'all' 时原样返回", () => {
+  const raw = twoInstances().query(3600, 1000);
+  assert.deepEqual(filterSeries(raw, 'all').instanceIds, ['line-a', 'line-b']);
 });

@@ -21,7 +21,20 @@ import type { HttpContext } from './context.ts';
 const MAX_BATCH = 1000;
 
 export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
-  const { config, repo, db, guard, cloudSink, spool, cloud } = ctx;
+  const { config, repo, db, guard, cloudSink, spool, cloud, visibleOnly } = ctx;
+
+  /*
+   * 台账类接口的鉴权（T4.4）。
+   *
+   * 指名了实例就按**实例级**判，落到授权矩阵上；没指名是聚合查询，
+   * 按 `field:view` 放行再逐条过滤 —— 这两条缺一不可：
+   * 只判 field:view 的话，任何登录用户都能读到别人那台实例的设备清单、
+   * 点位当前值，乃至 flows.json 反推出来的设备 IP 与寄存器地址。
+   */
+  const fieldGuard = (req: any, reply: any, instanceId: string | undefined) =>
+    (instanceId === undefined
+      ? guard(req, reply, { csrf: false, need: 'field:view' })
+      : guard(req, reply, { csrf: false, need: 'instance:view', instance: instanceId }));
 
   /*
    * 「云连接配没配」以运行期为准。
@@ -183,8 +196,8 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
    * `tl-uplink` 是上行的唯一出口（07 号文 6.2）：断网缓存、微批聚合、协议信封
    * 都需要一个汇聚点，散在各 flow 的 `mqtt out` 里这三件事全都落空。
    *
-   * 当前实现只做到「收下并落进台账」。真正送云的链路（微批 B4、断网续传 B5）
-   * 尚未接通，因此明确回 `cloud: "not-configured"` —— **不假装已经发出去了**。
+   * 收下后落进台账，同时进微批；攒够一批由 cloudSink 送云，送不出去落断网缓存。
+   * 没配云连接时明确回 `cloud: "not-configured"` —— **不假装已经发出去了**。
    */
   api.post(`${config.basePath}/api/edge/uplink`, async (req, reply) => {
     const instanceId = authed(req, reply);
@@ -255,15 +268,17 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
 
   // ── 控制台读取（走管理会话，不是接入令牌）────────────────
   api.get(`${config.basePath}/api/field/devices`, async (req, reply) => {
-    if (!guard(req, reply, { csrf: false, need: 'field:view' })) return;
     const { instanceId } = req.query as { instanceId?: string };
-    return reply.send({ devices: registry.devices(instanceId) });
+    const user = fieldGuard(req, reply, instanceId);
+    if (!user) return;
+    return reply.send({ devices: visibleOnly(user, registry.devices(instanceId)) });
   });
 
   api.get(`${config.basePath}/api/field/tags`, async (req, reply) => {
-    if (!guard(req, reply, { csrf: false, need: 'field:view' })) return;
     const { instanceId, nodeId } = req.query as { instanceId?: string; nodeId?: string };
-    return reply.send({ tags: registry.tags(instanceId, nodeId) });
+    const user = fieldGuard(req, reply, instanceId);
+    if (!user) return;
+    return reply.send({ tags: visibleOnly(user, registry.tags(instanceId, nodeId)) });
   });
 
   /*
@@ -275,9 +290,14 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
    * 让用户以为看到的是全部，是诚信问题（06 号文原话）。
    */
   api.get(`${config.basePath}/api/field/southbound`, async (req, reply) => {
-    if (!guard(req, reply, { csrf: false, need: 'field:view' })) return;
     const { instanceId } = req.query as { instanceId?: string };
-    if (!instanceId) return reply.code(400).send({ error: '缺少 instanceId' });
+    // 这条**必须**指名实例：它读的是那台实例的 flows.json，
+    // 里面是设备 IP 与寄存器地址，比台账更敏感
+    if (!instanceId) {
+      if (!guard(req, reply, { csrf: false, need: 'field:view' })) return;
+      return reply.code(400).send({ error: '缺少 instanceId' });
+    }
+    if (!guard(req, reply, { csrf: false, need: 'instance:view', instance: instanceId })) return;
 
     const flowsPath = join(config.instanceDataRoot, instanceId, 'flows.json');
     const raw = await readFile(flowsPath, 'utf8').catch(() => undefined);
@@ -293,16 +313,24 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
   });
 
   api.get(`${config.basePath}/api/field/summary`, async (req, reply) => {
-    if (!guard(req, reply, { csrf: false, need: 'field:view' })) return;
     const { instanceId } = req.query as { instanceId?: string };
+    const user = fieldGuard(req, reply, instanceId);
+    if (!user) return;
     /*
      * 两类数字**必须分开返回**，不能相加：
      * `managed` 是节点集回报的可信台账（有当前值、有质量码）；
      * `probed` 是从 flows.json 反推的尽力探测（没有运行时数据，可能漏）。
      * 加在一起显示会让用户以为那是同一种东西。
      */
+    // 汇总数字同样只能覆盖看得见的实例，否则「全厂多少台设备」会被越权读出来
+    const devices = visibleOnly(user, registry.devices(instanceId));
+    const tags = visibleOnly(user, registry.tags(instanceId));
     return reply.send({
-      managed: registry.summary(instanceId),
+      managed: {
+        devices: devices.length,
+        online: devices.filter((d) => d.online).length,
+        tags: tags.length,
+      },
       note: '「已纳管」来自 @thinglinks 节点主动回报，含当前值与质量码；'
           + '用原生 modbus/opcua/s7 节点采集的部分请看 /api/field/southbound，那是尽力探测，未纳管',
     });
