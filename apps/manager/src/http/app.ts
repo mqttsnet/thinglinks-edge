@@ -12,7 +12,10 @@ import { join } from 'node:path';
 import { createContext, type ServerDeps } from './context.ts';
 import { registerSession } from './session.ts';
 import { registerInstances } from './instances.ts';
+import { registerMetrics } from './metrics.ts';
 import { registerSso } from './sso.ts';
+import { registerIngest } from './ingest.ts';
+import { registerBackup } from './backup.ts';
 import { registerProxy } from './proxy.ts';
 import { registerConsole } from './console.ts';
 
@@ -47,7 +50,10 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
     registerSession(api, ctx);
     registerInstances(api, ctx);
+    registerMetrics(api, ctx);
     registerSso(api, ctx);
+    registerIngest(api, ctx);
+    registerBackup(api, ctx);
   });
 
   registerProxy(app, ctx);

@@ -171,10 +171,7 @@ cd apps/manager && pnpm verify
 
 ## 许可协议
 
-ThingLinks Edge 基于 [Apache License 2.0](LICENSE) 开源，并附加商业条款 ——
-详见 [LICENSE-COMMERCIAL](LICENSE-COMMERCIAL)。
-
-商业授权或企业版授权请联系 [mqttsnet@163.com](mailto:mqttsnet@163.com)。
+ThingLinks Edge 基于 [Apache License 2.0](LICENSE) 开源。
 
 ---
 

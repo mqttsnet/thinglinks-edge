@@ -7,13 +7,13 @@
 import bcrypt from 'bcryptjs';
 import type { Db } from './db.ts';
 import { recordAudit } from './db.ts';
-import { adminRootFor } from './core-reexport.ts';
+import { adminRootFor } from './config.ts';
 import { InstanceRepo, type PortRecord } from './instance-repo.ts';
 import { DockerClient } from './docker-client.ts';
 import { renderSettings } from './settings-template.ts';
 import { assertValidId } from './container-spec.ts';
 import { generatePassword } from './crypto.ts';
-import { validatePortSpec, recommendPorts, type PortRange } from './ports.ts';
+import { validatePortMappings, recommendPorts, type PortRange, type PortMapping } from './ports.ts';
 import { HealthProbe, analyzeLogs, judge, type InstanceHealth } from './health.ts';
 import { readHostStats, isExhausted, type HostStats } from './host-stats.ts';
 
@@ -30,12 +30,14 @@ export interface CreateInstanceInput {
   imageTag: string;
   memoryMb: number;
   cpus: number;
-  /** 用户自填的端口表达式，如 30101-30120；留空表示不映射 */
-  portSpec: string;
-  /** 端口绑定的网卡，默认回环 */
-  hostIp?: string | undefined;
-  containerPort?: number | undefined;
-  purpose?: string | undefined;
+  /**
+   * 端口映射表，一行一条，空数组表示不映射。
+   *
+   * 早先是「区间字符串 + 一个起始容器端口，其余递增」。那个抽象拟合不了真实协议布局
+   * （MQTT 1883、Modbus 502、OPC UA 4840 并不连号），且填错不报错、只是连不上。
+   * 现在每条映射显式给全：宿主端口、容器端口、协议、监听网卡、用途。
+   */
+  ports: PortMapping[];
   actor: string;
 }
 
@@ -126,22 +128,17 @@ export class InstanceService {
       throw new ServiceError(`${exhausted.reason}，已阻止创建新实例`);
     }
 
-    const hostPorts = await validatePortSpec(
-      input.portSpec, this.o.portRange, this.o.repo.usedPorts(),
-      { probeHost: this.o.probeHostPorts !== false, hostIp: input.hostIp ?? '127.0.0.1' },
+    await validatePortMappings(
+      input.ports, this.o.portRange, this.o.repo.usedPorts(),
+      { probeHost: this.o.probeHostPorts !== false },
     );
 
     const adminRoot = adminRootFor(this.o.basePath, input.id);
     const password = generatePassword();
     const credSecret = generatePassword(24);
-    const ports: PortRecord[] = hostPorts.map((hostPort, i) => ({
-      hostPort,
-      // 未指定容器端口时与宿主端口同号，便于按段绑定时顺序对应
-      containerPort: input.containerPort ? input.containerPort + i : hostPort,
-      protocol: 'tcp',
-      hostIp: input.hostIp ?? '127.0.0.1',
-      purpose: input.purpose ?? '',
-    }));
+    // 接入令牌：给实例里的 @thinglinks 节点回报台账用，与管理口令分开
+    const ingestToken = generatePassword(32);
+    const ports: PortRecord[] = input.ports.map((m) => ({ ...m }));
 
     // 1. 先在仓储占坑 —— 端口冲突在事务内原子检出
     this.o.repo.create(
@@ -153,6 +150,7 @@ export class InstanceService {
       ports,
       [{ username: 'admin', password, permissions: '*' }],
     );
+    this.o.repo.setIngestToken(input.id, ingestToken);
 
     // 2. 再落 Docker；失败则补偿删除仓储记录
     try {
@@ -163,7 +161,8 @@ export class InstanceService {
         credentials: [{ username: 'admin', passwordHash: bcrypt.hashSync(password, 8), permissions: '*' }],
       });
       await this.o.docker.createInstance(
-        { id: input.id, imageTag: input.imageTag, memoryMb: input.memoryMb, cpus: input.cpus, ports, adminRoot },
+        { id: input.id, imageTag: input.imageTag, memoryMb: input.memoryMb, cpus: input.cpus,
+            ports, adminRoot, ingestToken },
         settings,
       );
       await this.o.docker.start(input.id);
@@ -256,5 +255,15 @@ export class InstanceService {
     this.assertExists(id);
     await this.o.docker.assertManaged(id);
     return this.o.docker.logs(id, tail);
+  }
+
+  /** 跟随日志。与 logs 走同一套存在性与归属校验，返回未解帧的原始流 */
+  async logStream(
+    id: string,
+    opts: { tail?: number; since?: string } = {},
+  ): Promise<NodeJS.ReadableStream> {
+    this.assertExists(id);
+    await this.o.docker.assertManaged(id);
+    return this.o.docker.logStream(id, opts);
   }
 }

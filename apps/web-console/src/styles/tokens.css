@@ -1,6 +1,12 @@
 /*
- * 设计令牌 —— 沿用 flexy-vuetify-vue3-dashboard 的 DARK_BLUE 主题。
- * 与交互原型（prototype/console-mockup）保持一致，深浅色都显式定义。
+ * 设计令牌。
+ *
+ * 主色取自 flexy-vuetify-vue3-dashboard 的 DARK_BLUE_THEME —— 注意那是它的
+ * **暗色**主题；这份 flexy 的 LightTheme.ts 只含 ORANGE_THEME，没有浅色蓝。
+ * 所以浅色这一套是本项目自己配的：DARK_BLUE 的主色 + flexy 浅色主题的语义色与中性色。
+ * 暗色主色提亮到 #5183dd，原值 #1e4db7 在深底上对比度不足。
+ * 完整来源与差异见 12-控制台界面规范.md 第 4.1 节。
+ * 深浅色都显式定义。
  */
 :root {
   --primary: #1e4db7; --primary-d: #17409e; --secondary: #1a97f5; --primary-glow: 30, 77, 183;
@@ -11,6 +17,11 @@
   --hover: #f5f8fd; --grey100: #f2f6fa; --sidebar: #fbfcfe;
   --shadow: rgba(145, 158, 171, .1) 0 2px 4px, rgba(145, 158, 171, .1) 0 10px 26px -6px;
   --r: 14px; --rs: 9px;
+  /* 曲线配色。单列一组是因为图表要的是「彼此分得开」，
+     语义色（成功/警告）在图里会被读成「这条线是好的/坏的」，那不是它的意思 */
+  --chart-1: #1e4db7; --chart-2: #1a97f5; --chart-3: #05b187; --chart-4: #ff8f3f;
+  --chart-grid: #edf1f8; --chart-axis: #9aa5b8;
+  --tip-bg: rgba(17, 20, 45, .93); --tip-text: #fff; --tip-muted: #b9c2d6;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
 }
 @media (prefers-color-scheme: dark) {
@@ -21,6 +32,10 @@
     --bg: #131720; --surface: #1a202b; --border: #2a3242; --input-border: #3a4456;
     --hover: #222a38; --grey100: #252d3c; --sidebar: #171c26;
     --shadow: rgba(0, 0, 0, .3) 0 2px 4px, rgba(0, 0, 0, .28) 0 10px 26px -6px;
+    /* 深色下原色太闷，整体提亮一档，保证细线在深底上还看得清 */
+    --chart-1: #6f9bf0; --chart-2: #4bb6ff; --chart-3: #2fd0a5; --chart-4: #ffa963;
+    --chart-grid: #262f3f; --chart-axis: #71829b;
+    --tip-bg: rgba(8, 11, 18, .95); --tip-text: #eef3f9; --tip-muted: #93a3bb;
   }
 }
 * { box-sizing: border-box; }

@@ -14,6 +14,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { authTokenKeyFor } from '../dist/core/config.js';
+import { TEST_EDGE_ROOT, TEST_DATA_ROOT, ensureRoot, resetRoot, resetDataDir } from './_data-root.mjs';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const IMAGE = 'thinglinks-edge-manager:verify';
@@ -49,12 +50,13 @@ function socketGid() {
 async function cleanup() {
   await raw.getContainer(MGR).remove({ force: true }).catch(() => {});
   await raw.getContainer(`tle-nr-${ID}`).remove({ force: true }).catch(() => {});
-  await raw.getVolume(`tle-nr-${ID}-data`).remove({ force: true }).catch(() => {});
+  await resetDataDir(ID);
   await raw.getNetwork(networkName(ID)).remove().catch(() => {});
 }
 
 async function main() {
   console.log(`\n──── Manager 容器化 · 真实 Docker 验证（前缀 ${BASE || '/'}）────\n`);
+  await resetRoot();   // bind 挂载不随 down -v 消失，必须显式清
   await cleanup();
 
   console.log('  · 构建镜像…');
@@ -66,7 +68,11 @@ async function main() {
     'run', '-d', '--name', MGR,
     '--group-add', gid,
     '-v', '/var/run/docker.sock:/var/run/docker.sock',
+    // 同名挂载：容器内路径必须等于宿主路径。Manager 用容器内视角 mkdir 实例数据目录，
+    // 而 daemon 用宿主视角解析实例的 Binds —— 不同名就会各写各的，且毫无症状。
+    '-v', `${TEST_EDGE_ROOT}:${TEST_EDGE_ROOT}`,
     '-p', `127.0.0.1:${PORT}:8080`,
+    '-e', `EDGE_DATA_ROOT=${TEST_EDGE_ROOT}`,
     '-e', `EXTERNAL_URL=${B}`,
     '-e', 'MASTER_KEY=verify-master-key',
     '-e', `INITIAL_PASSWORD=${ADMIN_PW}`,
@@ -88,6 +94,17 @@ async function main() {
     throw new Error('Manager 容器未就绪');
   }
 
+  /*
+   * 库文件必须真的落在宿主 bind 挂载上。
+   * 镜像里一旦钉死 DATA_DIR，它会覆盖由 EDGE_DATA_ROOT 派生的默认值 ——
+   * 只读根文件系统下表现为启动失败，可写根文件系统下更阴：悄悄落进容器可写层，
+   * 功能全正常、测试全绿，容器一删数据就没了。所以这条要从**宿主侧**看。
+   */
+  const { access } = await import('node:fs/promises');
+  const dbPath = `${TEST_EDGE_ROOT}/manager/edge.db`;
+  const dbOnHost = await access(dbPath).then(() => true).catch(() => false);
+  check('库文件落在宿主数据根上，不在容器可写层', dbOnHost, dbPath);
+
   const whoami = sh('docker', ['exec', MGR, 'id', '-un']).trim();
   check('容器内进程不是 root', whoami === 'node', `user=${whoami}`);
 
@@ -105,9 +122,35 @@ async function main() {
   // 创建实例
   const created = await fetch(`${B}/api/instances`, {
     method: 'POST', headers: H,
-    body: JSON.stringify({ id: ID, name: '容器化验证', imageTag: TAG, hostPortStart: 31200, hostPortCount: 2 }),
+    // 两条不连号映射，且第二条绑到全部网卡 —— 现场设备要连的就是这种
+    body: JSON.stringify({ id: ID, name: '容器化验证', imageTag: TAG,
+                           ports: [
+                             { hostPort: 30200, containerPort: 1883, protocol: 'tcp', hostIp: '127.0.0.1', purpose: 'MQTT broker' },
+                             { hostPort: 30201, containerPort: 502, protocol: 'tcp', hostIp: '0.0.0.0', purpose: 'Modbus TCP' },
+                           ] }),
   });
   check('通过容器内 Manager 创建实例', created.status === 201, `HTTP ${created.status}`);
+
+  // 端口字段名写错会被服务端静默忽略，只断言 201 是看不出来的
+  const createdPorts = created.status === 201 ? (await created.json()).instance.ports : [];
+  check('端口映射逐条落到宿主，容器端口不被改写', createdPorts.length === 2
+          && createdPorts.some((p) => p.hostPort === 30200 && p.containerPort === 1883)
+          && createdPorts.some((p) => p.hostPort === 30201 && p.containerPort === 502),
+        createdPorts.map((p) => `${p.hostPort}→${p.containerPort}`).join(' ') || '一个都没有');
+
+  // 这条是本次修复的要害：早先 hostIp 前端从不发送，永远绑 127.0.0.1，
+  // 于是现场设备根本连不上，而界面上一切正常
+  const nrInfo = await raw.getContainer(`tle-nr-${ID}`).inspect();
+  const bindings = nrInfo.HostConfig.PortBindings ?? {};
+  check('指定的监听网卡真的传到了 Docker',
+        bindings['1883/tcp']?.[0]?.HostIp === '127.0.0.1'
+          && bindings['502/tcp']?.[0]?.HostIp === '0.0.0.0',
+        JSON.stringify(bindings));
+
+  // 时区：官方镜像默认 UTC，不注入 TZ 的话定时流程与时间戳整体偏移且不报错
+  const tzOut = (await raw.getContainer(`tle-nr-${ID}`).inspect()).Config.Env
+    .find((e) => e.startsWith('TZ='));
+  check('实例容器注入了时区，不再跑在 UTC 上', tzOut === 'TZ=Asia/Shanghai', String(tzOut));
 
   // Manager 是否真的接入了实例网络
   const netInfo = await raw.getNetwork(networkName(ID)).inspect();
@@ -143,6 +186,34 @@ async function main() {
   const logs = await (await fetch(`${B}/api/instances/${ID}/logs?tail=40`, { headers: { cookie } })).text();
   check('日志已解帧（容器内同样走多路复用流）',
         logs.includes('Server now running at') && ![...logs].some((c) => c.codePointAt(0) < 0x09));
+
+  // ── @thinglinks 节点集 ──
+  /*
+   * 节点集由 Manager 拷进实例数据目录，靠 settings.js 的 nodesDir 扫目录加载。
+   * 光断言「文件拷过去了」不够 —— 文件在而 Node-RED 没扫到是完全可能的，
+   * 表现是面板里没有 ThingLinks 分类，**没有任何报错**。
+   * 所以要看 Node-RED 自己写出的 .config.nodes.json。
+   */
+  const { readFile } = await import('node:fs/promises');
+  const nodesManifest = `${TEST_DATA_ROOT}/${ID}/.config.nodes.json`;
+  let manifest = null;
+  for (let i = 0; i < 40 && manifest === null; i++) {
+    await sleep(500);
+    manifest = await readFile(nodesManifest, 'utf8').then(JSON.parse).catch(() => null);
+  }
+  const registered = manifest
+    ? Object.values(manifest).flatMap((m) => Object.entries(m.nodes ?? {}))
+        .filter(([name]) => name.startsWith('tl-'))
+    : [];
+  check('Node-RED 真的加载了 @thinglinks 三个节点',
+        registered.length === 3 && registered.every(([, n]) => !n.err),
+        registered.map(([name, n]) => `${name}${n.err ? '(err)' : ''}`).join(' ') || '一个都没有');
+
+  const instEnv = (await raw.getContainer(`tle-nr-${ID}`).inspect()).Config.Env ?? [];
+  check('实例注入了接入令牌与管理台地址',
+        instEnv.some((e) => e.startsWith('TLE_INGEST_TOKEN=') && e.length > 20) &&
+        instEnv.some((e) => e.startsWith('TLE_MANAGER_URL=http://')),
+        instEnv.filter((e) => e.startsWith('TLE_')).map((e) => e.split('=')[0]).join(' '));
 
   // ── 控制台静态托管 ──
   const home = await fetch(`${B}/`);
@@ -181,6 +252,65 @@ async function main() {
     const outside = await fetch(`${ORIGIN}/instances`);
     check('挂载前缀之外的路径不串台（404 而非控制台）', outside.status === 404, `HTTP ${outside.status}`);
   }
+
+  // ── 备份与异机恢复演练（T4.3）──
+  /*
+   * 真正的验收是「**异机**恢复」：把备份搬到一台什么都没有的机器上，
+   * 恢复完能不能把实例带回来。这里用「全新数据根 + 全新 Manager 容器」模拟另一台机器。
+   */
+  const bkRes = await fetch(`${B}/api/backup`, { method: 'POST', headers: H });
+  const bkBuf = Buffer.from(await bkRes.arrayBuffer());
+  check('备份可下载且是 tar', bkRes.status === 200 &&
+        (bkRes.headers.get('content-type') ?? '').includes('x-tar') && bkBuf.length > 1024,
+        `${bkBuf.length} 字节`);
+
+  const { readManifest } = await import('../dist/core/backup.js');
+  const bkManifest = readManifest(bkBuf);
+  check('备份清单含实例与 MASTER_KEY 指纹',
+        bkManifest.instances.some((i) => i.id === ID) &&
+        typeof bkManifest.masterKeyFingerprint === 'string' &&
+        bkManifest.masterKeyFingerprint.length === 16,
+        `${bkManifest.instances.length} 个实例 · 指纹 ${bkManifest.masterKeyFingerprint}`);
+
+  // 「另一台机器」：全新数据根，把备份文件放进去
+  const { mkdtemp, writeFile: wf, mkdir: mkd } = await import('node:fs/promises');
+  const otherRoot = await mkdtemp('/private/tmp/tle-restore-');
+  await mkd(`${otherRoot}/manager`, { recursive: true, mode: 0o777 });
+  await mkd(`${otherRoot}/instances`, { recursive: true, mode: 0o777 });
+  await wf(`${otherRoot}/backup.tar`, bkBuf);
+  sh('docker', ['run', '--rm', '-v', `${otherRoot}:${otherRoot}`,
+      '-e', `EXTERNAL_URL=${B}`, '-e', 'MASTER_KEY=verify-master-key',
+      '-e', `EDGE_DATA_ROOT=${otherRoot}`,
+      IMAGE, 'node', 'dist/index.js', 'restore', `${otherRoot}/backup.tar`]);
+
+  const { openDb } = await import('../dist/core/db.js');
+  const { deriveKey } = await import('../dist/core/crypto.js');
+  const { InstanceRepo } = await import('../dist/core/instance-repo.js');
+  const restoredDb = openDb(`${otherRoot}/manager/edge.db`);
+  const restoredRepo = new InstanceRepo(restoredDb, deriveKey('verify-master-key', 'thinglinks-edge:instance-cred'));
+  check('异机恢复后实例记录回来了',
+        restoredRepo.get(ID) !== undefined, restoredRepo.list().map((i) => i.id).join(' '));
+  check('异机恢复后实例凭据仍能解开（MASTER_KEY 一致）',
+        (restoredRepo.credentials(ID)[0]?.password ?? '').length >= 20,
+        restoredRepo.credentials(ID)[0] ? '可解密' : '解不开');
+  restoredDb.close();
+
+  const fsp = await import('node:fs/promises');
+  check('实例的流程文件也跟着回来',
+        await fsp.access(`${otherRoot}/instances/${ID}/settings.js`).then(() => true).catch(() => false));
+
+  // 密钥不对时必须当场失败，而不是恢复出「能启动但实例全起不来」的系统
+  let keyRefused = false;
+  try {
+    sh('docker', ['run', '--rm', '-v', `${otherRoot}:${otherRoot}`,
+        '-e', `EXTERNAL_URL=${B}`, '-e', 'MASTER_KEY=a-totally-different-key',
+        '-e', `EDGE_DATA_ROOT=${otherRoot}`,
+        IMAGE, 'node', 'dist/index.js', 'restore', `${otherRoot}/backup.tar`], { stdio: 'pipe' });
+  } catch (e) {
+    keyRefused = /MASTER_KEY 与备份不符/.test(String(e.stderr ?? e.stdout ?? e.message));
+  }
+  check('MASTER_KEY 不符时拒绝恢复并说清原因', keyRefused);
+  await import('node:fs/promises').then((m) => m.rm(otherRoot, { recursive: true, force: true }));
 
   // ── 网络回收 ──
   const del = await fetch(`${B}/api/instances/${ID}`, { method: 'DELETE', headers: H });

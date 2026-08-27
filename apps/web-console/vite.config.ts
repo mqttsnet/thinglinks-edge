@@ -2,6 +2,8 @@ import { defineConfig } from 'vite';
 import vue from '@vitejs/plugin-vue';
 
 export default defineConfig({
+  // 相对路径构建：挂载前缀是运行期才知道的，由 Manager 注入 <base href> 钉住
+  base: './',
   plugins: [vue()],
   server: {
     port: 5173,

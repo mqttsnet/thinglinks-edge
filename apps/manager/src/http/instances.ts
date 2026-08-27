@@ -42,10 +42,20 @@ export function registerInstances(api: FastifyInstance, ctx: HttpContext): void 
         imageTag: String(b['imageTag'] ?? ''),
         memoryMb: Number(b['memoryMb'] ?? 512),
         cpus: Number(b['cpus'] ?? 0.5),
-        portSpec: String(b['portSpec'] ?? ''),
-        hostIp: b['hostIp'] ? String(b['hostIp']) : undefined,
-        containerPort: b['containerPort'] ? Number(b['containerPort']) : undefined,
-        purpose: b['purpose'] ? String(b['purpose']) : undefined,
+        // 端口映射逐条显式传入。这里只做形状归一，取值合法性交给
+        // validatePortMappings —— 校验集中一处，HTTP 层不重复判断
+        ports: Array.isArray(b['ports'])
+          ? (b['ports'] as unknown[]).map((raw) => {
+              const r = (raw ?? {}) as Record<string, unknown>;
+              return {
+                hostPort: Number(r['hostPort']),
+                containerPort: Number(r['containerPort']),
+                protocol: r['protocol'] === 'udp' ? ('udp' as const) : ('tcp' as const),
+                hostIp: String(r['hostIp'] ?? '127.0.0.1'),
+                purpose: String(r['purpose'] ?? ''),
+              };
+            })
+          : [],
         actor: user.username,
       });
       return reply.code(201).send({ instance: view });

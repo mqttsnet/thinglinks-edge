@@ -79,6 +79,9 @@ ${users}
     flowFile: "flows.json",
     flowFilePretty: true,
 
+    // @thinglinks 节点集：由 Manager 拷进数据目录，扫目录加载，不走 npm
+    nodesDir: "/data/nodes",
+
     // 不启用外部模块，收敛 Function 节点的可达面
     functionExternalModules: false,
     functionGlobalContext: {},

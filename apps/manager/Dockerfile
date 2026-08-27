@@ -1,4 +1,7 @@
-# syntax=docker/dockerfile:1
+#
+# 刻意不写 `# syntax=docker/dockerfile:1`：那行会让 BuildKit 每次构建都去
+# 拉一个外部前端镜像，即使所有层都命中缓存也要联网（实测在网络抖动时直接构建失败）。
+# 本文件只用 FROM/COPY/RUN/ENV/USER，默认前端完全够用，而离线安装是既定目标。
 #
 # ThingLinks Edge Manager 镜像。
 #
@@ -25,6 +28,7 @@ RUN pnpm install --frozen-lockfile --ignore-scripts
 COPY tsconfig.base.json ./
 COPY apps/manager apps/manager
 COPY apps/web-console apps/web-console
+COPY packages packages
 RUN pnpm --filter @thinglinks-edge/manager build
 # 控制台按相对路径构建（base: './'），挂载前缀由 Manager 运行期注入 <base href>
 RUN pnpm --filter @thinglinks-edge/web-console build
@@ -39,11 +43,21 @@ LABEL org.opencontainers.image.title="ThingLinks Edge Manager" \
       org.opencontainers.image.vendor="mqttsnet" \
       org.opencontainers.image.licenses="Apache-2.0"
 
+# alpine 不自带时区数据库。Node 自己带 ICU，所以**程序写出的时间戳本来就是对的**，
+# 但容器里的 date、ls、日志文件 mtime 这些走 libc 的东西会显示 UTC ——
+# 现场 docker exec 进来排障时，看到 UTC 会误判成时区没生效。装上 2MB 的 tzdata 消除歧义。
+RUN apk add --no-cache tzdata
+
 # LISTEN_ADDR 在容器内取 0.0.0.0：进程默认只监听回环是宿主部署的安全默认，
 # 容器里那样会让 -p 映射失效，暴露面由端口发布策略控制。
+# 刻意**不**在镜像里钉死 DATA_DIR：它的默认值由 EDGE_DATA_ROOT 派生
+# （`<EDGE_DATA_ROOT>/manager`）。镜像里写死会**覆盖**那个派生值，
+# 把库文件写到没有挂载的 /data —— 只读根文件系统下直接
+# `unable to open database file`，可写根文件系统下更糟：悄悄落进容器可写层，
+# 容器一删数据就没了，而且测试看不出来。
 ENV NODE_ENV=production \
-    DATA_DIR=/data \
     WEB_ROOT=/app/web \
+    TLE_NODE_PACKAGE_DIR=/app/nodes \
     LISTEN_ADDR=0.0.0.0 \
     LISTEN_PORT=8080
 
@@ -52,11 +66,15 @@ COPY --from=builder /out/node_modules ./node_modules
 COPY --from=builder /out/dist ./dist
 COPY --from=builder /out/package.json ./package.json
 COPY --from=builder /repo/apps/web-console/dist ./web
+# @thinglinks 节点集：创建实例时整份拷进实例数据目录，由 nodesDir 加载
+COPY --from=builder /repo/packages/thinglinks-nodes ./nodes
 
 # 非 root 运行（04-安全设计 第 96 行）。node 镜像自带 uid/gid 1000 的 node 用户。
 # 访问宿主 docker.sock 另需把容器加入 socket 所属组（compose 里的 group_add），
 # A4 接入受限 docker 代理后这条豁免即可撤掉。
-RUN mkdir -p /data && chown -R node:node /data
+# 数据目录不在镜像里预建：它是宿主上的 bind 挂载点（EDGE_DATA_ROOT），
+# 属主由 compose 的 init-data 一次性摆平。镜像里建一个同名空目录只会掩盖
+# 「忘记挂载」这种错误 —— 让它挂不上时直接失败，比默默用一个空目录好。
 USER node
 
 EXPOSE 8080

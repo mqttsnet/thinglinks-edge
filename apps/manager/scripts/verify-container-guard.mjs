@@ -5,7 +5,8 @@
  * 用法： node scripts/verify-container-guard.mjs
  */
 import Docker from 'dockerode';
-import { buildCreateOptions, assertSafeCreateOptions, volumeName } from '../dist/core/container-spec.js';
+import { buildCreateOptions, assertSafeCreateOptions } from '../dist/core/container-spec.js';
+import { TEST_DATA_ROOT, ensureRoot, resetDataDir } from './_data-root.mjs';
 
 const IMAGE = 'nodered/node-red:5.0.4-24-minimal';
 const NET = 'tle-verify-net';
@@ -19,6 +20,7 @@ const check = (name, ok, detail = '') => {
 
 async function main() {
   console.log('\n──── 容器参数白名单 · 真实 Docker 验证 ────\n');
+  await ensureRoot();
 
   const nets = await docker.listNetworks({ filters: { name: [NET] } });
   if (nets.length === 0) await docker.createNetwork({ Name: NET, Internal: true });
@@ -28,8 +30,11 @@ async function main() {
     ports: [{ hostPort: 30777, containerPort: 1883, protocol: 'tcp', hostIp: '127.0.0.1' }],
     adminRoot: '/red/guard-test/',
   };
-  const opts = buildCreateOptions(spec, { network: NET, imageRepo: 'nodered/node-red' });
-  assertSafeCreateOptions(opts);
+  const opts = buildCreateOptions(spec, {
+    network: NET, imageRepo: 'nodered/node-red', instanceDataRoot: TEST_DATA_ROOT,
+    timezone: 'Asia/Shanghai',
+  });
+  assertSafeCreateOptions(opts, { instanceDataRoot: TEST_DATA_ROOT });
 
   await docker.getContainer(opts.name).remove({ force: true }).catch(() => {});
   const c = await docker.createContainer(opts);
@@ -43,14 +48,14 @@ async function main() {
   check('能力已全部裁剪', Array.isArray(hc.CapDrop) && hc.CapDrop.includes('ALL'), JSON.stringify(hc.CapDrop));
   check('no-new-privileges 生效', (hc.SecurityOpt || []).includes('no-new-privileges:true'));
   check('非特权容器', hc.Privileged === false);
-  check('仅挂载平台具名卷', (hc.Binds || []).every((b) => /^tle-nr-.*-data:\/data$/.test(b)), JSON.stringify(hc.Binds));
+  check('仅挂载本实例数据目录', (hc.Binds || []).every((b) => b === `${TEST_DATA_ROOT}/${spec.id}:/data`), JSON.stringify(hc.Binds));
   check('1880 未映射到宿主', !Object.keys(hc.PortBindings || {}).some((k) => k.startsWith('1880/')),
         Object.keys(hc.PortBindings || {}).join(',') || '(无)');
   check('已加入内部网络', Object.keys(info.NetworkSettings.Networks).includes(NET));
   check('PidsLimit 生效', hc.PidsLimit === 512, String(hc.PidsLimit));
 
   await c.remove({ force: true }).catch(() => {});
-  await docker.getVolume(volumeName(spec.id)).remove({ force: true }).catch(() => {});
+  await resetDataDir(spec.id);
   await docker.getNetwork(NET).remove().catch(() => {});
 
   const pass = results.filter((r) => r.ok).length;

@@ -12,7 +12,8 @@ import Docker from 'dockerode';
 import { DockerClient } from '../dist/core/docker-client.js';
 import { renderSettings } from '../dist/core/settings-template.js';
 import { adminRootFor } from '../dist/core/config.js';
-import { containerName, volumeName } from '../dist/core/container-spec.js';
+import { containerName } from '../dist/core/container-spec.js';
+import { TEST_DATA_ROOT, ensureRoot, resetDataDir } from './_data-root.mjs';
 
 const A = 'iso-a';
 const B = 'iso-b';
@@ -44,7 +45,7 @@ async function execIn(name, script) {
 async function cleanup() {
   for (const id of [A, B]) {
     await raw.getContainer(containerName(id)).remove({ force: true }).catch(() => {});
-    await raw.getVolume(volumeName(id)).remove({ force: true }).catch(() => {});
+    await resetDataDir(id);
   }
   for (const n of [NET, `${NET}-${A}`, `${NET}-${B}`]) {
     await raw.getNetwork(n).remove().catch(() => {});
@@ -68,10 +69,12 @@ async function createAndStart(client, id) {
 
 async function main() {
   console.log('\n──── 实例间网络隔离 · 真实容器验证 ────\n');
+  await ensureRoot();
   await cleanup();
 
   const client = new DockerClient({
     network: NET, imageRepo: 'nodered/node-red', portRange: { min: 30000, max: 30999 },
+    instanceDataRoot: TEST_DATA_ROOT, timezone: 'Asia/Shanghai',
   });
 
   await createAndStart(client, A);

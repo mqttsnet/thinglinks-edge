@@ -1,0 +1,33 @@
+<script type="text/javascript">
+  RED.nodes.registerType('tl-uplink', {
+    category: 'ThingLinks',
+    color: '#05b187',
+    defaults: {
+      name: { value: '' },
+      serviceId: { value: '' },
+      deviceId: { value: '' },
+    },
+    inputs: 1,
+    outputs: 1,
+    align: 'right',
+    icon: 'font-awesome/fa-cloud-upload',
+    paletteLabel: '上行',
+    label: function () { return this.name || this.serviceId || 'tl-uplink'; },
+  });
+</script>
+
+<script type="text/html" data-template-name="tl-uplink">
+  <div class="form-row"><label for="node-input-serviceId">服务标识</label>
+    <input type="text" id="node-input-serviceId" placeholder="env"></div>
+  <div class="form-row"><label for="node-input-deviceId">子设备（可空）</label>
+    <input type="text" id="node-input-deviceId" placeholder="留空则归网关自身"></div>
+  <div class="form-row"><label for="node-input-name">名称</label>
+    <input type="text" id="node-input-name"></div>
+</script>
+
+<script type="text/html" data-help-name="tl-uplink">
+  <p>把数据交给平台上行到 ThingLinks 云。<b>这是上行的唯一出口</b>。</p>
+  <p>不要用 <code>mqtt out</code> 直接发往云端 —— 那样断网缓存、补传、
+  协议信封与签名都会失效。</p>
+  <p>子设备标识可由 <code>msg.nodeId</code> 覆盖。</p>
+</script>

@@ -69,6 +69,40 @@ const MIGRATIONS: string[] = [
   );
   CREATE INDEX idx_audit_ts ON audit(ts);
   `,
+  // v2 —— 现场设备台账与点位表（`@thinglinks` 节点集回报的结构化信息）
+  `
+  ALTER TABLE instance ADD COLUMN ingest_token_enc TEXT NOT NULL DEFAULT '';
+
+  CREATE TABLE field_device (
+    instance_id   TEXT NOT NULL,
+    node_id       TEXT NOT NULL,
+    name          TEXT NOT NULL,
+    protocol      TEXT NOT NULL DEFAULT '',
+    address       TEXT NOT NULL DEFAULT '',
+    model         TEXT NOT NULL DEFAULT '',
+    manufacturer  TEXT NOT NULL DEFAULT '',
+    online        INTEGER NOT NULL DEFAULT 0,
+    last_seen     TEXT,
+    registered_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (instance_id, node_id),
+    FOREIGN KEY (instance_id) REFERENCES instance(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE field_tag (
+    instance_id TEXT NOT NULL,
+    node_id     TEXT NOT NULL,
+    tag_id      TEXT NOT NULL,
+    name        TEXT NOT NULL DEFAULT '',
+    unit        TEXT NOT NULL DEFAULT '',
+    data_type   TEXT NOT NULL DEFAULT '',
+    last_value  TEXT,
+    quality     TEXT NOT NULL DEFAULT '',
+    last_at     TEXT,
+    PRIMARY KEY (instance_id, node_id, tag_id),
+    FOREIGN KEY (instance_id) REFERENCES instance(id) ON DELETE CASCADE
+  );
+  CREATE INDEX idx_field_tag_instance ON field_tag(instance_id);
+  `,
 ];
 
 export function openDb(file: string): Db {

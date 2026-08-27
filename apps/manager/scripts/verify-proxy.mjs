@@ -16,12 +16,13 @@ import { join } from 'node:path';
 import { DockerClient } from '../dist/core/docker-client.js';
 import { renderSettings } from '../dist/core/settings-template.js';
 import { adminRootFor, authTokenKeyFor } from '../dist/core/config.js';
-import { containerName, volumeName } from '../dist/core/container-spec.js';
+import { containerName } from '../dist/core/container-spec.js';
 import { openDb } from '../dist/core/db.js';
 import { deriveKey } from '../dist/core/crypto.js';
 import { AuthService } from '../dist/core/auth.js';
 import { InstanceRepo } from '../dist/core/instance-repo.js';
-import { buildServer } from '../dist/server.js';
+import { buildServer } from '../dist/http/app.js';
+import { TEST_DATA_ROOT, ensureRoot, resetDataDir } from './_data-root.mjs';
 
 const BASE_PATH = process.argv[2] ?? '';
 const ID = 'proxy-a';
@@ -43,7 +44,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function cleanup() {
   await raw.getContainer(BRIDGE).remove({ force: true }).catch(() => {});
   await raw.getContainer(containerName(ID)).remove({ force: true }).catch(() => {});
-  await raw.getVolume(volumeName(ID)).remove({ force: true }).catch(() => {});
+  await resetDataDir(ID);
   await raw.getNetwork(NET).remove().catch(() => {});
   const nets = await raw.listNetworks({ filters: { label: ['com.mqttsnet.thinglinks-edge.managed=true'] } }).catch(() => []);
   for (const n of nets) await raw.getNetwork(n.Id).remove().catch(() => {});
@@ -51,10 +52,14 @@ async function cleanup() {
 
 async function main() {
   console.log(`\n──── 反代端到端验证（basePath=${BASE_PATH || '(根路径)'}）────\n`);
+  await ensureRoot();
   await cleanup();
 
   const adminRoot = adminRootFor(BASE_PATH, ID);
-  const client = new DockerClient({ network: NET, imageRepo: 'nodered/node-red', portRange: { min: 30000, max: 30999 } });
+  const client = new DockerClient({
+    network: NET, imageRepo: 'nodered/node-red',
+    portRange: { min: 30000, max: 30999 }, instanceDataRoot: TEST_DATA_ROOT, timezone: 'Asia/Shanghai',
+  });
 
   await client.createInstance({
     id: ID, imageTag: '5.0.4-24-minimal', memoryMb: 256, cpus: 0.5, ports: [], adminRoot,

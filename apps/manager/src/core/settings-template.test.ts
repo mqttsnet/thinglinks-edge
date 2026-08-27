@@ -90,3 +90,9 @@ test('特殊字符不会破坏文件结构', () => {
   assert.equal(s['adminAuth'].users[0].username, 'ad"min');
   assert.equal(s['credentialSecret'], 'a"b\nc');
 });
+
+test('settings 指向 @thinglinks 节点集目录', () => {
+  // 少了这行，Manager 拷进去的节点集不会被 Node-RED 扫到，
+  // 表现是「面板里没有 ThingLinks 分类」而没有任何报错
+  assert.equal(evalSettings(renderSettings(input())).nodesDir, '/data/nodes');
+});

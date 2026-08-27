@@ -42,7 +42,9 @@ export class RepoError extends Error {
 export class InstanceRepo {
   // 不用 TS 参数属性：node --experimental-strip-types 为纯剥离模式，不支持需要代码生成的语法
   private readonly db: Db;
-  private readonly key: Buffer;
+  /** 备份要用它算 MASTER_KEY 指纹，故对外只读 */
+
+  readonly key: Buffer;
 
   constructor(db: Db, key: Buffer) {
     this.db = db;
@@ -133,6 +135,39 @@ export class InstanceRepo {
   // ── 凭据 ────────────────────────────────────────────────
 
   /** 取出实例账号明文 —— 免密跳转要用它向 Node-RED 换 access_token */
+  /**
+   * 设置实例的接入令牌（`@thinglinks` 节点回报台账时用）。
+   *
+   * 与 Node-RED 管理口令分开：那个是给人用的、会被重置；这个是给节点用的、
+   * 随实例生命周期。加密存储，因为容器重建时要能重新注入。
+   */
+  setIngestToken(instanceId: string, token: string): void {
+    this.db.prepare('UPDATE instance SET ingest_token_enc = ? WHERE id = ?')
+      .run(encryptSecret(token, this.key), instanceId);
+  }
+
+  ingestToken(instanceId: string): string | undefined {
+    const row = this.db.prepare('SELECT ingest_token_enc FROM instance WHERE id = ?')
+      .get(instanceId) as { ingest_token_enc?: string } | undefined;
+    if (!row?.ingest_token_enc) return undefined;
+    return decryptSecret(row.ingest_token_enc, this.key);
+  }
+
+  /**
+   * 令牌 → 实例 id 的全表映射，供接入鉴权建缓存。
+   *
+   * 不在每次请求时逐条解密比对：点位值上报是高频路径，
+   * 每条都做 N 次 AES 是白扔 CPU。
+   */
+  allIngestTokens(): Map<string, string> {
+    const rows = this.db.prepare(
+      "SELECT id, ingest_token_enc FROM instance WHERE ingest_token_enc != ''",
+    ).all() as Array<{ id: string; ingest_token_enc: string }>;
+    const out = new Map<string, string>();
+    for (const r of rows) out.set(decryptSecret(r.ingest_token_enc, this.key), r.id);
+    return out;
+  }
+
   credentials(instanceId: string): CredRecord[] {
     const rows = this.db.prepare(
       'SELECT username, pwd_enc, permissions FROM instance_cred WHERE instance_id = ? ORDER BY id',

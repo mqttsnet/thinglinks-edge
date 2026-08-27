@@ -1,13 +1,16 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, h } from 'vue';
 import {
-  NButton, NCard, NTag, NProgress, NModal, NForm, NFormItem, NInput,
+  NButton, NCard, NTag, NModal, NForm, NFormItem, NInput,
   NInputNumber, NSelect, NSpace, NSpin, NEmpty, NAlert, NCheckbox,
   useMessage, useDialog,
 } from 'naive-ui';
+import { useRouter } from 'vue-router';
 import { api, ApiError } from '../api/client';
-import type { Instance } from '../api/types';
+import type { Instance, PortRecord } from '../api/types';
+import FieldHelp from '../components/FieldHelp.vue';
 
+const router = useRouter();
 const message = useMessage();
 const dialog = useDialog();
 
@@ -40,19 +43,56 @@ const IMAGE_TAGS = [
   { label: '5.0.4-24-minimal（推荐）', value: '5.0.4-24-minimal' },
   { label: '4.1.13-22-minimal', value: '4.1.13-22-minimal' },
 ];
-const form = ref({
+/**
+ * 监听网卡。
+ *
+ * 这里不去枚举宿主网卡：Manager 跑在容器里，os.networkInterfaces() 看到的是
+ * 容器自己那几张，不是宿主的 —— 列出来只会误导。所以给两个明确选项加自填。
+ */
+const HOST_IP_OPTIONS = [
+  { label: '仅本机 127.0.0.1', value: '127.0.0.1' },
+  { label: '所有网卡 0.0.0.0', value: '0.0.0.0' },
+];
+
+const PROTOCOLS = [
+  { label: 'TCP', value: 'tcp' },
+  { label: 'UDP', value: 'udp' },
+];
+
+const emptyForm = () => ({
   id: '', name: '', imageTag: '5.0.4-24-minimal',
-  memoryMb: 512, cpus: 0.5, portSpec: '', containerPort: 1883, purpose: '',
+  memoryMb: 512, cpus: 0.5, ports: [] as PortRecord[],
 });
-const recommended = ref('');
+const form = ref(emptyForm());
+const recommended = ref<number[]>([]);
+
+/** 新增一行时给个不与现有行冲突的宿主端口建议 */
+function nextFreePort(): number {
+  const used = new Set(form.value.ports.map((p) => p.hostPort));
+  for (const p of recommended.value) if (!used.has(p)) return p;
+  const base = form.value.ports.length ? Math.max(...used) + 1 : 30000;
+  return base;
+}
+
+function addPort() {
+  form.value.ports.push({
+    hostPort: nextFreePort(), containerPort: 1883, protocol: 'tcp',
+    hostIp: '127.0.0.1', purpose: '',
+  });
+}
+const removePort = (i: number) => form.value.ports.splice(i, 1);
 
 async function openCreate() {
-  form.value = { id: '', name: '', imageTag: '5.0.4-24-minimal', memoryMb: 512, cpus: 0.5,
-                 portSpec: '', containerPort: 1883, purpose: '' };
+  form.value = emptyForm();
   showCreate.value = true;
   try {
-    recommended.value = (await api.recommendPorts(2)).recommended;
-  } catch { recommended.value = ''; }
+    const spec = (await api.recommendPorts(8)).recommended;
+    // 推荐接口回的是 "30000-30007" 这种区间串，这里摊平成候选池
+    const m = /^(\d+)-(\d+)$/.exec(spec);
+    recommended.value = m
+      ? Array.from({ length: Number(m[2]) - Number(m[1]) + 1 }, (_, i) => Number(m[1]) + i)
+      : spec ? [Number(spec)] : [];
+  } catch { recommended.value = []; }
 }
 
 async function submitCreate() {
@@ -64,9 +104,7 @@ async function submitCreate() {
       imageTag: form.value.imageTag,
       memoryMb: form.value.memoryMb,
       cpus: form.value.cpus,
-      portSpec: form.value.portSpec.trim(),
-      ...(form.value.portSpec.trim() ? { containerPort: form.value.containerPort } : {}),
-      ...(form.value.purpose.trim() ? { purpose: form.value.purpose.trim() } : {}),
+      ports: form.value.ports.map((p) => ({ ...p, purpose: p.purpose.trim() })),
     });
     showCreate.value = false;
     message.success('实例已创建，正在拉起容器');
@@ -176,6 +214,7 @@ const stateTag = (i: Instance) =>
             <NButton v-else size="small" @click="act(() => api.stopInstance(i.id), '已停止')">停止</NButton>
             <NButton size="small" type="primary" :disabled="!i.running"
                      tag="a" :href="i.openUrl" target="_blank">打开编辑器</NButton>
+            <NButton size="small" @click="router.push(`/instances/${i.id}/logs`)">日志</NButton>
             <NButton size="small" @click="resetPassword(i)">重置口令</NButton>
             <NButton size="small" quaternary type="error" @click="confirmRemove(i)">删除</NButton>
           </div>
@@ -183,50 +222,150 @@ const stateTag = (i: Instance) =>
       </div>
     </NSpin>
 
-    <NModal v-model:show="showCreate" preset="card" title="新建实例" style="max-width: 560px">
+    <NModal v-model:show="showCreate" preset="card" title="新建实例" style="max-width: 780px">
       <NForm label-placement="top">
         <NSpace :size="14">
-          <NFormItem label="实例 ID" style="flex:1">
+          <NFormItem style="flex:1">
+            <template #label>
+              实例 ID
+              <FieldHelp>
+                <p>容器名、内部网络名和访问网址都用它，<b>创建后不能改</b>，要换只能删了重建。</p>
+                <p>只允许小写字母、数字和连字符，字母开头、字母或数字结尾，长度 3–32。
+                  例：<code>line-a</code>、<code>oven-2</code>。</p>
+                <p>想用中文或以后要改的，写到右边的「名称」里。</p>
+              </FieldHelp>
+            </template>
             <NInput v-model:value="form.id" placeholder="line-a" class="mono" />
           </NFormItem>
-          <NFormItem label="名称" style="flex:1">
+          <NFormItem style="flex:1">
+            <template #label>
+              名称
+              <FieldHelp>
+                <p>只用于界面显示，<b>随时可改</b>，不影响容器和网址。</p>
+                <p>建议写现场认得出的位置或用途，例如「一号产线」「注塑车间温控」，
+                  以后卡片多了才分得清。</p>
+              </FieldHelp>
+            </template>
             <NInput v-model:value="form.name" placeholder="一号产线" />
           </NFormItem>
         </NSpace>
-        <NFormItem label="Node-RED 版本">
+        <NFormItem>
+          <template #label>
+            Node-RED 版本
+            <FieldHelp>
+              <p>实例容器使用的镜像版本。流程和已装节点存在数据目录里，不随版本走，
+                但<b>换版本需要重建实例</b>。</p>
+              <p>下拉里只列出本机已允许的版本 —— 现场无外网时，没预先拉取过的版本装不上，
+                所以不要临时改成没见过的版本号。</p>
+              <p>拿不准就用标注「推荐」的那个。</p>
+            </FieldHelp>
+          </template>
           <NSelect v-model:value="form.imageTag" :options="IMAGE_TAGS" />
         </NFormItem>
         <NSpace :size="14">
-          <NFormItem label="内存上限（MB）" style="flex:1">
+          <NFormItem style="flex:1">
+            <template #label>
+              内存上限（MB）
+              <FieldHelp>
+                <p>容器能用的内存<b>硬上限</b>。超过这个数，进程会被系统直接杀掉并自动重启，
+                  表现是实例反复重启、流程时断时续。</p>
+                <p>常规采集与转发 512 够用；做图像处理、大批量缓存或装了很多节点时往上调。</p>
+                <p>不确定就保持默认，之后看健康页的内存曲线再调。</p>
+              </FieldHelp>
+            </template>
             <NInputNumber v-model:value="form.memoryMb" :min="64" :step="128" style="width:100%" />
           </NFormItem>
-          <NFormItem label="CPU 配额（核）" style="flex:1">
+          <NFormItem style="flex:1">
+            <template #label>
+              CPU 配额（核）
+              <FieldHelp>
+                <p>容器最多能用多少个 CPU 核，可填小数：<code>0.5</code> 就是半个核。</p>
+                <p class="fh-warn">填小了<b>不会报错</b>，只是流程变慢、定时任务延迟 ——
+                  这种问题现场很难查，宁可给宽一点。</p>
+                <p>整机核数有限，所有实例加起来别超过物理核数太多。</p>
+              </FieldHelp>
+            </template>
             <NInputNumber v-model:value="form.cpus" :min="0.1" :step="0.1" style="width:100%" />
           </NFormItem>
         </NSpace>
-        <NFormItem label="宿主端口映射">
+        <NFormItem>
+          <template #label>
+            端口映射
+            <FieldHelp>
+              <p>只有当<b>现场设备要主动连进来</b>时才需要加 —— 比如流程里放了
+                MQTT broker 节点、Modbus TCP 从站、TCP/UDP 监听节点。</p>
+              <p>Node-RED 编辑器和 HTTP/WebSocket 类节点<b>不用加</b>，
+                它们走管理台统一入口，不占宿主端口。</p>
+              <p>一行一条，各自独立：协议端口从来不连号（MQTT 1883、Modbus 502、
+                OPC UA 4840），所以逐条填写。</p>
+            </FieldHelp>
+          </template>
           <NSpace vertical style="width:100%">
-            <NSpace>
-              <NInput v-model:value="form.portSpec" placeholder="留空表示不映射" class="mono" style="flex:1" />
-              <NButton v-if="recommended" tertiary @click="form.portSpec = recommended">
-                用推荐值 {{ recommended }}
-              </NButton>
+            <div v-if="form.ports.length" class="port-head">
+              <span>
+                宿主端口
+                <FieldHelp>
+                  <p>现场设备来连的是<b>这个</b>端口，即边缘盒子对外开放的端口。</p>
+                  <p>可用范围由部署时的 <code>INSTANCE_PORT_MIN/MAX</code> 决定，
+                    与其它实例、以及机器上已有服务都不能撞。</p>
+                </FieldHelp>
+              </span>
+              <span></span>
+              <span>
+                容器端口
+                <FieldHelp>
+                  <p>Node-RED <b>容器里</b>那个节点实际监听的端口。</p>
+                  <p>照节点配置填：MQTT broker 通常 <code>1883</code>、
+                    Modbus TCP 从站 <code>502</code>、OPC UA <code>4840</code>。</p>
+                  <p class="fh-warn">容器里没有节点监听这个端口的话<b>不会报错</b>，
+                    只是设备连上后没反应 —— 现场很难查，填之前先确认流程里的节点配置。</p>
+                </FieldHelp>
+              </span>
+              <span>协议</span>
+              <span>
+                监听网卡
+                <FieldHelp>
+                  <p><b>决定现场设备能不能连上的就是这一项。</b></p>
+                  <p><code>仅本机 127.0.0.1</code>：只有边缘盒子自己能连，
+                    外部设备一律连不上。默认选它是出于安全，不是因为它更常用。</p>
+                  <p><code>所有网卡 0.0.0.0</code>：这台机器接入的每个网络都能连，
+                    包括办公网。</p>
+                  <p>盒子同时接了设备网和办公网时，<b>直接填设备网那块网卡的 IP</b>
+                    （可手工输入），只对设备网开放，最稳妥。</p>
+                </FieldHelp>
+              </span>
+              <span>用途</span><span></span>
+            </div>
+            <div v-for="(p, i) in form.ports" :key="i" class="port-row">
+              <NInputNumber v-model:value="p.hostPort" :min="1" :max="65535"
+                            size="small" :show-button="false" placeholder="30000" />
+              <span class="arrow">→</span>
+              <NInputNumber v-model:value="p.containerPort" :min="1" :max="65535"
+                            size="small" :show-button="false" placeholder="1883" />
+              <NSelect v-model:value="p.protocol" :options="PROTOCOLS" size="small" />
+              <!-- consistent-menu-width=false：列宽只有 142px，下拉菜单跟着截断
+                   会让「所有网卡 0.0.0.0」显示成「所有网卡 0.0...」，选之前看不清 -->
+              <NSelect v-model:value="p.hostIp" :options="HOST_IP_OPTIONS"
+                       size="small" filterable tag placeholder="127.0.0.1"
+                       :consistent-menu-width="false" />
+              <NInput v-model:value="p.purpose" size="small" placeholder="MQTT broker" />
+              <NButton quaternary size="small" @click="removePort(i)">移除</NButton>
+            </div>
+
+            <NSpace align="center" :size="10">
+              <NButton dashed size="small" @click="addPort">+ 添加端口映射</NButton>
+              <span v-if="!form.ports.length" class="hint">
+                不需要设备直连就留空。编辑器与 HTTP 类节点不占宿主端口。
+              </span>
             </NSpace>
-            <span class="hint">
-              支持区间 <code class="mono">30101-30120</code>、单个 <code class="mono">30101</code>、
-              组合 <code class="mono">30101-30110,30150</code>。
-              HTTP 类节点走统一入口，不占宿主端口。
-            </span>
+
+            <NAlert v-if="form.ports.some((p) => p.hostIp === '0.0.0.0')"
+                    type="warning" :bordered="false" size="small">
+              有端口绑到<b>所有网卡</b>：这台机器接入的每个网络都能访问，办公网也在内。
+              只想让设备网连的话，把「监听网卡」改成设备网那块网卡的 IP。
+            </NAlert>
           </NSpace>
         </NFormItem>
-        <NSpace v-if="form.portSpec.trim()" :size="14">
-          <NFormItem label="起始容器端口" style="flex:1">
-            <NInputNumber v-model:value="form.containerPort" :min="1" :max="65535" style="width:100%" />
-          </NFormItem>
-          <NFormItem label="用途备注" style="flex:1">
-            <NInput v-model:value="form.purpose" placeholder="MQTT broker 节点" />
-          </NFormItem>
-        </NSpace>
         <NAlert type="info" :bordered="false" style="margin-top:4px">
           实例账号由管理台自动创建，口令加密存储；创建后可在卡片上重置。
         </NAlert>
@@ -261,5 +400,33 @@ const stateTag = (i: Instance) =>
 .sm { font-size: 11.5px; }
 .foot { display: flex; gap: 7px; padding-top: 12px; border-top: 1px solid var(--border); flex-wrap: wrap; }
 .hint { font-size: 12px; color: var(--muted); line-height: 1.6; }
-code { background: var(--grey100); padding: 1px 5px; border-radius: 4px; }
+
+/* 端口映射表：七列固定栅格，表头与数据行用同一套列宽才对得齐 */
+.port-head, .port-row {
+  display: grid;
+  grid-template-columns: 88px 12px 88px 72px 142px minmax(120px, 1fr) 48px;
+  gap: 8px;
+  align-items: center;
+}
+.port-head {
+  font-size: 11.5px;
+  color: var(--muted);
+  padding: 0 2px;
+}
+.arrow { color: var(--muted); text-align: center; }
+
+/* 窄屏下不横向挤压，改为每行一块卡片 */
+@media (max-width: 620px) {
+  .port-head { display: none; }
+  .port-row {
+    grid-template-columns: 1fr 1fr;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--rs);
+  }
+  .arrow { display: none; }
+}
+/* 限定在 .hint 内：scoped 样式会跟着插槽内容跑进 tooltip 的传送门，
+   裸 code 选择器会把提示框里的示例值刷成白底白字（实测不可见） */
+.hint code { background: var(--grey100); padding: 1px 5px; border-radius: 4px; }
 </style>

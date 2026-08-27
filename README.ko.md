@@ -176,10 +176,7 @@ cd apps/manager && pnpm verify
 
 ## 라이선스
 
-ThingLinks Edge 는 [Apache License 2.0](LICENSE) 으로 배포되며 상업 조항이 추가됩니다.
-자세한 내용은 [LICENSE-COMMERCIAL](LICENSE-COMMERCIAL) 을 참조하세요.
-
-상업용 또는 엔터프라이즈 라이선스는 [mqttsnet@163.com](mailto:mqttsnet@163.com) 으로 문의해 주세요.
+ThingLinks Edge 는 [Apache License 2.0](LICENSE) 으로 배포됩니다.
 
 ---
 

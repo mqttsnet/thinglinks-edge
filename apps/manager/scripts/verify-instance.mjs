@@ -1,8 +1,8 @@
 /**
  * 真容器端到端验证：DockerClient 创建的 Node-RED 实例是否真的按预期跑起来。
  *
- * 覆盖：settings.js 是否落进数据卷、httpAdminRoot 前缀是否生效、
- *      1880 是否未映射宿主、标签与卷是否按平台规则命名、删除是否只删自己的卷。
+ * 覆盖：settings.js 是否落进数据目录、httpAdminRoot 前缀是否生效、
+ *      1880 是否未映射宿主、标签与目录是否按平台规则命名、删除是否只删自己的数据。
  *
  * 用法： node scripts/verify-instance.mjs [basePath]
  *   例： node scripts/verify-instance.mjs /nodered
@@ -12,7 +12,8 @@ import Docker from 'dockerode';
 import { DockerClient } from '../dist/core/docker-client.js';
 import { renderSettings } from '../dist/core/settings-template.js';
 import { adminRootFor } from '../dist/core/config.js';
-import { containerName, volumeName } from '../dist/core/container-spec.js';
+import { containerName } from '../dist/core/container-spec.js';
+import { TEST_DATA_ROOT, ensureRoot, resetDataDir, dataDirExists } from './_data-root.mjs';
 
 const BASE_PATH = process.argv[2] ?? '';
 const ID = 'verify-a';
@@ -47,11 +48,13 @@ async function main() {
     network: 'tle-verify-net',
     imageRepo: 'nodered/node-red',
     portRange: { min: 30000, max: 30999 },
+    instanceDataRoot: TEST_DATA_ROOT, timezone: 'Asia/Shanghai',
   });
 
   // 清理上一轮残留
+  await ensureRoot();
   await raw.getContainer(containerName(ID)).remove({ force: true }).catch(() => {});
-  await raw.getVolume(volumeName(ID)).remove({ force: true }).catch(() => {});
+  await resetDataDir(ID);
 
   const adminRoot = adminRootFor(BASE_PATH, ID);
   const settings = renderSettings({
@@ -66,7 +69,7 @@ async function main() {
     ports: [{ hostPort: 30901, containerPort: 1883, protocol: 'tcp', hostIp: '127.0.0.1' }],
     adminRoot,
   }, settings);
-  check('创建实例容器与数据卷', true, containerName(ID));
+  check('创建实例容器与数据目录', await dataDirExists(ID), `${TEST_DATA_ROOT}/${ID}`);
 
   await client.start(ID);
   let ready = false;
@@ -100,14 +103,13 @@ async function main() {
   const listed = await client.list();
   check('按标签可列举到该实例', listed.some((i) => i.id === ID), `共 ${listed.length} 个受管容器`);
 
-  // 删除时保留数据卷
+  // 删除时保留数据目录
   await client.remove(ID, { removeData: false });
-  const volKept = await raw.getVolume(volumeName(ID)).inspect().then(() => true).catch(() => false);
-  check('删除容器时可保留数据卷', volKept);
+  check('删除容器时可保留数据目录', await dataDirExists(ID));
 
-  await raw.getVolume(volumeName(ID)).remove({ force: true }).catch(() => {});
-  const volGone = await raw.getVolume(volumeName(ID)).inspect().then(() => false).catch(() => true);
-  check('数据卷可显式删除', volGone);
+  // removeData:true 必须真的把宿主目录删掉 —— 这里正是原先用具名卷时会静默失效的地方
+  await client.remove(ID, { removeData: true }).catch(() => {});
+  check('removeData 真的删除宿主数据目录', !(await dataDirExists(ID)), `${TEST_DATA_ROOT}/${ID}`);
 
   await raw.getNetwork('tle-verify-net').remove().catch(() => {});
 

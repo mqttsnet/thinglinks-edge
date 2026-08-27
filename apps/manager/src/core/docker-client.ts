@@ -7,12 +7,14 @@
  *
  * 所有创建请求都必须经 assertSafeCreateOptions 二次校验后才下发。
  */
+import { mkdir, rm, cp } from 'node:fs/promises';
 import Docker from 'dockerode';
 import {
   buildCreateOptions, assertSafeCreateOptions, assertValidSpec,
-  containerName, volumeName, type InstanceSpec,
+  containerName, instanceDataDir, type InstanceSpec,
 } from './container-spec.ts';
 import { tarFile } from './tar.ts';
+import { dockerLogToText } from './log-stream.ts';
 
 /** 平台管理的容器统一打这个标签，列举与操作一律按标签过滤 */
 export const MANAGED_LABEL = 'com.mqttsnet.thinglinks-edge.managed';
@@ -21,11 +23,30 @@ const NODE_RED_UID = 1000;
 
 export interface DockerClientOptions {
   /** dockerode 连接参数；生产环境指向受限代理而非裸 socket */
-  connection?: Docker.DockerOptions;
+  connection?: Docker.DockerOptions | undefined;
   /** 网络名前缀；每个实例拥有独立网络 `${network}-${id}` */
   network: string;
   imageRepo: string;
   portRange: { min: number; max: number };
+  /**
+   * 实例数据根（宿主路径）。每个实例一个子目录并 bind 挂进容器 /data。
+   * Manager 容器必须把它挂在**同名路径**上，否则这里 mkdir 的位置
+   * 与 daemon 解析 Binds 的位置对不上 —— 那会静默挂到错误的盘。
+   */
+  instanceDataRoot: string;
+  /** 实例容器时区，缺省会让容器跑在 UTC 上（见 config.timezone） */
+  timezone: string;
+  /**
+   * Manager 在实例网络上的基址，注入给实例里的 `@thinglinks` 节点。
+   * 依赖容器名解析，因此只有 Manager 自己也是容器时才有值。
+   */
+  managerUrl?: string | undefined;
+  /**
+   * `@thinglinks` 节点集所在目录。创建实例时整份拷进 `<数据目录>/nodes/`，
+   * 由 settings.js 的 nodesDir 加载 —— 不走 npm install，容器内不需要联网。
+   * 留空则不装节点集（实例照常可用，只是平台看不见里面）。
+   */
+  nodePackageDir?: string | undefined;
   /**
    * Manager 自身的容器名或 id。提供后，每创建一个实例就把 Manager 接入该实例网络，
    * 使 Manager 可达实例、而实例之间互不可达。
@@ -86,12 +107,25 @@ export class DockerClient {
       });
   }
 
-  async ensureVolume(instanceId: string): Promise<void> {
-    const name = volumeName(instanceId);
-    try {
-      await this.docker.getVolume(name).inspect();
-    } catch {
-      await this.docker.createVolume({ Name: name, Labels: { [MANAGED_LABEL]: 'true' } });
+  /**
+   * 备好实例数据目录。
+   *
+   * 0o770 而非 0o777：同组可读写即可，不给其它用户。Manager 与 Node-RED 官方镜像
+   * 都以 uid 1000 运行，因此这里建出来的目录实例能直接写。
+   */
+  async ensureDataDir(instanceId: string): Promise<void> {
+    const dir = instanceDataDir(this.opts.instanceDataRoot, instanceId);
+    await mkdir(dir, { recursive: true, mode: 0o770 });
+
+    /*
+     * 装 `@thinglinks` 节点集。
+     *
+     * 直接拷文件而不是 npm install：容器内可能没有外网，而且装包会拖慢首次启动。
+     * Node-RED 的 nodesDir 本来就是扫目录，不需要 package.json。
+     * 每次创建都覆盖，保证节点集版本跟着 Manager 走。
+     */
+    if (this.opts.nodePackageDir) {
+      await cp(this.opts.nodePackageDir, `${dir}/nodes`, { recursive: true, force: true });
     }
   }
 
@@ -100,15 +134,19 @@ export class DockerClient {
    * settings.js 在容器启动前经 putArchive 落进数据卷，避免运行时再改配置。
    */
   async createInstance(spec: InstanceSpec, settingsJs: string): Promise<void> {
+    // managerUrl 由客户端统一补，调用方不必关心 Manager 自己是不是容器
+    if (this.opts.managerUrl) spec = { ...spec, managerUrl: this.opts.managerUrl };
     assertValidSpec(spec, this.opts.portRange);
     const options = buildCreateOptions(spec, {
       network: this.instanceNetwork(spec.id),
       imageRepo: this.opts.imageRepo,
+      instanceDataRoot: this.opts.instanceDataRoot,
+      timezone: this.opts.timezone,
     });
-    assertSafeCreateOptions(options);
+    assertSafeCreateOptions(options, { instanceDataRoot: this.opts.instanceDataRoot });
 
     await this.ensureNetwork(spec.id);
-    await this.ensureVolume(spec.id);
+    await this.ensureDataDir(spec.id);
 
     const container = await this.docker.createContainer(options as Docker.ContainerCreateOptions);
     await this.attachManager(spec.id);
@@ -145,13 +183,59 @@ export class DockerClient {
    * 删除实例。只删该实例自己的卷 —— 绝不做全局 prune，
    * 上游 PoC 的 pruneVolumes() 会波及其它容器的无主卷。
    */
+  /**
+   * 把 Manager 从实例网络摘出去。
+   *
+   * 必须在删网络之前做：Docker 拒绝删除仍有活动端点的网络，而 Manager 正是
+   * 那个端点。漏了这一步没有任何报错（删网络的失败是被吞掉的），
+   * 只会一次删一个实例、攒一堆空网络。
+   */
+  private async detachManager(instanceId: string): Promise<void> {
+    const mgr = this.opts.managerContainer;
+    if (!mgr) return;
+    await this.docker.getNetwork(this.instanceNetwork(instanceId))
+      .disconnect({ Container: mgr, Force: true })
+      .catch(() => undefined);
+  }
+
+  /**
+   * 拆除实例。
+   *
+   * 三步各自独立：容器、网络、数据目录。**不要**改回「前一步抛错就中断」的写法 ——
+   * 曾经因为容器已被手工删掉，第一步抛错，数据目录那步压根没执行，
+   * 用户以为连数据一起删了，其实还躺在盘上，且没有任何提示。
+   * 容器删除的真实失败仍会在最后抛出，只是不再连累后面的清理。
+   */
   async remove(instanceId: string, opts: { removeData: boolean }): Promise<void> {
-    await this.docker.getContainer(containerName(instanceId)).remove({ force: true });
+    let containerError: Error | null = null;
+    await this.docker.getContainer(containerName(instanceId)).remove({ force: true })
+      .catch((e: Error & { statusCode?: number }) => {
+        // 404 = 已经不在了，属于期望结果而非失败
+        if (e.statusCode !== 404) containerError = e;
+      });
+
     // 实例网络随实例一并回收，避免残留大量空网络
-    await this.docker.getNetwork(this.instanceNetwork(instanceId)).remove().catch(() => undefined);
+    await this.detachManager(instanceId);
+    await this.docker.getNetwork(this.instanceNetwork(instanceId)).remove()
+      .catch((e: Error & { statusCode?: number }) => {
+        // 404 同样是期望结果。常态就会响的告警会让人学会忽略告警，所以只报真异常
+        if (e.statusCode !== 404) {
+          console.warn(`[warn] 实例网络 ${this.instanceNetwork(instanceId)} 未能回收：${e.message}`);
+        }
+      });
+
     if (opts.removeData) {
-      await this.docker.getVolume(volumeName(instanceId)).remove().catch(() => undefined);
+      // 目录是我们自己建的宿主路径，直接删。不要指望 docker 帮忙回收 ——
+      // 具名卷那套语义在 bind 上不成立，实测 volume rm 根本不动宿主目录内容。
+      await rm(instanceDataDir(this.opts.instanceDataRoot, instanceId), {
+        recursive: true,
+        force: true,
+      }).catch((e: Error) =>
+        console.warn(`[warn] 实例数据目录未能删除：${e.message}`),
+      );
     }
+
+    if (containerError) throw containerError;
   }
 
   /** 只列举带平台标签的容器，避免误操作宿主上的其它容器 */
@@ -183,10 +267,37 @@ export class DockerClient {
     return this.docker.getContainer(containerName(instanceId));
   }
 
+  /**
+   * 取容器日志。
+   *
+   * 容器以 Tty:false 运行，Docker 返回的是多路复用流，必须解帧后才是正文 ——
+   * 直接 toString 会把 8 字节帧头当内容（见 log-stream.ts）。
+   */
   async logs(instanceId: string, tail = 200): Promise<string> {
     const buf = await this.docker.getContainer(containerName(instanceId)).logs({
       stdout: true, stderr: true, tail,
     });
-    return Buffer.isBuffer(buf) ? buf.toString('utf8') : String(buf);
+    return dockerLogToText(Buffer.isBuffer(buf) ? buf : Buffer.from(String(buf), 'utf8'));
+  }
+
+  /**
+   * 跟随容器日志（`follow`）。
+   *
+   * 返回的是**未解帧**的原始流 —— 帧头会被切在任意块边界上，
+   * 必须交给 DockerLogStream 增量解，不能逐块 toString。
+   * 调用方负责在连接断开时 destroy 这个流，否则 Docker 侧会一直往里写。
+   *
+   * 固定带 `timestamps`：断线重连要靠时间戳续传，否则每次重连都会把
+   * tail 那批历史再放一遍（实测重连三次，19 行变成 105 行）。
+   * `since` 存在时忽略 tail —— 两者同时给会既补历史又续传，重复更严重。
+   */
+  async logStream(
+    instanceId: string,
+    opts: { tail?: number; since?: string } = {},
+  ): Promise<NodeJS.ReadableStream> {
+    const base = { stdout: true, stderr: true, follow: true as const, timestamps: true };
+    return this.docker.getContainer(containerName(instanceId)).logs(
+      opts.since ? { ...base, since: opts.since } : { ...base, tail: opts.tail ?? 200 },
+    );
   }
 }

@@ -11,6 +11,8 @@ import { InstanceRepo } from '../core/instance-repo.ts';
 import type { InstanceService } from '../core/instance-service.ts';
 import { containerName } from '../core/container-spec.ts';
 import type { Db } from '../core/db.ts';
+import type { Spool } from '../core/spool/spool.ts';
+import type { MetricsHistory } from '../core/metrics-history.ts';
 
 export const SID = 'tle_sid';
 export const CSRF = 'tle_csrf';
@@ -25,12 +27,31 @@ export interface ServerDeps {
   upstreamFor?: (instanceId: string) => string;
   /** 控制台前端产物目录。留空则不托管（宿主开发态走 Vite） */
   webRoot?: string | undefined;
+  /**
+   * 云端出口。微批攒够一批就调它。
+   * 留空表示尚未配置云连接 —— 上行接口会如实回 `cloud: "not-configured"`，
+   * 而不是假装已经发出去了。
+   */
+  cloudSink?: ((payload: unknown) => Promise<void>) | undefined;
+  /**
+   * 断网缓存。云端出口失败时批次落这里，链路恢复后自动补传。
+   * 留空则失败即丢（并计数）—— 那是**明示**的降级，不是默认行为。
+   */
+  spool?: Spool | undefined;
+  /**
+   * 资源指标历史。留空表示没开后台采样 —— 趋势接口会如实回 `enabled: false`，
+   * 界面据此说明「未启用」，而不是画一张空图让人以为系统坏了。
+   */
+  metrics?: MetricsHistory | undefined;
 }
 
 const defaultUpstream = (id: string) => `http://${containerName(id)}:1880`;
 
 export interface HttpContext {
   config: EdgeConfig;
+  cloudSink: ((payload: unknown) => Promise<void>) | undefined;
+  spool: Spool | undefined;
+  metrics: MetricsHistory | undefined;
   db: Db;
   auth: AuthService;
   repo: InstanceRepo;
@@ -50,6 +71,9 @@ export function createContext(deps: ServerDeps): HttpContext {
 
   return {
     config,
+    cloudSink: deps.cloudSink,
+    spool: deps.spool,
+    metrics: deps.metrics,
     db: deps.db,
     auth,
     repo: deps.repo,

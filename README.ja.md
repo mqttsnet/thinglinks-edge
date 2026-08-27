@@ -178,10 +178,7 @@ cd apps/manager && pnpm verify
 
 ## ライセンス
 
-ThingLinks Edge は [Apache License 2.0](LICENSE) のもとで公開され、商用条項が追加されています。
-詳細は [LICENSE-COMMERCIAL](LICENSE-COMMERCIAL) を参照してください。
-
-商用・エンタープライズライセンスについては [mqttsnet@163.com](mailto:mqttsnet@163.com) までご連絡ください。
+ThingLinks Edge は [Apache License 2.0](LICENSE) のもとで公開されています。
 
 ---
 

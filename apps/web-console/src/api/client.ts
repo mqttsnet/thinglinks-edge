@@ -7,7 +7,21 @@
  */
 import type {
   SessionUser, Instance, InstanceHealth, HostStats, HealthSummary, CreateInstanceBody,
+  MetricsRange, MetricsSeries,
 } from './types';
+
+/**
+ * 控制台挂载前缀，由 Manager 在 index.html 里注入。
+ *
+ * 它是**运行期**才知道的（从 EXTERNAL_URL 派生），构建期拿不到，
+ * 所以所有请求路径都要在这里补上，不能写死成 `/api/...`。
+ * 开发态（Vite）没有注入，退化为空串。
+ *
+ * 不用 `document.baseURI` 反推：开发态没有 `<base>`，深链接下 baseURI 就是
+ * 当前地址，推出来的前缀会是 `/instances` 这种明显错误的值。
+ */
+export const basePath: string =
+  (window as unknown as { __TLE_BASE__?: string }).__TLE_BASE__ ?? '';
 
 export class ApiError extends Error {
   readonly status: number;
@@ -30,7 +44,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     if (init.body !== undefined) headers.set('content-type', 'application/json');
   }
 
-  const res = await fetch(path, { ...init, headers, credentials: 'same-origin' });
+  const res = await fetch(`${basePath}${path}`, { ...init, headers, credentials: 'same-origin' });
 
   if (res.status === 204) return undefined as T;
 
@@ -88,4 +102,7 @@ export const api = {
 
   health: () =>
     request<{ summary: HealthSummary; host: HostStats; instances: InstanceHealth[] }>('/api/health'),
+
+  /** 资源趋势历史。与 health 分开：那边现探三层探针，这边纯读内存，刷曲线不加探针压力 */
+  metrics: (range: MetricsRange) => request<MetricsSeries>(`/api/metrics?range=${range}`),
 };
