@@ -1,0 +1,70 @@
+ThingLinks Edge
+Copyright (c) 2019-present, MqttsNet (https://mqttsnet.com)
+
+This product includes software developed at MqttsNet.
+
+Dependencies:
+================================================================
+
+Fastify:
+
+  * LICENSE:
+    * https://github.com/fastify/fastify/blob/main/LICENSE (MIT)
+  * HOMEPAGE:
+    * https://fastify.dev
+
+better-sqlite3:
+
+  * LICENSE:
+    * https://github.com/WiseLibs/better-sqlite3/blob/master/LICENSE (MIT)
+  * HOMEPAGE:
+    * https://github.com/WiseLibs/better-sqlite3
+
+dockerode:
+
+  * LICENSE:
+    * https://github.com/apocas/dockerode/blob/master/LICENSE (Apache License 2.0)
+  * HOMEPAGE:
+    * https://github.com/apocas/dockerode
+
+bcryptjs:
+
+  * LICENSE:
+    * https://github.com/dcodeIO/bcrypt.js/blob/master/LICENSE (BSD-3-Clause)
+  * HOMEPAGE:
+    * https://github.com/dcodeIO/bcrypt.js
+
+Vue.js:
+
+  * LICENSE:
+    * https://github.com/vuejs/core/blob/main/LICENSE (MIT)
+  * HOMEPAGE:
+    * https://vuejs.org
+
+Naive UI:
+
+  * LICENSE:
+    * https://github.com/tusen-ai/naive-ui/blob/main/LICENSE (MIT)
+  * HOMEPAGE:
+    * https://www.naiveui.com
+
+Vite:
+
+  * LICENSE:
+    * https://github.com/vitejs/vite/blob/main/LICENSE (MIT)
+  * HOMEPAGE:
+    * https://vite.dev
+
+Node-RED (runs as a managed workload, not linked):
+
+  * LICENSE:
+    * https://github.com/node-red/node-red/blob/master/LICENSE (Apache License 2.0)
+  * HOMEPAGE:
+    * https://nodered.org
+
+wollomatic/socket-proxy (deployed as a sidecar image, not linked):
+
+  * LICENSE:
+    * https://github.com/wollomatic/socket-proxy/blob/main/LICENSE (MIT)
+  * HOMEPAGE:
+    * https://github.com/wollomatic/socket-proxy

@@ -1,0 +1,62 @@
+# ThingLinks Edge —— 单机部署
+#
+#   cp .env.example .env      # 至少填 EXTERNAL_URL 与 MASTER_KEY
+#   docker compose up -d
+#   docker compose logs manager | grep '\[init\]'    # 首次启动打印一次初始口令
+#
+# Manager 以**兄弟容器**模式管理 Node-RED 实例：实例是宿主上的独立容器，
+# 不是 Manager 的子进程。升级 Manager（docker compose pull && up -d）
+# 不会中断现场采集 —— 产线不会为了升级管理台而停止采集。
+
+services:
+  manager:
+    build:
+      context: .
+      dockerfile: apps/manager/Dockerfile
+    image: thinglinks-edge-manager:0.1.0
+    container_name: thinglinks-edge-manager
+    restart: unless-stopped
+
+    environment:
+      # 唯一真源：所有对外链接、跳转与 Cookie 策略都由它派生，程序绝不猜自己的外部地址
+      EXTERNAL_URL: ${EXTERNAL_URL:?必须设置，例如 http://192.168.10.20:8080}
+      # 实例凭据的加密主密钥。缺失时进程拒绝启动，不会静默回落默认值
+      MASTER_KEY: ${MASTER_KEY:?必须设置，可用 openssl rand -hex 32 生成}
+      # 显式给容器名，不要依赖回退。Manager 要把自己接入每个实例的独立网络，
+      # 未配置时它退回读 hostname；compose 不设 hostname 时那正好是容器短 id，
+      # network connect 也认，于是「碰巧能用」—— 但只要这里加了 hostname:，
+      # 或换了编排方式，接入就会失败，且表现是反代 502 而不是启动报错。
+      # 见 index.ts 的 resolveManagerContainer
+      MANAGER_CONTAINER: thinglinks-edge-manager
+      INSTANCE_NETWORK: ${INSTANCE_NETWORK:-thinglinks-edge}
+      INSTANCE_PORT_MIN: ${INSTANCE_PORT_MIN:-30000}
+      INSTANCE_PORT_MAX: ${INSTANCE_PORT_MAX:-30999}
+      ALLOWED_IMAGE_TAGS: ${ALLOWED_IMAGE_TAGS:-5.0.4-24-minimal,4.1.13-22-minimal}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+
+    ports:
+      # 默认只发布到回环：现场要外部可达时改成 "0.0.0.0:8080:8080"，
+      # 或（推荐）由前面的企业反代转发过来
+      - "${BIND_ADDR:-127.0.0.1}:${HOST_PORT:-8080}:8080"
+
+    volumes:
+      - edge-data:/data
+      # 兄弟容器模式的代价：Manager 需要宿主 docker 端点。
+      # A4 接入 docker-socket-proxy 后这里改成指向代理的 TCP 地址，裸 socket 不再挂载
+      - /var/run/docker.sock:/var/run/docker.sock
+
+    # 容器以非 root（node，uid 1000）运行，访问 docker.sock 需加入其属组。
+    # 查本机取值： stat -c '%g' /var/run/docker.sock
+    # Docker Desktop 下 socket 属 root:root，故默认 0；多数 Linux 发行版是 docker 组
+    group_add:
+      - "${DOCKER_GID:-0}"
+
+    # 只读根文件系统：可写的地方只有数据卷与 tmpfs
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  edge-data:
