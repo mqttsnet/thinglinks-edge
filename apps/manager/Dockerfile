@@ -42,6 +42,19 @@ RUN pnpm --filter @thinglinks-edge/web-console build
 # --prod：只保留运行时依赖（fastify / dockerode / better-sqlite3 / bcryptjs / @fastify/*）。
 RUN pnpm --filter @thinglinks-edge/manager deploy --legacy --prod --ignore-scripts /out
 
+# better-sqlite3 的 tarball 带着 8 个平台的预编译产物，合计 16MB，而 Alpine 运行时
+# 只会加载 linuxmusl-<arch> —— 这不是推断：在跑起来的 amd64 容器里查 /proc/1/maps，
+# 被 mmap 的确实是 prebuilds/linuxmusl-x64.node。
+# darwin/win32 在 Linux 容器里永远用不上，linux-*（glibc）同样用不上（底座是 musl）。
+# 删掉这 6 个省约 11MB。
+#
+# **保留两个 linuxmusl 而不是只留目标架构那一个**：构建阶段钉在 BUILDPLATFORM，
+# 同一份 /out 要同时供 amd64 与 arm64 的运行阶段使用。只留一个就会让另一个架构
+# 找不到原生模块 —— 而且构建不报错，要等容器跑起来才炸。
+# 按 -path 匹配而不是写死版本号目录，升级 better-sqlite3 时不用回来改这里。
+RUN find /out/node_modules/.pnpm -path '*/better-sqlite3/prebuilds/*.node' \
+      ! -name 'linuxmusl-*' -delete
+
 # 使用者变更说明（vX.Y.Z.zh-CN.md）随镜像走：升级后控制台要弹一次。
 # 刻意放在所有 RUN **之后**：没有任何构建步骤读它，而发版前改文案是常事 ——
 # 排在源码之前的话，动一个字就会让 pnpm build 与 deploy 全部重跑。

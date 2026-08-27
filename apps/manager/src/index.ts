@@ -13,6 +13,8 @@ import { InstanceService } from './core/instance-service.ts';
 import { DockerClient } from './core/docker-client.ts';
 import { buildServer } from './http/app.ts';
 import { Spool, type FullPolicy } from './core/spool/spool.ts';
+import { CloudConfigRepo } from './core/cloud/config-repo.ts';
+import { CloudRuntime } from './core/cloud/runtime.ts';
 import { MetricsHistory, MetricsSampler } from './core/metrics-history.ts';
 import { recordAudit } from './core/db.ts';
 import { join } from 'node:path';
@@ -233,8 +235,40 @@ export async function main(): Promise<void> {
     }).start();
   }
 
+  /*
+   * 云平台对接。
+   *
+   * 接入参数落库（加密），进程起来就按库里那份把连接拉起来 ——
+   * **但不等它连上**：现场常见「先装边缘、后开通云账号」，
+   * 也常见云端临时不可达。启动阻塞在连接上会让整台设备起不来，
+   * 而本地的实例管理与采集本来就不依赖云。
+   *
+   * 连不上时上行会落进 spool，链路一恢复自动补传（08 号文第 6 节）。
+   */
+  const cloudConfig = new CloudConfigRepo(db, key);
+  const cloud = new CloudRuntime({
+    onStateChange: (state, detail) => {
+      console.log(`[cloud] ${detail}`);
+      // 只记上线与掉线两个跃迁，connecting 每次重试都记会把审计刷爆
+      if (state === 'online' || state === 'offline') {
+        recordAudit(db, {
+          actor: 'system', action: 'cloud-state', target: state,
+          detail, result: state === 'online' ? 'ok' : 'fail',
+        });
+      }
+    },
+  });
+  try {
+    await cloud.apply(cloudConfig.get());
+  } catch (e) {
+    // 配置坏了不该拖垮启动：本地实例管理与采集不依赖云
+    console.error(`[cloud] 接入配置无法应用：${(e as Error).message}`);
+  }
+
   const app = buildServer({
     config, db, auth, repo, service, spool, metrics,
+    cloud, cloudConfig,
+    cloudSink: (payload) => cloud.publish(payload),
     webRoot: process.env['WEB_ROOT']?.trim() || undefined,
   });
   await app.listen({ host: config.listenAddr, port: config.listenPort });
@@ -243,7 +277,8 @@ export async function main(): Promise<void> {
       ` · 外部地址 ${config.externalUrl}` +
       ` · docker 端点 ${describeDockerEndpoint(connection)}` +
       ` · 缓存写满策略 ${fullPolicy}` +
-      ` · 指标采样 ${metricsIntervalSec > 0 ? `${metricsIntervalSec}s` : '已关闭'}`,
+      ` · 指标采样 ${metricsIntervalSec > 0 ? `${metricsIntervalSec}s` : '已关闭'}` +
+      ` · 云对接 ${cloud.state}`,
   );
 }
 

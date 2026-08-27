@@ -34,6 +34,13 @@ export type Action =
   | 'field:view'
   | 'replay:run'
   | 'backup:run'
+  /**
+   * 云对接。看状态与改参数分成两档：
+   * 现场运维需要判断「是不是断了」，但接入凭据只有管理员能动 ——
+   * signKey 一改，全站上行立刻验签失败。
+   */
+  | 'cloud:view'
+  | 'cloud:manage'
   | 'user:manage';
 
 export type Role = 'admin' | 'operator' | 'viewer';
@@ -47,12 +54,16 @@ const ROLE_ACTIONS: Record<Role, ReadonlySet<Action>> = {
   admin: new Set<Action>([
     'system:view', 'instance:list', 'instance:view', 'instance:operate', 'instance:create', 'instance:delete',
     'field:view', 'replay:run', 'backup:run', 'user:manage',
+    'cloud:view', 'cloud:manage',
   ]),
   // 运维：管得了运行，建不了也删不了，更管不了用户
   operator: new Set<Action>([
     'system:view', 'instance:list', 'instance:view', 'instance:operate', 'field:view', 'replay:run',
+    'cloud:view',
   ]),
-  viewer: new Set<Action>(['system:view', 'instance:list', 'instance:view', 'field:view']),
+  viewer: new Set<Action>([
+    'system:view', 'instance:list', 'instance:view', 'field:view', 'cloud:view',
+  ]),
 };
 
 /** 未知角色一律按最小权限处理，不按 admin —— 数据脏了不该变成提权 */
