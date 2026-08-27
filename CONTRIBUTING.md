@@ -60,6 +60,23 @@ One task touches at most 5 files. If the title needs the word "and", split it.
 2. Add assertions covering the new behaviour — regression only grows
 3. If you hit a non-obvious third-party behaviour, document it alongside the fix
 
+### Releasing
+
+When bumping `VERSION` in `apps/manager/src/core/version.ts`, write **both**
+changelog files under `changelogs/`:
+
+| File | Audience | Language |
+| ---- | -------- | -------- |
+| `vX.Y.Z.md` | developers — full changes, implementation detail | English |
+| `vX.Y.Z.zh-CN.md` | **operators** — what changes for daily use | Chinese |
+
+The console shows the `zh-CN` one **after** the upgrade, once per version. Missing it
+is not an error — the dialog simply never appears, which is easy to not notice.
+
+Keep the operator notes to `## sections`, `- bullets`, `**bold**` and `` `code` ``:
+the console renders that subset only (`web-console/src/components/ReleaseNotes.vue`).
+Notes to the author go in an HTML comment — anything outside one is shown to the user.
+
 ---
 
 ## 简体中文
@@ -107,3 +124,19 @@ cd apps/manager && pnpm verify   # 全量回归，需要 Docker 守护进程
 1. 确认 `pnpm verify` 全绿
 2. 为新行为补断言 —— 回归只增不减
 3. 踩到第三方的非显然行为，随修复一并记录下来
+
+### 发版
+
+升 `apps/manager/src/core/version.ts` 的 `VERSION` 时，`changelogs/` 下**两份都要写**：
+
+| 文件 | 给谁看 | 语言 |
+| ---- | ------ | ---- |
+| `vX.Y.Z.md` | 开发者 —— 完整变更、含实现细节 | 英文 |
+| `vX.Y.Z.zh-CN.md` | **现场使用者** —— 对日常操作有什么影响 | 中文 |
+
+控制台在**升级后**弹一次 `zh-CN` 那份，每个版本只弹一次。漏写不会报错，
+只是弹窗永远不出现 —— 这种缺失很难被发现。
+
+使用者说明只用 `## 小节`、`- 列表`、`**粗体**`、`` `代码` ``：
+控制台只渲染这个子集（`web-console/src/components/ReleaseNotes.vue`）。
+写给作者的编辑约定放进 HTML 注释，**注释之外的内容都会展示给使用者**。

@@ -112,6 +112,23 @@ export class InstanceService {
     return recommendPorts(count, this.o.portRange, this.o.repo.usedPorts());
   }
 
+  /**
+   * 可选的实例镜像版本，附带「本机有没有」。
+   *
+   * 前端据此把没有的版本标灰 —— 否则用户选了一个本机没有的版本，
+   * 要等到点「创建」才失败。白名单本身来自 `ALLOWED_IMAGE_TAGS`，
+   * 前端不再自己硬编码一份（两边会漂移）。
+   */
+  async imageOptions(): Promise<Array<{ tag: string; present: boolean }>> {
+    const repo = this.o.docker.imageRepo;
+    return Promise.all(
+      this.o.allowedImageTags.map(async (tag) => ({
+        tag,
+        present: await this.o.docker.imagePresent(`${repo}:${tag}`),
+      })),
+    );
+  }
+
   async create(input: CreateInstanceInput): Promise<InstanceView> {
     assertValidId(input.id);
     if (!input.name.trim()) throw new ServiceError('实例名称不能为空');

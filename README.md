@@ -12,7 +12,8 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?style=flat-square&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![Fastify](https://img.shields.io/badge/Fastify-5.x-000000?style=flat-square&logo=fastify&logoColor=white)](https://fastify.dev/)
 [![Vue](https://img.shields.io/badge/Vue-3.5-4FC08D?style=flat-square&logo=vuedotjs&logoColor=white)](https://vuejs.org/)
-[![Docker](https://img.shields.io/badge/Docker-Required-2496ED?style=flat-square&logo=docker&logoColor=white)](https://www.docker.com/)
+[![Docker Image](https://img.shields.io/docker/v/mqttsnet/thinglinks-edge?sort=semver&style=flat-square&logo=docker&logoColor=white&label=image&color=2496ED)](https://hub.docker.com/r/mqttsnet/thinglinks-edge)
+[![Docker Pulls](https://img.shields.io/docker/pulls/mqttsnet/thinglinks-edge?style=flat-square&logo=docker&logoColor=white&color=2496ED)](https://hub.docker.com/r/mqttsnet/thinglinks-edge)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square)](LICENSE)
 
 <br>
@@ -67,10 +68,20 @@ is the slice being built out first.
 | Component | Version |
 | --- | --- |
 | Docker Engine | 24+ with Compose v2 |
+| Host architecture | `x86_64` or `aarch64` — 32-bit ARM is **not** supported |
 | Node.js | 24 LTS (development only) |
 | pnpm | 10.32+ (development only) |
 
+> **32-bit ARM is not supported, and cannot be.** The official Node.js 24 images publish
+> no 32-bit ARM build, and `better-sqlite3` ships no 32-bit ARM prebuilt binary. A
+> Raspberry Pi needs a **64-bit OS** — check with `uname -m`: `aarch64` works, `armv7l` does not.
+
 ### Deploy
+
+The Manager image is published on Docker Hub as
+[`mqttsnet/thinglinks-edge`](https://hub.docker.com/r/mqttsnet/thinglinks-edge) — a multi-arch manifest covering
+`linux/amd64` and `linux/arm64`, so an x86 industrial PC and an ARM edge box run the
+exact same command. Nothing is compiled on the site machine; it only needs Docker.
 
 ```bash
 cp .env.example .env        # at minimum, set EXTERNAL_URL and MASTER_KEY
@@ -81,6 +92,11 @@ docker compose logs manager | grep '\[init\]'   # the initial password is printe
 Open `EXTERNAL_URL` in a browser — the console is served by the Manager itself.
 `EXTERNAL_URL` is the single source of truth for every outward-facing URL, redirect
 and cookie policy; the process never guesses its own external address.
+
+To upgrade, point `MANAGER_IMAGE` in `.env` at the new tag, then
+`docker compose pull && docker compose up -d`. Running Node-RED instances are **not**
+interrupted — they are sibling containers, not children of the Manager. A production
+line should never have to stop collecting data to upgrade the management console.
 
 ### Development
 
@@ -95,6 +111,16 @@ cd apps/manager && pnpm build && \
 # terminal 2 — console
 cd apps/web-console && pnpm dev      # http://localhost:5173
 ```
+
+To run the full stack from your own build instead of the published image, layer the
+build override on top of the deployment file:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+```
+
+`docker-compose.yml` alone is pull-only by design — that is what a site machine uses.
+
 
 ## Project Structure
 

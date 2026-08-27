@@ -47,7 +47,15 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const sh = (args, opts = {}) => execFileSync('docker', args, { encoding: 'utf8', cwd: REPO, ...opts });
 
 const envFile = join(mkdtempSync(join(tmpdir(), 'tle-compose-')), '.env');
-const compose = (...args) => sh(['compose', '-p', PROJECT, '--env-file', envFile, ...args], { stdio: 'pipe' });
+/*
+ * 显式叠加构建覆盖文件。docker-compose.yml 主文件已改成「纯拉取」
+ * （image 指向 Docker Hub 上的公开镜像，没有 build 段）—— 那是现场部署要的形态。
+ * 但验证要证明的是**本地这份源码**能跑起来，不是线上镜像能跑起来：
+ * 不加这两个 -f，`up --build` 会因为没有 build 段而静默跳过构建、
+ * 转去拉线上镜像，于是验证全绿而你的改动根本没被执行过。
+ */
+const FILES = ['-f', 'docker-compose.yml', '-f', 'docker-compose.build.yml'];
+const compose = (...args) => sh(['compose', '-p', PROJECT, ...FILES, '--env-file', envFile, ...args], { stdio: 'pipe' });
 
 function socketGid() {
   return sh(['run', '--rm', '-v', '/var/run/docker.sock:/var/run/docker.sock',
@@ -94,6 +102,10 @@ async function main() {
   writeFileSync(envFile, [
     `EXTERNAL_URL=${B}`,
     'MASTER_KEY=compose-verify-master-key',
+    // 给验证构建单独的镜像名。不这么做的话，构建产物会顶掉开发机上那份
+    // 从 Docker Hub 拉来的同名正式镜像 —— 之后本机 `docker compose up`
+    // 跑的就是验证构建，而 `docker images` 上看不出任何异常。
+    'MANAGER_IMAGE=thinglinks-edge-manager:compose-verify',
     `DOCKER_GID=${socketGid()}`,
     'BIND_ADDR=127.0.0.1',
     `HOST_PORT=${PORT}`,

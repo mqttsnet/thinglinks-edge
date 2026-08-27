@@ -26,7 +26,7 @@ export function registerBackup(api: FastifyInstance, ctx: HttpContext): void {
    * 走 CSRF 校验的写操作通道更稳妥，也不会被浏览器预取或缓存。
    */
   api.post(`${config.basePath}/api/backup`, async (req, reply) => {
-    const user = guard(req, reply, { csrf: true });
+    const user = guard(req, reply, { csrf: true, need: 'backup:run' });
     if (!user) return;
     const tar = await build();
     const name = `thinglinks-edge-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.tar`;
@@ -42,7 +42,7 @@ export function registerBackup(api: FastifyInstance, ctx: HttpContext): void {
 
   /** 只看内容不下载，供控制台展示「上次备份包含什么」 */
   api.post(`${config.basePath}/api/backup/inspect`, async (req, reply) => {
-    if (!guard(req, reply, { csrf: true })) return;
+    if (!guard(req, reply, { csrf: true, need: 'backup:run' })) return;
     return reply.send(await inspectBackup(await build()));
   });
 }

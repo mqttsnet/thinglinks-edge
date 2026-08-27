@@ -1,6 +1,6 @@
 {
   "name": "thinglinks-edge",
-  "version": "0.1.0",
+  "version": "1.0.1",
   "private": true,
   "description": "ThingLinks Edge —— 边缘计算网关平台",
   "license": "Apache-2.0",

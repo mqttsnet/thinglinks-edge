@@ -2,10 +2,11 @@
 import type { FastifyInstance } from 'fastify';
 import { authTokenKeyFor } from '../core/config.ts';
 import { recordAudit } from '../core/db.ts';
+import { canInstance } from '../core/authz.ts';
 import type { HttpContext } from './context.ts';
 
 export function registerSso(api: FastifyInstance, ctx: HttpContext): void {
-  const { config, db, repo, upstreamFor, currentUser } = ctx;
+  const { config, db, repo, upstreamFor, currentUser, users } = ctx;
 
   // 必须注册在反代之前，否则会被反代吞掉
 
@@ -16,6 +17,12 @@ export function registerSso(api: FastifyInstance, ctx: HttpContext): void {
     const { id } = req.params as { id: string };
     const inst = repo.get(id);
     if (!inst) return reply.code(404).send({ error: `实例 ${id} 不存在` });
+
+    // 免密跳转直接下发实例 token，越权后果与反代等同，判定必须一致
+    if (!canInstance(user.role, 'instance:view',
+                     user.role === 'admin' ? undefined : users.grantFor(user.username, id))) {
+      return reply.code(403).send({ error: `无权访问实例 ${id}` });
+    }
 
     const cred = repo.credentials(id)[0];
     if (!cred) return reply.code(500).send({ error: '实例无可用账号' });

@@ -38,6 +38,7 @@ run() {
   fi
 }
 
+run "越权用例全拒"        scripts/verify-authz.mjs
 run "容器参数白名单"      scripts/verify-container-guard.mjs
 run "实例创建 根路径"      scripts/verify-instance.mjs
 run "实例创建 子路径"      scripts/verify-instance.mjs /nodered

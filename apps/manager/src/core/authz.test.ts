@@ -58,7 +58,7 @@ test('哪些动作需要落到具体实例', () => {
 });
 
 test('每个动作至少归属一个角色 —— 否则谁都做不了', () => {
-  const all: Action[] = ['instance:view', 'instance:operate', 'instance:create',
+  const all: Action[] = ['system:view', 'instance:list', 'instance:view', 'instance:operate', 'instance:create',
     'instance:delete', 'field:view', 'replay:run', 'backup:run', 'user:manage'];
   for (const a of all) {
     assert.ok(ROLES.some((r) => can(r, a)), `动作 ${a} 没有任何角色能做`);
@@ -68,6 +68,13 @@ test('每个动作至少归属一个角色 —— 否则谁都做不了', () => 
 test('describeRole 给前端用，但只是展示', () => {
   const d = describeRole('viewer');
   assert.equal(d.role, 'viewer');
-  assert.deepEqual(d.actions, ['field:view', 'instance:view']);
+  assert.deepEqual(d.actions, ['field:view', 'instance:list', 'instance:view', 'system:view']);
   assert.deepEqual(describeRole('nobody').actions, []);
+});
+
+test('列表动作不是实例级 —— 否则列表接口永远 403', () => {
+  // 列表天然没有「某一台实例」可判。这条曾经真的把列表接口锁死过
+  assert.ok(!isInstanceScoped('instance:list'));
+  assert.ok(can('viewer', 'instance:list'));
+  assert.ok(can('operator', 'instance:list'));
 });

@@ -8,7 +8,7 @@
  * 且工业客户对「设备自己往外连」很敏感 —— 必须显式配 `UPDATE_CHECK_URL`
  * 才会发起请求，绝不默认回连。
  */
-export const VERSION = '0.1.0';
+export const VERSION = '1.0.1';
 
 export function describe(): string {
   return `ThingLinks Edge Manager v${VERSION}`;

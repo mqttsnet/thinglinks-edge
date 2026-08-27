@@ -7,7 +7,7 @@
  */
 import type {
   SessionUser, Instance, InstanceHealth, HostStats, HealthSummary, CreateInstanceBody,
-  MetricsRange, MetricsSeries,
+  MetricsRange, MetricsSeries, VersionInfo, ImageOption,
 } from './types';
 
 /**
@@ -105,4 +105,9 @@ export const api = {
 
   /** 资源趋势历史。与 health 分开：那边现探三层探针，这边纯读内存，刷曲线不加探针压力 */
   metrics: (range: MetricsRange) => request<MetricsSeries>(`/api/metrics?range=${range}`),
+
+  version: () => request<VersionInfo>('/api/version'),
+
+  /** 可选实例版本 + 本机是否已有。列表来自后端白名单，前端不再自己硬编码 */
+  images: () => request<{ images: ImageOption[] }>('/api/images'),
 };

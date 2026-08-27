@@ -71,7 +71,7 @@ async function main() {
     // 同名挂载：容器内路径必须等于宿主路径。Manager 用容器内视角 mkdir 实例数据目录，
     // 而 daemon 用宿主视角解析实例的 Binds —— 不同名就会各写各的，且毫无症状。
     '-v', `${TEST_EDGE_ROOT}:${TEST_EDGE_ROOT}`,
-    '-p', `127.0.0.1:${PORT}:8080`,
+    '-p', `127.0.0.1:${PORT}:19100`,
     '-e', `EDGE_DATA_ROOT=${TEST_EDGE_ROOT}`,
     '-e', `EXTERNAL_URL=${B}`,
     '-e', 'MASTER_KEY=verify-master-key',

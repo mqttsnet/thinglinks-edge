@@ -9,3 +9,18 @@ tasks
 docs
 *.log
 .DS_Store
+
+# 本地环境文件绝不进构建上下文。当前 Dockerfile 没有 COPY 它们，
+# 但构建上下文是整个仓库根 —— 一旦以后有人加了 `COPY . .`，
+# MASTER_KEY 就会随镜像推到公开仓库。在这里堵死，不依赖 Dockerfile 写得对。
+.env
+.env.*
+!.env.example
+
+# 发布物与本地数据
+docker-compose.build.yml
+data/
+*.db
+*.db-wal
+*.db-shm
+.master.key

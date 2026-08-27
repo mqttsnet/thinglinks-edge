@@ -12,7 +12,8 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?style=flat-square&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![Fastify](https://img.shields.io/badge/Fastify-5.x-000000?style=flat-square&logo=fastify&logoColor=white)](https://fastify.dev/)
 [![Vue](https://img.shields.io/badge/Vue-3.5-4FC08D?style=flat-square&logo=vuedotjs&logoColor=white)](https://vuejs.org/)
-[![Docker](https://img.shields.io/badge/Docker-Required-2496ED?style=flat-square&logo=docker&logoColor=white)](https://www.docker.com/)
+[![Docker Image](https://img.shields.io/docker/v/mqttsnet/thinglinks-edge?sort=semver&style=flat-square&logo=docker&logoColor=white&label=image&color=2496ED)](https://hub.docker.com/r/mqttsnet/thinglinks-edge)
+[![Docker Pulls](https://img.shields.io/docker/pulls/mqttsnet/thinglinks-edge?style=flat-square&logo=docker&logoColor=white&color=2496ED)](https://hub.docker.com/r/mqttsnet/thinglinks-edge)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square)](LICENSE)
 
 <br>
@@ -64,10 +65,20 @@ Node-RED 多实例托管是**其中一个能力**，不是产品全部，只是�
 | 组件 | 版本 |
 | --- | --- |
 | Docker Engine | 24+，含 Compose v2 |
+| 宿主架构 | `x86_64` 或 `aarch64` —— **不支持** 32 位 ARM |
 | Node.js | 24 LTS（仅开发需要） |
 | pnpm | 10.32+（仅开发需要） |
 
+> **32 位 ARM 不支持，且做不到支持。** 两个上游限制各自独立：Node.js 24 官方镜像
+> 根本没有 32 位 ARM 构建（alpine 和 debian 变体都没有），而 `better-sqlite3`
+> 也不带 32 位 ARM 的预编译产物。树莓派需要装 **64 位系统** ——
+> `uname -m` 显示 `aarch64` 可用，显示 `armv7l` 则不行。
+
 ### 部署
+
+Manager 镜像已发布在 Docker Hub：[`mqttsnet/thinglinks-edge`](https://hub.docker.com/r/mqttsnet/thinglinks-edge)，
+是覆盖 `linux/amd64` 与 `linux/arm64` 的多架构清单 —— x86 工控机和 ARM 边缘盒子敲同一条命令，
+docker 自己挑对应那一份。现场机器**不编译任何东西**，装了 docker 就够。
 
 ```bash
 cp .env.example .env        # 至少填 EXTERNAL_URL 与 MASTER_KEY
@@ -79,6 +90,10 @@ docker compose logs manager | grep '\[init\]'   # 初始口令只打印一次
 
 `EXTERNAL_URL` 是所有对外链接、跳转与 Cookie 策略的**唯一真源** —— 程序绝不猜自己的外部地址。
 现场「装到客户那儿打不开」的问题，根因几乎都是程序试图猜，而现场恰好有一层它没料到的东西。
+
+升级时把 `.env` 里的 `MANAGER_IMAGE` 指向新 tag，然后
+`docker compose pull && docker compose up -d`。正在跑的 Node-RED 实例**不会中断** ——
+它们是兄弟容器而不是 Manager 的子进程。产线不该为了升级管理台而停止采集。
 
 ### 本地开发
 
@@ -93,6 +108,15 @@ cd apps/manager && pnpm build && \
 # 终端 2 —— 控制台
 cd apps/web-console && pnpm dev      # http://localhost:5173
 ```
+
+要用**自己编的镜像**而不是发布镜像跑整套栈，叠加构建覆盖文件：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+```
+
+`docker-compose.yml` 本身是刻意做成「纯拉取」的 —— 那是现场机器用的形态。
+
 
 ## 目录结构
 

@@ -24,7 +24,7 @@ export function registerMetrics(api: FastifyInstance, ctx: HttpContext): void {
   const { config, guard, metrics } = ctx;
 
   api.get(`${config.basePath}/api/metrics`, async (req, reply) => {
-    if (!guard(req, reply, { csrf: false })) return;
+    if (!guard(req, reply, { csrf: false, need: 'field:view' })) return;
 
     const key = (req.query as { range?: string }).range ?? '1h';
     const rangeSec = RANGES[key];

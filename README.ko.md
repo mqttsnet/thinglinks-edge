@@ -12,7 +12,8 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?style=flat-square&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![Fastify](https://img.shields.io/badge/Fastify-5.x-000000?style=flat-square&logo=fastify&logoColor=white)](https://fastify.dev/)
 [![Vue](https://img.shields.io/badge/Vue-3.5-4FC08D?style=flat-square&logo=vuedotjs&logoColor=white)](https://vuejs.org/)
-[![Docker](https://img.shields.io/badge/Docker-Required-2496ED?style=flat-square&logo=docker&logoColor=white)](https://www.docker.com/)
+[![Docker Image](https://img.shields.io/docker/v/mqttsnet/thinglinks-edge?sort=semver&style=flat-square&logo=docker&logoColor=white&label=image&color=2496ED)](https://hub.docker.com/r/mqttsnet/thinglinks-edge)
+[![Docker Pulls](https://img.shields.io/docker/pulls/mqttsnet/thinglinks-edge?style=flat-square&logo=docker&logoColor=white&color=2496ED)](https://hub.docker.com/r/mqttsnet/thinglinks-edge)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square)](LICENSE)
 
 <br>
@@ -65,10 +66,21 @@ Node-RED 멀티 인스턴스 호스팅은 **여러 기능 중 하나**이며 제
 | 구성 요소 | 버전 |
 | --- | --- |
 | Docker Engine | 24+ (Compose v2 포함) |
+| 호스트 아키텍처 | `x86_64` 또는 `aarch64` —— 32비트 ARM 은 **미지원** |
 | Node.js | 24 LTS (개발 시에만) |
 | pnpm | 10.32+ (개발 시에만) |
 
+> **32비트 ARM 은 미지원이며, 지원할 수 없습니다.** Node.js 24 공식 이미지에는
+> 32비트 ARM 빌드가 아예 없고, `better-sqlite3` 에도 32비트 ARM 사전 빌드 바이너리가
+> 없습니다. Raspberry Pi 는 **64비트 OS** 가 필요합니다 ——
+> `uname -m` 이 `aarch64` 면 동작하고, `armv7l` 이면 동작하지 않습니다.
+
 ### 배포
+
+Manager 이미지는 Docker Hub 에 [`mqttsnet/thinglinks-edge`](https://hub.docker.com/r/mqttsnet/thinglinks-edge) 로 공개되어 있습니다.
+`linux/amd64` 와 `linux/arm64` 를 포함하는 멀티 아키텍처 매니페스트이므로
+x86 산업용 PC 와 ARM 엣지 박스에서 동일한 명령을 사용합니다.
+현장 머신에서는 아무것도 빌드하지 않으며, Docker 만 있으면 됩니다.
 
 ```bash
 cp .env.example .env        # 최소한 EXTERNAL_URL 과 MASTER_KEY 를 설정
@@ -80,6 +92,11 @@ docker compose logs manager | grep '\[init\]'   # 초기 비밀번호는 한 번
 
 `EXTERNAL_URL` 은 외부 URL·리다이렉트·쿠키 정책의 **유일한 진실 공급원**입니다.
 프로세스가 자신의 외부 주소를 추측하는 일은 결코 없습니다.
+
+업그레이드는 `.env` 의 `MANAGER_IMAGE` 를 새 태그로 바꾼 뒤
+`docker compose pull && docker compose up -d` 를 실행합니다. 실행 중인 Node-RED
+인스턴스는 **중단되지 않습니다** —— Manager 의 자식 프로세스가 아니라
+형제 컨테이너이기 때문입니다. 관리 콘솔을 업그레이드하려고 생산 라인을 멈출 이유는 없습니다.
 
 ### 개발
 
@@ -94,6 +111,16 @@ cd apps/manager && pnpm build && \
 # 터미널 2 —— 콘솔
 cd apps/web-console && pnpm dev      # http://localhost:5173
 ```
+
+공개 이미지 대신 **직접 빌드한 이미지**로 전체 스택을 실행하려면
+빌드 오버라이드 파일을 겹쳐서 사용합니다:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+```
+
+`docker-compose.yml` 자체는 의도적으로 "pull 전용" 입니다 —— 현장 머신이 쓰는 형태이기 때문입니다.
+
 
 ## 디렉터리 구조
 

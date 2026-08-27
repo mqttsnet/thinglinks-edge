@@ -218,7 +218,7 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
 
   /** 数据面指标（08 号文第 8 节要求控制台可见） */
   api.get(`${config.basePath}/api/edge/metrics`, async (req, reply) => {
-    if (!guard(req, reply, { csrf: false })) return;
+    if (!guard(req, reply, { csrf: false, need: 'field:view' })) return;
     return reply.send({
       cloud: cloudSink ? 'configured' : 'not-configured',
       batch: {
@@ -233,7 +233,7 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
 
   /** 手动触发一轮补传。正常情况下由每次成功发送自动带动，这个口子是给现场排障用的 */
   api.post(`${config.basePath}/api/edge/replay`, async (req, reply) => {
-    if (!guard(req, reply, { csrf: true })) return;
+    if (!guard(req, reply, { csrf: true, need: 'replay:run' })) return;
     if (!spool) return reply.code(400).send({ error: '未配置断网缓存' });
     if (!cloudSink) return reply.code(503).send({ error: '云连接未配置，无法补传' });
     const r = await spool.replay(async (p) => { await cloudSink(p); },
@@ -243,13 +243,13 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
 
   // ── 控制台读取（走管理会话，不是接入令牌）────────────────
   api.get(`${config.basePath}/api/field/devices`, async (req, reply) => {
-    if (!guard(req, reply, { csrf: false })) return;
+    if (!guard(req, reply, { csrf: false, need: 'field:view' })) return;
     const { instanceId } = req.query as { instanceId?: string };
     return reply.send({ devices: registry.devices(instanceId) });
   });
 
   api.get(`${config.basePath}/api/field/tags`, async (req, reply) => {
-    if (!guard(req, reply, { csrf: false })) return;
+    if (!guard(req, reply, { csrf: false, need: 'field:view' })) return;
     const { instanceId, nodeId } = req.query as { instanceId?: string; nodeId?: string };
     return reply.send({ tags: registry.tags(instanceId, nodeId) });
   });
@@ -263,7 +263,7 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
    * 让用户以为看到的是全部，是诚信问题（06 号文原话）。
    */
   api.get(`${config.basePath}/api/field/southbound`, async (req, reply) => {
-    if (!guard(req, reply, { csrf: false })) return;
+    if (!guard(req, reply, { csrf: false, need: 'field:view' })) return;
     const { instanceId } = req.query as { instanceId?: string };
     if (!instanceId) return reply.code(400).send({ error: '缺少 instanceId' });
 
@@ -281,7 +281,7 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
   });
 
   api.get(`${config.basePath}/api/field/summary`, async (req, reply) => {
-    if (!guard(req, reply, { csrf: false })) return;
+    if (!guard(req, reply, { csrf: false, need: 'field:view' })) return;
     const { instanceId } = req.query as { instanceId?: string };
     /*
      * 两类数字**必须分开返回**，不能相加：

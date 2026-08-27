@@ -15,6 +15,18 @@
 
 /** 系统级动作。新增动作必须同时在下面的角色表里归位，否则谁都做不了（fail-closed） */
 export type Action =
+  /** 登录即可见的信息类接口（版本号等）。存在的意义是让这类路由也必须**显式**声明 */
+  | 'system:view'
+  /**
+   * 看**列表**（实例列表、健康总览）。
+   *
+   * 与 `instance:view` 分开是必须的：列表天然没有「某一台实例」可判，
+   * 而 `instance:view` 是实例级动作、缺实例即拒。合成一个会让列表接口永远 403
+   * —— 这个 bug 就是被那条严格规则当场咬出来的。
+   *
+   * 拿到它只代表「能看到列表这个页面」，**具体哪几行仍要在处理函数里按矩阵过滤**。
+   */
+  | 'instance:list'
   | 'instance:view'
   | 'instance:operate'
   | 'instance:create'
@@ -33,14 +45,14 @@ export type GrantLevel = 'view' | 'operate';
 
 const ROLE_ACTIONS: Record<Role, ReadonlySet<Action>> = {
   admin: new Set<Action>([
-    'instance:view', 'instance:operate', 'instance:create', 'instance:delete',
+    'system:view', 'instance:list', 'instance:view', 'instance:operate', 'instance:create', 'instance:delete',
     'field:view', 'replay:run', 'backup:run', 'user:manage',
   ]),
   // 运维：管得了运行，建不了也删不了，更管不了用户
   operator: new Set<Action>([
-    'instance:view', 'instance:operate', 'field:view', 'replay:run',
+    'system:view', 'instance:list', 'instance:view', 'instance:operate', 'field:view', 'replay:run',
   ]),
-  viewer: new Set<Action>(['instance:view', 'field:view']),
+  viewer: new Set<Action>(['system:view', 'instance:list', 'instance:view', 'field:view']),
 };
 
 /** 未知角色一律按最小权限处理，不按 admin —— 数据脏了不该变成提权 */

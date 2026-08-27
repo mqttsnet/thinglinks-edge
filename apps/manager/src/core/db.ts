@@ -103,6 +103,22 @@ const MIGRATIONS: string[] = [
   );
   CREATE INDEX idx_field_tag_instance ON field_tag(instance_id);
   `,
+  // v3 —— 用户与权限：角色约束 + 实例授权矩阵（T4.4）
+  `
+  CREATE TABLE instance_grant (
+    username    TEXT NOT NULL,
+    instance_id TEXT NOT NULL,
+    level       TEXT NOT NULL CHECK (level IN ('view', 'operate')),
+    granted_by  TEXT NOT NULL DEFAULT '',
+    granted_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (username, instance_id),
+    FOREIGN KEY (instance_id) REFERENCES instance(id) ON DELETE CASCADE
+  );
+  CREATE INDEX idx_grant_user ON instance_grant(username);
+
+  -- 停用而不是删除：删掉用户会让审计里的操作人失去指向
+  ALTER TABLE app_user ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0;
+  `,
 ];
 
 export function openDb(file: string): Db {
