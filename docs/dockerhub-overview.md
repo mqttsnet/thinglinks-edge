@@ -19,18 +19,39 @@ resolves the right image for the host.
 
 | Platform | Typical hardware |
 | --- | --- |
-| `linux/amd64` | x86 industrial PCs, rack servers, VMs, NAS units, cloud instances |
-| `linux/arm64` | ARM edge gateways, Raspberry Pi 4/5, Jetson, Rockchip/Allwinner boxes |
+| `linux/amd64` | x86 industrial PCs (Advantech, SIMATIC IPC and similar), Intel N100/N5105 mini-PCs, edge servers and gateways, x86 NAS units, VMs and cloud instances |
+| `linux/arm64` | Raspberry Pi 3/4/5, CM4/CM5 and Zero 2 W on a 64-bit OS; NVIDIA Jetson (Nano, Xavier NX, Orin); Rockchip RK3588/RK3568/RK3399 boxes; NXP i.MX8; TI AM62/AM64; Allwinner H616/A64; Ampere and Graviton servers |
 
-**32-bit ARM (`armv7`/`armhf`) is not supported, and cannot be.** Two independent
-upstream limits: the official Node.js 24 images publish no 32-bit ARM build at all
-(neither Alpine nor Debian variants), and `better-sqlite3` ships no 32-bit ARM
-prebuilt binary. A Raspberry Pi therefore needs a **64-bit OS** — Raspberry Pi OS
-(64-bit), Ubuntu Server arm64, or Debian arm64. Check with `uname -m`: `aarch64`
-works, `armv7l` does not.
+### Why not 32-bit ARM
 
-`s390x` and `ppc64le` are likewise not published — the base image has them, but
-`better-sqlite3` has no prebuilt binary for either.
+`armv7`/`armhf` is **not published**, for reasons that are worth stating precisely.
+
+The decisive one is downstream of us: **Node-RED's own official images for 5.x are
+`amd64` and `arm64` only** — every 5.0.4 variant, including `-minimal`. Since this
+product exists to host Node-RED instances, an `armv7` Manager could start but would
+be permanently limited to Node-RED 4.1.x instances.
+
+Two build-side costs compound it: `better-sqlite3` ships no 32-bit ARM prebuilt
+binary (it would have to be compiled from source under emulation), and the official
+Node.js 24 images carry no 32-bit ARM variant either. Neither is a hard wall on its
+own — Alpine's own `nodejs` package does cover `armv7` — but together with the
+Node-RED limit they make the result poor value.
+
+Fit is the last argument. Measured footprint is **53 MiB** for the Manager and about
+**104 MiB** per idle Node-RED instance. The SoCs that are genuinely 32-bit-only —
+NXP i.MX6, TI AM335x/BeagleBone, Allwinner A20 — typically ship with 256 MB–1 GB of
+RAM and one or two ~1 GHz cores. That is one or two instances at best, which is
+precisely the case where multi-instance hosting adds nothing.
+
+**Raspberry Pi users: this probably does not affect you.** The Pi 3, 3B+ and
+Zero 2 W all use 64-bit-capable silicon; only a 32-bit OS image puts them in the
+`armv7` bucket. Install Raspberry Pi OS (64-bit), Ubuntu Server arm64 or Debian
+arm64 and they run the `arm64` image. Check with `uname -m` — `aarch64` works,
+`armv7l` does not.
+
+`riscv64`, `ppc64le`, `s390x` and LoongArch are not published either, for the same
+downstream reason and more starkly: **no Node-RED image exists for any of them**, so
+a Manager on those architectures could not create a single instance.
 
 ## Runtime requirements
 
@@ -40,6 +61,7 @@ works, `armv7l` does not.
 | Docker Compose | v2 | `depends_on: condition: service_completed_successfully` is a v2 feature; the data-root init step depends on it |
 | Host arch | `x86_64` / `aarch64` | See above |
 | Disk | ~74 MB to download, ~340 MB unpacked on disk, plus whatever your flows and instances need under `EDGE_DATA_ROOT` |
+| RAM | ~53 MiB for the Manager, plus ~104 MiB per idle Node-RED instance. Budget roughly `53 + 104 x instances` MiB on top of the host OS and Docker |
 
 Verified to run under a **read-only root filesystem**, as **non-root** (uid 1000), and
 with `no-new-privileges`. The image is Alpine-based (musl), carries `tzdata`, and ships

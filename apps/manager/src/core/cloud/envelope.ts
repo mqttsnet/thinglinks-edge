@@ -100,6 +100,18 @@ function keyMaterial(params: CipherParams): { key: Buffer; iv: Buffer; algorithm
   return { key, iv, algorithm: algorithmFor(cipherFlag, key.length) };
 }
 
+/**
+ * 对外的参数校验入口。
+ *
+ * 存在的意义是**只有一份长度规则**：配置入库前要校验，加解密时也要校验，
+ * 两处各写一遍必然漂移 —— 漂移的表现是「界面说配置合法，运行时才报密钥长度不对」。
+ * cipherFlag=0 不需要密钥材料，直接放行。
+ */
+export function validateCipherParams(params: CipherParams): void {
+  if (params.cipherFlag === 0) return;
+  keyMaterial(params);
+}
+
 function encryptHex(plain: string, params: CipherParams): string {
   const { key, iv, algorithm } = keyMaterial(params);
   const c = createCipheriv(algorithm, key, iv);

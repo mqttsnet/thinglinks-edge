@@ -72,9 +72,16 @@ is the slice being built out first.
 | Node.js | 24 LTS (development only) |
 | pnpm | 10.32+ (development only) |
 
-> **32-bit ARM is not supported, and cannot be.** The official Node.js 24 images publish
-> no 32-bit ARM build, and `better-sqlite3` ships no 32-bit ARM prebuilt binary. A
-> Raspberry Pi needs a **64-bit OS** — check with `uname -m`: `aarch64` works, `armv7l` does not.
+> **32-bit ARM is not published.** The decisive reason is downstream: Node-RED's own
+> official images for 5.x are `amd64`/`arm64` only, so an `armv7` Manager would be
+> permanently stuck on Node-RED 4.1.x instances. Build-side costs compound it
+> (`better-sqlite3` has no 32-bit ARM prebuilt binary), and the fit is poor anyway —
+> genuinely 32-bit-only SoCs (i.MX6, AM335x, A20) ship with 256 MB–1 GB of RAM, while
+> the Manager needs ~53 MiB and each instance ~104 MiB.
+>
+> **Raspberry Pi users are probably unaffected**: the Pi 3, 3B+ and Zero 2 W are all
+> 64-bit-capable — only a 32-bit OS image puts them in the `armv7` bucket. Check with
+> `uname -m`: `aarch64` works, `armv7l` does not.
 
 ### Deploy
 

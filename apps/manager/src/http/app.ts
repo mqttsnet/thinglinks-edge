@@ -16,6 +16,7 @@ import { registerMetrics } from './metrics.ts';
 import { registerSso } from './sso.ts';
 import { registerIngest } from './ingest.ts';
 import { registerBackup } from './backup.ts';
+import { registerCloud } from './cloud.ts';
 import { registerUsers } from './users.ts';
 import { registerVersion } from './version.ts';
 import { registerProxy } from './proxy.ts';
@@ -56,6 +57,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     registerSso(api, ctx);
     registerIngest(api, ctx);
     registerBackup(api, ctx);
+    registerCloud(api, ctx);
     registerUsers(api, ctx);
     registerVersion(api, ctx);
   });

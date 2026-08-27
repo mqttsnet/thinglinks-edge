@@ -12,6 +12,8 @@ import type { InstanceService } from '../core/instance-service.ts';
 import { containerName } from '../core/container-spec.ts';
 import type { Db } from '../core/db.ts';
 import type { Spool } from '../core/spool/spool.ts';
+import type { CloudRuntime } from '../core/cloud/runtime.ts';
+import type { CloudConfigRepo } from '../core/cloud/config-repo.ts';
 import { UserRepo } from '../core/user-repo.ts';
 import { can, canInstance, isInstanceScoped, type Action } from '../core/authz.ts';
 import type { MetricsHistory } from '../core/metrics-history.ts';
@@ -36,6 +38,13 @@ export interface ServerDeps {
    */
   cloudSink?: ((payload: unknown) => Promise<void>) | undefined;
   /**
+   * 云连接运行期。有它时「是否已配置」以它为准，而不是看 cloudSink 在不在 ——
+   * 配置可以热改，cloudSink 是个恒定的转发闭包，判断不了当前配没配。
+   */
+  cloud?: CloudRuntime | undefined;
+  /** 云对接参数仓储。留空表示这个部署不提供云配置界面（如单测装配） */
+  cloudConfig?: CloudConfigRepo | undefined;
+  /**
    * 断网缓存。云端出口失败时批次落这里，链路恢复后自动补传。
    * 留空则失败即丢（并计数）—— 那是**明示**的降级，不是默认行为。
    */
@@ -52,6 +61,8 @@ const defaultUpstream = (id: string) => `http://${containerName(id)}:1880`;
 export interface HttpContext {
   config: EdgeConfig;
   cloudSink: ((payload: unknown) => Promise<void>) | undefined;
+  cloud: CloudRuntime | undefined;
+  cloudConfig: CloudConfigRepo | undefined;
   spool: Spool | undefined;
   metrics: MetricsHistory | undefined;
   db: Db;
@@ -89,6 +100,8 @@ export function createContext(deps: ServerDeps): HttpContext {
     config,
     users,
     cloudSink: deps.cloudSink,
+    cloud: deps.cloud,
+    cloudConfig: deps.cloudConfig,
     spool: deps.spool,
     metrics: deps.metrics,
     db: deps.db,
