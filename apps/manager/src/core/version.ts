@@ -75,8 +75,11 @@ export class UpdateChecker {
   private cached: UpdateCheckResult | null = null;
   private inflight: Promise<UpdateCheckResult> | null = null;
 
-  constructor(opts: { url: string; intervalMs?: number }) {
-    this.url = opts.url;
+  constructor(opts: { url?: string | undefined; intervalMs?: number }) {
+    // 归一化很关键：直接存 opts.url 时，传 undefined 会让下面的 `!== ''` 判为
+    // **已启用**，于是去 fetch(undefined) —— 「没配置」变成「配置错了还往外连」，
+    // 把「默认不联网」这条承诺破掉。空白串同理。
+    this.url = String(opts.url ?? '').trim();
     this.intervalMs = opts.intervalMs ?? 6 * 60 * 60 * 1000;
   }
 
