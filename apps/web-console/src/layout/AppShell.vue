@@ -35,6 +35,10 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { name: 'instances', title: '实例', icon: 'M3 5.2C3 4 5 3 8.5 3S14 4 14 5.2 12 7.4 8.5 7.4 3 6.4 3 5.2ZM3 5.2v9.6c0 1.2 2 2.2 5.5 2.2s5.5-1 5.5-2.2V5.2M3 10c0 1.2 2 2.2 5.5 2.2S14 11.2 14 10' },
       { name: 'health', title: '健康监测', icon: 'M2 9h3l2-5 3 10 2-5h3' },
+      // field:view 目前三种角色都有，写出来是为了跟后端的判权一一对上：
+      // 哪天收紧了角色表，这里不用改也会自己收起来
+      { name: 'field', title: '现场设备', need: 'field:view',
+        icon: 'M7 3h6v3h3v8H4V6h3ZM7 6h6M2 8h2M2 12h2M16 8h2M16 12h2M8 9v2M12 9v2' },
     ],
   },
   {

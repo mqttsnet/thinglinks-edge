@@ -11,6 +11,10 @@ const routes: RouteRecordRaw[] = [
       { path: '', redirect: '/instances' },
       { path: 'instances', name: 'instances', component: () => import('./views/InstancesView.vue') },
       { path: 'health', name: 'health', component: () => import('./views/HealthView.vue') },
+      {
+        path: 'field', name: 'field', component: () => import('./views/FieldView.vue'),
+        meta: { need: 'field:view' },
+      },
       { path: 'cloud', name: 'cloud', component: () => import('./views/CloudView.vue') },
       {
         path: 'users', name: 'users', component: () => import('./views/UsersView.vue'),
