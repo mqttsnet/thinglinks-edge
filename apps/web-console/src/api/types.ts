@@ -141,3 +141,123 @@ export interface ImageOption {
   /** 本机是否已拉取。false 时不能用于创建实例 */
   present: boolean;
 }
+
+// ── 云平台对接 ────────────────────────────────────────
+
+export type CipherFlag = 0 | 1 | 2;
+
+/** 连接状态。`unconfigured`/`disabled` 是「没配」与「配了但关着」，不要混为 offline */
+export type CloudState = 'unconfigured' | 'disabled' | 'offline' | 'connecting' | 'online';
+
+/**
+ * 后端回的配置**永远不含明文密钥**，只用 secretsSet 说明某项设没设。
+ * 前端据此显示「已设置，留空表示不修改」。
+ */
+export interface CloudConfigView {
+  enabled: boolean;
+  brokerUrl: string;
+  clientId: string;
+  deviceIdentification: string;
+  username: string;
+  cipherFlag: CipherFlag;
+  protocolVersion: string;
+  qos: 0 | 1 | 2;
+  updatedAt: string;
+  updatedBy: string;
+  secretsSet: { password: boolean; signKey: boolean; encryptKey: boolean; encryptVector: boolean };
+}
+
+export interface CloudStatus {
+  state: CloudState;
+  configured: boolean;
+  brokerUrl: string;
+  deviceIdentification: string;
+  clientId: string;
+  cipherFlag: number;
+  lastError: string;
+  lastErrorAt: string | null;
+  connectedAt: string | null;
+  published: number;
+  failed: number;
+}
+
+/** 保存请求。密钥字段留 undefined 表示不修改，传空串才是清空 */
+export interface CloudConfigInput {
+  enabled: boolean;
+  brokerUrl: string;
+  clientId: string;
+  deviceIdentification: string;
+  username: string;
+  /* 显式带上 undefined：exactOptionalPropertyTypes 下「留空表示不修改」
+     这个语义要求调用方能真的传 undefined，只写 `?:` 是传不进去的 */
+  password?: string | undefined;
+  cipherFlag: CipherFlag;
+  signKey?: string | undefined;
+  encryptKey?: string | undefined;
+  encryptVector?: string | undefined;
+  protocolVersion?: string | undefined;
+  qos?: 0 | 1 | 2 | undefined;
+}
+
+/** 字段与 Manager 的 Spool.metrics() 一一对应，不要另起名字 */
+export interface SpoolMetrics {
+  pending: number;
+  bytes: number;
+  maxBytes: number;
+  usagePercent: number;
+  full: boolean;
+  policy: string;
+  segments: number;
+  droppedOldest: number;
+  droppedNewest: number;
+  rejected: number;
+  replayed: number;
+}
+
+// ── 用户与权限（T4.4）────────────────────────────────────────
+
+export type Role = 'admin' | 'operator' | 'viewer';
+/** 实例授权档位。operate 蕴含 view */
+export type GrantLevel = 'view' | 'operate';
+
+export interface UserRecord {
+  username: string;
+  role: string;
+  disabled: boolean;
+  mustChangePassword: boolean;
+  createdAt: string;
+}
+
+export interface GrantRecord {
+  username: string;
+  instanceId: string;
+  level: GrantLevel;
+  grantedBy: string;
+  grantedAt: string;
+}
+
+/** 当前登录者自己的权限。前端据此隐藏入口 —— 但后端仍然逐个路由判 */
+export interface MyPermissions {
+  role: string;
+  actions: string[];
+  /** admin 为 'all'，其余为逐条授权 */
+  instances: 'all' | GrantRecord[];
+}
+
+// ── 备份（T4.3）──────────────────────────────────────────────
+
+export interface BackupManifest {
+  format: number;
+  product: string;
+  createdAt: string;
+  schemaVersion: number;
+  /** MASTER_KEY 派生密钥的指纹，不含密钥本身 */
+  masterKeyFingerprint: string;
+  instances: { id: string; name: string; imageTag: string }[];
+}
+
+export interface BackupInspect {
+  manifest: BackupManifest;
+  files: number;
+  bytes: number;
+}

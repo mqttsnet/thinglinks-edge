@@ -9,6 +9,7 @@ import { useRouter } from 'vue-router';
 import { api, ApiError } from '../api/client';
 import type { Instance, PortRecord } from '../api/types';
 import FieldHelp from '../components/FieldHelp.vue';
+import { can, canOperate, loadPermissions } from '../api/permissions';
 
 const router = useRouter();
 const message = useMessage();
@@ -30,6 +31,7 @@ async function refresh(quiet = false) {
 }
 
 onMounted(() => {
+  void loadPermissions();
   void refresh();
   timer = window.setInterval(() => void refresh(true), 5000);
 });
@@ -230,11 +232,19 @@ function portTitle(i: Instance): string {
 
 /* 低频且有破坏性的两项收进「更多」：行高是按最常用的三个操作定的，
    全摆出来就又回到原先那种一屏放不下几个实例的样子 */
-const MORE_OPTIONS = [
-  { label: '重置口令', key: 'reset' },
+/*
+ * 按权限裁剪。只读用户看到一个点了必然「权限不足」的菜单，
+ * 会以为系统坏了 —— 少显示比多显示好（后端仍然逐条判权）。
+ */
+function moreOptions(inst: Instance) {
+  const items: { label: string; key: string; props?: Record<string, string> }[] = [];
+  if (canOperate(inst.id)) items.push({ label: '重置口令', key: 'reset' });
   // 删除是不可逆的，收进菜单后更要保住红色警示 —— 原先它是一个红色按钮
-  { label: '删除实例', key: 'remove', props: { style: 'color: var(--error)' } },
-];
+  if (can('instance:delete')) {
+    items.push({ label: '删除实例', key: 'remove', props: { style: 'color: var(--error)' } });
+  }
+  return items;
+}
 
 function onMore(key: string | number, inst: Instance): void {
   if (key === 'reset') resetPassword(inst);
@@ -252,13 +262,18 @@ function onMore(key: string | number, inst: Instance): void {
       <div class="tools">
         <NInput v-model:value="keyword" clearable size="small" class="search"
                 placeholder="搜索名称 / ID / 版本 / 端口 / 路径" />
-        <NButton type="primary" @click="openCreate">+ 新建实例</NButton>
+        <NButton v-if="can('instance:create')" type="primary" @click="openCreate">+ 新建实例</NButton>
       </div>
     </div>
 
     <NSpin :show="loading">
-      <NEmpty v-if="!loading && instances.length === 0" description="还没有实例" style="padding: 60px 0">
-        <template #extra><NButton size="small" @click="openCreate">创建第一个实例</NButton></template>
+      <!-- 空列表有两种成因，说法必须分开：没实例 vs 有实例但没授权给你 -->
+      <NEmpty v-if="!loading && instances.length === 0" style="padding: 60px 0"
+              :description="can('instance:create') ? '还没有实例' : '还没有被授权可访问的实例'">
+        <template #extra>
+          <NButton v-if="can('instance:create')" size="small" @click="openCreate">创建第一个实例</NButton>
+          <span v-else class="noperm">现场实例由管理员在「用户与权限」里分配，找他给你加上即可</span>
+        </template>
       </NEmpty>
 
       <template v-else>
@@ -289,12 +304,15 @@ function onMore(key: string | number, inst: Instance): void {
             </div>
 
             <div class="ops">
-              <NButton v-if="!i.running" size="tiny" @click="act(() => api.startInstance(i.id), '已启动')">启动</NButton>
-              <NButton v-else size="tiny" @click="act(() => api.stopInstance(i.id), '已停止')">停止</NButton>
+              <template v-if="canOperate(i.id)">
+                <NButton v-if="!i.running" size="tiny" @click="act(() => api.startInstance(i.id), '已启动')">启动</NButton>
+                <NButton v-else size="tiny" @click="act(() => api.stopInstance(i.id), '已停止')">停止</NButton>
+              </template>
               <NButton size="tiny" type="primary" :disabled="!i.running"
                        tag="a" :href="i.openUrl" target="_blank">打开编辑器</NButton>
               <NButton size="tiny" @click="router.push(`/instances/${i.id}/logs`)">日志</NButton>
-              <NDropdown trigger="click" :options="MORE_OPTIONS" @select="(k) => onMore(k, i)">
+              <NDropdown v-if="moreOptions(i).length" trigger="click" :options="moreOptions(i)"
+                         @select="(k) => onMore(k, i)">
                 <NButton size="tiny" quaternary>更多</NButton>
               </NDropdown>
             </div>
@@ -474,6 +492,7 @@ function onMore(key: string | number, inst: Instance): void {
 </template>
 
 <style scoped>
+.noperm { font-size: 12.5px; color: var(--muted); }
 .page { display: flex; flex-direction: column; gap: 18px; }
 /* 窄屏时整块工具区换行，而不是把标题挤成三行 */
 .bar { display: flex; align-items: flex-start; gap: 16px; flex-wrap: wrap; }

@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
+import { ref, computed, onMounted } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
 import { NButton, NModal, NAlert, useMessage } from 'naive-ui';
 import { api } from '../api/client';
+import { can, clearPermissions, loadPermissions } from '../api/permissions';
 import ReleaseNotes from '../components/ReleaseNotes.vue';
 
 const router = useRouter();
@@ -20,10 +21,54 @@ function toggleSide() {
   localStorage.setItem('tle-side', collapsed.value ? '1' : '0');
 }
 
-const NAV = [
-  { name: 'instances', title: '实例', icon: 'M3 5.2C3 4 5 3 8.5 3S14 4 14 5.2 12 7.4 8.5 7.4 3 6.4 3 5.2ZM3 5.2v9.6c0 1.2 2 2.2 5.5 2.2s5.5-1 5.5-2.2V5.2M3 10c0 1.2 2 2.2 5.5 2.2S14 11.2 14 10' },
-  { name: 'health', title: '健康监测', icon: 'M2 9h3l2-5 3 10 2-5h3' },
+/*
+ * 导航按语义分组：「运行」是看现场此刻怎么样，「对接」是配上下游怎么连。
+ * 云对接放进「运行」会让人以为它也是个监控页，实际上它主要是改配置的地方。
+ */
+/** `need` 省略即所有登录者可见；写了就要该动作才显示 */
+interface NavItem { name: string; title: string; icon: string; need?: string }
+interface NavGroup { label: string; items: NavItem[]; need?: string }
+
+const NAV_GROUPS: NavGroup[] = [
+  {
+    label: '运行',
+    items: [
+      { name: 'instances', title: '实例', icon: 'M3 5.2C3 4 5 3 8.5 3S14 4 14 5.2 12 7.4 8.5 7.4 3 6.4 3 5.2ZM3 5.2v9.6c0 1.2 2 2.2 5.5 2.2s5.5-1 5.5-2.2V5.2M3 10c0 1.2 2 2.2 5.5 2.2S14 11.2 14 10' },
+      { name: 'health', title: '健康监测', icon: 'M2 9h3l2-5 3 10 2-5h3' },
+    ],
+  },
+  {
+    label: '对接',
+    items: [
+      { name: 'cloud', title: '云平台', icon: 'M6 15.5a3.5 3.5 0 0 1 .3-6.99A5 5 0 0 1 15.6 8.2 3.4 3.4 0 0 1 15 15.5Z' },
+    ],
+  },
+  {
+    label: '系统',
+    // 只有管得了用户的人才看得到这一项。不是安全措施（后端自己判），
+    // 而是不要把点进去必然 403 的入口摆在别人面前
+    // 逐项判权限而不是整组判：运维能跑备份但管不了用户，
+    // 整组挂 need 会把「备份」也一起藏掉
+    items: [
+      { name: 'users', title: '用户与权限', need: 'user:manage', icon: 'M2.6 16.5a5 5 0 0 1 9.8 0M7.5 8.6a2.9 2.9 0 1 0 0-5.8 2.9 2.9 0 0 0 0 5.8Zm6.2 0a2.4 2.4 0 1 0 0-4.8M14 11.4a4.4 4.4 0 0 1 3.4 5.1' },
+      { name: 'backup', title: '备份', need: 'backup:run', icon: 'M3 5.5C3 4.4 5.5 3.5 9 3.5s6 .9 6 2v7c0 1.1-2.5 2-6 2s-6-.9-6-2ZM3 9c0 1.1 2.5 2 6 2s6-.9 6-2' },
+    ],
+  },
 ];
+
+/** 当前能看到的导航分组。权限没取到时按「看不到」处理，取到后自动补上 */
+/**
+ * 逐项过滤，再丢掉空组。
+ *
+ * 组级和条目级都要判：组级用于整块只对某类人开放；条目级用于同一组里
+ * 各项权限不同（备份要 backup:run，用户管理要 user:manage，运维只有前者）。
+ * 只判组级会把运维能用的「备份」一起藏掉。
+ */
+const navGroups = computed(() =>
+  NAV_GROUPS
+    .filter((g) => !g.need || can(g.need))
+    .map((g) => ({ ...g, items: g.items.filter((i) => !i.need || can(i.need)) }))
+    .filter((g) => g.items.length > 0));
 
 /**
  * 版本与升级说明。
@@ -42,6 +87,7 @@ const update = ref<{ outdated?: boolean; latest?: string; url?: string } | null>
 
 onMounted(async () => {
   try { username.value = (await api.me()).user.username; } catch { /* 守卫已处理 */ }
+  await loadPermissions();
 
   try {
     const info = await api.version();
@@ -69,6 +115,7 @@ function dismissNotes() {
 
 async function signOut() {
   await api.logout().catch(() => undefined);
+  clearPermissions();
   message.success('已登出');
   await router.replace('/login');
 }
@@ -96,13 +143,15 @@ async function signOut() {
       </div>
 
       <nav>
-        <div class="lab">运行</div>
-        <button v-for="n in NAV" :key="n.name" class="item" :class="{ on: route.name === n.name }"
-                :title="n.title" @click="router.push({ name: n.name })">
-          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"
-               stroke-linecap="round" stroke-linejoin="round"><path :d="n.icon" /></svg>
-          <span>{{ n.title }}</span>
-        </button>
+        <template v-for="g in navGroups" :key="g.label">
+          <div class="lab">{{ g.label }}</div>
+          <button v-for="n in g.items" :key="n.name" class="item" :class="{ on: route.name === n.name }"
+                  :title="n.title" @click="router.push({ name: n.name })">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"
+                 stroke-linecap="round" stroke-linejoin="round"><path :d="n.icon" /></svg>
+            <span>{{ n.title }}</span>
+          </button>
+        </template>
       </nav>
 
       <div class="foot">

@@ -8,6 +8,8 @@
 import type {
   SessionUser, Instance, InstanceHealth, HostStats, HealthSummary, CreateInstanceBody,
   MetricsRange, MetricsSeries, VersionInfo, ImageOption,
+  CloudConfigView, CloudConfigInput, CloudStatus, SpoolMetrics,
+  UserRecord, GrantRecord, MyPermissions, BackupInspect, Role, GrantLevel,
 } from './types';
 
 /**
@@ -110,4 +112,88 @@ export const api = {
 
   /** 可选实例版本 + 本机是否已有。列表来自后端白名单，前端不再自己硬编码 */
   images: () => request<{ images: ImageOption[] }>('/api/images'),
+
+  // ── 云平台对接 ──────────────────────────────────────
+
+  cloud: () => request<{
+    config: CloudConfigView | null;
+    status: CloudStatus;
+    spool: SpoolMetrics | null;
+  }>('/api/cloud'),
+
+  saveCloud: (input: CloudConfigInput) =>
+    request<{ config: CloudConfigView; status: CloudStatus }>('/api/cloud', {
+      method: 'PUT', body: JSON.stringify(input),
+    }),
+
+  reconnectCloud: () =>
+    request<{ status: CloudStatus }>('/api/cloud/reconnect', { method: 'POST' }),
+
+  unlinkCloud: () =>
+    request<{ status: CloudStatus }>('/api/cloud', { method: 'DELETE' }),
+
+  // ── 用户与权限（T4.4）──────────────────────────────────
+
+  myPermissions: () => request<MyPermissions>('/api/me/permissions'),
+
+  users: () =>
+    request<{ users: UserRecord[]; roles: Role[]; grants: GrantRecord[] }>('/api/users'),
+
+  /** 返回的一次性明文口令**只出现这一次**，不落库、不可再查 */
+  createUser: (username: string, role: Role) =>
+    request<{ username: string; role: Role; password: string }>('/api/users', {
+      method: 'POST', body: JSON.stringify({ username, role }),
+    }),
+
+  setUserRole: (username: string, role: Role) =>
+    request<void>(`/api/users/${encodeURIComponent(username)}/role`, {
+      method: 'POST', body: JSON.stringify({ role }),
+    }),
+
+  setUserDisabled: (username: string, disabled: boolean) =>
+    request<void>(`/api/users/${encodeURIComponent(username)}/disabled`, {
+      method: 'POST', body: JSON.stringify({ disabled }),
+    }),
+
+  resetUserPassword: (username: string) =>
+    request<{ username: string; password: string }>(
+      `/api/users/${encodeURIComponent(username)}/password/reset`, { method: 'POST' }),
+
+  grantInstance: (username: string, instanceId: string, level: GrantLevel) =>
+    request<void>(`/api/users/${encodeURIComponent(username)}/grants`, {
+      method: 'POST', body: JSON.stringify({ instanceId, level }),
+    }),
+
+  revokeInstance: (username: string, instanceId: string) =>
+    request<void>(
+      `/api/users/${encodeURIComponent(username)}/grants/${encodeURIComponent(instanceId)}`,
+      { method: 'DELETE' }),
+
+  // ── 备份（T4.3）────────────────────────────────────────
+
+  /** 只看内容不下载，用于「这次备份会包含什么」 */
+  inspectBackup: () => request<BackupInspect>('/api/backup/inspect', { method: 'POST' }),
+
+  /**
+   * 下载备份。
+   *
+   * 不能走 `request`：它用 `res.text()` 读响应，会把 tar 里的二进制按 UTF-8
+   * 解码而损坏内容 —— 且**下下来的包看着正常，恢复时才炸**。这里直接取 blob。
+   */
+  downloadBackup: async (): Promise<{ blob: Blob; filename: string }> => {
+    const res = await fetch(`${basePath}/api/backup`, {
+      method: 'POST',
+      headers: { 'x-csrf-token': csrfToken() },
+      credentials: 'same-origin',
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      let message = `备份失败（HTTP ${res.status}）`;
+      try { message = String(JSON.parse(text).error ?? message); } catch { /* 非 JSON 用默认 */ }
+      throw new ApiError(res.status, message);
+    }
+    const disp = res.headers.get('content-disposition') ?? '';
+    const filename = /filename="([^"]+)"/.exec(disp)?.[1] ?? 'thinglinks-edge-backup.tar';
+    return { blob: await res.blob(), filename };
+  },
 };
