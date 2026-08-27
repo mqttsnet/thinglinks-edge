@@ -214,6 +214,44 @@ export interface SpoolMetrics {
   replayed: number;
 }
 
+// ── 数据面：微批与积压（B4/B5）──────────────────────────────
+
+/** 触发一次攒批的三个阈值，任一达到即发出 */
+export interface BatchLimits {
+  windowMs: number;
+  maxPoints: number;
+  maxBytes: number;
+}
+
+export interface BatchMetrics {
+  limits: BatchLimits;
+  /** 当前还攒在内存里、尚未发出的点数与字节数 */
+  pending: number;
+  pendingBytes: number;
+  /** 累计发出的批次与点数 */
+  batches: number;
+  points: number;
+  /** 发送失败的点数（这些点会转入断网缓存） */
+  failures: number;
+  /** 累计落入断网缓存的批次数 */
+  spooled: number;
+  lastError: string;
+}
+
+export interface EdgeMetrics {
+  cloud: 'configured' | 'not-configured';
+  cloudStatus: CloudStatus | null;
+  batch: BatchMetrics;
+  /** 未启用断网缓存时为 null —— 如实为空，不编一个全零对象 */
+  spool: SpoolMetrics | null;
+}
+
+/** 一轮补传的结果 */
+export interface ReplayResult {
+  sent: number;
+  failed: number;
+}
+
 // ── 用户与权限（T4.4）────────────────────────────────────────
 
 export type Role = 'admin' | 'operator' | 'viewer';
@@ -260,4 +298,74 @@ export interface BackupInspect {
   manifest: BackupManifest;
   files: number;
   bytes: number;
+}
+
+// ── 现场设备台账与南向探测（T4.5）──────────────────────────
+//
+// 两类数据**不能混**，类型上就分开：
+//   · FieldDeviceRecord / FieldTagRecord 是 `@thinglinks` 节点主动回报的可信台账，
+//     有在线状态、当前值与质量码；
+//   · ProbedDevice / ProbedTag 是从 flows.json 反推的尽力探测，恒 managed: false，
+//     没有运行时数据。界面必须标「未纳管」，两边的数字也不许相加。
+
+export interface FieldDeviceRecord {
+  instanceId: string;
+  nodeId: string;
+  name: string;
+  protocol: string;
+  address: string;
+  model: string;
+  manufacturer: string;
+  online: boolean;
+  lastSeen: string | null;
+  registeredAt: string;
+}
+
+export interface FieldTagRecord {
+  instanceId: string;
+  nodeId: string;
+  tagId: string;
+  name: string;
+  unit: string;
+  dataType: string;
+  /** 最近一次上报的值，已还原为原始类型；从未上报过时为 null */
+  lastValue: unknown;
+  quality: string;
+  lastAt: string | null;
+}
+
+/** 只涵盖**已纳管**的部分。note 是后端给的口径说明，原样展示，不要自己改写 */
+export interface FieldSummary {
+  managed: { devices: number; online: number; tags: number };
+  note: string;
+}
+
+export interface ProbedDevice {
+  nodeId: string;
+  name: string;
+  protocol: string;
+  address: string;
+  /** 原始节点类型，便于用户对回流里的哪个节点 */
+  sourceType: string;
+}
+
+export interface ProbedTag {
+  /** 所属设备（配置节点 id）；认不出归属时为空 */
+  nodeId: string;
+  tagId: string;
+  name: string;
+  address: string;
+  dataType: string;
+  sourceType: string;
+}
+
+export interface ProbeResult {
+  devices: ProbedDevice[];
+  tags: ProbedTag[];
+  /** 见到但认不出的节点类型 —— 必须如实告知「还有这些我看不懂」 */
+  unrecognized: { type: string; count: number }[];
+  /** 恒为 false。方案 A 永远不是可靠台账 */
+  managed: false;
+  /** 没探成的原因（无 flows.json、JSON 坏了）。有它就说明结果是空的，不是「真没设备」 */
+  reason?: string;
 }

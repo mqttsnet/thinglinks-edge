@@ -10,6 +10,8 @@ import type {
   MetricsRange, MetricsSeries, VersionInfo, ImageOption,
   CloudConfigView, CloudConfigInput, CloudStatus, SpoolMetrics,
   UserRecord, GrantRecord, MyPermissions, BackupInspect, Role, GrantLevel,
+  FieldDeviceRecord, FieldTagRecord, FieldSummary, ProbeResult,
+  EdgeMetrics, ReplayResult,
 } from './types';
 
 /**
@@ -61,6 +63,14 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     throw new ApiError(res.status, message);
   }
   return payload as T;
+}
+
+/** 拼查询串：值为空的键直接不出现，避免发出 `?instanceId=` 这种后端要当真的空值 */
+function qs(params: Record<string, string | undefined>): string {
+  const u = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) if (v) u.set(k, v);
+  const s = u.toString();
+  return s ? `?${s}` : '';
 }
 
 export const api = {
@@ -132,9 +142,40 @@ export const api = {
   unlinkCloud: () =>
     request<{ status: CloudStatus }>('/api/cloud', { method: 'DELETE' }),
 
+  /** 数据面明细：微批当前攒了多少、断网缓存积压多少 */
+  edgeMetrics: () => request<EdgeMetrics>('/api/edge/metrics'),
+
+  /**
+   * 手动跑一轮补传。
+   *
+   * 正常情况下补传由每次成功发送自动带动，这个口子是给现场排障用的 ——
+   * 「明明连上了但积压不降」时手动推一把，并看到 sent/failed 的实数。
+   */
+  replaySpool: () => request<ReplayResult>('/api/edge/replay', { method: 'POST' }),
+
   // ── 用户与权限（T4.4）──────────────────────────────────
 
   myPermissions: () => request<MyPermissions>('/api/me/permissions'),
+
+  // ── 现场设备（T4.5）────────────────────────────────────
+  //
+  // 不指名 instanceId 就是跨实例聚合，后端按登录者的授权逐条过滤 ——
+  // 前端拿到多少就是他能看多少，不需要（也不应该）在这里再筛一遍。
+
+  fieldSummary: (instanceId?: string) =>
+    request<FieldSummary>(`/api/field/summary${qs({ instanceId })}`),
+
+  fieldDevices: (instanceId?: string) =>
+    request<{ devices: FieldDeviceRecord[] }>(`/api/field/devices${qs({ instanceId })}`),
+
+  /** 点位按设备懒加载：现场一台实例几千个点，全量拉会把首屏拖垮 */
+  fieldTags: (instanceId?: string, nodeId?: string) =>
+    request<{ tags: FieldTagRecord[] }>(`/api/field/tags${qs({ instanceId, nodeId })}`),
+
+  /** 南向探测**必须**指名实例：读的是那台的 flows.json，比台账更敏感 */
+  southbound: (instanceId: string) =>
+    request<ProbeResult>(`/api/field/southbound${qs({ instanceId })}`),
+
 
   users: () =>
     request<{ users: UserRecord[]; roles: Role[]; grants: GrantRecord[] }>('/api/users'),
