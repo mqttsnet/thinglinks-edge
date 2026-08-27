@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 | Version | Date | Highlights |
 | ------- | ---- | ---------- |
-| [1.0.1](changelogs/v1.0.1.md) | 2026-08-27 | Node-RED multi-instance hosting, built-in reverse proxy, three-layer health probes, web console, Compose deployment behind a restricted Docker endpoint |
+| [1.0.1](changelogs/v1.0.1.md) | 2026-08-27 | First public release. Node-RED multi-instance hosting, built-in reverse proxy, three-layer health probes and trends, users with per-instance authorization, backup/restore, offline buffering and replay, cloud uplink, web console, and a published multi-arch image deployed behind a restricted Docker endpoint |
 
 ---
 

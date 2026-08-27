@@ -31,8 +31,6 @@ COPY apps/web-console/package.json apps/web-console/package.json
 RUN pnpm install --frozen-lockfile --ignore-scripts
 
 COPY tsconfig.base.json ./
-# 使用者变更说明（vX.Y.Z.zh-CN.md）随镜像走：升级后控制台要弹一次
-COPY changelogs changelogs
 COPY apps/manager apps/manager
 COPY apps/web-console apps/web-console
 COPY packages packages
@@ -43,6 +41,11 @@ RUN pnpm --filter @thinglinks-edge/web-console build
 # --legacy：本仓库未开 inject-workspace-packages，pnpm 10 的 deploy 默认拒绝非注入式工作区。
 # --prod：只保留运行时依赖（fastify / dockerode / better-sqlite3 / bcryptjs / @fastify/*）。
 RUN pnpm --filter @thinglinks-edge/manager deploy --legacy --prod --ignore-scripts /out
+
+# 使用者变更说明（vX.Y.Z.zh-CN.md）随镜像走：升级后控制台要弹一次。
+# 刻意放在所有 RUN **之后**：没有任何构建步骤读它，而发版前改文案是常事 ——
+# 排在源码之前的话，动一个字就会让 pnpm build 与 deploy 全部重跑。
+COPY changelogs changelogs
 
 # ── 运行阶段 ────────────────────────────────────────────────
 FROM node:24.19.0-alpine AS runtime

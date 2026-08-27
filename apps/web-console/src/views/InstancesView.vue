@@ -232,7 +232,8 @@ function portTitle(i: Instance): string {
    全摆出来就又回到原先那种一屏放不下几个实例的样子 */
 const MORE_OPTIONS = [
   { label: '重置口令', key: 'reset' },
-  { label: '删除实例', key: 'remove' },
+  // 删除是不可逆的，收进菜单后更要保住红色警示 —— 原先它是一个红色按钮
+  { label: '删除实例', key: 'remove', props: { style: 'color: var(--error)' } },
 ];
 
 function onMore(key: string | number, inst: Instance): void {
@@ -244,7 +245,7 @@ function onMore(key: string | number, inst: Instance): void {
 <template>
   <div class="page">
     <div class="bar">
-      <div>
+      <div class="ttl">
         <h2>实例</h2>
         <p class="sub">「打开编辑器」直接进入，无需再输实例口令</p>
       </div>
@@ -474,11 +475,13 @@ function onMore(key: string | number, inst: Instance): void {
 
 <style scoped>
 .page { display: flex; flex-direction: column; gap: 18px; }
-.bar { display: flex; align-items: flex-start; gap: 16px; }
+/* 窄屏时整块工具区换行，而不是把标题挤成三行 */
+.bar { display: flex; align-items: flex-start; gap: 16px; flex-wrap: wrap; }
+.ttl { min-width: 220px; }
 .bar h2 { margin: 0; font-size: 23px; font-weight: 650; letter-spacing: -.02em; color: var(--primary); }
 .bar .sub { margin: 2px 0 0; color: var(--muted); font-size: 12.5px; }
 .tools { display: flex; align-items: center; gap: 10px; margin-left: auto; }
-.search { width: 250px; }
+.search { width: 250px; max-width: 100%; }
 .muted { color: var(--muted); }
 .hint { font-size: 12px; color: var(--muted); line-height: 1.6; }
 

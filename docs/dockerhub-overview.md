@@ -39,7 +39,7 @@ works, `armv7l` does not.
 | Docker Engine | 24+ | Older engines work for the image itself, but the deployment relies on Compose v2 semantics |
 | Docker Compose | v2 | `depends_on: condition: service_completed_successfully` is a v2 feature; the data-root init step depends on it |
 | Host arch | `x86_64` / `aarch64` | See above |
-| Disk | ~340 MB for the image on disk, plus whatever your flows and instances need under `EDGE_DATA_ROOT` |
+| Disk | ~74 MB to download, ~340 MB unpacked on disk, plus whatever your flows and instances need under `EDGE_DATA_ROOT` |
 
 Verified to run under a **read-only root filesystem**, as **non-root** (uid 1000), and
 with `no-new-privileges`. The image is Alpine-based (musl), carries `tzdata`, and ships
