@@ -29,6 +29,8 @@ const PORT_A = 30810;
 const PORT_B = 30833;
 const ID2 = 'api-b';
 const TAG = '5.0.4-24-minimal';
+/** 白名单内、但本机不会去拉的版本。verify 环境不联网拉镜像，这一点是稳定的 */
+const MISSING_TAG = '4.1.13-22-minimal';
 
 const raw = new Docker();
 const results = [];
@@ -63,7 +65,8 @@ async function main() {
   });
   const service = new InstanceService({
     db, repo, docker, basePath: '', portRange: { min: 30000, max: 30999 },
-    allowedImageTags: [TAG],
+    // MISSING_TAG 是**本机没有拉取**的版本 —— 用它验镜像预检那条路径
+    allowedImageTags: [TAG, MISSING_TAG],
   });
   const config = {
     externalUrl: `http://127.0.0.1:${PORT}`, basePath: '', cookieSecure: false,
@@ -396,6 +399,19 @@ async function main() {
         JSON.stringify(metrics.batch?.limits) + ` 已发 ${metrics.batch?.batches} 批 ${metrics.batch?.points} 点`);
   check('云端已配置时如实报告', metrics.cloud === 'configured', metrics.cloud);
 
+  /*
+   * 契约断言：控制台「微批与积压」卡片逐个读这些字段。
+   * 少一个字段不会让接口报错，只会让卡片上那一格空着 —— 这种缺失很难被发现，
+   * 所以在这里把整个形状钉住，而不是只挑几个抽查。
+   */
+  const BATCH_KEYS = ['limits', 'pending', 'pendingBytes', 'batches', 'points',
+                      'failures', 'spooled', 'lastError'];
+  const missingBatch = BATCH_KEYS.filter((k) => metrics.batch?.[k] === undefined);
+  check('指标接口的 batch 字段与控制台契约一致',
+        missingBatch.length === 0 &&
+        typeof metrics.batch.limits.maxBytes === 'number',
+        missingBatch.length ? `缺 ${missingBatch.join('、')}` : BATCH_KEYS.join(' '));
+
     // ── 断网缓存与补传（B5）──
   /*
    * 断网时批次必须落缓存而**不是丢掉**；链路恢复后自动补回去。
@@ -428,6 +444,13 @@ async function main() {
   const m2 = await (await fetch(`${B}/api/edge/metrics`, { headers: { cookie } })).json();
   check('补传后待补条数归零', m2.spool?.pending === 0, `剩 ${m2.spool?.pending} 条`);
   check('补传计数被记录', m2.spool?.replayed === 3, `已补传 ${m2.spool?.replayed} 条`);
+
+  const SPOOL_KEYS = ['pending', 'bytes', 'maxBytes', 'usagePercent', 'full', 'policy',
+                      'segments', 'droppedOldest', 'droppedNewest', 'rejected', 'replayed'];
+  const missingSpool = SPOOL_KEYS.filter((k) => m2.spool?.[k] === undefined);
+  check('指标接口的 spool 字段与控制台契约一致',
+        missingSpool.length === 0 && typeof m2.spool.policy === 'string',
+        missingSpool.length ? `缺 ${missingSpool.join('、')}` : `${SPOOL_KEYS.length} 项齐备`);
 
   const seqSeen = cloudBatches.map((b) => b.devices?.[0]?.services?.[0]?.data?.seq);
   check('补传内容一条不少（0,1,2 都回来了）',
@@ -500,6 +523,44 @@ async function main() {
   check('默认保留数据目录（不默认删数据）', await dataDirExists(ID));
 
   await resetDataDir(ID);
+
+  // ── 控制台依赖的三个信息接口 ──
+  /*
+   * 这三条是控制台外壳与「新建实例」弹窗的数据来源。它们出问题不会让 API 报错，
+   * 只会让界面显示成「版本 —」「版本下拉是空的」，很容易被当成前端小毛病。
+   */
+  const ver = await (await fetch(`${B}/api/version`, { headers: { cookie } })).json();
+  check('版本接口返回版本号与使用者说明',
+        /^\d+\.\d+\.\d+$/.test(String(ver.version)) && typeof ver.notes === 'string',
+        `v${ver.version} · 说明 ${String(ver.notes).length} 字`);
+  check('未配置 UPDATE_CHECK_URL 时不联网检查更新',
+        ver.update?.enabled === false, JSON.stringify(ver.update));
+
+  const perm = await (await fetch(`${B}/api/me/permissions`, { headers: { cookie } })).json();
+  check('权限接口返回角色与动作清单',
+        perm.role === 'admin' && Array.isArray(perm.actions) && perm.actions.includes('backup:run'),
+        `${perm.role} · ${perm.actions?.length} 项动作`);
+
+  // ── 镜像预检：本机没有的版本必须在选之前就标出来 ──
+  /*
+   * Docker API **不会自动拉取**（命令行的 docker create 会，容易让人误判）。
+   * 镜像缺失时 containers/create 回 `No such image`，那句话对现场人员没有指导意义。
+   */
+  const imgs = await (await fetch(`${B}/api/images`, { headers: { cookie } })).json();
+  const imgPresent = Object.fromEntries((imgs.images ?? []).map((i) => [i.tag, i.present]));
+  check('镜像接口如实报告本机有没有该版本',
+        imgPresent[TAG] === true && imgPresent[MISSING_TAG] === false, JSON.stringify(imgPresent));
+
+  const missRes = await fetch(`${B}/api/instances`, {
+    method: 'POST', headers: H,
+    body: JSON.stringify({ id: 'api-miss', name: '缺镜像', imageTag: MISSING_TAG, ports: [] }),
+  });
+  const missErr = String((await missRes.json()).error ?? '');
+  check('用本机没有的镜像建实例被拒，且给的是能照做的说明',
+        missRes.status === 400 && missErr.includes('本机没有镜像') && missErr.includes('docker load'),
+        missErr.slice(0, 60).replace(/\n/g, ' '));
+  // 失败路径不该留下半个实例
+  check('预检失败后没有残留容器', (await containerState('api-miss')) === 'missing');
 
   await app.close();
   await cleanup();
