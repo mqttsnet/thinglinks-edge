@@ -5,7 +5,7 @@ import {
   type MetricSample, type MetricsSource,
 } from './metrics-history.ts';
 import type { HostStats } from './host-stats.ts';
-import type { InstanceHealth } from './health.ts';
+import type { InstanceHealth } from './probes.ts';
 
 const sample = (t: number, over: Partial<MetricSample> = {}): MetricSample => ({
   t,

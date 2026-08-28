@@ -5,17 +5,17 @@
  * Docker 失败时补偿删除仓储记录，避免留下「有记录无容器」的半条状态。
  */
 import bcrypt from 'bcryptjs';
-import type { Db } from './db.ts';
-import { recordAudit } from './db.ts';
-import { adminRootFor } from './config.ts';
-import { InstanceRepo, type PortRecord } from './instance-repo.ts';
+import type { Db } from '../db.ts';
+import { recordAudit } from '../db.ts';
+import { adminRootFor } from '../config.ts';
+import { InstanceRepo, type PortRecord } from './repo.ts';
 import { DockerClient } from './docker-client.ts';
 import { renderSettings } from './settings-template.ts';
 import { assertValidId } from './container-spec.ts';
-import { generatePassword } from './crypto.ts';
+import { generatePassword } from '../auth/crypto.ts';
 import { validatePortMappings, recommendPorts, type PortRange, type PortMapping } from './ports.ts';
-import { HealthProbe, analyzeLogs, judge, type InstanceHealth } from './health.ts';
-import { readHostStats, isExhausted, type HostStats } from './host-stats.ts';
+import { HealthProbe, analyzeLogs, judge, type InstanceHealth } from '../health/probes.ts';
+import { readHostStats, isExhausted, type HostStats } from '../health/host-stats.ts';
 
 export class ServiceError extends Error {
   constructor(message: string) {

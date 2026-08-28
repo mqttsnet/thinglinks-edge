@@ -1,8 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { openDb, migrate, recordAudit } from './db.ts';
-import { deriveKey } from './crypto.ts';
-import { InstanceRepo, RepoError, type InstanceRecord, type PortRecord } from './instance-repo.ts';
+import { openDb, migrate, recordAudit } from '../db.ts';
+import { deriveKey } from '../auth/crypto.ts';
+import { InstanceRepo, RepoError, type InstanceRecord, type PortRecord } from './repo.ts';
 
 const KEY = deriveKey('test-master', 'salt');
 const fresh = () => new InstanceRepo(openDb(':memory:'), KEY);

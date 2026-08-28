@@ -11,9 +11,9 @@
  */
 import { ref, onMounted } from 'vue';
 import { NButton, NCard, NSpin, NAlert, NSpace, NTag, useMessage } from 'naive-ui';
-import { api, ApiError } from '../api/client';
-import type { BackupInspect } from '../api/types';
-import FieldHelp from '../components/FieldHelp.vue';
+import { api, ApiError } from '../../api/client';
+import type { BackupInspect } from '../../api/types';
+import FieldHelp from '../../components/FieldHelp.vue';
 
 const message = useMessage();
 const loading = ref(true);

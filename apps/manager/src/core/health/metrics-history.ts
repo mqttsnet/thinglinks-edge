@@ -18,7 +18,7 @@
  * (360 + 288) × (3 + 50) ≈ 3.4 万个数，几 MB 以内。
  */
 import type { HostStats } from './host-stats.ts';
-import type { InstanceHealth } from './health.ts';
+import type { InstanceHealth } from './probes.ts';
 
 export type Verdict = InstanceHealth['verdict'];
 

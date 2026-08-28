@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { cpuPercent, memoryUsage, analyzeLogs, judge, type DockerStatsLike } from './health.ts';
+import { cpuPercent, memoryUsage, analyzeLogs, judge, type DockerStatsLike } from './probes.ts';
 
 const stats = (over: Partial<DockerStatsLike> = {}): DockerStatsLike => ({
   cpu_stats: {

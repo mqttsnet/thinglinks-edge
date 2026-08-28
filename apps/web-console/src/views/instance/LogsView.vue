@@ -11,7 +11,7 @@
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { NButton, NTag, NSelect, NInput, NEmpty, NSpin, useMessage } from 'naive-ui';
-import { basePath } from '../api/client';
+import { basePath } from '../../api/client';
 
 /** 超过这个行数就丢最旧的 —— 现场机器长期挂着不能无限吃内存 */
 const MAX_LINES = 5000;

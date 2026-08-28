@@ -20,7 +20,7 @@ import { mkdir, readdir, readFile, writeFile, rm, stat } from 'node:fs/promises'
 import { join, relative, sep, posix } from 'node:path';
 import { tmpdir } from 'node:os';
 import { tarArchive, untar, type TarEntry } from './tar.ts';
-import type { Db } from './db.ts';
+import type { Db } from '../db.ts';
 
 export const BACKUP_FORMAT = 1;
 

@@ -3,9 +3,9 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { openDb } from './db.ts';
-import { deriveKey } from './crypto.ts';
-import { InstanceRepo } from './instance-repo.ts';
+import { openDb } from '../db.ts';
+import { deriveKey } from '../auth/crypto.ts';
+import { InstanceRepo } from '../instance/repo.ts';
 import { createBackup, restoreBackup, readManifest, keyFingerprint, BackupError } from './backup.ts';
 
 const KEY = deriveKey('master-a', 'salt');

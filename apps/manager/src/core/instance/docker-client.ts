@@ -13,7 +13,7 @@ import {
   buildCreateOptions, assertSafeCreateOptions, assertValidSpec,
   containerName, instanceDataDir, type InstanceSpec,
 } from './container-spec.ts';
-import { tarFile } from './tar.ts';
+import { tarFile } from '../archive/tar.ts';
 import { dockerLogToText } from './log-stream.ts';
 
 /** 平台管理的容器统一打这个标签，列举与操作一律按标签过滤 */

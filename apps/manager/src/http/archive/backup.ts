@@ -5,9 +5,9 @@
  * 在线做等于自找损坏。恢复走 CLI，恢复完再启动 —— 见 `core/backup.ts` 注释。
  */
 import type { FastifyInstance } from 'fastify';
-import { createBackup, inspectBackup } from '../core/backup.ts';
-import { recordAudit } from '../core/db.ts';
-import type { HttpContext } from './context.ts';
+import { createBackup, inspectBackup } from '../../core/archive/backup.ts';
+import { recordAudit } from '../../core/db.ts';
+import type { HttpContext } from '../context.ts';
 
 export function registerBackup(api: FastifyInstance, ctx: HttpContext): void {
   const { config, db, repo, guard } = ctx;

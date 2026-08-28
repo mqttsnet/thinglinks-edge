@@ -1,7 +1,7 @@
 /** 实例：列表、创建、启停、删除、凭据重置、健康、日志。 */
 import type { FastifyInstance } from 'fastify';
-import { DockerLogStream, splitTimestamp } from '../core/log-stream.ts';
-import type { HttpContext } from './context.ts';
+import { DockerLogStream, splitTimestamp } from '../../core/instance/log-stream.ts';
+import type { HttpContext } from '../context.ts';
 
 export function registerInstances(api: FastifyInstance, ctx: HttpContext): void {
   // guard / fail 统一取自上下文：鉴权与错误响应必须全站一致

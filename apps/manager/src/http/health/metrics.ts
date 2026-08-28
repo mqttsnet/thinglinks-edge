@@ -6,8 +6,8 @@
  * 分开的好处是页面刷曲线不会把探针压力翻倍。
  */
 import type { FastifyInstance } from 'fastify';
-import { filterSeries } from '../core/metrics-history.ts';
-import type { HttpContext } from './context.ts';
+import { filterSeries } from '../../core/health/metrics-history.ts';
+import type { HttpContext } from '../context.ts';
 
 /**
  * 允许的窗口。做成白名单而不是自由秒数：

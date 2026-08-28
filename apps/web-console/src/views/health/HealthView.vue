@@ -16,14 +16,14 @@ import { useRouter } from 'vue-router';
 import {
   NCard, NTag, NSpin, NEmpty, NAlert, NButton, NRadioGroup, NRadioButton, useMessage,
 } from 'naive-ui';
-import { api, ApiError } from '../api/client';
+import { api, ApiError } from '../../api/client';
 import type {
   InstanceHealth, HostStats, HealthSummary, MetricsSeries, MetricsRange,
-} from '../api/types';
-import TrendChart, { type TrendSeries } from '../components/TrendChart.vue';
-import RingGauge from '../components/RingGauge.vue';
-import StatusStrip from '../components/StatusStrip.vue';
-import FieldHelp from '../components/FieldHelp.vue';
+} from '../../api/types';
+import TrendChart, { type TrendSeries } from '../../components/TrendChart.vue';
+import RingGauge from '../../components/RingGauge.vue';
+import StatusStrip from '../../components/StatusStrip.vue';
+import FieldHelp from '../../components/FieldHelp.vue';
 
 const router = useRouter();
 const message = useMessage();

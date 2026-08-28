@@ -4,8 +4,8 @@
  * 端口分配遵循「用户自填、系统只推荐」：现场工程师通常已有既定端口规划，
  * 系统硬分配反而添乱。系统负责的是冲突检测与范围校验。
  */
-import type { Db } from './db.ts';
-import { encryptSecret, decryptSecret } from './crypto.ts';
+import type { Db } from '../db.ts';
+import { encryptSecret, decryptSecret } from '../auth/crypto.ts';
 
 export interface InstanceRecord {
   id: string;

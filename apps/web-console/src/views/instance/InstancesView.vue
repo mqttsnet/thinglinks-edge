@@ -6,10 +6,10 @@ import {
   useMessage, useDialog,
 } from 'naive-ui';
 import { useRouter } from 'vue-router';
-import { api, ApiError } from '../api/client';
-import type { Instance, PortRecord } from '../api/types';
-import FieldHelp from '../components/FieldHelp.vue';
-import { can, canOperate, loadPermissions } from '../api/permissions';
+import { api, ApiError } from '../../api/client';
+import type { Instance, PortRecord } from '../../api/types';
+import FieldHelp from '../../components/FieldHelp.vue';
+import { can, canOperate, loadPermissions } from '../../api/permissions';
 
 const router = useRouter();
 const message = useMessage();
