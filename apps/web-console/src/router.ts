@@ -3,28 +3,39 @@ import { api, ApiError, basePath } from './api/client';
 import { can, loadPermissions } from './api/permissions';
 
 const routes: RouteRecordRaw[] = [
-  { path: '/login', name: 'login', component: () => import('./views/LoginView.vue'), meta: { anon: true } },
+  { path: '/login', name: 'login', component: () => import('./views/auth/LoginView.vue'), meta: { anon: true } },
   {
     path: '/',
     component: () => import('./layout/AppShell.vue'),
     children: [
       { path: '', redirect: '/instances' },
-      { path: 'instances', name: 'instances', component: () => import('./views/InstancesView.vue') },
-      { path: 'health', name: 'health', component: () => import('./views/HealthView.vue') },
+      { path: 'instances', name: 'instances', component: () => import('./views/instance/InstancesView.vue') },
+      { path: 'health', name: 'health', component: () => import('./views/health/HealthView.vue') },
       {
-        path: 'field', name: 'field', component: () => import('./views/FieldView.vue'),
+        path: 'field', name: 'field', component: () => import('./views/edge/FieldView.vue'),
         meta: { need: 'field:view' },
       },
-      { path: 'cloud', name: 'cloud', component: () => import('./views/CloudView.vue') },
+      { path: 'cloud', name: 'cloud', component: () => import('./views/cloud/CloudView.vue') },
       {
-        path: 'users', name: 'users', component: () => import('./views/UsersView.vue'),
+        path: 'users', name: 'users', component: () => import('./views/auth/UsersView.vue'),
         meta: { need: 'user:manage' },
       },
       {
-        path: 'backup', name: 'backup', component: () => import('./views/BackupView.vue'),
+        path: 'backup', name: 'backup', component: () => import('./views/archive/BackupView.vue'),
         meta: { need: 'backup:run' },
+      },      {
+        path: 'diag', name: 'diag', component: () => import('./views/diag/DiagView.vue'),
+        meta: { need: 'diag:run' },
       },
-      { path: 'instances/:id/logs', name: 'logs', component: () => import('./views/LogsView.vue') },
+      {
+        path: 'templates', name: 'templates',
+        component: () => import('./views/flows/TemplatesView.vue'),
+        // 只要求 view：能看模板的人就该看得到这一页，
+        // 建/删的按钮在页内再按 template:manage 收起来
+        meta: { need: 'template:view' },
+      },
+
+      { path: 'instances/:id/logs', name: 'logs', component: () => import('./views/instance/LogsView.vue') },
     ],
   },
 ];

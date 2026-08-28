@@ -35,6 +35,10 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { name: 'instances', title: '实例', icon: 'M3 5.2C3 4 5 3 8.5 3S14 4 14 5.2 12 7.4 8.5 7.4 3 6.4 3 5.2ZM3 5.2v9.6c0 1.2 2 2.2 5.5 2.2s5.5-1 5.5-2.2V5.2M3 10c0 1.2 2 2.2 5.5 2.2S14 11.2 14 10' },
       { name: 'health', title: '健康监测', icon: 'M2 9h3l2-5 3 10 2-5h3' },
+      // 放在实例旁边而不是「系统」组：套模板是产线上的日常动作，
+      // 不是运维配置 —— 现场找它的时候是在找「怎么把这条线的流程复制到那条」
+      { name: 'templates', title: '流程模板', need: 'template:view',
+        icon: 'M4 3h7l3 3v11H4ZM11 3v3h3M6.5 9.5h5M6.5 12.5h5' },
       // field:view 目前三种角色都有，写出来是为了跟后端的判权一一对上：
       // 哪天收紧了角色表，这里不用改也会自己收起来
       { name: 'field', title: '现场设备', need: 'field:view',
@@ -55,6 +59,8 @@ const NAV_GROUPS: NavGroup[] = [
     // 整组挂 need 会把「备份」也一起藏掉
     items: [
       { name: 'users', title: '用户与权限', need: 'user:manage', icon: 'M2.6 16.5a5 5 0 0 1 9.8 0M7.5 8.6a2.9 2.9 0 1 0 0-5.8 2.9 2.9 0 0 0 0 5.8Zm6.2 0a2.4 2.4 0 1 0 0-4.8M14 11.4a4.4 4.4 0 0 1 3.4 5.1' },
+      // 运维也有 diag:run —— 现场第一响应人就是他们，不能只给管理员
+      { name: 'diag', title: '远程诊断', need: 'diag:run', icon: 'M2 10h3l2.5-6 3.5 12 2.5-6h3' },
       { name: 'backup', title: '备份', need: 'backup:run', icon: 'M3 5.5C3 4.4 5.5 3.5 9 3.5s6 .9 6 2v7c0 1.1-2.5 2-6 2s-6-.9-6-2ZM3 9c0 1.1 2.5 2 6 2s6-.9 6-2' },
     ],
   },

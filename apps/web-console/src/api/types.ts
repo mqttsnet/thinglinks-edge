@@ -146,6 +146,96 @@ export interface ImageOption {
 
 export type CipherFlag = 0 | 1 | 2;
 
+/**
+ * ThingLinks 公有云的默认接入地址。
+ *
+ * Manager 侧另有一份同名常量（`core/cloud/config-repo.ts`），两处必须一致 ——
+ * 一处改了另一处没改，用户会照着界面提示填出一个后端报错的地址。
+ * 这里没有共享包可以放，所以只能靠这条注释盯着。
+ */
+export const DEFAULT_BROKER_HOST = 'broker.thinglinks.mqttsnet.com';
+export const DEFAULT_BROKER_URL = `mqtt://${DEFAULT_BROKER_HOST}:11883`;
+export const DEFAULT_BROKER_URL_TLS = `mqtts://${DEFAULT_BROKER_HOST}:11884`;
+
+/**
+ * 证书模式。
+ *
+ * `system` 走系统根证书（公网签发的证书用这个）；`ca` 是自签 CA；
+ * `mutual` 在自签 CA 之上再加客户端证书与私钥（双向认证）。
+ */
+export type TlsMode = 'system' | 'ca' | 'mutual';
+
+/** 证书摘要。后端不回 PEM 本身 —— 要判断「传对了没有」，看这几项比看 PEM 清楚 */
+export interface CertSummary {
+  subject: string;
+  issuer: string;
+  validFrom: string;
+  validTo: string;
+  /** SHA-256 指纹，与云平台那边对一眼就知道是不是同一张 */
+  fingerprint: string;
+  expired: boolean;
+}
+
+/**
+ * MQTT 协议版本。**不是** topic 首段那个 `v1`（那是 protocolVersion）。
+ * 数字取自 mqtt.js 的 protocolVersion：3 = MQTT 3.1，4 = 3.1.1，5 = 5.0。
+ */
+export type MqttVersion = 3 | 4 | 5;
+
+/** 连接参数。里面没有秘密，读写都是原样 */
+export interface ConnectionOptions {
+  mqttVersion: MqttVersion;
+  keepaliveSec: number;
+  connectTimeoutSec: number;
+  autoReconnect: boolean;
+  reconnectPeriodMs: number;
+}
+
+/**
+ * 服务器地址在界面上拆成四段，落库仍是一整条 `brokerUrl`。
+ *
+ * 为什么不把四段分别存起来：mqtt.js 要的就是一条 URL，拆开存就得在两处保持一致，
+ * 迟早出现「界面上是 8883、实际连的是 1883」这种对不上的状态。
+ * 界面拆是为了好填，存一份是为了不打架。
+ */
+export const BROKER_SCHEMES = ['mqtt://', 'mqtts://', 'ws://', 'wss://'] as const;
+export type BrokerScheme = (typeof BROKER_SCHEMES)[number];
+
+/**
+ * 换协议时顺手把端口带过去的**建议值**（ThingLinks 的约定端口）。
+ * 用户改过端口就不再自动改。这只是填表建议，不是协议默认端口。
+ */
+export const SCHEME_DEFAULT_PORT: Record<BrokerScheme, number> = {
+  'mqtt://': 11883,
+  'mqtts://': 11884,
+  'ws://': 8083,
+  'wss://': 8084,
+};
+
+/**
+ * 协议**真正的**默认端口。只用在一处：把一条没写端口的旧地址拆开时，
+ * 补的必须是它实际会连的那个端口。
+ *
+ * 拿上面那组建议值来补是错的 —— `mqtts://host` 实际连的是 8883，
+ * 补成 11884 再存回去，地址就被悄悄改掉了，而用户只是来改了个心跳。
+ */
+export const PROTOCOL_DEFAULT_PORT: Record<BrokerScheme, number> = {
+  'mqtt://': 1883,
+  'mqtts://': 8883,
+  'ws://': 80,
+  'wss://': 443,
+};
+
+/** 保存请求里的 TLS 部分。私钥与口令同一套语义：留 undefined 表示不改 */
+export interface TlsConfigInput {
+  mode?: TlsMode | undefined;
+  ca?: string | undefined;
+  cert?: string | undefined;
+  key?: string | undefined;
+  rejectUnauthorized?: boolean | undefined;
+  servername?: string | undefined;
+}
+
 /** 连接状态。`unconfigured`/`disabled` 是「没配」与「配了但关着」，不要混为 offline */
 export type CloudState = 'unconfigured' | 'disabled' | 'offline' | 'connecting' | 'online';
 
@@ -160,11 +250,26 @@ export interface CloudConfigView {
   deviceIdentification: string;
   username: string;
   cipherFlag: CipherFlag;
+  /** 连接参数。里面没有秘密，原样回传 */
+  connection: ConnectionOptions;
+  /** 证书部分。`ca`/`cert` 是摘要不是 PEM，没传过就是 null */
+  tls: {
+    mode: TlsMode;
+    rejectUnauthorized: boolean;
+    servername: string;
+    /** 地址本身是不是加密协议。界面据此决定要不要展开证书那一段 */
+    secure: boolean;
+    ca: CertSummary | null;
+    cert: CertSummary | null;
+  };
   protocolVersion: string;
   qos: 0 | 1 | 2;
   updatedAt: string;
   updatedBy: string;
-  secretsSet: { password: boolean; signKey: boolean; encryptKey: boolean; encryptVector: boolean };
+  secretsSet: {
+    password: boolean; signKey: boolean; encryptKey: boolean; encryptVector: boolean;
+    tlsKey: boolean;
+  };
 }
 
 export interface CloudStatus {
@@ -174,6 +279,13 @@ export interface CloudStatus {
   deviceIdentification: string;
   clientId: string;
   cipherFlag: number;
+  /** 链路是不是加密的。第一屏要能一眼看出来 */
+  secure: boolean;
+  tlsMode: TlsMode;
+  /** false 就是「只加密不认人」，界面必须标出来 */
+  rejectUnauthorized: boolean;
+  /** 实际以哪一版 MQTT 连上的 */
+  mqttVersion: MqttVersion;
   lastError: string;
   lastErrorAt: string | null;
   connectedAt: string | null;
@@ -195,6 +307,10 @@ export interface CloudConfigInput {
   signKey?: string | undefined;
   encryptKey?: string | undefined;
   encryptVector?: string | undefined;
+  /** 整块留 undefined 表示 TLS 设置一个字段都不改 */
+  tls?: TlsConfigInput | undefined;
+  /** 同上：整块或逐字段留空都表示不改 */
+  connection?: Partial<ConnectionOptions> | undefined;
   protocolVersion?: string | undefined;
   qos?: 0 | 1 | 2 | undefined;
 }
@@ -368,4 +484,110 @@ export interface ProbeResult {
   managed: false;
   /** 没探成的原因（无 flows.json、JSON 坏了）。有它就说明结果是空的，不是「真没设备」 */
   reason?: string;
+}
+
+// ── 远程诊断（T4.5）──────────────────────────────────────────
+
+export interface DnsResult {
+  host: string;
+  ok: boolean;
+  addresses: string[];
+  elapsedMs: number;
+  error?: string;
+}
+
+export interface TcpResult {
+  host: string;
+  port: number;
+  ok: boolean;
+  elapsedMs: number;
+  /** 实际连到的地址，双栈环境下用于确认走的是 v4 还是 v6 */
+  remoteAddress?: string;
+  error?: string;
+}
+
+export interface ClockResult {
+  localTime: string;
+  timezone: string;
+  uptimeSec: number;
+  /** 配了时钟源才有；正数表示本机比参考时间慢 */
+  offsetMs?: number;
+  roundtripMs?: number;
+  server?: string;
+  ok: boolean;
+  /** 没配时钟源时说明原因，而不是假装检查过 */
+  note: string;
+}
+
+/** 一次「解析 + 连通」的合并结论。解析没成功时 tcp 为 null —— 那时根本没去连 */
+export interface EndpointProbe {
+  target: string;
+  dns: DnsResult | null;
+  tcp: TcpResult | null;
+  summary: string;
+}
+
+export interface DiagProbeResponse {
+  probes: EndpointProbe[];
+  clock: ClockResult;
+  /** 后端附带的口径说明，原样展示 —— 「可达」不等于「可用」 */
+  note: string;
+}
+
+// ── 流程模板（T4.6）──────────────────────────────────────────
+
+/** 模板元信息。列表接口只回这些，**不含 flows** —— 一个模板可能几百 KB */
+export interface FlowTemplate {
+  id: string;
+  name: string;
+  description: string;
+  nodeCount: number;
+  /** 标签页数量，等于「几张流程图」 */
+  tabCount: number;
+  /** 去重后的节点类型 */
+  nodeTypes: string[];
+  /** 来源实例 id；从文件建的是 `upload` */
+  source: string;
+  /** 疑似写死在 function 节点里的凭据。**只告警不剥离** */
+  warnings: string[];
+  createdBy: string;
+  createdAt: string;
+}
+
+/** 套用前的兼容性结论 */
+export interface CompatResult {
+  /** 是否齐全。**必须连着 `checked` 一起看** —— 没查成时它也是 true */
+  ok: boolean;
+  /**
+   * 这次到底查没查成。取不到目标实例的节点清单时后端不阻断部署，
+   * 但那时的 `ok: true` 是默认值不是结论 —— 界面**不能**把它显示成
+   * 绿色的「节点齐全」，那是替一件没做过的事打包票。
+   */
+  checked: boolean;
+  /** 目标实例没装的节点类型。套上去它们会变成坏节点，且部署仍然返回成功 */
+  missing: string[];
+}
+
+/** 试算（dryRun）结果：只查不动 */
+export interface ApplyPreview {
+  dryRun: true;
+  nodeCount: number;
+  tabCount: number;
+  nodeTypes: string[];
+  compat: CompatResult;
+  warnings: string[];
+  note: string;
+}
+
+/** 真正套用之后的结果 */
+export interface ApplyResult {
+  applied: true;
+  deployStatus: number;
+  nodeCount: number;
+  tabCount: number;
+  nodeTypes: string[];
+  compat: CompatResult;
+  /** 被替换掉的旧流程节点数；取不到时为 null */
+  replacedNodeCount: number | null;
+  note: string;
 }

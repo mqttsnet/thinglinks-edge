@@ -12,7 +12,10 @@ import type {
   UserRecord, GrantRecord, MyPermissions, BackupInspect, Role, GrantLevel,
   FieldDeviceRecord, FieldTagRecord, FieldSummary, ProbeResult,
   EdgeMetrics, ReplayResult,
+  DiagProbeResponse,
+  FlowTemplate, ApplyPreview, ApplyResult,
 } from './types';
+import { filenameFrom } from './filename';
 
 /**
  * 控制台挂载前缀，由 Manager 在 index.html 里注入。
@@ -234,7 +237,108 @@ export const api = {
       throw new ApiError(res.status, message);
     }
     const disp = res.headers.get('content-disposition') ?? '';
-    const filename = /filename="([^"]+)"/.exec(disp)?.[1] ?? 'thinglinks-edge-backup.tar';
+    const filename = filenameFrom(disp, 'thinglinks-edge-backup.tar');
     return { blob: await res.blob(), filename };
   },
+
+  // ── 远程诊断（T4.5）────────────────────────────────────
+
+  /**
+   * 连通性与时钟探测。
+   *
+   * `targets` 留空时后端探当前配置的云 broker —— 现场十次里九次问的就是这个。
+   * 上限 8 个目标、超时上限 15 秒，都由后端裁剪，前端不必重复限制。
+   */
+  diagProbe: (targets: string[], timeoutMs = 5000) =>
+    request<DiagProbeResponse>('/api/diag/probe', {
+      method: 'POST', body: JSON.stringify({ targets, timeoutMs }),
+    }),
+
+  /**
+   * 导出诊断包。
+   *
+   * 与备份下载同理，**不能走 `request`**：它用 `res.text()` 读响应，
+   * 会把 tar 里的二进制按 UTF-8 解码而损坏，且下下来的包看着正常、解包才炸。
+   */
+  diagBundle: async (probeTargets: string[], logTail = 500): Promise<{ blob: Blob; filename: string }> => {
+    const res = await fetch(`${basePath}/api/diag/bundle`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-csrf-token': csrfToken() },
+      credentials: 'same-origin',
+      body: JSON.stringify({ probeTargets, logTail }),
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      let message = `导出失败（HTTP ${res.status}）`;
+      try {
+        const j = JSON.parse(text);
+        // 自检拒绝时后端会给 hint，那句才是能照做的部分
+        message = [j.error, j.hint].filter(Boolean).join(' ') || message;
+      } catch { /* 非 JSON 就用默认 */ }
+      throw new ApiError(res.status, message);
+    }
+    const disp = res.headers.get('content-disposition') ?? '';
+    const filename = filenameFrom(disp, 'thinglinks-edge-diag.tar');
+    return { blob: await res.blob(), filename };
+  },
+
+  // ── 流程模板（T4.6）────────────────────────────────────
+
+  templates: () => request<{ templates: FlowTemplate[] }>('/api/templates'),
+
+  /**
+   * 建模板。两种来源二选一：
+   *   · `instanceId` —— 从运行中的实例现导（要有那台实例的查看授权）
+   *   · `content`    —— 直接给流程 JSON（从文件读进来的）
+   */
+  createTemplate: (body: {
+    name: string; description?: string; instanceId?: string; content?: unknown;
+  }) => request<{ template: FlowTemplate }>('/api/templates', {
+    method: 'POST', body: JSON.stringify(body),
+  }),
+
+  renameTemplate: (id: string, name: string, description: string) =>
+    request<{ template: FlowTemplate }>(`/api/templates/${id}`, {
+      method: 'PATCH', body: JSON.stringify({ name, description }),
+    }),
+
+  deleteTemplate: (id: string) => request<void>(`/api/templates/${id}`, { method: 'DELETE' }),
+
+  /**
+   * 下载模板文件。
+   *
+   * 走原生 fetch 而非 `request`：`request` 会把响应当 JSON 解析成对象，
+   * 那样就拿不到原文了 —— 而模板文件要的正是**逐字节原样**的那份，
+   * 重新序列化会改掉缩进和键序，跟别处导出的文件对不上 diff。
+   */
+  downloadTemplate: async (id: string): Promise<{ blob: Blob; filename: string }> => {
+    const res = await fetch(`${basePath}/api/templates/${id}/download`, {
+      credentials: 'same-origin',
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      let message = `下载失败（HTTP ${res.status}）`;
+      try { message = String(JSON.parse(text).error) || message; } catch { /* 非 JSON 用默认 */ }
+      throw new ApiError(res.status, message);
+    }
+    const disp = res.headers.get('content-disposition') ?? '';
+    return { blob: await res.blob(), filename: filenameFrom(disp, 'flows.json') };
+  },
+
+  /**
+   * 套用模板到实例。
+   *
+   * `dryRun` 为 true 时只做兼容性检查**不动目标实例**；为 false 才真正
+   * **整体替换**它的全部流程。两个分支返回不同结构，故拆成两个方法，
+   * 免得调用方拿到联合类型还要自己收窄。
+   */
+  previewApply: (instanceId: string, templateId: string) =>
+    request<ApplyPreview>(`/api/instances/${instanceId}/flows`, {
+      method: 'POST', body: JSON.stringify({ templateId, dryRun: true }),
+    }),
+
+  applyTemplate: (instanceId: string, templateId: string) =>
+    request<ApplyResult>(`/api/instances/${instanceId}/flows`, {
+      method: 'POST', body: JSON.stringify({ templateId }),
+    }),
 };
