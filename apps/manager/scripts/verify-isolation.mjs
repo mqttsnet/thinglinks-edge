@@ -9,10 +9,10 @@
  */
 import bcrypt from 'bcryptjs';
 import Docker from 'dockerode';
-import { DockerClient } from '../dist/core/docker-client.js';
-import { renderSettings } from '../dist/core/settings-template.js';
+import { DockerClient } from '../dist/core/instance/docker-client.js';
+import { renderSettings } from '../dist/core/instance/settings-template.js';
 import { adminRootFor } from '../dist/core/config.js';
-import { containerName } from '../dist/core/container-spec.js';
+import { containerName } from '../dist/core/instance/container-spec.js';
 import { TEST_DATA_ROOT, ensureRoot, resetDataDir } from './_data-root.mjs';
 
 const A = 'iso-a';

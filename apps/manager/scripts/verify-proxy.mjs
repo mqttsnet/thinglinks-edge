@@ -13,14 +13,14 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { DockerClient } from '../dist/core/docker-client.js';
-import { renderSettings } from '../dist/core/settings-template.js';
+import { DockerClient } from '../dist/core/instance/docker-client.js';
+import { renderSettings } from '../dist/core/instance/settings-template.js';
 import { adminRootFor, authTokenKeyFor } from '../dist/core/config.js';
-import { containerName } from '../dist/core/container-spec.js';
+import { containerName } from '../dist/core/instance/container-spec.js';
 import { openDb } from '../dist/core/db.js';
-import { deriveKey } from '../dist/core/crypto.js';
-import { AuthService } from '../dist/core/auth.js';
-import { InstanceRepo } from '../dist/core/instance-repo.js';
+import { deriveKey } from '../dist/core/auth/crypto.js';
+import { AuthService } from '../dist/core/auth/service.js';
+import { InstanceRepo } from '../dist/core/instance/repo.js';
 import { buildServer } from '../dist/http/app.js';
 import { TEST_DATA_ROOT, ensureRoot, resetDataDir } from './_data-root.mjs';
 
@@ -122,8 +122,31 @@ async function main() {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ username: 'admin', password: ADMIN_PW }),
   });
-  const cookie = (login.headers.get('set-cookie') ?? '').split(',').map((c) => c.split(';')[0].trim()).join('; ');
-  check('管理面登录成功', login.status === 200 && cookie.includes('tle_sid'));
+  const jar = (res) => (res.headers.get('set-cookie') ?? '')
+    .split(',').map((c) => c.split(';')[0].trim()).join('; ');
+  const first = jar(login);
+  check('管理面登录成功', login.status === 200 && first.includes('tle_sid'));
+
+  /*
+   * 必须先改掉初始口令再往下走。
+   *
+   * 强制改密现在是**后端闸门**（guard 与反代都判），不再只由前端路由引导 ——
+   * 拿初始口令的会话调任何业务接口、开任何实例编辑器都会 403。
+   * 这段是补上「真实用户本来就要做的第一步」，不是为了绕过检查。
+   */
+  const csrf = /tle_csrf=([^;]+)/.exec(first)?.[1] ?? '';
+  await fetch(`${B}/api/change-password`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', cookie: first, 'x-csrf-token': csrf },
+    body: JSON.stringify({ oldPassword: ADMIN_PW, newPassword: 'proxy-verify-pass-1' }),
+  });
+  const relogin = await fetch(`${B}/api/login`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'admin', password: 'proxy-verify-pass-1' }),
+  });
+  const cookie = jar(relogin);
+  check('首次强制改密后可正常使用', relogin.status === 200 && cookie.includes('tle_sid'),
+        `HTTP ${relogin.status}`);
 
   // 3. 编辑器
   const editor = await fetch(`${B}/red/${ID}/`, { headers: { cookie } });
@@ -191,6 +214,32 @@ async function main() {
   // 12. 无 token 时实例自身拒绝（纵深防御）
   const bare = await fetch(`${B}/red/${ID}/flows`, { headers: { cookie } });
   check('无 token 调 admin API 被实例自身拒绝', bare.status === 401, `HTTP ${bare.status}（实例侧 adminAuth 生效）`);
+
+  // 13. 流程自己提供的路径必须带 CSP
+  /*
+   * 实例的 httpNodeRoot 是 `<adminRoot>api/`，与管理台**同源**。
+   * `http in` / Function 节点能在那里返回任意 HTML+JS，那段脚本带着管理员 Cookie，
+   * 还读得到双提交用的 CSRF Cookie —— 同源之内没有任何 Token 技巧挡得住。
+   *
+   * 所以给这一段加 CSP，把 connect-src 限死在实例自己的流程路径上：
+   * 流程页面照样能调自己的后端，但 fetch('/api/users') 会被浏览器拒掉。
+   */
+  const flowRes = await fetch(`${B}/red/${ID}/api/anything`, { headers: { cookie } });
+  const csp = flowRes.headers.get('content-security-policy') ?? '';
+  check('流程提供的路径带 CSP', csp !== '', csp.slice(0, 60) || '（没有）');
+  check('CSP 把 connect-src 限死在本实例流程路径',
+        csp.includes(`connect-src `) && csp.includes(`/red/${ID}/api/`) &&
+        !/connect-src[^;]*'self'/.test(csp),
+        csp.match(/connect-src[^;]*/)?.[0] ?? '（无 connect-src）');
+  check('CSP 同时封掉表单提交（否则 form POST 绕过 connect-src）',
+        /form-action\s+'none'/.test(csp), csp.includes('form-action') ? '有' : '没有');
+  check('流程路径禁止内容嗅探', flowRes.headers.get('x-content-type-options') === 'nosniff');
+
+  // 编辑器自身不加 CSP —— 那是平台自己的界面，加了会把它拆坏
+  const edRes = await fetch(`${B}/red/${ID}/`, { headers: { cookie } });
+  check('编辑器本身不受 CSP 影响',
+        !edRes.headers.get('content-security-policy'),
+        edRes.headers.get('content-security-policy') ?? '（无，符合预期）');
 
   await app.close();
   await cleanup();

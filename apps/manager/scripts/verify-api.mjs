@@ -10,15 +10,16 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { openDb } from '../dist/core/db.js';
-import { deriveKey } from '../dist/core/crypto.js';
-import { AuthService } from '../dist/core/auth.js';
-import { InstanceRepo } from '../dist/core/instance-repo.js';
-import { InstanceService } from '../dist/core/instance-service.js';
-import { DockerClient } from '../dist/core/docker-client.js';
+import { deriveKey } from '../dist/core/auth/crypto.js';
+import { AuthService } from '../dist/core/auth/service.js';
+import { InstanceRepo } from '../dist/core/instance/repo.js';
+import { InstanceService } from '../dist/core/instance/service.js';
+import { DockerClient } from '../dist/core/instance/docker-client.js';
 import { buildServer } from '../dist/http/app.js';
 import { Spool } from '../dist/core/spool/spool.js';
-import { containerName } from '../dist/core/container-spec.js';
+import { containerName } from '../dist/core/instance/container-spec.js';
 import { TEST_DATA_ROOT, ensureRoot, resetDataDir, dataDirExists, TEST_EDGE_ROOT } from './_data-root.mjs';
+import { adminSession } from './_session.mjs';
 
 const NET = 'tle-api-net';
 const PORT = 13202;
@@ -91,13 +92,9 @@ async function main() {
   const B = `http://127.0.0.1:${PORT}`;
 
   // 登录并取 CSRF 令牌
-  const login = await fetch(`${B}/api/login`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'admin', password: ADMIN_PW }),
-  });
-  const setCookies = login.headers.getSetCookie?.() ?? [];
-  const cookie = setCookies.map((c) => c.split(';')[0]).join('; ');
-  const csrf = /tle_csrf=([^;]+)/.exec(cookie)?.[1] ?? '';
+  const sess = await adminSession(B, ADMIN_PW);
+  const { cookie, csrf } = sess;
+  const login = { status: sess.status };
   check('登录并下发 CSRF 令牌', login.status === 200 && Boolean(csrf));
 
   const H = { cookie, 'content-type': 'application/json', 'x-csrf-token': csrf };
@@ -456,9 +453,38 @@ async function main() {
   check('补传内容一条不少（0,1,2 都回来了）',
         [0, 1, 2].every((n) => seqSeen.includes(n)), JSON.stringify(seqSeen));
 
+  /*
+   * 手动补传：控制台「立即补传」按钮走的就是这条。
+   *
+   * 上面那轮是**自动**补传（由一次成功发送带动），跑完缓存已空，
+   * 这时候调手动接口只会拿到 {sent:0,failed:0} —— 那验不出它到底会不会排空。
+   * 所以这里重新造一批积压，且**不再 ingest 新数据**（避免又触发自动补传），
+   * 让手动接口成为唯一的排空途径。
+   */
+  cloudBatches.length = 0;
+  cloudUp = false;
+  for (const seq of [201, 202]) {
+    await ingest('uplink', { serviceId: 'env', nodeId: 'plc-1', data: { seq } });
+    await sleep(260);
+  }
+  const mBefore = await (await fetch(`${B}/api/edge/metrics`, { headers: { cookie } })).json();
+  // 控制台的「立即补传」按钮正是靠 pending > 0 才从灰变亮
+  check('断网后重新攒出积压，pending 如实大于 0',
+        mBefore.spool?.pending === 2, `积压 ${mBefore.spool?.pending} 条`);
+
+  cloudUp = true;
   const manual = await fetch(`${B}/api/edge/replay`, { method: 'POST', headers: H });
-  check('手动补传接口可用（现场排障用）', manual.status === 200,
-        `HTTP ${manual.status} ${JSON.stringify(await manual.json())}`);
+  const manualBody = await manual.json();
+  check('手动补传把积压真的发出去了（不是只返回 200）',
+        manual.status === 200 && manualBody.sent === 2 && manualBody.failed === 0,
+        `HTTP ${manual.status} ${JSON.stringify(manualBody)}`);
+  check('手动补传后云端确实收到了那两条',
+        [201, 202].every((n) =>
+          cloudBatches.some((b) => b.devices?.[0]?.services?.[0]?.data?.seq === n)),
+        JSON.stringify(cloudBatches.map((b) => b.devices?.[0]?.services?.[0]?.data?.seq)));
+
+  const mAfter = await (await fetch(`${B}/api/edge/metrics`, { headers: { cookie } })).json();
+  check('手动补传后积压归零', mAfter.spool?.pending === 0, `剩 ${mAfter.spool?.pending} 条`);
 
     // ── 南向探测（T5.3，06 号文方案 A）──
   /*

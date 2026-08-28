@@ -19,6 +19,7 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { TEST_EDGE_ROOT, TEST_DATA_ROOT, ensureRoot, resetRoot, resetDataDir } from './_data-root.mjs';
+import { adminSession } from './_session.mjs';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const PROJECT = 'tle-compose-verify';
@@ -155,13 +156,10 @@ async function main() {
   const initialPw = /初始口令：(\S+)/.exec(compose('logs', 'manager'))?.[1];
   check('首次启动打印一次初始口令', Boolean(initialPw));
 
-  const login = await fetch(`${B}/api/login`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'admin', password: initialPw ?? ADMIN_PW }),
-  });
-  const cookie = (login.headers.getSetCookie?.() ?? []).map((c) => c.split(';')[0]).join('; ');
-  const csrf = /tle_csrf=([^;]+)/.exec(cookie)?.[1];
-  check('用打印的初始口令能登录', login.status === 200 && Boolean(csrf), `HTTP ${login.status}`);
+  // 强制改密是后端闸门，拿初始口令的会话调业务接口会 403，所以这里连改密一起走完
+  const sess = await adminSession(B, initialPw ?? ADMIN_PW);
+  const { cookie, csrf } = sess;
+  check('用打印的初始口令能登录并完成首次改密', sess.ok, `HTTP ${sess.status}`);
   const H = { cookie, 'x-csrf-token': csrf, 'content-type': 'application/json' };
 
   const created = await fetch(`${B}/api/instances`, {

@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { authTokenKeyFor } from '../dist/core/config.js';
 import { TEST_EDGE_ROOT, TEST_DATA_ROOT, ensureRoot, resetRoot, resetDataDir } from './_data-root.mjs';
+import { adminSession } from './_session.mjs';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const IMAGE = 'thinglinks-edge-manager:verify';
@@ -109,13 +110,9 @@ async function main() {
   check('容器内进程不是 root', whoami === 'node', `user=${whoami}`);
 
   // 登录
-  const login = await fetch(`${B}/api/login`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'admin', password: ADMIN_PW }),
-  });
-  const setCookie = login.headers.getSetCookie?.() ?? [];
-  const cookie = setCookie.map((c) => c.split(';')[0]).join('; ');
-  const csrf = /tle_csrf=([^;]+)/.exec(cookie)?.[1];
+  const sess = await adminSession(B, ADMIN_PW);
+  const { cookie, csrf } = sess;
+  const login = { status: sess.status };
   check('登录成功', login.status === 200 && Boolean(csrf), `HTTP ${login.status}`);
   const H = { cookie, 'x-csrf-token': csrf, 'content-type': 'application/json' };
 
@@ -264,7 +261,7 @@ async function main() {
         (bkRes.headers.get('content-type') ?? '').includes('x-tar') && bkBuf.length > 1024,
         `${bkBuf.length} 字节`);
 
-  const { readManifest } = await import('../dist/core/backup.js');
+  const { readManifest } = await import('../dist/core/archive/backup.js');
   const bkManifest = readManifest(bkBuf);
   check('备份清单含实例与 MASTER_KEY 指纹',
         bkManifest.instances.some((i) => i.id === ID) &&
@@ -284,8 +281,8 @@ async function main() {
       IMAGE, 'node', 'dist/index.js', 'restore', `${otherRoot}/backup.tar`]);
 
   const { openDb } = await import('../dist/core/db.js');
-  const { deriveKey } = await import('../dist/core/crypto.js');
-  const { InstanceRepo } = await import('../dist/core/instance-repo.js');
+  const { deriveKey } = await import('../dist/core/auth/crypto.js');
+  const { InstanceRepo } = await import('../dist/core/instance/repo.js');
   const restoredDb = openDb(`${otherRoot}/manager/edge.db`);
   const restoredRepo = new InstanceRepo(restoredDb, deriveKey('verify-master-key', 'thinglinks-edge:instance-cred'));
   check('异机恢复后实例记录回来了',

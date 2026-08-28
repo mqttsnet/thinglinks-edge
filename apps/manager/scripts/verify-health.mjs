@@ -11,15 +11,16 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { openDb } from '../dist/core/db.js';
-import { deriveKey } from '../dist/core/crypto.js';
-import { AuthService } from '../dist/core/auth.js';
-import { InstanceRepo } from '../dist/core/instance-repo.js';
-import { InstanceService } from '../dist/core/instance-service.js';
-import { DockerClient } from '../dist/core/docker-client.js';
+import { deriveKey } from '../dist/core/auth/crypto.js';
+import { AuthService } from '../dist/core/auth/service.js';
+import { InstanceRepo } from '../dist/core/instance/repo.js';
+import { InstanceService } from '../dist/core/instance/service.js';
+import { DockerClient } from '../dist/core/instance/docker-client.js';
 import { buildServer } from '../dist/http/app.js';
-import { MetricsHistory, MetricsSampler } from '../dist/core/metrics-history.js';
-import { containerName } from '../dist/core/container-spec.js';
+import { MetricsHistory, MetricsSampler } from '../dist/core/health/metrics-history.js';
+import { containerName } from '../dist/core/instance/container-spec.js';
 import { TEST_DATA_ROOT, ensureRoot, resetDataDir } from './_data-root.mjs';
+import { adminSession } from './_session.mjs';
 
 const ID = 'health-a';
 const NET = 'tle-health-net';
@@ -76,12 +77,9 @@ async function main() {
   await app.listen({ host: '127.0.0.1', port: PORT });
   const B = `http://127.0.0.1:${PORT}`;
 
-  const login = await fetch(`${B}/api/login`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'admin', password: PW }),
-  });
-  const cookie = (login.headers.getSetCookie?.() ?? []).map((c) => c.split(';')[0]).join('; ');
-  const csrf = /tle_csrf=([^;]+)/.exec(cookie)?.[1] ?? '';
+  const sess = await adminSession(B, PW);
+  const { cookie, csrf } = sess;
+  const login = { status: sess.status };
   const H = { cookie, 'content-type': 'application/json', 'x-csrf-token': csrf };
 
   await fetch(`${B}/api/instances`, {

@@ -16,12 +16,24 @@ docker volume ls -q --filter "name=tle-nr-" | sort > "$BEFORE_V"
 docker network ls -q --filter "label=com.mqttsnet.thinglinks-edge.managed=true" | sort > "$BEFORE_N"
 
 echo "── 单元测试 ──"
-pnpm test 2>&1 | grep -E "^# (tests|pass|fail)" | sed 's/^/  /'
+printf "  manager  "
+pnpm test 2>&1 | grep -E "^# (tests|pass|fail)" | tr '\n' ' ' | sed 's/# //g'
+echo ""
+# 控制台也有单测（时间戳按 UTC 解析、文件名 RFC 5987、broker 地址拼装 …）。
+# 这些逻辑一旦回归，界面上是「时间差 8 小时」「文件名成一串下划线」这类
+# 不报错的错，构建和类型检查一律看不出来 —— 所以必须跑在同一道闸门里。
+printf "  console  "
+pnpm --filter @thinglinks-edge/web-console test 2>&1 \
+  | grep -E "^# (tests|pass|fail)" | tr '\n' ' ' | sed 's/# //g'
+echo ""
 echo ""
 
 echo "── 类型与构建 ──"
-pnpm typecheck >/dev/null 2>&1 && echo "  typecheck ✓" || { echo "  typecheck ✗"; exit 1; }
-pnpm build >/dev/null 2>&1 && echo "  build ✓" || { echo "  build ✗"; exit 1; }
+pnpm typecheck >/dev/null 2>&1 && echo "  manager typecheck ✓" || { echo "  manager typecheck ✗"; exit 1; }
+pnpm build >/dev/null 2>&1 && echo "  manager build ✓" || { echo "  manager build ✗"; exit 1; }
+# 控制台构建即类型检查（build 脚本是 vue-tsc --noEmit && vite build）
+pnpm --filter @thinglinks-edge/web-console build >/dev/null 2>&1 \
+  && echo "  console 构建 ✓" || { echo "  console 构建 ✗"; exit 1; }
 echo ""
 
 echo "── 真容器验证 ──"
@@ -52,6 +64,9 @@ run "Manager 容器化 子路径" scripts/verify-container.mjs /nodered
 run "docker-compose 部署"  scripts/verify-compose.mjs
 run "虚拟网关 云边上下行"  scripts/verify-cloud-gateway.mjs
 run "云对接整条链路"      scripts/verify-cloud-link.mjs
+run "远程诊断导出"        scripts/verify-diag.mjs
+run "流程模板导入套用"    scripts/verify-template.mjs
+run "云对接 TLS 证书"      scripts/verify-cloud-tls.mjs
 
 echo ""
 echo "── 残留检查 ──"

@@ -5,7 +5,7 @@
  * 用法： node scripts/verify-container-guard.mjs
  */
 import Docker from 'dockerode';
-import { buildCreateOptions, assertSafeCreateOptions } from '../dist/core/container-spec.js';
+import { buildCreateOptions, assertSafeCreateOptions } from '../dist/core/instance/container-spec.js';
 import { TEST_DATA_ROOT, ensureRoot, resetDataDir } from './_data-root.mjs';
 
 const IMAGE = 'nodered/node-red:5.0.4-24-minimal';
