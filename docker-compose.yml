@@ -22,7 +22,9 @@ services:
   # found unknown escape character。行尾的 $$ 是防御写法 —— compose 只在 $ 后面
   # 跟标识符或 { 时才插值（实测 ^abc$FOO 到容器里会变成 ^abc），孤立的行尾 $ 本身安全。
   docker-proxy:
-    image: wollomatic/socket-proxy:1.13.1
+    # 参数化是为了两件事：离线包要把镜像改名后随包发（见 scripts/build-offline-bundle.sh），
+    # 以及现场把镜像同步到内网仓库时不必改这个文件
+    image: ${PROXY_IMAGE:-wollomatic/socket-proxy:1.13.1}
     container_name: ${EDGE_NAME_PREFIX:-thinglinks-edge}-docker-proxy
     restart: unless-stopped
     command:
@@ -68,7 +70,7 @@ services:
   # 且表现是「容器起来了但建实例失败」而不是明确的挂载错误。
   # 以 root 跑一次即退出，Manager 等它成功后再起。
   init-data:
-    image: alpine:3.22
+    image: ${INIT_IMAGE:-alpine:3.22}
     container_name: ${EDGE_NAME_PREFIX:-thinglinks-edge}-init-data
     user: "0:0"
     command: >
@@ -119,6 +121,24 @@ services:
       TZ: ${TZ:-Asia/Shanghai}
       # 升级检查。留空即完全不联网（默认）—— 见 .env.example 的说明
       UPDATE_CHECK_URL: ${UPDATE_CHECK_URL:-}
+      # 出网代理（03 号文 2.10）。只有企业代理能出网的现场才需要填；离线部署留空。
+      # NO_PROXY 里的内部条目由平台注入实例时自动补齐，这里填企业网管给的那份即可 ——
+      # 但宿主上手动跑的 curl / npm / docker 用的是这份，别漏了内网段
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      #
+      # NO_PROXY 的内部条目**必须在这里补**，不能只靠部署方填。
+      #
+      # Manager 自己的内部调用也走 Node 的 HTTP 客户端：连受限 docker 代理、
+      # 反代到实例、应用层探针，全是 HTTP。配了 HTTP_PROXY 而 NO_PROXY 没写这些名字，
+      # 它们会被一并送去企业代理 —— 实测表现是「创建实例失败：无法查询镜像…
+      # connect ECONNREFUSED 127.0.0.1:7890」，看起来完全像 docker 端点坏了。
+      #
+      # 固定条目写在前面、部署方那份接在后面：顺序不影响匹配，但这样
+      # NO_PROXY 为空时也不会出现前导逗号。
+      NO_PROXY: localhost,127.0.0.1,::1,${EDGE_NAME_PREFIX:-thinglinks-edge}-manager,${EDGE_NAME_PREFIX:-thinglinks-edge}-docker-proxy,tle-nr-,${INSTANCE_NETWORK:-thinglinks-edge},${NO_PROXY:-localhost}
+      # 企业内网网段，供自检比对 Docker 网段冲突（03 号文 2.9）
+      CORPORATE_CIDRS: ${CORPORATE_CIDRS:-}
       # 健康监测趋势曲线的采样间隔（秒）。0 关闭采样，界面会明说趋势未启用。
       # 历史只存内存：重启即清零，换来的是不去磨盒子的 SD 卡
       EDGE_METRICS_INTERVAL_SEC: ${EDGE_METRICS_INTERVAL_SEC:-10}

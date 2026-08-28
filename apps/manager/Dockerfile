@@ -84,7 +84,11 @@ RUN apk add --no-cache tzdata
 # 把库文件写到没有挂载的 /data —— 只读根文件系统下直接
 # `unable to open database file`，可写根文件系统下更糟：悄悄落进容器可写层，
 # 容器一删数据就没了，而且测试看不出来。
-ENV NODE_ENV=production \
+# 出网代理（03 号文 2.10）：Node 24 的内置开关，读 HTTP_PROXY/HTTPS_PROXY/NO_PROXY。
+# 常开是安全的 —— 没配那几个变量时它什么都不做，离线部署完全不受影响；
+# 而做成「按需开」就得在启动脚本里判断，反而多一处会配错的地方。
+ENV NODE_USE_ENV_PROXY=1 \
+    NODE_ENV=production \
     WEB_ROOT=/app/web \
     TLE_NODE_PACKAGE_DIR=/app/nodes \
     LISTEN_ADDR=0.0.0.0 \

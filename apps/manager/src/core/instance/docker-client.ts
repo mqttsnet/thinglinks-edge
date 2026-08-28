@@ -53,6 +53,11 @@ export interface DockerClientOptions {
    * 开发态 Manager 跑在宿主上时留空。
    */
   managerContainer?: string | undefined;
+  /**
+   * 注入实例容器的出网代理变量（03 号文 2.10）。
+   * 由 core/proxy.ts 生成 —— 其中 NO_PROXY 已补齐内部条目，不要自己拼。
+   */
+  proxyEnv?: readonly string[] | undefined;
 }
 
 export interface InstanceStatus {
@@ -199,6 +204,7 @@ export class DockerClient {
       imageRepo: this.opts.imageRepo,
       instanceDataRoot: this.opts.instanceDataRoot,
       timezone: this.opts.timezone,
+      proxyEnv: this.opts.proxyEnv ?? [],
     });
     assertSafeCreateOptions(options, { instanceDataRoot: this.opts.instanceDataRoot });
 

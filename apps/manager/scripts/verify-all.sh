@@ -52,6 +52,9 @@ run() {
 
 run "越权用例全拒"        scripts/verify-authz.mjs
 run "上线前安全验收"      scripts/verify-security.mjs
+run "安全基线 7 组对照"   scripts/verify-baseline.mjs
+run "企业代理出网"        scripts/verify-proxy-egress.mjs
+run "离线安装包"          scripts/verify-offline.mjs
 run "容器参数白名单"      scripts/verify-container-guard.mjs
 run "实例创建 根路径"      scripts/verify-instance.mjs
 run "实例创建 子路径"      scripts/verify-instance.mjs /nodered

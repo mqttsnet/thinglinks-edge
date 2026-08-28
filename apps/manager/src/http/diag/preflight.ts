@@ -32,6 +32,12 @@ export function registerPreflight(api: FastifyInstance, ctx: HttpContext): void 
       corporateCidrs: (process.env['CORPORATE_CIDRS'] ?? '')
         .split(',').map((c) => c.trim()).filter(Boolean),
       ntpServer: process.env['NTP_SERVER']?.trim() ?? '',
+      internalHosts: {
+        managerContainer: process.env['MANAGER_CONTAINER']?.trim() ?? '',
+        instancePrefix: 'tle-nr-',
+        network: process.env['INSTANCE_NETWORK'] ?? 'thinglinks-edge',
+      },
+      cloudConfigured: ctx.cloud?.configured === true,
       ...(raw ? { docker: adaptDocker(raw) } : {}),
       hostStats: () => readHostStats(config.dataDir),
     });

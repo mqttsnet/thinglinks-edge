@@ -20,6 +20,9 @@ import { OutageLog } from './core/cloud/outage.ts';
 import { runPreflight, renderReport, adaptDocker } from './core/preflight/run.ts';
 import { readHostStats } from './core/health/host-stats.ts';
 import { MetricsHistory, MetricsSampler } from './core/health/metrics-history.ts';
+import {
+  readProxySettings, proxyConfigured, proxyEnvFor, proxyHasCredentials, missingInternalNoProxy,
+} from './core/proxy.ts';
 import { recordAudit } from './core/db.ts';
 import { join } from 'node:path';
 import { readFile } from 'node:fs/promises';
@@ -227,15 +230,56 @@ export async function main(): Promise<void> {
 
   const connection = dockerConnection();
   const managerContainer = resolveManagerContainer();
+  /*
+   * 出网代理（03 号文 2.10）。Manager 自己出网由 NODE_USE_ENV_PROXY 接管（镜像里已开），
+   * 这里负责把变量透传给实例容器 —— 它们装第三方节点时要出网。
+   * NO_PROXY 由 proxyEnvFor 补齐内部条目，不能原样透传。
+   */
+  const proxy = readProxySettings();
+  const instanceNetwork = process.env['INSTANCE_NETWORK'] ?? 'thinglinks-edge';
+  const proxyEnv = proxyEnvFor(proxy, {
+    managerContainer: managerContainer ?? '',
+    instancePrefix: 'tle-nr-',
+    network: instanceNetwork,
+  });
+  if (proxyConfigured(proxy)) {
+    console.log(`[proxy] 出网走企业代理 ${proxy.httpProxy || proxy.httpsProxy}，已透传给实例容器`);
+    if (proxyHasCredentials(proxy.httpProxy) || proxyHasCredentials(proxy.httpsProxy)) {
+      // 说出来而不是替客户决定：带认证的代理在企业里很常见，
+      // 但口令会随环境变量落进实例容器与进程列表，部署方必须知情
+      console.warn('[proxy] 代理地址内嵌了账号口令，它会随环境变量进入实例容器与进程列表');
+    }
+    console.log('[proxy] 注意：云连接是 MQTT，不经 HTTP 代理，需要防火墙直接放行 broker 端口');
+    /*
+     * 自己的 NO_PROXY 漏了内部名字是**会把平台弄瘫**的配置错误：
+     * 连 docker 端点、反代实例、应用层探针都会被送去企业代理。
+     * 这时候只能大声报，改不了 —— 代理规则在进程启动时就定死了。
+     */
+    const missing = missingInternalNoProxy(proxy, {
+      managerContainer: managerContainer ?? '',
+      instancePrefix: 'tle-nr-',
+      network: instanceNetwork,
+    });
+    if (missing.length > 0) {
+      console.error(
+        `[proxy] ⚠ NO_PROXY 缺少内部条目：${missing.join('、')}。`
+        + '这会让 Manager 连 docker 端点、反代实例、探针请求全被送去企业代理，'
+        + '表现是「创建实例失败：无法查询镜像…ECONNREFUSED <代理地址>」。'
+        + '请在 compose 的 NO_PROXY 里补上后重启',
+      );
+    }
+  }
+
   const docker = new DockerClient({
     connection,
-    network: process.env['INSTANCE_NETWORK'] ?? 'thinglinks-edge',
+    network: instanceNetwork,
     imageRepo: process.env['NODE_RED_IMAGE_REPO'] ?? 'nodered/node-red',
     portRange: config.portRange,
     instanceDataRoot: config.instanceDataRoot,
     timezone: config.timezone,
     managerContainer: managerContainer,
     nodePackageDir: resolveNodePackageDir(),
+    proxyEnv,
     /*
      * 实例里的 @thinglinks 节点要回报台账，得能找到 Manager。
      * 靠容器名解析，因此只有 Manager 自己也是容器时才给得出地址 ——

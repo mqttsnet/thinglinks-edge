@@ -104,7 +104,14 @@ export const instanceDataDir = (root: string, id: string) => `${root}/${id}`;
 /** 由固定模板生成容器配置；用户输入只影响本文件允许的字段 */
 export function buildCreateOptions(
   spec: InstanceSpec,
-  opts: { network: string; imageRepo: string; instanceDataRoot: string; timezone: string },
+  opts: {
+    network: string; imageRepo: string; instanceDataRoot: string; timezone: string;
+    /**
+     * 出网代理环境变量（03 号文 2.10）。实例装第三方节点要出网，
+     * 而现场常常只有企业代理这一条路。留空表示不配 —— 离线部署即此形态。
+     */
+    proxyEnv?: readonly string[];
+  },
 ): Record<string, unknown> {
   const exposed: Record<string, Record<string, never>> = {};
   const bindings: Record<string, Array<{ HostIp: string; HostPort: string }>> = {};
@@ -129,6 +136,12 @@ export function buildCreateOptions(
       ...(spec.ingestToken && spec.managerUrl
         ? [`TLE_INGEST_TOKEN=${spec.ingestToken}`, `TLE_MANAGER_URL=${spec.managerUrl}`]
         : []),
+      /*
+       * 出网代理。NO_PROXY 由平台补齐过内部条目（见 core/proxy.ts）——
+       * 漏了容器名的话，实例回报台账、Manager 反代实例都会被绕去代理，
+       * 表现是 502 或探针不通，而代理日志里只有一串解析不了的主机名。
+       */
+      ...(opts.proxyEnv ?? []),
     ],
     Labels: {
       'com.mqttsnet.thinglinks-edge.managed': 'true',

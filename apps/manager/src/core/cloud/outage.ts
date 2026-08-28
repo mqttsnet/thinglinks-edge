@@ -140,12 +140,22 @@ export class OutageLog {
     this.#db.prepare('UPDATE cloud_outage SET peak_pending = ? WHERE id = ?').run(pending, cur.id);
   }
 
-  /** 累加计数。字段名受限于枚举，避免把列名拼进 SQL */
+  /**
+   * 累加计数。
+   *
+   * 三条语句写死，不把列名拼进 SQL —— 即使拼的值来自封闭枚举、当下注入不了。
+   * 「这一处是安全的拼接」是个会传染的例外：下一个人照着写，
+   * 而他那处的值可能来自请求。红线就该是「SQL 里没有变量拼接」，没有但书。
+   */
   bump(field: 'spooled' | 'replayed' | 'dropped', n = 1): void {
     const cur = this.open();
     if (!cur || n <= 0) return;
-    const col = { spooled: 'spooled', replayed: 'replayed', dropped: 'dropped' }[field];
-    this.#db.prepare(`UPDATE cloud_outage SET ${col} = ${col} + ? WHERE id = ?`).run(n, cur.id);
+    const SQL = {
+      spooled: 'UPDATE cloud_outage SET spooled = spooled + ? WHERE id = ?',
+      replayed: 'UPDATE cloud_outage SET replayed = replayed + ? WHERE id = ?',
+      dropped: 'UPDATE cloud_outage SET dropped = dropped + ? WHERE id = ?',
+    } as const;
+    this.#db.prepare(SQL[field]).run(n, cur.id);
   }
 
   /** 最近若干条，最新在前。控制台「最近断网记录」直接用它 */

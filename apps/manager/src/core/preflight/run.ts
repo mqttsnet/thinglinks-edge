@@ -1,7 +1,9 @@
 /**
  * 安装自检的编排与报告（T6.2）。
  *
- * 九项检查按 `03-复杂网络环境适配.md` 第 3 节的表格，**等级由规格定，不由这里判**。
+ * 十项检查按 `03-复杂网络环境适配.md` 第 3 节的表格，**等级由规格定，不由这里判**。
+ * 第十项「出网代理」补的是 2.10 —— 只有企业代理能出网的现场，
+ * 装完才发现不通的代价最高，必须在装之前查。
  *
  * 两条编排原则：
  *
@@ -14,6 +16,8 @@ import { checkDockerAvailable, checkArchMatch, checkCgroupMemory, checkNetworkCo
   from './docker.ts';
 import { checkPorts, checkDisk, checkClock } from './host.ts';
 import { checkExternalUrl, checkCertificate } from './endpoint.ts';
+import { checkProxy } from './proxy.ts';
+import { readProxySettings, type ProxySettings } from '../proxy.ts';
 import { skip, summarize, type CheckResult, type PreflightReport } from './types.ts';
 
 export interface PreflightInput {
@@ -27,6 +31,12 @@ export interface PreflightInput {
   /** 企业内网网段，用于网段冲突比对；留空则该项跳过 */
   corporateCidrs: readonly string[];
   ntpServer: string;
+  /** 出网代理设置；不传则现读环境变量 */
+  proxy?: ProxySettings;
+  /** 平台必须绕过代理的内部目标 */
+  internalHosts?: { managerContainer: string; instancePrefix: string; network: string };
+  /** 云连接是否已配置 —— 配了才提醒「MQTT 不走 HTTP 代理」 */
+  cloudConfigured?: boolean;
   /** dockerode 实例；连不上时传 undefined，相关项会如实跳过 */
   docker?: {
     version(): Promise<Record<string, unknown>>;
@@ -112,6 +122,14 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
     () => checkExternalUrl(input.externalUrl, t)));
   checks.push(...await attempt('endpoint.certificate', '证书有效性与有效期',
     () => checkCertificate(input.externalUrl, t)));
+  checks.push(...await attempt('network.proxy', '出网代理可用性',
+    () => checkProxy({
+      proxy: input.proxy ?? readProxySettings(),
+      internal: input.internalHosts
+        ?? { managerContainer: '', instancePrefix: 'tle-nr-', network: 'thinglinks-edge' },
+      cloudConfigured: input.cloudConfigured ?? false,
+      timeoutMs: t,
+    })));
 
   return summarize(checks);
 }
