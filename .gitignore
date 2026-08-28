@@ -2,6 +2,10 @@ node_modules/
 dist/
 *.log
 
+# TypeScript 增量编译缓存。跟 dist 一样是构建产物，
+# 但它不在 dist/ 目录下，单独忽略容易漏
+*.tsbuildinfo
+
 # 本地数据与凭据 —— 永不提交
 data/
 *.db
@@ -12,10 +16,24 @@ data/
 .env.*
 !.env.example
 
-# 编辑器
+# 运行期产出的归档：备份包、诊断包、安装自检报告。
+# 这三样都可能含现场拓扑与日志，即便脱敏过也不该进版本库
+*.tar
+thinglinks-edge-backup-*/
+thinglinks-edge-diag-*.tar
+preflight-report*.json
+
+# AI 协作与任务过程文档。
+# 需求与交接文档另有归口（仓库外的需求目录），不放代码仓 ——
+# 它们随会话高频变动，混进来会把真正的代码改动淹掉
+tasks/
+.claude
+CLAUDE.md
+*.scratch.*
+scratchpad/
+
+# 编辑器与系统
 .idea/
 .vscode/
 .DS_Store
-
-
-.claude
+*.swp
