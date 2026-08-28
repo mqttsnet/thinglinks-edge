@@ -51,6 +51,7 @@ run() {
 }
 
 run "越权用例全拒"        scripts/verify-authz.mjs
+run "上线前安全验收"      scripts/verify-security.mjs
 run "容器参数白名单"      scripts/verify-container-guard.mjs
 run "实例创建 根路径"      scripts/verify-instance.mjs
 run "实例创建 子路径"      scripts/verify-instance.mjs /nodered
@@ -67,6 +68,7 @@ run "云对接整条链路"      scripts/verify-cloud-link.mjs
 run "远程诊断导出"        scripts/verify-diag.mjs
 run "流程模板导入套用"    scripts/verify-template.mjs
 run "云对接 TLS 证书"      scripts/verify-cloud-tls.mjs
+run "首次设置"            scripts/verify-setup.mjs
 run "系统设置与两步验证"  scripts/verify-2fa.mjs
 
 echo ""
