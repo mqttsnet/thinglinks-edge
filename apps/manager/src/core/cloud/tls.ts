@@ -204,15 +204,20 @@ function assertPrivateKey(rawKey: string, certPem: string): void {
 /**
  * 校验并规范化一份 TLS 配置。
  *
- * `prev` 是库里已有的材料：私钥留空表示不改，所以校验「证书与私钥配不配对」时
- * 要拿合并后的值去比，不是拿这次提交的值。
+ * `prev` 是库里已有的那一份，**每个字段**都是「没传就不改」——
+ * 包括 mode 本身。这条一致性很要紧：只要有一个字段的缺省是「回到默认」，
+ * 一个只想改 QoS 的请求就能把现场的证书悄悄清掉、把链路降级成系统根证书校验，
+ * 而界面上什么都不会说。新建配置时 `prev` 是 `DEFAULT_TLS`，于是缺省即 system + 严格校验。
+ *
+ * 「证书与私钥配不配对」要拿**合并后**的值去比，不是这次提交的值 ——
+ * 只换证书不换私钥的改法同样要被检出来。
  */
 export function normalizeTls(
   input: TlsConfigInput,
   brokerUrl: string,
-  prev: Pick<TlsConfig, 'ca' | 'cert' | 'key'> = { ca: '', cert: '', key: '' },
+  prev: TlsConfig = DEFAULT_TLS,
 ): TlsConfig {
-  const mode = input.mode ?? 'system';
+  const mode = input.mode ?? prev.mode;
   if (!MODES.has(mode)) {
     throw new TlsConfigError(`证书模式只能是 system / ca / mutual，收到：${String(mode)}`);
   }
@@ -230,8 +235,8 @@ export function normalizeTls(
   const cert = normalizePem(input.cert ?? prev.cert);
   const key = normalizePem(input.key ?? prev.key);
 
-  const rejectUnauthorized = input.rejectUnauthorized ?? true;
-  const servername = (input.servername ?? '').trim();
+  const rejectUnauthorized = input.rejectUnauthorized ?? prev.rejectUnauthorized;
+  const servername = (input.servername ?? prev.servername).trim();
   if (servername !== '' && !/^[A-Za-z0-9][A-Za-z0-9.-]{0,252}[A-Za-z0-9]$/.test(servername)) {
     throw new TlsConfigError(`SNI 主机名不合法：${servername}（只能是域名，不带协议、端口和路径）`);
   }

@@ -32,13 +32,39 @@ export interface BatchLimits {
   windowMs: number;
   maxPoints: number;
   maxBytes: number;
+  /**
+   * 已发出但还没完成的批次上限（发送是串行的，超出的都在排队）。
+   *
+   * 没有这条上限时，云端**慢**（不是断——断了会立刻抛错落缓存，而是 TCP 卡住不回）
+   * 会让批次在内存里无限排队：每一批最多 256KB，一个实例狂灌点位就能把
+   * 共享的 Manager 内存吃穿，连带拖垮同机其它实例。
+   */
+  maxQueuedBatches: number;
+  /** 排队批次的字节上限，与条数上限谁先到算谁 */
+  maxQueuedBytes: number;
 }
 
 export const DEFAULT_LIMITS: BatchLimits = {
   windowMs: 200,
   maxPoints: 500,
   maxBytes: 256 * 1024,
+  // 8 批 × 256KB ≈ 2MB 上限：够扛住一次网络抖动，又不至于把小盒子撑爆
+  maxQueuedBatches: 8,
+  maxQueuedBytes: 2 * 1024 * 1024,
 };
+
+/**
+ * 队列满时 `add` 抛这个。
+ *
+ * 单独一个类型是为了让调用方能把它和「数据不合法」区分开：
+ * 前者该回 503 让上游**稍后再来**，后者是 400 永远别再来了。
+ */
+export class BatchOverflowError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'BatchOverflowError';
+  }
+}
 
 export interface MicroBatcherOptions {
   limits?: Partial<BatchLimits>;
@@ -91,6 +117,10 @@ export class MicroBatcher {
   #timer: unknown;
   /** 串行发送，避免乱序与并发压垮云端 */
   #chain: Promise<void> = Promise.resolve();
+  /** 已排队待发的批次数与字节数 —— 队列的水位，满了就拒收 */
+  #queued = 0;
+  #queuedBytes = 0;
+  #rejected = 0;
   #closed = false;
 
   constructor(options: MicroBatcherOptions) {
@@ -100,6 +130,20 @@ export class MicroBatcher {
 
   get pending(): number { return this.#buf.length; }
   get pendingBytes(): number { return this.#bytes; }
+  /** 排队中的批次数（含正在发的那一批） */
+  get queued(): number { return this.#queued; }
+  get queuedBytes(): number { return this.#queuedBytes; }
+  /** 被拒收的点位累计数。看板上要看得见，否则「数据少了」查不出原因 */
+  get rejected(): number { return this.#rejected; }
+
+  /**
+   * 队列是否已满。调用方应当在收下一批数据**之前**问一次，
+   * 好回一个明确的「稍后再来」，而不是等 add 抛错抛到一半。
+   */
+  get saturated(): boolean {
+    return this.#queued >= this.limits.maxQueuedBatches
+      || this.#queuedBytes >= this.limits.maxQueuedBytes;
+  }
 
   /**
    * 入队一个点位。
@@ -109,6 +153,19 @@ export class MicroBatcher {
    */
   add(point: UplinkPoint): void {
     if (this.#closed) throw new Error('批处理器已关闭');
+    /*
+     * 满了就**拒收并计数**，不排队也不静默丢。
+     *
+     * 静默丢是最糟的选项：现场看到的是「数据少了几段」，而系统一切正常。
+     * 拒收让上游立刻知道发不进去，它可以自己缓存或降采样；
+     * 计数则让看板上能看见到底丢了多少。
+     */
+    if (this.saturated) {
+      this.#rejected += 1;
+      throw new BatchOverflowError(
+        `上行队列已满（${this.#queued} 批 / ${this.#queuedBytes} 字节），云端发送跟不上`,
+      );
+    }
     this.#buf.push(point);
     this.#bytes += Buffer.byteLength(JSON.stringify(point), 'utf8');
 
@@ -130,14 +187,21 @@ export class MicroBatcher {
     if (this.#buf.length === 0) return this.#chain;
 
     const points = this.#buf;
+    const bytes = this.#bytes;
     this.#buf = [];
     this.#bytes = 0;
 
+    this.#queued += 1;
+    this.#queuedBytes += bytes;
     this.#chain = this.#chain.then(async () => {
       try {
         await this.#o.flush(groupPoints(points), points);
       } catch (e) {
         this.#o.onFlushError?.(e as Error, points);
+      } finally {
+        // 水位必须在 finally 里退，否则 flush 抛错就再也降不下来，队列永久假满
+        this.#queued -= 1;
+        this.#queuedBytes -= bytes;
       }
     });
     return this.#chain;

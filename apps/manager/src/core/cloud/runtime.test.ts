@@ -10,6 +10,8 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { CloudRuntime } from './runtime.ts';
 import type { CloudConfig } from './config-repo.ts';
+import { DEFAULT_TLS } from './tls.ts';
+import { DEFAULT_CONNECTION } from './connection.ts';
 
 /** 最小可用的假 mqtt 客户端。连接时机由测试显式驱动，不靠 sleep */
 class FakeClient extends EventEmitter {
@@ -37,14 +39,10 @@ const config = (over: Partial<CloudConfig> = {}): CloudConfig => ({
   username: 'u',
   password: 'p',
   cipher: { cipherFlag: 0, signKey: 'sign-key-abc' },
-  tls: {
-    mode: 'system',
-    ca: '',
-    cert: '',
-    key: '',
-    rejectUnauthorized: true,
-    servername: '',
-  },
+  // 用导出的默认值而不是就地抄一份：抄的那份会随类型新增字段悄悄过期，
+  // 而测试不参与类型检查，过期了只会在运行时炸成一句 undefined
+  tls: { ...DEFAULT_TLS },
+  connection: { ...DEFAULT_CONNECTION },
   protocolVersion: 'v1',
   qos: 1,
   updatedAt: '2026-08-27 00:00:00',

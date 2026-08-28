@@ -17,6 +17,7 @@ import {
   fetchModel, type ModelQueryRequest, type ModelQueryResponse, type ProductModel,
 } from './model-client.ts';
 import { tlsConnectOptions, DEFAULT_TLS, type TlsConfig } from './tls.ts';
+import { connectionOptions, DEFAULT_CONNECTION, type ConnectionOptions } from './connection.ts';
 import {
   buildAddPayload, buildUpdatePayload, buildDeletePayload, chunk, summarizeAddResult,
   DEFAULT_BATCH_SIZE, TopoError,
@@ -43,12 +44,18 @@ export interface GatewayOptions {
    * 不在这里再判一次 —— 同一条规则两处实现必然漂移。
    */
   tls?: TlsConfig;
-  /** topic 首段的协议版本，当前 `v1` */
+  /**
+   * MQTT 连接参数（版本、心跳、超时、重连）。缺省即 `DEFAULT_CONNECTION`，
+   * 也就是这几项还写死在这里时用的那一组值。
+   */
+  connection?: ConnectionOptions;
+  /** topic 首段的协议版本，当前 `v1`。**不是** MQTT 版本，别和 connection.mqttVersion 混 */
   protocolVersion?: string;
   /** 上行 QoS，默认 1。云侧不做去重，QoS2 的代价通常不值得 */
   qos?: 0 | 1 | 2;
-  /** 重连间隔上限，毫秒 */
+  /** 重连间隔上限，毫秒。仅测试注入用；正常路径走 connection.reconnectPeriodMs */
   reconnectPeriodMs?: number;
+  /** 同上，仅测试注入用 */
   connectTimeoutMs?: number;
   /** 请求-响应等待上限，默认 15 秒 */
   requestTimeoutMs?: number;
@@ -127,12 +134,15 @@ export class CloudGateway {
       username: credentials.username,
       password: credentials.password,
       // 干净会话：离线期间的补发由我们自己的 spool 负责，不依赖 broker 的会话保持 ——
-      // 会话队列有上限且不可控，断网一小时那种场景靠它兜不住
+      // 会话队列有上限且不可控，断网一小时那种场景靠它兜不住。
+      // 这一条**不做成可配**：打开会话保持等于同时开了两套续传，同一条数据发两遍
       clean: true,
-      protocolVersion: 5,
-      reconnectPeriod: this.#o.reconnectPeriodMs ?? 5_000,
-      connectTimeout: this.#o.connectTimeoutMs ?? 15_000,
       resubscribe: true,
+      // 版本 / 心跳 / 超时 / 重连，全部来自落库的连接参数
+      ...connectionOptions(this.#o.connection ?? DEFAULT_CONNECTION),
+      // 测试注入优先级最高，覆盖上面那两项
+      ...(this.#o.reconnectPeriodMs === undefined ? {} : { reconnectPeriod: this.#o.reconnectPeriodMs }),
+      ...(this.#o.connectTimeoutMs === undefined ? {} : { connectTimeout: this.#o.connectTimeoutMs }),
       // ca/cert/key/rejectUnauthorized/servername 原样交给 node:tls。
       // 明文地址下这里是空对象，一个 TLS 字段都不会塞进去
       ...tlsConnectOptions(this.#o.tls ?? DEFAULT_TLS, brokerUrl),

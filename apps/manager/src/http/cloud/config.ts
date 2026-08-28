@@ -10,10 +10,12 @@
  *      每轮重启会把正在跑的实例一并带断。
  */
 import type { FastifyInstance } from 'fastify';
-import { recordAudit } from '../core/db.ts';
-import { CloudConfigError, type CloudConfigInput } from '../core/cloud/config-repo.ts';
-import type { HttpContext } from './context.ts';
-import type { CipherFlag } from '../core/cloud/envelope.ts';
+import { recordAudit } from '../../core/db.ts';
+import { CloudConfigError, type CloudConfigInput } from '../../core/cloud/config-repo.ts';
+import type { HttpContext } from '../context.ts';
+import type { CipherFlag } from '../../core/cloud/envelope.ts';
+import type { TlsConfigInput, TlsMode } from '../../core/cloud/tls.ts';
+import type { ConnectionOptions } from '../../core/cloud/connection.ts';
 
 /** 请求体里可能缺字段，逐个取而不是整体断言，缺什么就报什么 */
 function readInput(body: unknown): CloudConfigInput {
@@ -34,6 +36,64 @@ function readInput(body: unknown): CloudConfigInput {
   const cipherFlag = Number(b['cipherFlag'] ?? 0);
   const qosRaw = b['qos'];
 
+  /*
+   * TLS 整块缺省 = 沿用库里已有的设置。
+   *
+   * 刻意不是「缺省即 system」：那样一来，任何一个不认识 tls 字段的老客户端
+   * 存一次配置，就会把现场的证书悄悄清空、把链路降级成系统根证书校验。
+   * 要改证书就得显式传 tls。
+   */
+  const tlsRaw = b['tls'];
+  let tls: TlsConfigInput | undefined;
+  if (tlsRaw !== undefined && tlsRaw !== null) {
+    if (typeof tlsRaw !== 'object') throw new CloudConfigError('字段类型不对：tls');
+    const t = tlsRaw as Record<string, unknown>;
+    const text = (k: string): string | undefined => {
+      const v = t[k];
+      if (v === undefined || v === null) return undefined;
+      if (typeof v !== 'string') throw new CloudConfigError(`字段类型不对：tls.${k}`);
+      return v;
+    };
+    tls = {
+      mode: t['mode'] === undefined ? undefined : (String(t['mode']) as TlsMode),
+      ca: text('ca'),
+      cert: text('cert'),
+      // 私钥与口令同一套语义：undefined 表示不改，空串才是清空
+      key: text('key'),
+      rejectUnauthorized: t['rejectUnauthorized'] === undefined
+        ? undefined : t['rejectUnauthorized'] !== false,
+      servername: text('servername'),
+    };
+  }
+
+  /*
+   * 连接参数同样是「整块不传 = 一个字段都不改」。
+   *
+   * 逐个字段取而不是整体断言：漏一个字段就沿用旧值，而不是被 NaN 顶掉 ——
+   * `Number(undefined)` 是 NaN，直接塞进去会让校验报一句「收到 NaN」，
+   * 看的人根本对不上是哪个字段没填。
+   */
+  const connRaw = b['connection'];
+  let connection: Partial<ConnectionOptions> | undefined;
+  if (connRaw !== undefined && connRaw !== null) {
+    if (typeof connRaw !== 'object') throw new CloudConfigError('字段类型不对：connection');
+    const c = connRaw as Record<string, unknown>;
+    const num = (k: string): number | undefined => {
+      const v = c[k];
+      if (v === undefined || v === null || v === '') return undefined;
+      const n = Number(v);
+      if (!Number.isFinite(n)) throw new CloudConfigError(`字段类型不对：connection.${k}`);
+      return n;
+    };
+    connection = {
+      ...(num('mqttVersion') === undefined ? {} : { mqttVersion: num('mqttVersion') as 3 | 4 | 5 }),
+      ...(num('keepaliveSec') === undefined ? {} : { keepaliveSec: num('keepaliveSec')! }),
+      ...(num('connectTimeoutSec') === undefined ? {} : { connectTimeoutSec: num('connectTimeoutSec')! }),
+      ...(c['autoReconnect'] === undefined ? {} : { autoReconnect: c['autoReconnect'] !== false }),
+      ...(num('reconnectPeriodMs') === undefined ? {} : { reconnectPeriodMs: num('reconnectPeriodMs')! }),
+    };
+  }
+
   return {
     enabled: b['enabled'] !== false,
     brokerUrl: str('brokerUrl'),
@@ -45,6 +105,8 @@ function readInput(body: unknown): CloudConfigInput {
     signKey: secret('signKey'),
     encryptKey: secret('encryptKey'),
     encryptVector: secret('encryptVector'),
+    tls,
+    connection,
     protocolVersion: typeof b['protocolVersion'] === 'string' ? b['protocolVersion'] : undefined,
     qos: qosRaw === undefined ? undefined : (Number(qosRaw) as 0 | 1 | 2),
   };
@@ -102,7 +164,10 @@ export function registerCloud(api: FastifyInstance, ctx: HttpContext): void {
     recordAudit(db, {
       actor: user.username, action: 'cloud-config', target: saved.brokerUrl,
       detail: `enabled=${saved.enabled} device=${saved.deviceIdentification} ` +
-        `cipherFlag=${saved.cipher.cipherFlag} → ${state}`,
+        `cipherFlag=${saved.cipher.cipherFlag} mqtt=${saved.connection.mqttVersion} ` +
+        `tls=${saved.tls.mode}` +
+        // 关掉证书校验是一次安全降级，审计里必须留下痕迹，而不是只在界面上闪一下
+        `${saved.tls.rejectUnauthorized ? '' : '(已关闭证书校验)'} → ${state}`,
       result: 'ok',
     });
 

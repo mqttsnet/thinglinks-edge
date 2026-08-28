@@ -11,24 +11,25 @@
  * 而「参数存了却没被 apply」这种错，假 broker 一样收得到消息。
  */
 import mqtt from 'mqtt';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { openDb } from '../dist/core/db.js';
-import { deriveKey } from '../dist/core/crypto.js';
-import { AuthService } from '../dist/core/auth.js';
-import { InstanceRepo } from '../dist/core/instance-repo.js';
-import { InstanceService } from '../dist/core/instance-service.js';
-import { DockerClient } from '../dist/core/docker-client.js';
+import { deriveKey } from '../dist/core/auth/crypto.js';
+import { AuthService } from '../dist/core/auth/service.js';
+import { InstanceRepo } from '../dist/core/instance/repo.js';
+import { InstanceService } from '../dist/core/instance/service.js';
+import { DockerClient } from '../dist/core/instance/docker-client.js';
 import { buildServer } from '../dist/http/app.js';
 import { Spool } from '../dist/core/spool/spool.js';
 import { CloudConfigRepo } from '../dist/core/cloud/config-repo.js';
 import { CloudRuntime } from '../dist/core/cloud/runtime.js';
 import { dataSignOf, parseEnvelopeFull } from '../dist/core/cloud/envelope.js';
-import { UserRepo } from '../dist/core/user-repo.js';
+import { UserRepo } from '../dist/core/auth/user-repo.js';
 import { TEST_DATA_ROOT, TEST_EDGE_ROOT, ensureRoot } from './_data-root.mjs';
+import { adminSession, sessionFor } from './_session.mjs';
 
 const IMAGE = 'eclipse-mosquitto:2.1.2-alpine';
 const NAME = 'tle-cloudlink-mqtt';
@@ -69,8 +70,11 @@ function startBroker() {
     `mosquitto_passwd -c -b /tmp/pw ${MQTT_USER} ${MQTT_PASS} >/dev/null 2>&1 && cat /tmp/pw`]);
   writeFileSync(join(dir, 'passwd'), hashed);
   // allow_anonymous false：凭据没真的发出去就连不上，后面那些断言才有意义
+  // log_type all：下面要从连接日志里读出协议版本与心跳（`(p5, c1, k60)`），
+  // 那是唯一能证明这两项真的上了线的地方 —— 客户端侧怎么打印都只是自说自话
   writeFileSync(join(dir, 'mosquitto.conf'),
-    'listener 1883\nallow_anonymous false\npassword_file /mosquitto/config/passwd\n');
+    'listener 1883\nallow_anonymous false\npassword_file /mosquitto/config/passwd\n'
+    + 'log_type all\n');
   sh(['run', '-d', '--name', NAME, '-p', `127.0.0.1:${MQTT_PORT}:1883`,
       '-v', `${dir}/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro`,
       '-v', `${dir}/passwd:/mosquitto/config/passwd:ro`, IMAGE]);
@@ -144,15 +148,8 @@ async function main() {
   await app.listen({ host: '127.0.0.1', port: HTTP_PORT });
   const B = `http://127.0.0.1:${HTTP_PORT}`;
 
-  const loginAs = async (username, password) => {
-    const r = await fetch(`${B}/api/login`, {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ username, password }),
-    });
-    const cookie = (r.headers.getSetCookie?.() ?? []).map((c) => c.split(';')[0]).join('; ');
-    return { cookie, csrf: /tle_csrf=([^;]+)/.exec(cookie)?.[1] ?? '' };
-  };
-  const admin = await loginAs('admin', ADMIN_PW);
+  // 先改掉初始口令：强制改密是后端闸门，不改的话后面每条业务接口都会 403
+  const admin = await adminSession(B, ADMIN_PW);
   const H = { cookie: admin.cookie, 'content-type': 'application/json', 'x-csrf-token': admin.csrf };
   check('管理员登录成功', Boolean(admin.csrf));
 
@@ -243,6 +240,58 @@ async function main() {
     check('第三方用同一套密钥能解出原始点位', flat.includes('21.5') && flat.includes('63'));
   }
 
+  // ── 5.5 连接参数真的上了线（版本 / 心跳）─────────────
+  /*
+   * 从 mosquitto 的连接日志里读，而不是信我们自己打印的配置：
+   * `New client connected from … as <id> (p5, c1, k60, u'edge-user')`
+   *   p = MQTT 协议级别，直接就是 3/4/5（实测 mosquitto 2.1.2 打的是级别本身，
+   *   不是老版本那个 p1/p2 的编号）· c1 = clean session · k60 = 心跳 60 秒
+   * 「参数存了却没被 apply」这种错，只有对面记下来的东西能戳穿。
+   */
+  const connLine = (clientId) => {
+    // mosquitto 把日志写到 **stderr**，而 execFileSync 只带回 stdout ——
+    // 用 sh() 拿到的会是空字符串，且不报错。两个流都收才看得到东西
+    const r = spawnSync('docker', ['logs', NAME], { encoding: 'utf8' });
+    const log = `${r.stdout ?? ''}${r.stderr ?? ''}`;
+    const lines = log.split('\n').filter((l) => l.includes('New client connected')
+      && l.includes(`as ${clientId}`));
+    return lines[lines.length - 1] ?? '';
+  };
+
+  const defaultLine = connLine(CLIENT_ID);
+  check('默认以 MQTT 5.0 连上，心跳 60 秒（与可配之前写死的值一致）',
+        /\(p5, c1, k60/.test(defaultLine), defaultLine.slice(-46) || '(日志里没找到连接行)');
+
+  // 换成 3.1.1 + 心跳 30：只传 connection，其余字段一个都不带
+  const switched = await put({ ...base, connection: { mqttVersion: 4, keepaliveSec: 30 } });
+  const switchedBody = await switched.json();
+  check('切到 MQTT 3.1.1 + 心跳 30 后仍能连上',
+        switchedBody.status.state === 'online', `state=${switchedBody.status.state}`);
+  await waitFor(() => /\(p4, c1, k30/.test(connLine(CLIENT_ID)), 8000);
+  check('broker 记下的就是 3.1.1 与 30 秒 —— 参数真的到了线上',
+        /\(p4, c1, k30/.test(connLine(CLIENT_ID)), connLine(CLIENT_ID).slice(-46));
+
+  check('掩码版本回传的连接参数与提交的一致',
+        switchedBody.config.connection.mqttVersion === 4
+        && switchedBody.config.connection.keepaliveSec === 30,
+        JSON.stringify(switchedBody.config.connection));
+
+  // 只改 QoS，不带 connection：上面换过的版本与心跳都不该被退回默认
+  const qosOnly = await put({ ...base, qos: 2 });
+  const qosOnlyBody = await qosOnly.json();
+  check('不带 connection 的保存不会把版本与心跳退回默认',
+        qosOnlyBody.config.connection.mqttVersion === 4
+        && qosOnlyBody.config.connection.keepaliveSec === 30,
+        JSON.stringify(qosOnlyBody.config.connection));
+
+  const badKeepalive = await put({ ...base, connection: { keepaliveSec: 99999 } });
+  check('越界的心跳在保存阶段就被拒（不是等 broker 拒连）',
+        badKeepalive.status === 400, `HTTP ${badKeepalive.status}`);
+
+  // 后面几节按默认参数继续，别让 3.1.1 带进断网续传那一段
+  await put(base);
+  await waitFor(async () => cloud.state === 'online', 10000);
+
   // ── 6. 断网落缓存，恢复后补传 ─────────────────────────
   received.length = 0;
   sh(['stop', NAME], { stdio: 'pipe' });
@@ -268,7 +317,8 @@ async function main() {
   }
 
   // ── 7. 权限：运维能看不能改 ───────────────────────────
-  const ops = await loginAs('ops', opsPassword);
+  // 运维同样要先完成强制改密：不走这一步，「角色不够」和「没改密」会混成同一个 403
+  const ops = await sessionFor(B, 'ops', opsPassword);
   const opsGet = await fetch(`${B}/api/cloud`, { headers: { cookie: ops.cookie } });
   check('运维可以查看云连接状态', opsGet.status === 200, `HTTP ${opsGet.status}`);
   const opsPut = await put(base,
