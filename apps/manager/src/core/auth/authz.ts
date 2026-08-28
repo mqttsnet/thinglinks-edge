@@ -18,6 +18,14 @@ export type Action =
   /** 登录即可见的信息类接口（版本号等）。存在的意义是让这类路由也必须**显式**声明 */
   | 'system:view'
   /**
+   * 改系统设置（会话超时、登录锁定阈值、是否强制两步验证）。
+   *
+   * 与 `system:view` 分成两档：这几项一改会影响**所有人**的登录 ——
+   * 把锁定阈值调到 3 次、会话超时调到 5 分钟，全站跟着变。
+   * 看得见和改得了不是一回事。
+   */
+  | 'system:manage'
+  /**
    * 看**列表**（实例列表、健康总览）。
    *
    * 与 `instance:view` 分开是必须的：列表天然没有「某一台实例」可判，
@@ -70,7 +78,7 @@ export type GrantLevel = 'view' | 'operate';
 
 const ROLE_ACTIONS: Record<Role, ReadonlySet<Action>> = {
   admin: new Set<Action>([
-    'system:view', 'instance:list', 'instance:view', 'instance:operate', 'instance:create', 'instance:delete',
+    'system:view', 'system:manage', 'instance:list', 'instance:view', 'instance:operate', 'instance:create', 'instance:delete',
     'field:view', 'replay:run', 'backup:run', 'user:manage',
     'cloud:view', 'cloud:manage', 'diag:run', 'template:view', 'template:manage',
   ]),

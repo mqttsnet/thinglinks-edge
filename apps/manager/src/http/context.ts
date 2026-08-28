@@ -18,6 +18,7 @@ import type { CloudRuntime } from '../core/cloud/runtime.ts';
 import type { CloudConfigRepo } from '../core/cloud/config-repo.ts';
 import { UserRepo } from '../core/auth/user-repo.ts';
 import { can, canInstance, isInstanceScoped, type Action } from '../core/auth/authz.ts';
+import { SettingsRepo } from '../core/auth/settings.ts';
 import type { MetricsHistory } from '../core/health/metrics-history.ts';
 
 export const SID = 'tle_sid';
@@ -93,10 +94,19 @@ export interface HttpContext {
    */
   guard: (
     req: any, reply: any,
-    opts: { csrf: boolean; need: Action; instance?: string; allowPending?: boolean },
+    opts: {
+      csrf: boolean; need: Action; instance?: string;
+      allowPending?: boolean;
+      /** 放行「还没绑两步验证」的会话。只有绑定相关的那几条路由该传 */
+      allowEnroll?: boolean;
+    },
   ) => ReturnType<AuthService['resolve']>;
   /** 授权矩阵仓储，用户管理路由要用 */
   users: UserRepo;
+  /** 系统设置。每次读都回库里最新的值，改完立刻生效 */
+  settings: SettingsRepo;
+  /** 单点判权，给需要「能看但不一定能改」的接口用（设置页就是） */
+  can: (user: { role: string }, action: Action) => boolean;
   /**
    * 这个用户能不能看见某台实例。
    *
@@ -116,12 +126,15 @@ export interface HttpContext {
 export function createContext(deps: ServerDeps): HttpContext {
   const { config, auth } = deps;
   const users = new UserRepo(deps.db);
+  const settings = new SettingsRepo(deps.db);
   const currentUser = (req: { cookies: Record<string, string | undefined> }) =>
     auth.resolve(req.cookies[SID]);
 
   return {
     config,
     users,
+    settings,
+    can: (user, action) => can(user.role, action),
     cloudSink: deps.cloudSink,
     cloud: deps.cloud,
     cloudConfig: deps.cloudConfig,
@@ -161,6 +174,24 @@ export function createContext(deps: ServerDeps): HttpContext {
         reply.code(403).send({
           error: '首次登录必须先修改初始口令，改完才能使用其它功能',
           code: 'PASSWORD_CHANGE_REQUIRED',
+        });
+        return undefined;
+      }
+
+      /*
+       * 全站强制两步验证、而这个人还没绑 —— 同样拦在后端。
+       *
+       * 顺序在改密之后：先把初始口令换掉，再绑第二因子。反过来的话，
+       * 用户会拿着日志里印过的那个初始口令去绑定，等于给一把已经暴露的钥匙
+       * 加了第二道锁。
+       *
+       * 例外是绑定本身那几条路由（`allowEnroll`）—— 不放行就成了死循环：
+       * 要绑定得先能调接口，能调接口又得先绑定。
+       */
+      if (user.mustEnroll2fa && opts.allowEnroll !== true) {
+        reply.code(403).send({
+          error: '系统已要求启用两步验证，请先完成绑定',
+          code: 'TOTP_ENROLL_REQUIRED',
         });
         return undefined;
       }

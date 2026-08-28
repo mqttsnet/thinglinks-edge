@@ -39,13 +39,25 @@ if (!row) {
 
 const password = generatePassword();
 const { hash, salt } = hashPassword(password);
-// must_change_pwd = 1：这条口令是一次性的，登录后必须换掉。
-// 同时解除停用 —— 「进不去」有时正是因为账号被自己停用了
+/*
+ * must_change_pwd = 1：这条口令是一次性的，登录后必须换掉。
+ * 同时解除停用 —— 「进不去」有时正是因为账号被自己停用了。
+ *
+ * 两步验证也一并清掉：会跑到这个脚本的场景，多半是「口令忘了」和
+ * 「手机换了/验证器丢了」同时发生。只重置口令的话，人还是卡在第二步，
+ * 而那时错误信息只说「验证码不正确」，更难判断该往哪儿查。
+ */
+const hadTotp = db.prepare('SELECT totp_enabled FROM app_user WHERE username = ?')
+  .get(username)?.totp_enabled === 1;
 db.prepare(
-  'UPDATE app_user SET pwd_hash = ?, pwd_salt = ?, must_change_pwd = 1, disabled = 0 WHERE username = ?',
+  `UPDATE app_user SET pwd_hash = ?, pwd_salt = ?, must_change_pwd = 1, disabled = 0,
+     totp_secret_enc = '', totp_enabled = 0, totp_last_step = 0
+   WHERE username = ?`,
 ).run(hash, salt, username);
+db.prepare('DELETE FROM recovery_code WHERE username = ?').run(username);
 
 console.log(`\n[reset] 已重置 ${username}（角色 ${row.role}）`);
+if (hadTotp) console.log('[reset] 该账号原本开着两步验证，已一并解绑，登录后需重新绑定。');
 console.log(`[reset] 一次性口令：${password}`);
 console.log('[reset] 登录后会强制要求改密，改完这条即失效。');
 console.log('[reset] 口令变更会作废该账号手上的旧会话，浏览器里要重新登录。\n');

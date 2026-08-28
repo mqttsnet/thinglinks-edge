@@ -18,6 +18,16 @@ const oldPassword = ref('');
 const newPassword = ref('');
 const newPassword2 = ref('');
 
+/**
+ * 第二因子。
+ *
+ * `ticket` 不是会话 —— 口令过了但还没放行时，后端**不下发任何 Cookie**，
+ * 只给这张一次性票据。所以这一步失败或离开，用户仍然是未登录状态。
+ */
+const ticket = ref('');
+const code = ref('');
+const needCode = ref(false);
+
 onMounted(async () => {
   try {
     const { user } = await api.me();
@@ -29,19 +39,52 @@ onMounted(async () => {
 async function signIn() {
   busy.value = true;
   try {
-    const { user } = await api.login(username.value, password.value);
-    if (user.mustChangePassword) {
-      mustChange.value = true;
-      oldPassword.value = password.value;
-      message.warning('首次登录，请先修改初始口令');
-    } else {
-      await router.replace('/instances');
+    const r = await api.login(username.value, password.value);
+    if (r.mfa) {
+      ticket.value = r.ticket;
+      needCode.value = true;
+      code.value = '';
+      return;
     }
+    await afterLogin(r.user.mustChangePassword);
   } catch (e) {
     message.error(e instanceof ApiError ? e.message : '登录失败');
   } finally {
     busy.value = false;
   }
+}
+
+async function submitCode() {
+  busy.value = true;
+  try {
+    const { user } = await api.loginSecondFactor(ticket.value, code.value);
+    needCode.value = false;
+    await afterLogin(user.mustChangePassword);
+  } catch (e) {
+    code.value = '';
+    message.error(e instanceof ApiError ? e.message : '验证失败');
+  } finally {
+    busy.value = false;
+  }
+}
+
+/** 两条登录路径的共同收尾：要么去改密，要么进主界面 */
+async function afterLogin(mustChangePassword: boolean) {
+  if (mustChangePassword) {
+    mustChange.value = true;
+    oldPassword.value = password.value;
+    message.warning('首次登录，请先修改初始口令');
+  } else {
+    await router.replace('/instances');
+  }
+}
+
+/** 放弃第二步：票据丢掉，回到用户名口令。此时本来就还没有会话 */
+function cancelCode() {
+  needCode.value = false;
+  ticket.value = '';
+  code.value = '';
+  password.value = '';
 }
 
 async function submitChange() {
@@ -80,7 +123,24 @@ async function submitChange() {
         </div>
       </div>
 
-      <template v-if="!mustChange">
+      <template v-if="needCode">
+        <NAlert type="info" :bordered="false" style="margin: 16px 0">
+          请输入验证器上的 6 位验证码；验证器不在手边时，可以用一条恢复码代替。
+        </NAlert>
+        <NForm class="form" @submit.prevent="submitCode">
+          <NFormItem label="验证码">
+            <!-- inputmode 让手机弹数字键盘；恢复码是字母数字，所以不限制 type -->
+            <NInput
+              v-model:value="code" placeholder="6 位验证码 或 恢复码"
+              autofocus inputmode="numeric" autocomplete="one-time-code"
+              @keyup.enter="submitCode" />
+          </NFormItem>
+          <NButton type="primary" block :loading="busy" @click="submitCode">验证并登录</NButton>
+          <NButton quaternary block style="margin-top: 8px" @click="cancelCode">返回</NButton>
+        </NForm>
+      </template>
+
+      <template v-else-if="!mustChange">
         <NForm class="form" @submit.prevent="signIn">
           <NFormItem label="用户名"><NInput v-model:value="username" placeholder="admin" /></NFormItem>
           <NFormItem label="口令">
