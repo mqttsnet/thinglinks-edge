@@ -36,8 +36,13 @@ services:
       # 不能拉取（images/create 仍未放行）也不能删除。放行它是为了让 Manager
       # 能在建实例前判断镜像在不在 —— 否则只能等 containers/create 回 404
       # 名字里允许 / 与 :（nodered/node-red:5.0.4-…），但必须以 /json 结尾，只能查不能改
+      #
+      # `info` 是安装自检要的：架构匹配与 cgroup 内存限额两项只能从它读。
+      # 它是纯只读的守护进程元信息（版本、架构、cgroup、存储驱动、容器计数），
+      # 敏感度低于已经放行的 containers/json —— 不放行的话那两项在装完之后
+      # 永远报「读不到 docker info」，而现场恰恰要靠它们发现「限额配了不生效」。
       # 「No such image」，那句话对现场人员毫无指导意义。
-      - '-allowGET=^(/v1\.[0-9]+)?/(_ping|version|containers/json|containers/[a-zA-Z0-9][a-zA-Z0-9_.-]*/(json|logs|stats)|images/json|images/[a-zA-Z0-9][a-zA-Z0-9_.:@/-]*/json|volumes/[a-zA-Z0-9][a-zA-Z0-9_.-]*|networks)(\?.*)?$$'
+      - '-allowGET=^(/v1\.[0-9]+)?/(_ping|version|info|containers/json|containers/[a-zA-Z0-9][a-zA-Z0-9_.-]*/(json|logs|stats)|images/json|images/[a-zA-Z0-9][a-zA-Z0-9_.:@/-]*/json|volumes/[a-zA-Z0-9][a-zA-Z0-9_.-]*|networks)(\?.*)?$$'
       - '-allowPOST=^(/v1\.[0-9]+)?/(containers/create|containers/[a-zA-Z0-9][a-zA-Z0-9_.-]*/(start|stop|restart)|networks/create|networks/[a-zA-Z0-9][a-zA-Z0-9_.-]*/(connect|disconnect)|volumes/create)(\?.*)?$$'
       - '-allowPUT=^(/v1\.[0-9]+)?/containers/[a-zA-Z0-9][a-zA-Z0-9_.-]*/archive(\?.*)?$$'
       - '-allowDELETE=^(/v1\.[0-9]+)?/(containers/[a-zA-Z0-9][a-zA-Z0-9_.-]*|networks/[a-zA-Z0-9][a-zA-Z0-9_.-]*|volumes/[a-zA-Z0-9][a-zA-Z0-9_.-]*)(\?.*)?$$'
