@@ -98,6 +98,21 @@ docker compose logs manager | grep '\[init\]'   # the initial password is printe
 ```
 
 Open `EXTERNAL_URL` in a browser — the console is served by the Manager itself.
+
+### Locked out?
+
+The initial password is printed **once**, on the very first boot, and `ensureInitialUser`
+only fires when the user table is completely empty — so once any account exists, deleting
+`admin` and restarting will not recreate it. Recover from the host instead:
+
+```bash
+node apps/manager/scripts/reset-admin.mjs admin
+```
+
+It writes a fresh one-time password (printed to the terminal, never to a file) and flags
+the account so the next login must change it. Point `EDGE_DATA_ROOT` at your data root if
+it is not the default. Anyone who can run this already has filesystem access to the
+database, so it grants nothing new — it just avoids rebuilding the deployment to get back in.
 `EXTERNAL_URL` is the single source of truth for every outward-facing URL, redirect
 and cookie policy; the process never guesses its own external address.
 
@@ -173,6 +188,8 @@ cd apps/manager && pnpm verify
 | `verify-compose` | Compose deployment, read-only rootfs, restricted Docker endpoint |
 | `verify-cloud-gateway` | Envelope, signing, encryption, topics and reconnect against real Mosquitto |
 | `verify-cloud-link` | Config → runtime → broker end to end: credential encryption, offline spooling, replay |
+| `verify-cloud-tls` | TLS handshake against real certificates: CA trust, mutual auth, SNI, downgrade audit |
+| `verify-2fa` | System settings and TOTP: no cookie on the password step, ticket replay, recovery codes, forced enrolment |
 
 ## Security
 
