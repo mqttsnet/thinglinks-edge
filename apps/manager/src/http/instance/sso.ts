@@ -1,9 +1,9 @@
 /** 免密跳转：换取 Node-RED token 并注入浏览器本地存储。 */
 import type { FastifyInstance } from 'fastify';
-import { authTokenKeyFor } from '../core/config.ts';
-import { recordAudit } from '../core/db.ts';
-import { canInstance } from '../core/authz.ts';
-import type { HttpContext } from './context.ts';
+import { authTokenKeyFor } from '../../core/config.ts';
+import { recordAudit } from '../../core/db.ts';
+import { canInstance } from '../../core/auth/authz.ts';
+import type { HttpContext } from '../context.ts';
 
 export function registerSso(api: FastifyInstance, ctx: HttpContext): void {
   const { config, db, repo, upstreamFor, currentUser, users } = ctx;

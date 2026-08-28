@@ -9,12 +9,45 @@
  */
 import type { FastifyInstance } from 'fastify';
 import httpProxy from '@fastify/http-proxy';
-import { AuthService } from '../core/auth.ts';
-import { canInstance } from '../core/authz.ts';
-import type { HttpContext } from './context.ts';
+import { AuthService } from '../../core/auth/service.ts';
+import { canInstance } from '../../core/auth/authz.ts';
+import type { HttpContext } from '../context.ts';
 
 export function registerProxy(app: FastifyInstance, ctx: HttpContext): void {
   const { config, repo, upstreamFor, currentUser, instanceIdFromUrl, users } = ctx;
+
+  // 浏览器看到的源。CSP 的 source 表达式必须带 host，不能只写路径
+  const origin = new URL(config.externalUrl).origin;
+
+  /**
+   * 流程自己提供的路径：`settings.js` 里 `httpNodeRoot = <adminRoot>api/`。
+   * 这一段的内容是**用户在流程里写的**，与管理台同源。
+   */
+  const flowPathOf = (id: string) => `${config.basePath}/red/${id}/api/`;
+
+  /**
+   * 给流程页面加 CSP。
+   *
+   * 要解决的问题：`http in` / Function 节点能在**管理台同源**下返回任意 HTML+JS。
+   * 那段脚本带着管理员的会话 Cookie，且能读到双提交用的 CSRF Cookie ——
+   * 于是可以伪造任意管理接口调用。这是控制台完全接管。
+   *
+   * 为什么不靠 Cookie 或 CSRF 修：同源之内，攻击脚本读得到 CSRF Token、
+   * 发得出凭据请求，**任何 Token 技巧都挡不住**。根治办法是把实例挪到独立的源
+   * （另一个端口或子域），那是架构改动，见下面的 TODO。
+   *
+   * 这里做的是精确削权：`connect-src` 只放行**这台实例自己的流程路径**，
+   * 于是流程页面照样能调自己的后端（Dashboard 之类不受影响），
+   * 但 `fetch('/api/users')` 会被浏览器直接拒掉。
+   * `form-action` 一并封死，否则表单 POST 能绕过 connect-src。
+   */
+  const flowCsp = (id: string) => [
+    `default-src 'self'`,
+    `connect-src ${origin}${flowPathOf(id)}`,
+    `form-action 'none'`,
+    `base-uri 'none'`,
+    `frame-ancestors 'none'`,
+  ].join('; ');
 
   app.register(httpProxy, {
     upstream: '',
@@ -27,6 +60,20 @@ export function registerProxy(app: FastifyInstance, ctx: HttpContext): void {
         const id = instanceIdFromUrl(req.url ?? '');
         // 未知实例指向不可用地址，由代理层报错而非误转发
         return id && repo.get(id) ? upstreamFor(id) : 'http://127.0.0.1:1';
+      },
+      /*
+       * 只给**流程提供的路径**加 CSP，编辑器那段（adminRoot 本身）不动 ——
+       * 编辑器是平台自己的界面，加了反而会把它拆坏。
+       */
+      rewriteHeaders: (headers, req) => {
+        const url = (req as { url?: string })?.url ?? '';
+        const id = instanceIdFromUrl(url);
+        if (id && url.startsWith(flowPathOf(id))) {
+          headers['content-security-policy'] = flowCsp(id);
+          // 流程返回 text/plain 时不许浏览器嗅探成 HTML 执行
+          headers['x-content-type-options'] = 'nosniff';
+        }
+        return headers;
       },
     },
     /*
@@ -48,6 +95,15 @@ export function registerProxy(app: FastifyInstance, ctx: HttpContext): void {
         reply.code(401).send({ error: '未登录' });
         return;
       }
+      /*
+       * 反代走的是 currentUser 而不是 guard，所以强制改密要在这里单独拦一次。
+       * 漏了这一处，待改密的用户虽然进不了控制台，却能直接打开 Node-RED 编辑器 ——
+       * 那后面是整台实例的 admin API。
+       */
+      if (user.mustChangePassword) {
+        reply.code(403).send({ error: '首次登录必须先修改初始口令' });
+        return;
+      }
       const id = instanceIdFromUrl(req.url ?? '');
       if (!id || !repo.get(id)) {
         reply.code(404).send({ error: '实例不存在' });
@@ -66,18 +122,32 @@ export function registerProxy(app: FastifyInstance, ctx: HttpContext): void {
        * 只判 view 的话，给了「只读」授权的人照样能改别人产线的流程，
        * 而界面上他看起来只是「能看」。
        *
-       * WebSocket 升级本身是 GET（编辑器的 comms 通道，推运行时事件），
-       * 归读；真正的改动仍要走上面那些 POST。
+       * **WebSocket 升级一律按写操作判**，尽管握手本身是 GET。
+       *
+       * 握手方法只描述握手，不描述握手之后的会话 —— 通道建起来就是双向的。
+       * 而实例的 `httpNodeRoot` 是 `<adminRoot>api/`，与编辑器同处一个反代前缀：
+       * 流程里放一个 `websocket in` 节点就能对外开一个端点，
+       * 只读用户握手成功后即可往流程里灌消息。那不是「看」，是「写」。
+       *
+       * 代价是只读用户打开编辑器时拿不到 comms 实时事件流（调试侧栏没有消息、
+       * 节点状态不刷新），编辑器会提示连接中断。这是**有意的取舍**：
+       * 另一条路是只放行编辑器自己的 `<adminRoot>comms`，但那要依赖
+       * 「Node-RED 的 comms 通道不可写」这个第三方内部行为 ——
+       * 本项目已经在 `wsUpgrade` 上栽过一次「能用但机制是错的」，不再赌第二次。
        */
       const method = (req.method ?? 'GET').toUpperCase();
-      const writing = method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS';
+      const upgrading = String(req.headers.upgrade ?? '').toLowerCase() === 'websocket';
+      const writing = upgrading
+        || (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS');
       const need = writing ? 'instance:operate' : 'instance:view';
       if (!canInstance(user.role, need,
                        user.role === 'admin' ? undefined : users.grantFor(user.username, id))) {
         reply.code(403).send({
-          error: writing
-            ? `只读授权：对实例 ${id} 只能查看，不能改动流程`
-            : `无权访问实例 ${id}`,
+          error: upgrading
+            ? `只读授权：对实例 ${id} 不能建立实时通道（该通道可向流程写入）`
+            : writing
+              ? `只读授权：对实例 ${id} 只能查看，不能改动流程`
+              : `无权访问实例 ${id}`,
         });
         return;
       }

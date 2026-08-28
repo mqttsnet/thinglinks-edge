@@ -6,17 +6,19 @@
  */
 import type { FastifyInstance } from 'fastify';
 import type { EdgeConfig } from '../core/config.ts';
-import { AuthService } from '../core/auth.ts';
-import { InstanceRepo } from '../core/instance-repo.ts';
-import type { InstanceService } from '../core/instance-service.ts';
-import { containerName } from '../core/container-spec.ts';
+import { AuthService } from '../core/auth/service.ts';
+import { InstanceRepo } from '../core/instance/repo.ts';
+import type { InstanceService } from '../core/instance/service.ts';
+import { containerName } from '../core/instance/container-spec.ts';
 import type { Db } from '../core/db.ts';
 import type { Spool } from '../core/spool/spool.ts';
+import type { SpoolDrainer } from '../core/spool/drainer.ts';
+import type { OutageLog } from '../core/cloud/outage.ts';
 import type { CloudRuntime } from '../core/cloud/runtime.ts';
 import type { CloudConfigRepo } from '../core/cloud/config-repo.ts';
-import { UserRepo } from '../core/user-repo.ts';
-import { can, canInstance, isInstanceScoped, type Action } from '../core/authz.ts';
-import type { MetricsHistory } from '../core/metrics-history.ts';
+import { UserRepo } from '../core/auth/user-repo.ts';
+import { can, canInstance, isInstanceScoped, type Action } from '../core/auth/authz.ts';
+import type { MetricsHistory } from '../core/health/metrics-history.ts';
 
 export const SID = 'tle_sid';
 export const CSRF = 'tle_csrf';
@@ -50,6 +52,13 @@ export interface ServerDeps {
    */
   spool?: Spool | undefined;
   /**
+   * 补传调度。触发口有三个（发送成功后 / 链路恢复 / 定时兜底），
+   * 由 index.ts 统一持有 —— 路由层只负责在发送成功后捅一下。
+   */
+  drainer?: SpoolDrainer | undefined;
+  /** 断网记录。留空表示这个部署不记录（如单测装配） */
+  outages?: OutageLog | undefined;
+  /**
    * 资源指标历史。留空表示没开后台采样 —— 趋势接口会如实回 `enabled: false`，
    * 界面据此说明「未启用」，而不是画一张空图让人以为系统坏了。
    */
@@ -64,6 +73,8 @@ export interface HttpContext {
   cloud: CloudRuntime | undefined;
   cloudConfig: CloudConfigRepo | undefined;
   spool: Spool | undefined;
+  drainer: SpoolDrainer | undefined;
+  outages: OutageLog | undefined;
   metrics: MetricsHistory | undefined;
   db: Db;
   auth: AuthService;
@@ -82,7 +93,7 @@ export interface HttpContext {
    */
   guard: (
     req: any, reply: any,
-    opts: { csrf: boolean; need: Action; instance?: string },
+    opts: { csrf: boolean; need: Action; instance?: string; allowPending?: boolean },
   ) => ReturnType<AuthService['resolve']>;
   /** 授权矩阵仓储，用户管理路由要用 */
   users: UserRepo;
@@ -115,6 +126,8 @@ export function createContext(deps: ServerDeps): HttpContext {
     cloud: deps.cloud,
     cloudConfig: deps.cloudConfig,
     spool: deps.spool,
+    drainer: deps.drainer,
+    outages: deps.outages,
     metrics: deps.metrics,
     db: deps.db,
     auth,
@@ -132,6 +145,24 @@ export function createContext(deps: ServerDeps): HttpContext {
       if (!user) { reply.code(401).send({ error: '未登录' }); return undefined; }
       if (opts.csrf && !AuthService.csrfOk(req.headers['x-csrf-token'], req.cookies[CSRF])) {
         reply.code(403).send({ error: 'CSRF 校验失败' }); return undefined;
+      }
+
+      /*
+       * 强制改密必须在**后端**拦。
+       *
+       * 之前只有 Vue 路由守卫在做这件事 —— 那只是界面上的引导，
+       * 会话本身完全有效：拿着初始口令直接 curl 后端接口就能绕过去，
+       * 而初始口令是打印在启动日志里的。
+       *
+       * 例外只有会话自身那三条（me / logout / change-password），
+       * 它们不走 guard，天然放行 —— 否则用户会被锁死在无法改密的死循环里。
+       */
+      if (user.mustChangePassword && opts.allowPending !== true) {
+        reply.code(403).send({
+          error: '首次登录必须先修改初始口令，改完才能使用其它功能',
+          code: 'PASSWORD_CHANGE_REQUIRED',
+        });
+        return undefined;
       }
 
       if (isInstanceScoped(opts.need)) {
