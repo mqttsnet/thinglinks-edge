@@ -16,11 +16,11 @@
 import { ref, computed, onMounted, onBeforeUnmount } from 'vue';
 import { NSelect, NSpin, NEmpty, NTag, NButton, NAlert, useMessage } from 'naive-ui';
 import { useRouter } from 'vue-router';
-import { api, ApiError } from '../api/client';
+import { api, ApiError } from '../../api/client';
 import type {
   Instance, FieldDeviceRecord, FieldTagRecord, FieldSummary, ProbeResult,
-} from '../api/types';
-import FieldHelp from '../components/FieldHelp.vue';
+} from '../../api/types';
+import FieldHelp from '../../components/FieldHelp.vue';
 
 const router = useRouter();
 const message = useMessage();

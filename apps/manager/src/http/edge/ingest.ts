@@ -10,18 +10,19 @@
  *   · 实例 id **只从令牌反查**，绝不取自请求体 —— 否则实例 A 可以冒充实例 B 写台账
  */
 import type { FastifyInstance } from 'fastify';
-import { FieldRegistry } from '../core/edge/registry.ts';
-import { MicroBatcher, type UplinkPoint } from '../core/cloud/batch.ts';
-import { probeFlows } from '../core/edge/southbound.ts';
+import { FieldRegistry } from '../../core/edge/registry.ts';
+import { BatchOverflowError, MicroBatcher, type UplinkPoint } from '../../core/cloud/batch.ts';
+import { probeFlows } from '../../core/edge/southbound.ts';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { HttpContext } from './context.ts';
+import { SpoolDrainer } from '../../core/spool/drainer.ts';
+import type { HttpContext } from '../context.ts';
 
 /** 单次上报的条数上限，防止一条请求把内存吃穿 */
 const MAX_BATCH = 1000;
 
 export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
-  const { config, repo, db, guard, cloudSink, spool, cloud, visibleOnly } = ctx;
+  const { config, repo, db, guard, cloudSink, spool, cloud } = ctx;
 
   /*
    * 台账类接口的鉴权（T4.4）。
@@ -31,11 +32,6 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
    * 只判 field:view 的话，任何登录用户都能读到别人那台实例的设备清单、
    * 点位当前值，乃至 flows.json 反推出来的设备 IP 与寄存器地址。
    */
-  const fieldGuard = (req: any, reply: any, instanceId: string | undefined) =>
-    (instanceId === undefined
-      ? guard(req, reply, { csrf: false, need: 'field:view' })
-      : guard(req, reply, { csrf: false, need: 'instance:view', instance: instanceId }));
-
   /*
    * 「云连接配没配」以运行期为准。
    *
@@ -51,25 +47,30 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
    * 微批。1.4k 点/秒的现场负载聚合后约 5 条消息/秒（08 号文第 2 节）。
    * 没配云连接时 flush 直接抛错并计数 —— 不能假装发出去了。
    */
-  const metrics = { batches: 0, points: 0, failures: 0, spooled: 0, lastError: '' };
+  const metrics = { batches: 0, points: 0, failures: 0, spooled: 0, rejected: 0, lastError: '' };
 
   /*
-   * 补传搭在**成功发送之后**：链路刚证明可用，才去追欠账。
-   * 这样实时数据天然优先（它先发），补传拿的是剩下的余量 —— 08 号文第 6 节
-   * 要的优先级关系由顺序保证，不需要额外的调度器。
-   * 限速与单轮条数都设了上限，避免一次性把积压全冲出去压垮云端。
+   * 补传由 `SpoolDrainer` 统一调度（core/spool/drainer.ts）。
+   *
+   * 这里只保留「发送成功之后捅一下」这一个触发口 —— 链路刚证明可用，
+   * 趁势追欠账，实时数据天然优先（它先发），补传拿的是剩下的余量。
+   * 另外两个触发口（链路恢复、定时兜底）在 index.ts 里挂，
+   * 因为只有那儿拿得到 CloudRuntime 的状态事件。
    */
-  let draining = false;
-  const drain = async () => {
-    if (!spool || !cloudSink || !cloudReady() || draining) return;
-    draining = true;
-    try {
-      await spool.replay(async (p) => { await cloudSink(p); },
-                         { ratePerSec: 50, maxRecords: 200 });
-    } finally {
-      draining = false;
-    }
-  };
+  /*
+   * 没装 drainer 时**就地兜一个**，而不是让补传静默失效。
+   *
+   * 这是被回归咬出来的：把 `drain()` 直接换成 `drainer?.trigger()` 之后，
+   * 所有不带 drainer 装配服务的地方（验证脚本、单用途测试装配）补传全停了，
+   * 而接口一切正常、没有任何报错 —— 正是这次审查要消灭的那类静默失效。
+   *
+   * 兜底的这个**不启定时器**：定时兜底的生命周期归 index.ts 管，
+   * 这里只恢复「发送成功后补一轮」这一个原有行为。
+   */
+  const localDrainer = ctx.drainer ?? (spool && cloudSink
+    ? new SpoolDrainer({ spool, send: cloudSink, ready: cloudReady })
+    : undefined);
+  const drain = () => { void localDrainer?.trigger('after-send'); };
 
   const batcher = new MicroBatcher({
     flush: async (payload, points) => {
@@ -218,6 +219,25 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
       const accepted = registry.recordValues(instanceId, values);
 
       /*
+       * 上行队列满了就当场回 503，**不收下再说**。
+       *
+       * 微批是全平台共用的一条队列：云端卡住（TCP 不回，不是断开）时，
+       * 一个狂灌点位的实例能把队列撑到几百兆，把同机其它实例一起拖垮。
+       *
+       * 台账照常记 —— 那是本地库、有界的，而且现场看当前值靠的就是它；
+       * 只有送云的部分明确拒收，让节点自己决定缓存还是降采样。
+       * `accepted` 如实回落库条数，不是 0：数据确实收下了。
+       */
+      if (batcher.saturated) {
+        metrics.rejected += values.length;
+        metrics.lastError = '上行队列已满，已拒收';
+        return reply.code(503).header('retry-after', '5').send({
+          error: '上行队列已满，云端发送跟不上，请稍后重试',
+          accepted, cloud: 'saturated',
+        });
+      }
+
+      /*
        * 时间戳在**入队时**打，不是发送时（08 号文第 5 节）。
        * 发送时才打的话，断网补传的数据会带上补传那一刻的时间，
        * 云侧按 eventTime 排出来的顺序就是错的。
@@ -236,7 +256,16 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
         batched: batcher.pending,
         cloud: cloudReady() ? 'queued' : 'not-configured',
       });
-    } catch (e) { return fail(reply, e); }
+    } catch (e) {
+      // 队列在收点的中途满了：同样是「稍后再来」，不是「这条数据有问题」
+      if (e instanceof BatchOverflowError) {
+        metrics.rejected += values.length;
+        metrics.lastError = e.message;
+        return reply.code(503).header('retry-after', '5')
+          .send({ error: e.message, accepted: 0, cloud: 'saturated' });
+      }
+      return fail(reply, e);
+    }
   });
 
   /** 数据面指标（08 号文第 8 节要求控制台可见） */
@@ -250,6 +279,11 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
         limits: batcher.limits,
         pending: batcher.pending,
         pendingBytes: batcher.pendingBytes,
+        // 队列水位与拒收数要看得见：现场「数据少了一段」时，
+        // 这两个数字是区分「云端慢」和「节点没发」的唯一依据
+        queued: batcher.queued,
+        queuedBytes: batcher.queuedBytes,
+        saturated: batcher.saturated,
         ...metrics,
       },
       spool: spool ? await spool.metrics() : null,
@@ -261,78 +295,14 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
     if (!guard(req, reply, { csrf: true, need: 'replay:run' })) return;
     if (!spool) return reply.code(400).send({ error: '未配置断网缓存' });
     if (!cloudSink || !cloudReady()) return reply.code(503).send({ error: '云连接未配置，无法补传' });
-    const r = await spool.replay(async (p) => { await cloudSink(p); },
-                                 { ratePerSec: 200, maxRecords: 1000 });
-    return reply.send(r);
-  });
-
-  // ── 控制台读取（走管理会话，不是接入令牌）────────────────
-  api.get(`${config.basePath}/api/field/devices`, async (req, reply) => {
-    const { instanceId } = req.query as { instanceId?: string };
-    const user = fieldGuard(req, reply, instanceId);
-    if (!user) return;
-    return reply.send({ devices: visibleOnly(user, registry.devices(instanceId)) });
-  });
-
-  api.get(`${config.basePath}/api/field/tags`, async (req, reply) => {
-    const { instanceId, nodeId } = req.query as { instanceId?: string; nodeId?: string };
-    const user = fieldGuard(req, reply, instanceId);
-    if (!user) return;
-    return reply.send({ tags: visibleOnly(user, registry.tags(instanceId, nodeId)) });
-  });
-
-  /*
-   * 南向探测（06 号文方案 A）。解析实例的 flows.json 反推用户用原生
-   * modbus / OPC UA / S7 节点接的设备 —— **尽力而为，不是可靠台账**。
-   *
-   * 结果恒带 `managed: false`，并把「认不出的节点类型」一并返回。
-   * 界面必须标「未纳管」，且不能把这些数字和真实台账加在一起显示 ——
-   * 让用户以为看到的是全部，是诚信问题（06 号文原话）。
-   */
-  api.get(`${config.basePath}/api/field/southbound`, async (req, reply) => {
-    const { instanceId } = req.query as { instanceId?: string };
-    // 这条**必须**指名实例：它读的是那台实例的 flows.json，
-    // 里面是设备 IP 与寄存器地址，比台账更敏感
-    if (!instanceId) {
-      if (!guard(req, reply, { csrf: false, need: 'field:view' })) return;
-      return reply.code(400).send({ error: '缺少 instanceId' });
-    }
-    if (!guard(req, reply, { csrf: false, need: 'instance:view', instance: instanceId })) return;
-
-    const flowsPath = join(config.instanceDataRoot, instanceId, 'flows.json');
-    const raw = await readFile(flowsPath, 'utf8').catch(() => undefined);
-    if (raw === undefined) {
-      // 实例还没部署过流程时没有这个文件，属正常，不是错误
-      return reply.send({ ...probeFlows(null), reason: '该实例尚无 flows.json（未部署过流程）' });
-    }
-    let parsed: unknown;
-    try { parsed = JSON.parse(raw); } catch {
-      return reply.send({ ...probeFlows(null), reason: 'flows.json 不是合法 JSON，无法探测' });
-    }
-    return reply.send(probeFlows(parsed));
-  });
-
-  api.get(`${config.basePath}/api/field/summary`, async (req, reply) => {
-    const { instanceId } = req.query as { instanceId?: string };
-    const user = fieldGuard(req, reply, instanceId);
-    if (!user) return;
+    if (!localDrainer) return reply.code(503).send({ error: '补传调度未装配' });
     /*
-     * 两类数字**必须分开返回**，不能相加：
-     * `managed` 是节点集回报的可信台账（有当前值、有质量码）；
-     * `probed` 是从 flows.json 反推的尽力探测（没有运行时数据，可能漏）。
-     * 加在一起显示会让用户以为那是同一种东西。
+     * 走 drainer 而不是直接调 spool.replay —— 必须与自动补传共用同一个单飞闸门。
+     * 早先这里直接调，与后台补传并发时两边从同一个进度开始读，
+     * 会重复发送并把 pending 计数搞乱。
+     * 限速放宽是有意的：这是人盯着的排障操作，不是后台任务。
      */
-    // 汇总数字同样只能覆盖看得见的实例，否则「全厂多少台设备」会被越权读出来
-    const devices = visibleOnly(user, registry.devices(instanceId));
-    const tags = visibleOnly(user, registry.tags(instanceId));
-    return reply.send({
-      managed: {
-        devices: devices.length,
-        online: devices.filter((d) => d.online).length,
-        tags: tags.length,
-      },
-      note: '「已纳管」来自 @thinglinks 节点主动回报，含当前值与质量码；'
-          + '用原生 modbus/opcua/s7 节点采集的部分请看 /api/field/southbound，那是尽力探测，未纳管',
-    });
+    const r = await localDrainer.trigger('manual', { ratePerSec: 200, maxRecords: 1000 });
+    return reply.send({ ...r, running: localDrainer.running });
   });
 }
