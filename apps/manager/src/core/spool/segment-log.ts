@@ -18,6 +18,14 @@ import { crc32 } from 'node:zlib';
 
 const HEADER = 8;
 const SEG_EXT = '.seg';
+/**
+ * 刷盘连续失败时的退避上限。
+ *
+ * 磁盘真坏了会一直失败，按正常间隔重试等于每 200ms 刷一条告警日志 ——
+ * 噪音会把真正有用的信息淹掉。退避到 30 秒既保住「恢复后能自愈」，
+ * 又不至于刷屏。
+ */
+const MAX_FLUSH_BACKOFF_MS = 30_000;
 /** 段文件名固定 8 位十进制，保证字典序等于数值序 */
 const segName = (id: number) => String(id).padStart(8, '0') + SEG_EXT;
 
@@ -31,6 +39,24 @@ export interface SegmentLogOptions {
    * 对边缘采集是可接受的取舍 —— 但必须是**明示**的取舍，不能默默不刷。
    */
   flushIntervalMs?: number;
+  /**
+   * 刷盘失败回调。
+   *
+   * **必须有人接住。** 定时刷盘是 fire-and-forget 的，fsync 失败没有调用方能
+   * catch；早先这里写的是 `.catch(() => undefined)`，于是磁盘故障时刷盘静默失败，
+   * 而 spool 照常报告「数据已存」—— 那是最坏的一种谎报：
+   * 界面一切正常，数据其实没落盘。
+   */
+  onFlushError?: (e: Error) => void;
+  /**
+   * 注入 fsync 实现，**仅测试用**。
+   *
+   * 需要它是因为「刷盘失败」在真实文件系统上很难确定性复现：
+   * 删目录、改权限都挡不住已打开的 fd（POSIX 语义，inode 活到 fd 关闭）。
+   * 没有这个注入口，相关测试只能靠时序碰运气 —— 那种测试比没有更糟。
+   * 与 MicroBatcher 的 setTimer / CloudGateway 的 connectFn 是同一类做法。
+   */
+  fsyncFn?: (handle: FileHandle) => Promise<void>;
 }
 
 export interface RecordRef {
@@ -64,12 +90,19 @@ export class SegmentLog {
   #chain: Promise<unknown> = Promise.resolve();
   #dirty = false;
   #flushTimer: NodeJS.Timeout | undefined;
+  #lastFlushError: string | undefined;
+  readonly #onFlushError: ((e: Error) => void) | undefined;
+  readonly #fsync: (h: FileHandle) => Promise<void>;
+  /** 连续刷盘失败时的退避间隔；成功一次即归零。0 表示用正常间隔 */
+  #flushBackoff = 0;
   #closed = false;
 
   private constructor(opts: SegmentLogOptions) {
     this.dir = opts.dir;
     this.maxSegmentBytes = opts.maxSegmentBytes ?? 64 * 1024 * 1024;
     this.flushIntervalMs = opts.flushIntervalMs ?? 200;
+    this.#onFlushError = opts.onFlushError;
+    this.#fsync = opts.fsyncFn ?? ((h) => h.sync());
   }
 
   static async open(opts: SegmentLogOptions): Promise<SegmentLog> {
@@ -170,16 +203,55 @@ export class SegmentLog {
     if (this.#flushTimer !== undefined) return;
     this.#flushTimer = setTimeout(() => {
       this.#flushTimer = undefined;
-      void this.flush();
-    }, this.flushIntervalMs);
+      /*
+       * 定时刷盘没有调用方能 catch，所以失败一律交给 onFlushError。
+       * 没配回调时至少打一条 error 日志 —— 绝不静默吞掉。
+       */
+      this.flush().then(
+        () => { this.#flushBackoff = 0; },
+        (e: Error) => {
+          if (this.#onFlushError) this.#onFlushError(e);
+          else console.error(`[alarm] 断网缓存刷盘失败：${e.message}`);
+          /*
+           * **必须显式重排**。`flush()` 失败时会重新标脏，但标脏本身不会
+           * 排定时器 —— 只有 append 才会。不重排的话，磁盘临时故障之后
+           * 这批数据就再也不会被尝试刷盘了，哪怕磁盘马上恢复。
+           * 这个 bug 是被「刷盘失败后会重试」那条测试当场抓出来的。
+           */
+          this.#flushBackoff = Math.min(
+            this.#flushBackoff === 0 ? this.flushIntervalMs : this.#flushBackoff * 2,
+            MAX_FLUSH_BACKOFF_MS,
+          );
+          this.#scheduleFlush();
+        },
+      );
+    }, this.#flushBackoff || this.flushIntervalMs);
     this.#flushTimer.unref?.();
   }
 
-  /** 立刻落盘 */
+  /**
+   * 立刻落盘。
+   *
+   * 失败时**重新标记为脏**并抛出：下一个刷盘周期会再试，而调用方（或
+   * onFlushError）能知道这次没成。不重新标脏的话，一次失败之后这批数据
+   * 就再也不会被尝试刷盘了。
+   */
   async flush(): Promise<void> {
     if (!this.#dirty) return;
     this.#dirty = false;
-    await this.#handle?.sync().catch(() => undefined);
+    try {
+      if (this.#handle) await this.#fsync(this.#handle);
+      this.#lastFlushError = undefined;
+    } catch (e) {
+      this.#dirty = true;
+      this.#lastFlushError = (e as Error).message;
+      throw e;
+    }
+  }
+
+  /** 最近一次刷盘失败的原因，供指标与诊断包展示；成功一次即清空 */
+  get lastFlushError(): string | undefined {
+    return this.#lastFlushError;
   }
 
   /**
