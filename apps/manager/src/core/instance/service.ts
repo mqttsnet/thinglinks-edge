@@ -79,6 +79,14 @@ export class InstanceService {
     });
   }
 
+  /**
+   * 底层 docker 句柄，**只给安装自检用**（读 version / info / listNetworks）。
+   *
+   * 那些是环境事实查询，与本类「编排实例容器」的职责无关；
+   * 为它们各包一层方法只会让这个类变胖，而放开整个 DockerClient 又太宽。
+   */
+  get dockerHandle(): DockerClient['raw'] { return this.o.docker.raw; }
+
   async hostStats(): Promise<HostStats> {
     return readHostStats();
   }

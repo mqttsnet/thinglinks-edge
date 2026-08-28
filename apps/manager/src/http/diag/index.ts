@@ -9,8 +9,10 @@ import type { FastifyInstance } from 'fastify';
 import type { HttpContext } from '../context.ts';
 import { registerDiagBundle } from './bundle.ts';
 import { registerDiagProbe } from './probe.ts';
+import { registerPreflight } from './preflight.ts';
 
 export function registerDiag(api: FastifyInstance, ctx: HttpContext): void {
   registerDiagBundle(api, ctx);
   registerDiagProbe(api, ctx);
+  registerPreflight(api, ctx);
 }

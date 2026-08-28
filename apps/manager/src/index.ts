@@ -6,7 +6,7 @@
  */
 import { loadConfig } from './core/config.ts';
 import { openDb } from './core/db.ts';
-import { requireMasterKey, deriveKey, generatePassword } from './core/auth/crypto.ts';
+import { requireMasterKey, deriveKey } from './core/auth/crypto.ts';
 import { AuthService } from './core/auth/service.ts';
 import { InstanceRepo } from './core/instance/repo.ts';
 import { InstanceService } from './core/instance/service.ts';
@@ -17,6 +17,8 @@ import { SpoolDrainer } from './core/spool/drainer.ts';
 import { CloudConfigRepo } from './core/cloud/config-repo.ts';
 import { CloudRuntime } from './core/cloud/runtime.ts';
 import { OutageLog } from './core/cloud/outage.ts';
+import { runPreflight, renderReport, adaptDocker } from './core/preflight/run.ts';
+import { readHostStats } from './core/health/host-stats.ts';
 import { MetricsHistory, MetricsSampler } from './core/health/metrics-history.ts';
 import { recordAudit } from './core/db.ts';
 import { join } from 'node:path';
@@ -146,6 +148,54 @@ async function runRestore(argv: string[]): Promise<void> {
   console.log('[restore] 现在可以启动 Manager；实例容器会在下次启动时按记录重建。');
 }
 
+/**
+ * 安装自检（T6.2 / `03-复杂网络环境适配.md` 第 3 节）。
+ *
+ * 独立子命令而不是启动时自动跑：**装之前就要能跑**，那时候服务还没起来；
+ * 而且现场往往要先跑一遍看结论、改完环境再跑一遍，做成启动副作用就没法这么用。
+ *
+ *   node dist/index.js preflight            # 人读的报告
+ *   node dist/index.js preflight --json     # 结构化，供自动化与交付材料留档
+ *
+ * 有阻断项时退出码为 1，方便安装脚本 `set -e` 直接卡住。
+ */
+async function runPreflightCli(argv: string[]): Promise<void> {
+  const config = loadConfig();
+  const asJson = argv.includes('--json');
+
+  /*
+   * Docker 端点连不上不该让自检整个失败 —— 「连不上」正是它要报告的结论之一。
+   * 所以这里吞掉构造异常，把 docker 传成 undefined，由检查项如实报「阻断」。
+   */
+  let docker: DockerClient | undefined;
+  try {
+    docker = new DockerClient({
+      connection: dockerConnection(),
+      network: 'tle-preflight', imageRepo: 'nodered/node-red',
+      portRange: config.portRange, instanceDataRoot: config.instanceDataRoot,
+      timezone: config.timezone,
+    });
+  } catch { docker = undefined; }
+
+  const report = await runPreflight({
+    externalUrl: config.externalUrl,
+    listenAddr: config.listenAddr,
+    listenPort: config.listenPort,
+    dataDir: config.dataDir,
+    portRange: config.portRange,
+    images: (process.env['ALLOWED_IMAGE_TAGS'] ?? '5.0.4-24-minimal,4.1.13-22-minimal')
+      .split(',').map((t) => `nodered/node-red:${t.trim()}`).filter(Boolean),
+    corporateCidrs: (process.env['CORPORATE_CIDRS'] ?? '')
+      .split(',').map((c) => c.trim()).filter(Boolean),
+    ntpServer: process.env['NTP_SERVER']?.trim() ?? '',
+    ...(docker ? { docker: adaptDocker(docker.raw) } : {}),
+    hostStats: () => readHostStats(config.dataDir),
+  });
+
+  process.stdout.write(asJson ? JSON.stringify(report, null, 2) + '\n' : renderReport(report));
+  if (!report.ok) process.exitCode = 1;
+}
+
 export async function main(): Promise<void> {
   const config = loadConfig();
   const key = deriveKey(requireMasterKey(), 'thinglinks-edge:instance-cred');
@@ -155,11 +205,24 @@ export async function main(): Promise<void> {
   const auth = new AuthService(db, key);
   const repo = new InstanceRepo(db, key);
 
-  // 首次启动生成随机初始口令并打印一次；标记必须改密
-  const initialPassword = process.env['INITIAL_PASSWORD'] ?? generatePassword();
-  if (auth.ensureInitialUser('admin', initialPassword)) {
-    console.log(`[init] 已创建初始账号 admin，初始口令：${initialPassword}`);
-    console.log('[init] 首次登录后必须修改口令，之后此口令即失效。');
+  /*
+   * 账号从哪来，两条路：
+   *
+   *   · 配了 `INITIAL_PASSWORD` —— 无人值守装机用。口令是操作者自己给的，
+   *     他本来就知道，**不打印**。
+   *   · 没配 —— 什么都不建，等人打开控制台自己定账号和口令（首次设置）。
+   *
+   * 以前是「随机生成一个、打进启动日志、让用户去 docker logs 里翻」。
+   * 那样口令会跟着日志跑：进日志聚合、进备份、进随手截的一张图 ——
+   * 诊断包的脱敏模块里专门为它留了一条规则，就是这个原因。
+   */
+  const initialPassword = process.env['INITIAL_PASSWORD']?.trim();
+  if (initialPassword) {
+    if (auth.ensureInitialUser('admin', initialPassword)) {
+      console.log('[init] 已按 INITIAL_PASSWORD 创建初始账号 admin，首次登录后必须改密。');
+    }
+  } else if (auth.needsSetup()) {
+    console.log(`[init] 这台设备还没有账号，请打开 ${config.externalUrl} 设置管理员账号与口令。`);
   }
 
   const connection = dockerConnection();
@@ -276,6 +339,12 @@ export async function main(): Promise<void> {
    * 前向引用：CloudRuntime 的状态回调要触发补传，而 drainer 依赖 cloud.publish，
    * 两者互相需要。用一个后赋值的引用打破循环 —— 比把整块逻辑搅在一起清楚。
    */
+  /*
+   * 声明与赋值必须分离：上面的 onStateChange 闭包要引用它，
+   * 而 drainer 依赖 cloud.publish —— 只能等 cloud 造好之后再回填。
+   * 合并成 const 会形成循环依赖，所以这里豁免 prefer-const。
+   */
+  // eslint-disable-next-line prefer-const
   let drainerRef: SpoolDrainer | undefined;
   /*
    * 断网记录。重启时先收尾上一条未结束的 —— 它的 restoring 状态在内存里的
@@ -287,9 +356,28 @@ export async function main(): Promise<void> {
     console.log(`[outage] 接管重启前未结束的断网记录 #${adopted.id}（${adopted.startedAt} 起）`);
   }
   const cloudConfig = new CloudConfigRepo(db, key);
+
+  /*
+   * 连接状态只在**真正跃迁**时打一行。
+   *
+   * `connecting` 是重试循环在走，不是事件：断网时 mqtt.js 每 reconnectPeriod
+   * （默认 5 秒）就 close → reconnect 一轮，两个状态各来一次。实测断网十分钟
+   * 会触发 243 次回调，全打出来一天三万多行 —— 在边缘盒子上那是拿日志磨 SD 卡，
+   * 而真正有用的「掉线了」「回来了」两行反倒被埋掉。
+   *
+   * 去掉 connecting、再按上一次**打过的**状态去重，同样这十分钟只剩 3 行，
+   * 信息量一点没少。审计侧早就按同一个理由只记 online/offline，这里跟上。
+   */
+  let lastLoggedCloud = '';
+  const logCloudState = (state: string, detail: string) => {
+    if (state === 'connecting' || state === lastLoggedCloud) return;
+    lastLoggedCloud = state;
+    console.log(`[cloud] ${detail}`);
+  };
+
   const cloud = new CloudRuntime({
     onStateChange: (state, detail) => {
-      console.log(`[cloud] ${detail}`);
+      logCloudState(state, detail);
       /*
        * 一连上就立刻补一轮，**不等下一条业务数据**。
        * 这是三个触发口里最关键的一个：断网期间现场可能已经停产，
@@ -378,7 +466,9 @@ export async function main(): Promise<void> {
 // 直接运行时启动服务；被 import 时只导出
 if (process.argv[1] && import.meta.url.endsWith(process.argv[1].replace(/^.*\//, ''))) {
   const [sub, ...rest] = process.argv.slice(2);
-  const task = sub === 'restore' ? runRestore(rest) : main();
+  const task = sub === 'restore' ? runRestore(rest)
+    : sub === 'preflight' ? runPreflightCli(rest)
+      : main();
   task.catch((e) => {
     console.error('[fatal]', (e as Error).message);
     process.exit(1);
