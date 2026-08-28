@@ -41,6 +41,24 @@ export type Action =
    */
   | 'cloud:view'
   | 'cloud:manage'
+  /**
+   * 导诊断包 / 跑连通性探测。
+   *
+   * 给到运维而不是只给管理员：现场出问题时第一个到场的就是运维，
+   * 让他必须找管理员才能取诊断信息，等于把 MTTR 拖长一倍。
+   * 包内容已全程脱敏并有导出前自检兜底，风险可控。
+   */
+  | 'diag:run'
+  /**
+   * 流程模板。看与改分开：模板是跨实例、跨项目复用的资产，
+   * 谁都可以照着已有模板了解现场做法；但删改模板会影响别人后续的套用，
+   * 那是需要担责的动作。
+   *
+   * 注意「把模板套到某台实例上」不用这里的权限，用的是 `instance:operate`
+   * —— 那是对**那台实例**的破坏性操作，必须过实例授权矩阵。
+   */
+  | 'template:view'
+  | 'template:manage'
   | 'user:manage';
 
 export type Role = 'admin' | 'operator' | 'viewer';
@@ -54,15 +72,15 @@ const ROLE_ACTIONS: Record<Role, ReadonlySet<Action>> = {
   admin: new Set<Action>([
     'system:view', 'instance:list', 'instance:view', 'instance:operate', 'instance:create', 'instance:delete',
     'field:view', 'replay:run', 'backup:run', 'user:manage',
-    'cloud:view', 'cloud:manage',
+    'cloud:view', 'cloud:manage', 'diag:run', 'template:view', 'template:manage',
   ]),
   // 运维：管得了运行，建不了也删不了，更管不了用户
   operator: new Set<Action>([
     'system:view', 'instance:list', 'instance:view', 'instance:operate', 'field:view', 'replay:run',
-    'cloud:view',
+    'cloud:view', 'diag:run', 'template:view', 'template:manage',
   ]),
   viewer: new Set<Action>([
-    'system:view', 'instance:list', 'instance:view', 'field:view', 'cloud:view',
+    'system:view', 'instance:list', 'instance:view', 'field:view', 'cloud:view', 'template:view',
   ]),
 };
 

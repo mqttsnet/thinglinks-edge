@@ -5,13 +5,13 @@
  * 新建与重置口令返回的一次性明文**只出现这一次**，不落库、不重复查询。
  */
 import type { FastifyInstance } from 'fastify';
-import { UserError } from '../core/user-repo.ts';
-import { describeRole, ROLES, type GrantLevel, type Role } from '../core/authz.ts';
-import { recordAudit } from '../core/db.ts';
-import type { HttpContext } from './context.ts';
+import { UserError } from '../../core/auth/user-repo.ts';
+import { describeRole, ROLES, type GrantLevel, type Role } from '../../core/auth/authz.ts';
+import { recordAudit } from '../../core/db.ts';
+import type { HttpContext } from '../context.ts';
 
 export function registerUsers(api: FastifyInstance, ctx: HttpContext): void {
-  const { config, db, guard, users, repo } = ctx;
+  const { config, db, guard, users, repo, auth } = ctx;
 
   const fail = (reply: any, e: unknown) =>
     reply.code(e instanceof UserError ? 400 : 500).send({ error: (e as Error).message });
@@ -74,7 +74,15 @@ export function registerUsers(api: FastifyInstance, ctx: HttpContext): void {
     const { username } = req.params as { username: string };
     try {
       const password = users.resetPassword(username);
-      recordAudit(db, { actor: actor.username, action: 'reset-user-password', target: username, result: 'ok' });
+      /*
+       * 重置口令必须当场踢掉那个人已有的会话。
+       * 重置的场景往往是「他的凭据可能泄漏了」或「这个人不该再进来了」——
+       * 旧会话还活着的话，这个动作等于没做。
+       * （AuthService.resolve 里的凭据比对也会兜住，这里是立刻生效那一层。）
+       */
+      const kicked = auth.revokeUser(username);
+      recordAudit(db, { actor: actor.username, action: 'reset-user-password', target: username,
+                        detail: `踢下线 ${kicked} 个会话`, result: 'ok' });
       return reply.send({ username, password });
     } catch (e) { return fail(reply, e); }
   });

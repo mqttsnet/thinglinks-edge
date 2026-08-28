@@ -2,7 +2,7 @@
 import { ref, onMounted } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
 import { NCard, NForm, NFormItem, NInput, NButton, NAlert, useMessage } from 'naive-ui';
-import { api, ApiError } from '../api/client';
+import { api, ApiError } from '../../api/client';
 
 const router = useRouter();
 const route = useRoute();

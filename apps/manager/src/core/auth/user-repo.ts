@@ -5,7 +5,7 @@
  * 分开是因为会话是热路径、账号管理是低频操作，混在一起会让前者被后者的复杂度拖累。
  */
 import { hashPassword, generatePassword } from './crypto.ts';
-import type { Db } from './db.ts';
+import type { Db } from '../db.ts';
 import { ROLES, type GrantLevel, type Role } from './authz.ts';
 
 export interface UserRecord {

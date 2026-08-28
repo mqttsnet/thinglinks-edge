@@ -15,9 +15,9 @@ import {
   NAlert, NTag, useMessage, useDialog,
 } from 'naive-ui';
 import { useRouter } from 'vue-router';
-import { api, ApiError } from '../api/client';
-import type { UserRecord, GrantRecord, Instance, Role, GrantLevel } from '../api/types';
-import FieldHelp from '../components/FieldHelp.vue';
+import { api, ApiError } from '../../api/client';
+import type { UserRecord, GrantRecord, Instance, Role, GrantLevel } from '../../api/types';
+import FieldHelp from '../../components/FieldHelp.vue';
 
 const router = useRouter();
 const message = useMessage();
@@ -224,6 +224,10 @@ function confirmReset(u: UserRecord) {
             <FieldHelp>
               <p><b>只读</b>：能看列表、日志与健康，也能打开编辑器查看流程，
                 但<b>改不了</b> —— 部署会被拒。</p>
+              <p class="fh-warn">只读用户的编辑器<b>没有实时事件流</b>：调试侧栏收不到消息、
+                节点状态不刷新，编辑器右上角会提示连接中断。这是有意的 ——
+                那条实时通道是双向的，能往流程里写入，所以按「改动」对待。
+                需要看实时调试请给「可操作」。</p>
               <p><b>可操作</b>：能启停、重置实例口令、在编辑器里部署流程。</p>
               <p>选「无」就是没有权限：那台实例不会出现在他的列表、健康看板和趋势图里，
                 直接访问也会被拒。</p>

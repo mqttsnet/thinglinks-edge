@@ -13,12 +13,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { openDb } from '../dist/core/db.js';
-import { deriveKey } from '../dist/core/crypto.js';
-import { AuthService } from '../dist/core/auth.js';
-import { InstanceRepo } from '../dist/core/instance-repo.js';
-import { UserRepo } from '../dist/core/user-repo.js';
-import { InstanceService } from '../dist/core/instance-service.js';
-import { MetricsHistory } from '../dist/core/metrics-history.js';
+import { deriveKey } from '../dist/core/auth/crypto.js';
+import { AuthService } from '../dist/core/auth/service.js';
+import { InstanceRepo } from '../dist/core/instance/repo.js';
+import { UserRepo } from '../dist/core/auth/user-repo.js';
+import { InstanceService } from '../dist/core/instance/service.js';
+import { MetricsHistory } from '../dist/core/health/metrics-history.js';
 import { FieldRegistry } from '../dist/core/edge/registry.js';
 import { buildServer } from '../dist/http/app.js';
 import WebSocket from 'ws';
@@ -179,6 +179,78 @@ async function main() {
   check('被拒时请求根本没打到上游', upstreamHits === 0, `上游被访问 ${upstreamHits} 次`);
   check('授权实例的反代仍然可用', await status('/red/line-a/', op) === 200);
 
+  // ── 强制改密不能只靠前端路由 ──
+  /*
+   * 会话在改密前是**完全有效**的，只有 Vue 路由守卫在拦。
+   * 拿着初始口令直接打后端接口就能绕过去 —— 而初始口令印在启动日志里。
+   * 所以闸门必须在后端 guard 上，前端那层只是引导。
+   */
+  const pendPw = await mk('pending', 'admin');
+  const pend = await login('pending', pendPw);
+  check('待改密用户能登录（否则没法改密）', Boolean(pend));
+  check('待改密·调业务接口被拒', await status('/api/instances', pend) === 403);
+  check('待改密·管理员接口也被拒（角色再大也先改密）',
+        await status('/api/users', pend) === 403);
+  check('待改密·反代打开编辑器被拒（编辑器后面是实例 admin API）',
+        await status('/red/line-a/', pend) === 403);
+  const pendErr = await (await fetch(`${B}/api/instances`, { headers: pend.headers })).json();
+  check('待改密·错误里带机器可识别的 code，前端据此跳改密页',
+        pendErr.code === 'PASSWORD_CHANGE_REQUIRED', JSON.stringify(pendErr).slice(0, 70));
+  // 改密通道本身必须留着，否则用户被锁死
+  check('待改密·仍可读自己的会话（/api/me）', await status('/api/me', pend) === 200);
+  const changed = await fetch(`${B}/api/change-password`, {
+    method: 'POST', headers: pend.headers,
+    body: JSON.stringify({ oldPassword: pendPw, newPassword: 'pending-pass-1234' }),
+  });
+  check('待改密·改密接口可用（不能把人锁死）', changed.status === 204, `HTTP ${changed.status}`);
+  const afterPend = await login('pending', 'pending-pass-1234');
+  check('改密后恢复正常访问', await status('/api/instances', afterPend) === 200);
+  /*
+   * 用完降级。这个账号特意建成 admin，是为了证明「角色再大也得先改密」；
+   * 但留着它系统里就有两个管理员，后面「最后一个管理员不能被停用」那条前提就没了 ——
+   * 那条会拿到 204，再 .json() 空体直接抛 Unexpected end of JSON input。
+   */
+  await fetch(`${B}/api/users/pending/role`, {
+    method: 'POST', headers: root.headers, body: JSON.stringify({ role: 'viewer' }),
+  });
+
+  // ── WebSocket 升级按写操作判 ──
+  /*
+   * 握手是 GET，但通道建起来就是双向的：实例的 httpNodeRoot 与编辑器同处
+   * 一个反代前缀，流程里放个 `websocket in` 节点就能对外开端点，
+   * 只读用户握手成功即可往流程灌消息。那是写，不是看。
+   */
+  /*
+   * 必须用原生 http.request 发升级请求：**Node 的 fetch 不支持 Upgrade**，
+   * 它会直接抛异常。用 fetch 写这条断言会拿到 status 0 ——
+   * 「只读被拒」那条看似失败、「可操作放行」那条却因 0 !== 403 **假通过**。
+   */
+  const { request: httpRequest } = await import('node:http');
+  const upgradeStatus = (sess) => new Promise((resolve) => {
+    const req = httpRequest({
+      host: '127.0.0.1', port: PORT, path: '/red/line-a/comms', method: 'GET',
+      headers: {
+        ...sess.headers,
+        connection: 'Upgrade',
+        upgrade: 'websocket',
+        'sec-websocket-version': '13',
+        'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==',
+      },
+    });
+    // 被授权层放行时上游不可达，会走 error 或非 101 响应；两者都不是 403
+    req.on('response', (res) => { res.resume(); resolve(res.statusCode ?? 0); });
+    req.on('upgrade', (res, socket) => { socket.destroy(); resolve(101); });
+    req.on('error', () => resolve(-1));
+    req.setTimeout(4000, () => { req.destroy(); resolve(-2); });
+    req.end();
+  });
+
+  const viUp = await upgradeStatus(vi);
+  check('越权·只读用户建立实时通道被拒（该通道可向流程写入）', viUp === 403, `HTTP ${viUp}`);
+  const opUp = await upgradeStatus(op);
+  check('可操作用户的实时通道通过了授权层（未被 403）',
+        opUp !== 403 && opUp !== 0, `结果 ${opUp}（403 表示被拦，其它表示已放行到上游）`);
+
   // ── 越权：角色级动作 ──
   check('越权·运维建实例被拒',
         await status('/api/instances', op, { method: 'POST', body: '{}' }) === 403);
@@ -262,6 +334,22 @@ async function main() {
     method: 'POST', headers: root.headers, body: JSON.stringify({ role: 'viewer' }),
   });
   check('最后一个管理员不能被降级', selfDemote.status === 400);
+
+  // ── 重置口令必须当场踢掉旧会话 ──
+  // 重置的场景往往是「凭据可能泄漏了」，旧会话还活着的话这个动作等于没做
+  const tmpPw = await mk('shift-b', 'viewer');
+  const tmp = await useAs('shift-b', tmpPw, 'shiftb-pass-12345');
+  check('新账号登录后会话可用', await status('/api/instances', tmp) === 200);
+  await fetch(`${B}/api/users/shift-b/password/reset`, { method: 'POST', headers: root.headers });
+  check('管理员重置口令后，旧会话立即失效', await status('/api/instances', tmp) === 401);
+
+  // ── 登录失败限速不能变成锁死管理员的按钮 ──
+  for (let i = 0; i < 6; i += 1) await login('admin', 'wrong-password-xxx');
+  check('同一来源连续失败会被锁定',
+        (await (await fetch(`${B}/api/login`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ username: 'admin', password: 'admin-pass-1234' }),
+        })).json()).error?.includes('锁定') === true);
 
   // ── 未登录 ──
   check('未登录访问实例被拒', await status('/api/instances') === 401);

@@ -65,7 +65,8 @@ test('每个动作至少归属一个角色 —— 否则谁都做不了', () => 
   const ALL: Record<Action, true> = {
     'system:view': true, 'instance:list': true, 'instance:view': true, 'instance:operate': true,
     'instance:create': true, 'instance:delete': true, 'field:view': true, 'replay:run': true,
-    'backup:run': true, 'cloud:view': true, 'cloud:manage': true, 'user:manage': true,
+    'backup:run': true, 'cloud:view': true, 'cloud:manage': true, 'diag:run': true,
+    'template:view': true, 'template:manage': true, 'user:manage': true,
   };
   for (const a of Object.keys(ALL) as Action[]) {
     assert.ok(ROLES.some((r) => can(r, a)), `动作 ${a} 没有任何角色能做`);
@@ -76,7 +77,7 @@ test('describeRole 给前端用，但只是展示', () => {
   const d = describeRole('viewer');
   assert.equal(d.role, 'viewer');
   assert.deepEqual(d.actions,
-    ['cloud:view', 'field:view', 'instance:list', 'instance:view', 'system:view']);
+    ['cloud:view', 'field:view', 'instance:list', 'instance:view', 'system:view', 'template:view']);
   assert.deepEqual(describeRole('nobody').actions, []);
 });
 
