@@ -122,10 +122,16 @@ services:
       # 升级检查。留空即完全不联网（默认）—— 见 .env.example 的说明
       UPDATE_CHECK_URL: ${UPDATE_CHECK_URL:-}
       # 出网代理（03 号文 2.10）。只有企业代理能出网的现场才需要填；离线部署留空。
-      # NO_PROXY 里的内部条目由平台注入实例时自动补齐，这里填企业网管给的那份即可 ——
-      # 但宿主上手动跑的 curl / npm / docker 用的是这份，别漏了内网段
-      HTTP_PROXY: ${HTTP_PROXY:-}
-      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      #
+      # 变量名**刻意加了 EDGE_ 前缀**，不直接读 HTTP_PROXY：
+      # docker compose 的取值顺序是「shell 环境 > .env」，用标准名的话，
+      # 谁在带代理的机器上敲了 `docker compose up`，谁的代理地址就被带进现场容器 ——
+      # 而 .env 里明明写着留空。那种「配了不生效、没配反而生效」最难查。
+      # 加前缀后，这台设备用不用代理只由 .env 决定，与执行者的 shell 无关。
+      HTTP_PROXY: ${EDGE_HTTP_PROXY:-}
+      # 只填了 HTTP 代理时 HTTPS 回落到它：不回落的话 https 请求会绕过代理直连，
+      # 在只有代理能出网的现场表现为「升级检查一直超时」，而代理明明配了
+      HTTPS_PROXY: ${EDGE_HTTPS_PROXY:-${EDGE_HTTP_PROXY:-}}
       #
       # NO_PROXY 的内部条目**必须在这里补**，不能只靠部署方填。
       #
@@ -136,7 +142,7 @@ services:
       #
       # 固定条目写在前面、部署方那份接在后面：顺序不影响匹配，但这样
       # NO_PROXY 为空时也不会出现前导逗号。
-      NO_PROXY: localhost,127.0.0.1,::1,${EDGE_NAME_PREFIX:-thinglinks-edge}-manager,${EDGE_NAME_PREFIX:-thinglinks-edge}-docker-proxy,tle-nr-,${INSTANCE_NETWORK:-thinglinks-edge},${NO_PROXY:-localhost}
+      NO_PROXY: localhost,127.0.0.1,::1,${EDGE_NAME_PREFIX:-thinglinks-edge}-manager,${EDGE_NAME_PREFIX:-thinglinks-edge}-docker-proxy,tle-nr-,${INSTANCE_NETWORK:-thinglinks-edge},${EDGE_NO_PROXY:-localhost}
       # 企业内网网段，供自检比对 Docker 网段冲突（03 号文 2.9）
       CORPORATE_CIDRS: ${CORPORATE_CIDRS:-}
       # 健康监测趋势曲线的采样间隔（秒）。0 关闭采样，界面会明说趋势未启用。
