@@ -6,20 +6,22 @@
  */
 import { loadConfig } from './core/config.ts';
 import { openDb } from './core/db.ts';
-import { requireMasterKey, deriveKey, generatePassword } from './core/crypto.ts';
-import { AuthService } from './core/auth.ts';
-import { InstanceRepo } from './core/instance-repo.ts';
-import { InstanceService } from './core/instance-service.ts';
-import { DockerClient } from './core/docker-client.ts';
+import { requireMasterKey, deriveKey, generatePassword } from './core/auth/crypto.ts';
+import { AuthService } from './core/auth/service.ts';
+import { InstanceRepo } from './core/instance/repo.ts';
+import { InstanceService } from './core/instance/service.ts';
+import { DockerClient } from './core/instance/docker-client.ts';
 import { buildServer } from './http/app.ts';
 import { Spool, type FullPolicy } from './core/spool/spool.ts';
+import { SpoolDrainer } from './core/spool/drainer.ts';
 import { CloudConfigRepo } from './core/cloud/config-repo.ts';
 import { CloudRuntime } from './core/cloud/runtime.ts';
-import { MetricsHistory, MetricsSampler } from './core/metrics-history.ts';
+import { OutageLog } from './core/cloud/outage.ts';
+import { MetricsHistory, MetricsSampler } from './core/health/metrics-history.ts';
 import { recordAudit } from './core/db.ts';
 import { join } from 'node:path';
 import { readFile } from 'node:fs/promises';
-import { restoreBackup } from './core/backup.ts';
+import { restoreBackup } from './core/archive/backup.ts';
 import { existsSync } from 'node:fs';
 import { hostname } from 'node:os';
 
@@ -149,7 +151,8 @@ export async function main(): Promise<void> {
   const key = deriveKey(requireMasterKey(), 'thinglinks-edge:instance-cred');
   const db = openDb(join(config.dataDir, 'edge.db'));
 
-  const auth = new AuthService(db);
+  // 主密钥同时用于两步验证的 TOTP 密钥加密，与实例凭据同一套
+  const auth = new AuthService(db, key);
   const repo = new InstanceRepo(db, key);
 
   // 首次启动生成随机初始口令并打印一次；标记必须改密
@@ -193,11 +196,35 @@ export async function main(): Promise<void> {
    * 数据取舍这种事发生了却没人知道，是最糟的情况。
    */
   const fullPolicy = resolveFullPolicy();
+  /** 同一个磁盘故障原因只告警一次，恢复正常后由下一次不同的原因重置 */
+  let lastWriteErrorKey = '';
   const spool = await Spool.open({
     dir: join(config.dataDir, 'spool'),
     maxBytes: Number(process.env['EDGE_SPOOL_MAX_BYTES'] ?? 2 * 1024 * 1024 * 1024),
     fullPolicy,
+    /*
+     * 落盘失败告警。与 onFull 走同一条通道 —— 早先只有「逻辑写满」会告警，
+     * 而「物理写不进去」（ENOSPC、磁盘故障、权限）悄无声息，后者明明更严重。
+     *
+     * 同一个原因只报第一次：磁盘坏了会每批都失败，逐条写审计会把表刷爆，
+     * 而刷爆之后真正有用的那几条反而找不到了。
+     */
+    onWriteError: (info) => {
+      const key = `${info.phase}:${info.error}`;
+      if (key === lastWriteErrorKey) return;
+      lastWriteErrorKey = key;
+      const what = info.phase === 'append'
+        ? '断网缓存写入失败，这批数据已丢失'
+        : '断网缓存刷盘失败，已写入的数据可能未真正落盘，掉电会丢';
+      console.error(`[alarm] ${what}：${info.error}`);
+      recordAudit(db, {
+        actor: 'system', action: 'spool-write-error', target: info.phase,
+        detail: `${what}：${info.error}`, result: 'fail',
+      });
+    },
     onFull: (info) => {
+      // 写满意味着开始丢数据，断网记录里必须留下这笔
+      if (info.full) outages.bump('dropped', 1);
       const msg = info.full
         ? `断网缓存已写满（${info.bytes}/${info.maxBytes} 字节），按「${info.policy}」处置`
         : `断网缓存已回落到安全水位（${info.bytes}/${info.maxBytes} 字节）`;
@@ -245,10 +272,38 @@ export async function main(): Promise<void> {
    *
    * 连不上时上行会落进 spool，链路一恢复自动补传（08 号文第 6 节）。
    */
+  /*
+   * 前向引用：CloudRuntime 的状态回调要触发补传，而 drainer 依赖 cloud.publish，
+   * 两者互相需要。用一个后赋值的引用打破循环 —— 比把整块逻辑搅在一起清楚。
+   */
+  let drainerRef: SpoolDrainer | undefined;
+  /*
+   * 断网记录。重启时先收尾上一条未结束的 —— 它的 restoring 状态在内存里的
+   * 补传进度已经没了，不标注的话会一直显示「补传中」而实际没人在补。
+   */
+  const outages = new OutageLog(db);
+  const adopted = outages.adoptAfterRestart();
+  if (adopted) {
+    console.log(`[outage] 接管重启前未结束的断网记录 #${adopted.id}（${adopted.startedAt} 起）`);
+  }
   const cloudConfig = new CloudConfigRepo(db, key);
   const cloud = new CloudRuntime({
     onStateChange: (state, detail) => {
       console.log(`[cloud] ${detail}`);
+      /*
+       * 一连上就立刻补一轮，**不等下一条业务数据**。
+       * 这是三个触发口里最关键的一个：断网期间现场可能已经停产，
+       * 恢复后没有任何新数据能带动补传。
+       */
+      if (state === 'online') {
+        outages.restore();
+        void drainerRef?.trigger('link-online');
+      }
+      /*
+       * 掉线即开一条记录。`begin` 自己会去重 —— 连接抖动会在几秒内
+       * 掉线重连好几次，每次开一条会把列表刷成噪音。
+       */
+      if (state === 'offline') outages.begin();
       // 只记上线与掉线两个跃迁，connecting 每次重试都记会把审计刷爆
       if (state === 'online' || state === 'offline') {
         recordAudit(db, {
@@ -265,8 +320,46 @@ export async function main(): Promise<void> {
     console.error(`[cloud] 接入配置无法应用：${(e as Error).message}`);
   }
 
+  /*
+   * 补传调度。
+   *
+   * 修的是一个真实漏洞：补传原先**只在微批发送成功之后**触发，
+   * 没有定时器也没挂链路恢复事件。于是断网攒下积压、链路恢复之后，
+   * 只要现场此刻没有新数据上报，积压就永远滞留 —— 而界面显示「已连接」。
+   * 夜班停机、长周期抄读、断网期间实例也停了，都会踩到。
+   */
+  const drainer = new SpoolDrainer({
+    spool,
+    send: (payload) => cloud.publish(payload),
+    ready: () => cloud.configured && cloud.state === 'online',
+    ratePerSec: Number(process.env['EDGE_REPLAY_RATE'] ?? 50),
+    intervalMs: Number(process.env['EDGE_REPLAY_INTERVAL_MS'] ?? 60_000),
+    onRound: (r) => {
+      if (r.sent > 0) console.log(`[replay] 补传 ${r.sent} 条（触发：${r.trigger}）`);
+      if (r.failed > 0) console.warn(`[replay] 补传中断，${r.failed} 条未送出，等下一轮`);
+      outages.bump('replayed', r.sent);
+      /*
+       * 积压清零才算这次断网真正结束。放在补传回调里判而不是定时轮询：
+       * 只有补传动过之后 pending 才可能归零。
+       */
+      void spool.metrics().then((m) => {
+        outages.observePending(m.pending);
+        if (m.pending === 0) {
+          const done = outages.finish();
+          if (done) {
+            console.log(`[outage] #${done.id} 已补完：断网 ${done.outageSec}s · `
+              + `补传 ${done.recoverySec}s · 峰值积压 ${done.peakPending} 条`
+              + (done.dropped > 0 ? ` · **丢弃 ${done.dropped} 条**` : ''));
+          }
+        }
+      });
+    },
+  });
+  drainerRef = drainer;
+  drainer.start();
+
   const app = buildServer({
-    config, db, auth, repo, service, spool, metrics,
+    config, db, auth, repo, service, spool, metrics, drainer, outages,
     cloud, cloudConfig,
     cloudSink: (payload) => cloud.publish(payload),
     webRoot: process.env['WEB_ROOT']?.trim() || undefined,

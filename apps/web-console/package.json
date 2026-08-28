@@ -8,7 +8,7 @@
     "build": "vue-tsc --noEmit && vite build",
     "typecheck": "vue-tsc --noEmit",
     "lint": "vue-tsc --noEmit",
-    "test": "echo '(web-console 暂无单测)'",
+    "test": "node --experimental-strip-types --test 'src/**/*.test.ts'",
     "preview": "vite preview"
   },
   "dependencies": {

@@ -164,8 +164,122 @@ const MIGRATIONS: string[] = [
   ALTER TABLE cloud_config ADD COLUMN tls_reject_unauthorized INTEGER NOT NULL DEFAULT 1;
   ALTER TABLE cloud_config ADD COLUMN tls_servername          TEXT    NOT NULL DEFAULT '';
   `,
-];
+  /*
+   * v6 —— 流程模板（T4.6）。
+   *
+   * 存的是 Node-RED 的 flows JSON 原文。**不含凭据**：实测 5.0.4 的
+   * `GET /flows` 不返回 credentials（它们单独存在加密的 flows_cred.json 里）。
+   * 但 function 节点里硬编码的密钥会原样带出来，所以导出时扫一遍存进 `warnings`，
+   * 让共享模板的人在分发前就知道有这回事。
+   *
+   * `node_types` 是套用前的护栏：模板用了目标实例没装的节点，套上去会得到
+   * 一堆坏节点而且不会报错。存下来就能在套用前当场比对。
+   */
+  `
+  CREATE TABLE flow_template (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    content     TEXT NOT NULL,
+    node_count  INTEGER NOT NULL DEFAULT 0,
+    tab_count   INTEGER NOT NULL DEFAULT 0,
+    node_types  TEXT NOT NULL DEFAULT '',
+    source      TEXT NOT NULL DEFAULT '',
+    warnings    TEXT NOT NULL DEFAULT '[]',
+    created_by  TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+  CREATE INDEX idx_template_created ON flow_template(created_at);
+  `,
+  /*
+   * v7 —— MQTT 连接参数（版本、心跳、超时、重连）。
+   *
+   * 在此之前这几项写死在 gateway 里。写死的问题不是不能用，是**现场没得调**：
+   * 有些云侧只认 MQTT 3.1.1；NAT 网关常在 60 秒后回收空闲连接，心跳得压到 30；
+   * 4G 弱网现场重连间隔 5 秒会把本就窄的带宽打满。这些都不该靠改代码解决。
+   *
+   * 每一个默认值都**等于改动前写死的那个值**，所以已装的现场升上来行为不变 ——
+   * 升级顺手改掉运行参数是最难排查的一类事故。
+   *
+   * 注意 `mqtt_version` 与既有的 `protocol_version` 是两回事：前者是 MQTT 协议本身
+   * （3/4/5，即 3.1 / 3.1.1 / 5.0），后者是 topic 首段的 `v1`。名字挨着但一个都不能混。
+   */
+  `
+  ALTER TABLE cloud_config ADD COLUMN mqtt_version        INTEGER NOT NULL DEFAULT 5;
+  ALTER TABLE cloud_config ADD COLUMN keepalive_sec       INTEGER NOT NULL DEFAULT 60;
+  ALTER TABLE cloud_config ADD COLUMN connect_timeout_sec INTEGER NOT NULL DEFAULT 15;
+  ALTER TABLE cloud_config ADD COLUMN auto_reconnect      INTEGER NOT NULL DEFAULT 1;
+  ALTER TABLE cloud_config ADD COLUMN reconnect_period_ms INTEGER NOT NULL DEFAULT 5000;
+  `,
+  /*
+   * v8 —— 系统设置与两步验证。
+   *
+   * `system_setting` 是单行表（`id` 恒为 1），只装**运行期可改**的那几项。
+   * 部署期的东西（EXTERNAL_URL、MASTER_KEY、数据根、缓存写满策略）**刻意不放进来**：
+   * 从 Web 改 EXTERNAL_URL 能把自己锁在外面，改写满策略是替客户做数据取舍。
+   * 那些留在 compose 里，改动有文件、有版本、有人 review。
+   *
+   * 默认值同样等于改动前写死在代码里的常量，升上来行为不变。
+   *
+   * 两步验证的密钥与实例凭据、云端 signKey 同一套主密钥加密入库（`_enc` 后缀）。
+   * `totp_last_step` 存上次用过的时间步：TOTP 一个码有 30 秒有效期，
+   * 中间人截到之后在窗口内重放是能成功的，只接受更大的步数才堵得住。
+   *
+   * 恢复码单独一张表而不是塞进 app_user 的一个 JSON 列：用掉一条要标记 used_at，
+   * 塞在 JSON 里就得读出来改完再写回去，并发下会互相覆盖。
+   */
+  `
+  CREATE TABLE system_setting (
+    id                   INTEGER PRIMARY KEY CHECK (id = 1),
+    session_idle_min     INTEGER NOT NULL DEFAULT 480,
+    login_max_failures   INTEGER NOT NULL DEFAULT 5,
+    login_lock_min       INTEGER NOT NULL DEFAULT 5,
+    require_2fa          INTEGER NOT NULL DEFAULT 0,
+    update_check_enabled INTEGER NOT NULL DEFAULT 1,
+    updated_at           TEXT    NOT NULL DEFAULT (datetime('now')),
+    updated_by           TEXT    NOT NULL DEFAULT ''
+  );
+  INSERT INTO system_setting (id) VALUES (1);
 
+  ALTER TABLE app_user ADD COLUMN totp_secret_enc TEXT    NOT NULL DEFAULT '';
+  ALTER TABLE app_user ADD COLUMN totp_enabled    INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE app_user ADD COLUMN totp_last_step  INTEGER NOT NULL DEFAULT 0;
+
+  CREATE TABLE recovery_code (
+    username  TEXT NOT NULL,
+    code_hash TEXT NOT NULL,
+    used_at   TEXT,
+    PRIMARY KEY (username, code_hash)
+  );
+  CREATE INDEX idx_recovery_user ON recovery_code(username);
+  `,
+  /*
+   * v9 —— 断网记录（08 号文第 8 节）。
+   *
+   * 现场问「昨晚断了多久、丢没丢、补完没有」时，光靠当前状态答不上来 ——
+   * 那时候链路早恢复了，指标也归零了。所以每次断网留一条，**跨重启留存**。
+   *
+   * 一次断网有三个时刻，不是两个：断开、链路恢复、积压补完。
+   * 中间那段是「连上了但还在追欠账」，现场最关心的恰恰是它 ——
+   * 只记断开和恢复，会让人以为一恢复就没事了。
+   */
+  `
+  CREATE TABLE cloud_outage (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at   TEXT    NOT NULL,
+    restored_at  TEXT,
+    drained_at   TEXT,
+    peak_pending INTEGER NOT NULL DEFAULT 0,
+    spooled      INTEGER NOT NULL DEFAULT 0,
+    replayed     INTEGER NOT NULL DEFAULT 0,
+    dropped      INTEGER NOT NULL DEFAULT 0,
+    status       TEXT    NOT NULL DEFAULT 'ongoing'
+                 CHECK (status IN ('ongoing', 'restoring', 'done')),
+    note         TEXT    NOT NULL DEFAULT ''
+  );
+  CREATE INDEX idx_outage_started ON cloud_outage(started_at DESC);
+  `,
+];
 export function openDb(file: string): Db {
   if (file !== ':memory:') mkdirSync(dirname(file), { recursive: true });
   const db = new Database(file);
