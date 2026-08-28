@@ -1,0 +1,99 @@
+# CI 基线（T0.3）：每次 push 与 PR 都跑 lint + typecheck + 单元测试。
+#
+# 分成两个 job 是有原因的：
+#
+#   · `check` 不需要 Docker，一两分钟出结果，是**每次提交都必须绿**的那道门
+#   · `verify` 要起真容器（Node-RED、mosquitto、socat），十几分钟起步，
+#     跑在 PR 与主干推送上，但不阻塞日常提交的快速反馈
+#
+# 为什么一定要有这个：在此之前全靠人在本地手工跑 `pnpm verify`，
+# 而多人/多会话并行改动时，红了都分不清是谁弄红的 —— 这正是本仓库真实踩过的坑。
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  # 手动触发，用于验证 workflow 本身
+  workflow_dispatch:
+
+# 同一分支的新推送取消上一次跑，省额度也省等待
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: lint + typecheck + 单元测试
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # 与 package.json 的 engines 保持一致；用 lockfile 之外的版本没意义
+          node-version: '22'
+          cache: pnpm
+
+      - name: 安装依赖
+        # --frozen-lockfile：lockfile 与 package.json 不一致时**直接失败**，
+        # 而不是悄悄改 lockfile —— 那会让 CI 装的和本地装的不是同一套
+        run: pnpm install --frozen-lockfile
+
+      - name: lint
+        run: pnpm lint
+
+      - name: typecheck
+        run: pnpm typecheck
+
+      - name: 单元测试
+        run: pnpm test
+
+      - name: 构建
+        # 放在最后：前面三道都过了才值得花时间编译
+        run: pnpm build
+
+  verify:
+    name: 真容器回归
+    runs-on: ubuntu-latest
+    # 只在 PR 与主干推送上跑；日常 push 到 dev 不必每次等十几分钟
+    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
+    needs: check
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 预拉镜像
+        # 提前拉好，避免验证脚本里的超时把「镜像还在下载」误判成「实例起不来」
+        run: |
+          docker pull nodered/node-red:5.0.4-24-minimal
+          docker pull eclipse-mosquitto:2.1.2-alpine
+          docker pull alpine/socat
+          docker pull wollomatic/socket-proxy:1.13.1
+
+      - name: 全量回归
+        working-directory: apps/manager
+        env:
+          # 验证脚本用的数据根。GH runner 上 /tmp 可写且 Docker 默认共享
+          TLE_VERIFY_EDGE_ROOT: /tmp/tle-verify
+        run: pnpm verify
+
+      - name: 失败时导出容器日志
+        if: failure()
+        run: |
+          docker ps -a
+          for c in $(docker ps -aq); do
+            echo "───── $(docker inspect --format '{{.Name}}' "$c") ─────"
+            docker logs --tail 50 "$c" 2>&1 || true
+          done

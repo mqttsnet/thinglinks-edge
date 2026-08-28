@@ -9,7 +9,7 @@
     "build": "rm -rf dist && tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --experimental-strip-types --test 'src/**/*.test.ts'",
-    "lint": "tsc -p tsconfig.json --noEmit",
+    "lint": "echo '(lint 在仓库根统一跑：pnpm lint)'",
     "verify": "sh scripts/verify-all.sh"
   },
   "dependencies": {
