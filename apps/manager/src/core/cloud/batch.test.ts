@@ -29,7 +29,13 @@ function collector() {
 
 test('默认阈值就是 08 号文定的三个数，外加一条队列水位上限', () => {
   assert.deepEqual(DEFAULT_LIMITS, {
-    windowMs: 200, maxPoints: 500, maxBytes: 256 * 1024,
+    /*
+     * maxPoints 2026-08-28 从 500 调到 2000，08 号文第 2 节同步更新过。
+     * 依据是实测：分组后一个点约 19 字节，500 点才 9.3 KB，
+     * 而字节预算 256 KB —— 点数限制远早于字节限制触发，白白把上行切成小包。
+     * 上行串行（QoS 1 等 PUBACK），包越小往返越多，吞吐被 RTT 除。
+     */
+    windowMs: 200, maxPoints: 2000, maxBytes: 256 * 1024,
     // 队列上限不是 08 号文的三个触发条件，是为了不让云端卡住时把内存排爆
     maxQueuedBatches: 8, maxQueuedBytes: 2 * 1024 * 1024,
   });

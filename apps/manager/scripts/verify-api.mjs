@@ -391,7 +391,7 @@ async function main() {
 
   const metrics = await (await fetch(`${B}/api/edge/metrics`, { headers: { cookie } })).json();
   check('指标接口暴露批量阈值与已发数量',
-        metrics.batch?.limits?.windowMs === 200 && metrics.batch?.limits?.maxPoints === 500 &&
+        metrics.batch?.limits?.windowMs === 200 && metrics.batch?.limits?.maxPoints === 2000 &&
         metrics.batch?.batches === 1 && metrics.batch?.points === 3,
         JSON.stringify(metrics.batch?.limits) + ` 已发 ${metrics.batch?.batches} 批 ${metrics.batch?.points} 点`);
   check('云端已配置时如实报告', metrics.cloud === 'configured', metrics.cloud);
