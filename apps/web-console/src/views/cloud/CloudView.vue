@@ -27,6 +27,8 @@ import {
   splitBroker, joinBroker, isWs, isSecure,
   portOnSchemeChange, pathOnSchemeChange, defaultBroker,
 } from './broker-url.ts';
+import { summarizeOutage, summarizeReplay } from './outage-format.ts';
+import type { ReplayProgress, OutageRecord } from '../../api/types.ts';
 
 const message = useMessage();
 const dialog = useDialog();
@@ -36,6 +38,10 @@ const saving = ref(false);
 const config = ref<CloudConfigView | null>(null);
 const status = ref<CloudStatus | null>(null);
 const spool = ref<SpoolMetrics | null>(null);
+/** 补传进度与预计完成。etaSec 为 null 时由 reason 说明原因，界面照原样转述 */
+const replay = ref<ReplayProgress | null>(null);
+/** 最近断网记录。当前状态答不了「昨晚断了多久」，这张表才能 */
+const outages = ref<OutageRecord[] | null>(null);
 /** 数据面明细。与 api.cloud() 的 spool 概要分开取：那边只够画一条提示，这边要画整张卡 */
 const metrics = ref<EdgeMetrics | null>(null);
 const replaying = ref(false);
@@ -144,6 +150,8 @@ async function refresh(quiet = false) {
     config.value = r.config;
     status.value = r.status;
     spool.value = r.spool;
+    replay.value = r.replay;
+    outages.value = r.outages;
     // 单独一路，失败不影响上面的连接状态显示
     metrics.value = await api.edgeMetrics().catch(() => null);
     // 只在非静默刷新时回填表单，否则用户正在输入的内容会被轮询冲掉
@@ -408,9 +416,12 @@ const dbTime = (v: string | undefined) =>
         </NAlert>
 
         <NAlert v-if="spool && spool.pending > 0" type="info" :bordered="false" style="margin-top:12px">
-          断网缓存里还有 <b>{{ spool.pending }}</b> 条待补传，
-          占用 {{ mb(spool.bytes) }} MB / {{ mb(spool.maxBytes) }} MB。
-          链路恢复后会在实时数据之外的余量里自动补发。
+          {{ summarizeReplay(replay) }}，占用 {{ mb(spool.bytes) }} MB / {{ mb(spool.maxBytes) }} MB。
+          <template v-if="replay?.etaSec === null">
+            <br /><span class="sm muted">
+              预计完成时间要有实测速率才算得出来 —— 没有就如实说没有，不猜一个数。
+            </span>
+          </template>
         </NAlert>
       </NCard>
 
@@ -519,6 +530,28 @@ const dbTime = (v: string | undefined) =>
           </NAlert>
         </template>
         <p v-else class="hint">读取数据面状态失败，稍后自动重试。</p>
+      </NCard>
+
+      <!-- 断网记录：事后追溯「昨晚断了多久、丢没丢、补完没有」 -->
+      <NCard v-if="outages && outages.length" class="card" title="最近断网记录" :bordered="false">
+        <template #header-extra>
+          <span class="sm muted">最近 {{ outages.length }} 次</span>
+        </template>
+        <div class="outages">
+          <div v-for="o in outages" :key="o.id" class="outage">
+            <span class="dot" :class="`s-${summarizeOutage(o).tone}`" />
+            <div class="o-main">
+              <div class="o-when mono">{{ dbTime(o.startedAt.replace('T', ' ').replace('Z', '')) }}</div>
+              <div class="o-text" :class="`t-${summarizeOutage(o).tone}`">
+                {{ summarizeOutage(o).text }}
+              </div>
+              <div v-if="o.note" class="sm muted">{{ o.note }}</div>
+            </div>
+            <div class="o-num sm muted">
+              峰值 {{ o.peakPending }} 条
+            </div>
+          </div>
+        </div>
       </NCard>
 
       <!-- 第二屏：接入参数 -->
@@ -1023,4 +1056,12 @@ h4.sec {
 /* 拼出来的整条地址：给得出来但不抢眼，长了就省略 */
 .quick .url { max-width: 42ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   vertical-align: bottom; display: inline-block; }
+/* 断网记录：一条一行，红点在最左，扫一眼就知道哪次丢过数据 */
+.outages { display: flex; flex-direction: column; gap: 10px; }
+.outage { display: flex; align-items: flex-start; gap: 10px; }
+.o-main { flex: 1; min-width: 0; }
+.o-when { font-size: 11.5px; color: var(--muted); }
+.o-text { font-size: 12.5px; margin-top: 1px; }
+.o-num { white-space: nowrap; padding-top: 12px; }
+
 </style>

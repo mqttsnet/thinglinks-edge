@@ -113,7 +113,7 @@ function readInput(body: unknown): CloudConfigInput {
 }
 
 export function registerCloud(api: FastifyInstance, ctx: HttpContext): void {
-  const { config, db, guard, cloud, cloudConfig, spool } = ctx;
+  const { config, db, guard, cloud, cloudConfig, spool, drainer, outages } = ctx;
 
   /** 这个部署没装云配置能力时，路由如实回 501 而不是假装成功 */
   const unavailable = (reply: any) =>
@@ -122,10 +122,19 @@ export function registerCloud(api: FastifyInstance, ctx: HttpContext): void {
   api.get(`${config.basePath}/api/cloud`, async (req, reply) => {
     if (!guard(req, reply, { csrf: false, need: 'cloud:view' })) return;
     if (!cloudConfig || !cloud) return unavailable(reply);
+    const m = spool ? await spool.metrics() : null;
     return reply.send({
       config: cloudConfig.getRedacted() ?? null,
       status: cloud.status(),
-      spool: spool ? await spool.metrics() : null,
+      spool: m,
+      /*
+       * 补传进度与预计完成（08 号文第 8 节）。
+       * 算不出来时 etaSec 是 null 并由 reason 说明为什么 —— **不编数**：
+       * 现场看到「预计 3 分钟」然后等了半小时，下次就再也不信这个读数了。
+       */
+      replay: drainer && m ? drainer.progress(m.pending) : null,
+      /** 最近断网记录：起止、时长、峰值积压、补传结果。事后追溯全靠它 */
+      outages: outages ? outages.recent(10) : null,
     });
   });
 
