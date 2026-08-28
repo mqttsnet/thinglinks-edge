@@ -68,11 +68,10 @@ interface Session {
  * 那种部署必须在反代上开启 XFF —— Fastify 这边已经开了 trustProxy。
  */
 /*
- * 这三个值现在由「系统设置」定（`system_setting` 表），默认值仍是这里的数。
- * 保留常量是因为 AuthService 在没有设置表的装配下也要能跑（老测试、诊断工具）。
+ * 登录失败阈值与锁定时长由「系统设置」定（`system_setting` 表），
+ * 默认值写在 `settings.ts` 的 DEFAULTS 里（5 次 / 5 分钟），本文件不再留副本 ——
+ * 两处各存一份必然漂移，而漂移的表现是「界面上改了阈值但不生效」。
  */
-const MAX_FAILURES = 5;
-const LOCK_MS = 5 * 60_000;
 /** 没到阈值时计数的有效期：超过这么久没再失败就重新计 */
 const FAILURE_WINDOW_MS = 15 * 60_000;
 /**
@@ -89,7 +88,13 @@ const MAX_FAILURE_KEYS = 4096;
  * 试探者据此就能枚举出哪些用户名是真的 —— 那正是下面那段注释想避免的事。
  */
 const DUMMY_HASH = hashPassword('\u0000no-such-user');
-const SESSION_IDLE_MS = 8 * 60 * 60_000;
+/**
+ * 口令长度下限。首次设置与改密共用 —— 两处各写一个数字，迟早出现
+ * 「设置时能填 8 位、改密时又说要 12 位」这种自相矛盾。
+ */
+export const MIN_PASSWORD_LEN = 12;
+/** 与 UserRepo 同一条：字母开头、3~32 位、仅字母数字与 . _ - */
+const USERNAME_RE = /^[a-zA-Z][a-zA-Z0-9._-]{2,31}$/;
 
 interface Failure {
   count: number;
@@ -159,6 +164,42 @@ export class AuthService {
     return true;
   }
 
+  /**
+   * 还没有任何账号 —— 也就是「这台设备还没被认领」。
+   *
+   * 首次设置接口据此决定放不放行。判据是**一个用户都没有**，
+   * 而不是「没有 admin」：留着一个 operator 的库不是未认领状态，
+   * 那种情况该走 `reset-admin` 而不是重新认领。
+   */
+  needsSetup(): boolean {
+    return this.db.prepare('SELECT 1 FROM app_user LIMIT 1').get() === undefined;
+  }
+
+  /**
+   * 首次设置：由**用户自己**定第一个管理员的账号与口令。
+   *
+   * 这条路取代了「随机生成口令打进启动日志」。日志那套有两个毛病：
+   * 口令会跟着日志进聚合系统、进备份、进随手一截的图（脱敏模块里专门为它
+   * 留了一条规则，就是这个原因）；而且用户还得先去 `docker logs` 里翻。
+   *
+   * 定完即用，**不再强制改密** —— 口令本来就是他自己选的，再逼一次没有意义。
+   */
+  createFirstAdmin(username: string, password: string): void {
+    if (!this.needsSetup()) {
+      throw new AuthError('已经有账号了，首次设置只能在全新部署上做一次');
+    }
+    if (!USERNAME_RE.test(username)) {
+      throw new AuthError('用户名需 3~32 位，字母开头，仅含字母数字与 . _ -');
+    }
+    if (password.length < MIN_PASSWORD_LEN) {
+      throw new AuthError(`口令至少 ${MIN_PASSWORD_LEN} 位`);
+    }
+    const { hash, salt } = hashPassword(password);
+    this.db.prepare(
+      'INSERT INTO app_user (username, pwd_hash, pwd_salt, role, must_change_pwd) VALUES (?, ?, ?, ?, 0)',
+    ).run(username, hash, salt, 'admin');
+  }
+
   /** 计数键：同一个用户名从不同来源来的失败互不牵连 */
   private static failureKey(username: string, client: string): string {
     return `${client}\u0000${username}`;
@@ -215,7 +256,7 @@ export class AuthService {
    * 登录。
    *
    * `client` 是来源标识（通常是对端 IP），用于把失败计数分摊到来源上，
-   * 见 MAX_FAILURES 处的说明。取不到时退回 `unknown`，行为等同于旧的按用户名计数。
+   * 见 settings.ts 的 DEFAULTS 说明。取不到时退回 `unknown`，行为等同于旧的按用户名计数。
    */
   login(username: string, password: string, client = 'unknown'): LoginResult {
     const now = Date.now();
@@ -384,8 +425,8 @@ export class AuthService {
   }
 
   changePassword(username: string, oldPassword: string, newPassword: string): void {
-    if (newPassword.length < 12) {
-      throw new AuthError('新口令至少 12 位');
+    if (newPassword.length < MIN_PASSWORD_LEN) {
+      throw new AuthError(`新口令至少 ${MIN_PASSWORD_LEN} 位`);
     }
     const row = this.db.prepare('SELECT pwd_hash, pwd_salt FROM app_user WHERE username = ?')
       .get(username) as { pwd_hash: string; pwd_salt: string } | undefined;

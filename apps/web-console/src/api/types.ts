@@ -9,6 +9,15 @@ export interface SessionUser {
   totpEnabled: boolean;
 }
 
+/** 首次设置状态。`needed` 为真时登录页显示「创建管理员」而不是登录表单 */
+export interface SetupState {
+  needed: boolean;
+  /** 认领窗口已过 —— 要重启 Manager 才能再设置 */
+  expired: boolean;
+  /** 窗口剩余秒数；0 表示不限时 */
+  expiresInSec: number;
+}
+
 // ── 系统设置与两步验证 ────────────────────────────────
 
 export interface SystemSettings {

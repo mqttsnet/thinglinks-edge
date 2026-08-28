@@ -94,10 +94,20 @@ exact same command. Nothing is compiled on the site machine; it only needs Docke
 ```bash
 cp .env.example .env        # at minimum, set EXTERNAL_URL and MASTER_KEY
 docker compose up -d
-docker compose logs manager | grep '\[init\]'   # the initial password is printed once
 ```
 
-Open `EXTERNAL_URL` in a browser — the console is served by the Manager itself.
+Open `EXTERNAL_URL` in a browser — the console is served by the Manager itself. On a fresh
+deployment it asks you to **create the administrator account right there**: you choose the
+username and password, and the password never touches the logs.
+
+There is **no time limit** on that first-run step by default: the console binds to
+`127.0.0.1` out of the box, so only the host itself can reach it, and being interrupted
+mid-installation is normal on site. If you deliberately expose the console (changing
+`BIND_ADDR`, or fronting it with a reverse proxy), set `SETUP_WINDOW_MIN` to close the
+claim window after N minutes — restarting the Manager reopens it.
+
+For unattended provisioning set `INITIAL_PASSWORD` instead — the account is created at boot
+with the password you supplied, and setup is skipped.
 
 ### Locked out?
 
@@ -189,6 +199,7 @@ cd apps/manager && pnpm verify
 | `verify-cloud-gateway` | Envelope, signing, encryption, topics and reconnect against real Mosquitto |
 | `verify-cloud-link` | Config → runtime → broker end to end: credential encryption, offline spooling, replay |
 | `verify-cloud-tls` | TLS handshake against real certificates: CA trust, mutual auth, SNI, downgrade audit |
+| `verify-setup` | First-run claim: anonymous setup, one-shot only, window expiry, no password in logs |
 | `verify-2fa` | System settings and TOTP: no cookie on the password step, ticket replay, recovery codes, forced enrolment |
 
 ## Security

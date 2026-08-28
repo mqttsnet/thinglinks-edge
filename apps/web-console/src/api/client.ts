@@ -6,7 +6,7 @@
  *   401 表示未登录，由调用方跳转登录页，而不是在这里硬跳转。
  */
 import type {
-  SessionUser, LoginResult, SettingsView, SystemSettings, TotpStatus, TotpSetup, Instance, InstanceHealth, HostStats, HealthSummary, CreateInstanceBody,
+  SessionUser, LoginResult, SetupState, SettingsView, SystemSettings, TotpStatus, TotpSetup, Instance, InstanceHealth, HostStats, HealthSummary, CreateInstanceBody,
   MetricsRange, MetricsSeries, VersionInfo, ImageOption,
   CloudConfigView, CloudConfigInput, CloudStatus, SpoolMetrics,
   ReplayProgress, OutageRecord,
@@ -78,6 +78,15 @@ function qs(params: Record<string, string | undefined>): string {
 }
 
 export const api = {
+  /** 匿名可读：登录页要靠它决定显示登录还是首次设置 */
+  setupState: () => request<SetupState>('/api/setup'),
+
+  /** 首次设置。成功即登录，直接回会话 */
+  setup: (username: string, password: string) =>
+    request<{ user: SessionUser }>('/api/setup', {
+      method: 'POST', body: JSON.stringify({ username, password }),
+    }),
+
   login: (username: string, password: string) =>
     request<LoginResult>('/api/login', {
       method: 'POST', body: JSON.stringify({ username, password }),

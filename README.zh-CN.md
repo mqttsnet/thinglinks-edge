@@ -87,10 +87,19 @@ docker 自己挑对应那一份。现场机器**不编译任何东西**，装了
 ```bash
 cp .env.example .env        # 至少填 EXTERNAL_URL 与 MASTER_KEY
 docker compose up -d
-docker compose logs manager | grep '\[init\]'   # 初始口令只打印一次
+# 然后打开 EXTERNAL_URL —— 全新部署会让你当场设置管理员账号与口令
 ```
 
-浏览器打开 `EXTERNAL_URL` 即是控制台，前端由 Manager 自己托管。
+浏览器打开 `EXTERNAL_URL` 即是控制台，前端由 Manager 自己托管。全新部署会先让你
+**当场设置管理员账号与口令** —— 口令由你自己定，不会出现在日志里。
+
+这一步**默认不限时**：`BIND_ADDR` 默认是 `127.0.0.1`，控制台只有宿主本机够得到，
+没人能抢先认领；而装完机被叫走、回来再接着设置，本来就是现场的常态。
+
+只有当你**主动把控制台暴露**到厂区网或公网（改了 `BIND_ADDR`、或挂了反代）时，
+「谁先打开谁是管理员」才成立 —— 那种部署用 `SETUP_WINDOW_MIN` 开启限时，过期重启 Manager 即可重开。
+
+无人值守批量装机改用 `INITIAL_PASSWORD`：账号在启动时按你给的口令建好，跳过首次设置。
 
 `EXTERNAL_URL` 是所有对外链接、跳转与 Cookie 策略的**唯一真源** —— 程序绝不猜自己的外部地址。
 现场「装到客户那儿打不开」的问题，根因几乎都是程序试图猜，而现场恰好有一层它没料到的东西。

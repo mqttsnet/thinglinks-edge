@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
+import { ref, computed, onMounted } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
 import { NCard, NForm, NFormItem, NInput, NButton, NAlert, useMessage } from 'naive-ui';
+import type { SetupState } from '../../api/types';
 import { api, ApiError } from '../../api/client';
 
 const router = useRouter();
@@ -28,13 +29,54 @@ const ticket = ref('');
 const code = ref('');
 const needCode = ref(false);
 
+/**
+ * 首次设置。
+ *
+ * 全新部署上一个账号都没有，这时显示的是「创建管理员」而不是登录 ——
+ * 口令由用户自己定，不再走「随机生成打进日志、你去 docker logs 里翻」那一套。
+ */
+const setup = ref<SetupState | null>(null);
+const setupName = ref('admin');
+const setupPw = ref('');
+const setupPw2 = ref('');
+const needSetup = computed(() => setup.value?.needed === true);
+/** 窗口剩余分钟。0 表示不限时，界面就不提这回事 */
+const setupLeftMin = computed(() =>
+  (setup.value && setup.value.expiresInSec > 0 ? Math.ceil(setup.value.expiresInSec / 60) : 0));
+
 onMounted(async () => {
+  // 先问要不要首次设置：全新部署上连登录表单都不该出现
+  try {
+    setup.value = await api.setupState();
+  } catch { /* 拿不到就按常规登录页处理 */ }
+  if (needSetup.value) return;
+
   try {
     const { user } = await api.me();
     if (user.mustChangePassword) mustChange.value = true;
     else await router.replace('/instances');
   } catch { /* 未登录，停在登录页 */ }
 });
+
+async function submitSetup() {
+  if (setupPw.value !== setupPw2.value) {
+    message.error('两次输入的口令不一致');
+    return;
+  }
+  busy.value = true;
+  try {
+    // 设置成功即已登录，不必再输一遍刚定好的口令
+    await api.setup(setupName.value.trim(), setupPw.value);
+    message.success('管理员账号已创建');
+    await router.replace('/instances');
+  } catch (e) {
+    message.error(e instanceof ApiError ? e.message : '创建失败');
+    // 窗口过期这类状态会变，重新取一次让界面跟上
+    try { setup.value = await api.setupState(); } catch { /* 保持原样 */ }
+  } finally {
+    busy.value = false;
+  }
+}
 
 async function signIn() {
   busy.value = true;
@@ -123,7 +165,35 @@ async function submitChange() {
         </div>
       </div>
 
-      <template v-if="needCode">
+      <template v-if="needSetup">
+        <NAlert v-if="setup?.expired" type="error" :bordered="false" style="margin: 16px 0">
+          首次设置窗口已过期（这台部署开启了 <code>SETUP_WINDOW_MIN</code> 限时）。
+          请重启 Manager 容器后重新设置。
+        </NAlert>
+        <NAlert v-else type="info" :bordered="false" style="margin: 16px 0">
+          这台设备还没有账号，请设置管理员账号与口令。
+          <!-- 限时是可选加固，默认关着，开了才提这回事 -->
+          <template v-if="setupLeftMin > 0">
+            请在 <b>{{ setupLeftMin }}</b> 分钟内完成。
+          </template>
+        </NAlert>
+        <NForm v-if="!setup?.expired" class="form" @submit.prevent="submitSetup">
+          <NFormItem label="管理员用户名">
+            <NInput v-model:value="setupName" placeholder="admin" />
+          </NFormItem>
+          <NFormItem label="口令">
+            <NInput v-model:value="setupPw" type="password" show-password-on="click"
+                    placeholder="至少 12 位" />
+          </NFormItem>
+          <NFormItem label="确认口令">
+            <NInput v-model:value="setupPw2" type="password"
+                    @keyup.enter="submitSetup" />
+          </NFormItem>
+          <NButton type="primary" block :loading="busy" @click="submitSetup">创建并进入</NButton>
+        </NForm>
+      </template>
+
+      <template v-else-if="needCode">
         <NAlert type="info" :bordered="false" style="margin: 16px 0">
           请输入验证器上的 6 位验证码；验证器不在手边时，可以用一条恢复码代替。
         </NAlert>

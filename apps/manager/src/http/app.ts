@@ -23,6 +23,7 @@ import { registerTemplates } from './instance/templates.ts';
 import { registerFlows } from './instance/flows.ts';
 import { registerUsers } from './auth/users.ts';
 import { registerSettings } from './auth/settings.ts';
+import { registerSetup } from './auth/setup.ts';
 import { registerVersion } from './version.ts';
 import { registerProxy } from './instance/proxy.ts';
 import { registerConsole } from './console.ts';
@@ -56,6 +57,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       }
     });
 
+    registerSetup(api, ctx);
     registerSession(api, ctx);
     registerSettings(api, ctx);
     registerInstances(api, ctx);

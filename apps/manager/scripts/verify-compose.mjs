@@ -19,7 +19,6 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { TEST_EDGE_ROOT, TEST_DATA_ROOT, ensureRoot, resetRoot, resetDataDir } from './_data-root.mjs';
-import { adminSession } from './_session.mjs';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const PROJECT = 'tle-compose-verify';
@@ -33,7 +32,8 @@ const MGR = `${PREFIX}-manager`;
 const PROXY = `${PREFIX}-docker-proxy`;
 const NET = 'tle-cv-net';
 const PORT = 13211;
-const ADMIN_PW = 'initial-password-123';
+/** 首次设置时现场指定的口令。这一串**不该出现在任何日志里** */
+const SETUP_PW = 'compose-verify-pass-01';
 const ID = 'cv-a';
 const TAG = '5.0.4-24-minimal';
 const B = `http://127.0.0.1:${PORT}`;
@@ -153,13 +153,27 @@ async function main() {
   check('容器 hostname 不等于容器名（故 MANAGER_CONTAINER 必须显式配置）',
         info.Config.Hostname !== MGR, `hostname=${info.Config.Hostname} vs 容器名=${MGR}`);
 
-  const initialPw = /初始口令：(\S+)/.exec(compose('logs', 'manager'))?.[1];
-  check('首次启动打印一次初始口令', Boolean(initialPw));
+  /*
+   * 首次设置：口令**不再出现在日志里**，由这一步现场指定。
+   * 顺带把「日志里没有口令」当成一条断言 —— 那正是这次改造要保住的性质。
+   */
+  const logs = compose('logs', 'manager');
+  check('启动日志里没有任何口令',
+        !/初始口令/.test(logs) && !logs.includes(SETUP_PW),
+        /\[init\]/.test(logs) ? '有 [init] 行但不含口令' : '');
 
-  // 强制改密是后端闸门，拿初始口令的会话调业务接口会 403，所以这里连改密一起走完
-  const sess = await adminSession(B, initialPw ?? ADMIN_PW);
-  const { cookie, csrf } = sess;
-  check('用打印的初始口令能登录并完成首次改密', sess.ok, `HTTP ${sess.status}`);
+  const state = await (await fetch(`${B}/api/setup`)).json();
+  check('全新部署上匿名读得到「需要首次设置」', state.needed === true, JSON.stringify(state));
+
+  const setupRes = await fetch(`${B}/api/setup`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'admin', password: SETUP_PW }),
+  });
+  const cookie = (setupRes.headers.getSetCookie?.() ?? []).map((c) => c.split(';')[0]).join('; ');
+  const csrf = /tle_csrf=([^;]+)/.exec(cookie)?.[1] ?? '';
+  check('设置完直接带着会话进去，不必再登录一次',
+        setupRes.status === 200 && cookie.includes('tle_sid') && Boolean(csrf),
+        `HTTP ${setupRes.status}`);
   const H = { cookie, 'x-csrf-token': csrf, 'content-type': 'application/json' };
 
   const created = await fetch(`${B}/api/instances`, {
@@ -167,7 +181,10 @@ async function main() {
     body: JSON.stringify({ id: ID, name: 'compose 验证', imageTag: TAG,
                            ports: [{ hostPort: 31300, containerPort: 1883, protocol: 'tcp', hostIp: '127.0.0.1', purpose: 'MQTT' }] }),
   });
-  check('创建实例成功（只读 rootfs 下 SQLite 仍可写）', created.status === 201, `HTTP ${created.status}`);
+  // 失败时把正文带出来 —— 光一个「HTTP 400」在这一步是排不动的
+  const createdDetail = created.status === 201 ? '' : (await created.text()).slice(0, 160);
+  check('创建实例成功（只读 rootfs 下 SQLite 仍可写）', created.status === 201,
+        `HTTP ${created.status}${createdDetail ? ' ' + createdDetail : ''}`);
 
   const netInfo = await raw.getNetwork(`${NET}-${ID}`).inspect();
   const attached = Object.values(netInfo.Containers ?? {}).map((c) => c.Name);

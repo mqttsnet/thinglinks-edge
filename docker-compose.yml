@@ -2,7 +2,8 @@
 #
 #   cp .env.example .env      # 至少填 EXTERNAL_URL 与 MASTER_KEY
 #   docker compose up -d
-#   docker compose logs manager | grep '\[init\]'    # 首次启动打印一次初始口令
+#   打开 EXTERNAL_URL —— 全新部署会让你**当场设置**管理员账号与口令。
+#   口令由你自己定，不落日志（认领窗口默认 30 分钟，见 SETUP_WINDOW_MIN）。
 #
 # Manager 以**兄弟容器**模式管理 Node-RED 实例：实例是宿主上的独立容器，
 # 不是 Manager 的子进程。升级 Manager（docker compose pull && up -d）
