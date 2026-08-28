@@ -12,7 +12,7 @@
  */
 import { ref, computed, onMounted } from 'vue';
 import {
-  NButton, NCard, NInput, NInputNumber, NSpin, NAlert, NTag, NSpace, useMessage,
+  NButton, NCard, NInput, NInputNumber, NSpin, NAlert, NTag, useMessage,
 } from 'naive-ui';
 import { api, ApiError } from '../../api/client';
 import type { DiagProbeResponse, EndpointProbe } from '../../api/types';

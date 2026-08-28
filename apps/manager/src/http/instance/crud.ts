@@ -172,7 +172,16 @@ export function registerInstances(api: FastifyInstance, ctx: HttpContext): void 
         id,
         sinceId ? { since: sinceId } : { tail: Math.min(Math.max(tail, 1), 2000) },
       );
-    } catch (e) { return fail(reply, e); }
+    } catch (e) {
+      /*
+       * 裸 return，与上面 guard 的早退保持一致。
+       * 这个处理器走的是 SSE：正常路径要一直挂着连接、不返回任何值，
+       * 所以所有早退也必须不返回值，否则 noImplicitReturns 会判为路径不一致。
+       * `fail()` 自己已经 .send()，丢掉它的返回值不影响响应。
+       */
+      fail(reply, e);
+      return;
+    }
 
     /*
      * 接管原始响应。x-accel-buffering 是给中间可能存在的 nginx 看的 ——

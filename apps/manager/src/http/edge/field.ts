@@ -17,7 +17,7 @@ import { join } from 'node:path';
 import type { HttpContext } from '../context.ts';
 
 export function registerField(api: FastifyInstance, ctx: HttpContext): void {
-  const { config, repo, db, guard, visibleOnly } = ctx;
+  const { config, db, guard, visibleOnly } = ctx;
   const registry = new FieldRegistry(db);
 
   /**

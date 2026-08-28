@@ -66,6 +66,15 @@ export interface InstanceStatus {
 
 export class DockerClient {
   private readonly docker: Docker;
+
+  /**
+   * 底层 dockerode 句柄，**只给安装自检用**。
+   *
+   * 自检要读 `version` / `info` / `listNetworks` —— 这些是环境事实查询，
+   * 与本类「编排实例容器」的职责无关，为它们各包一层方法只会让这个类变胖。
+   * 但也不该让业务代码拿它绕过白名单，所以命名上写明用途。
+   */
+  get raw(): Docker { return this.docker; }
   private readonly opts: DockerClientOptions;
 
   constructor(opts: DockerClientOptions) {
@@ -125,9 +134,12 @@ export class DockerClient {
       return true;
     } catch (e) {
       if ((e as { statusCode?: number }).statusCode === 404) return false;
+      // 带上 cause：只留自己的措辞会把原始 docker 错误与堆栈丢掉，
+      // 而「端点没放行」和「网络不通」在现场是完全不同的两件事
       throw new Error(
         `无法查询镜像 ${image}：${(e as Error).message}。` +
         '这不是镜像缺失，请检查 docker 端点是否放行了 images/<name>/json',
+        { cause: e },
       );
     }
   }

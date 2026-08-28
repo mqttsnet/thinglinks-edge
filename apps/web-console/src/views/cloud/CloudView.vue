@@ -19,8 +19,7 @@ import type {
   TlsMode, CertSummary, BrokerScheme, MqttVersion,
 } from '../../api/types';
 import {
-  DEFAULT_BROKER_HOST, BROKER_SCHEMES, SCHEME_DEFAULT_PORT, PROTOCOL_DEFAULT_PORT,
-} from '../../api/types';
+  DEFAULT_BROKER_HOST, BROKER_SCHEMES, } from '../../api/types';
 import { can } from '../../api/permissions';
 import FieldHelp from '../../components/FieldHelp.vue';
 import {
@@ -269,7 +268,6 @@ async function pickPem(field: 'ca' | 'cert' | 'key') {
   el.click();
 }
 
-const CERT_LABEL: Record<'ca' | 'cert', string> = { ca: 'CA 证书', cert: '客户端证书' };
 /** 摘要里的有效期给本地时间，别让人去换算 UTC */
 const certValid = (c: CertSummary) =>
   `${new Date(c.validFrom).toLocaleDateString()} — ${new Date(c.validTo).toLocaleDateString()}`;

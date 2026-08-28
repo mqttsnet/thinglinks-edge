@@ -14,12 +14,6 @@ function listen(): Promise<{ server: Server; port: number }> {
   });
 }
 
-/** 找一个几乎肯定没人监听的端口：先占住再立刻释放 */
-async function closedPort(): Promise<number> {
-  const { server, port } = await listen();
-  await new Promise<void>((r) => server.close(() => r()));
-  return port;
-}
 
 /*
  * 这条不断言「不存在的主机探不通」——在这台机器上它**探得通**。

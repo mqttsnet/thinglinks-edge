@@ -13,7 +13,7 @@
 import { ref, computed, onMounted, h } from 'vue';
 import {
   NButton, NCard, NForm, NFormItem, NInputNumber, NSwitch, NSpace, NAlert, NSpin,
-  NTag, NInput, NModal, useMessage, useDialog,
+  NTag, NInput, useMessage, useDialog,
 } from 'naive-ui';
 import { api, ApiError } from '../../api/client';
 import type { SystemSettings, TotpStatus, TotpSetup } from '../../api/types';

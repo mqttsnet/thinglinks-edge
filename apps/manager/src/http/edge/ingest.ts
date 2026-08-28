@@ -12,9 +12,6 @@
 import type { FastifyInstance } from 'fastify';
 import { FieldRegistry } from '../../core/edge/registry.ts';
 import { BatchOverflowError, MicroBatcher, type UplinkPoint } from '../../core/cloud/batch.ts';
-import { probeFlows } from '../../core/edge/southbound.ts';
-import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
 import { SpoolDrainer } from '../../core/spool/drainer.ts';
 import type { HttpContext } from '../context.ts';
 
