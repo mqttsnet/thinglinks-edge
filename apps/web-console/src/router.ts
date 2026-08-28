@@ -35,6 +35,13 @@ const routes: RouteRecordRaw[] = [
         meta: { need: 'template:view' },
       },
 
+      {
+        path: 'settings', name: 'settings',
+        component: () => import('./views/auth/SettingsView.vue'),
+        // 不设 need：每个人都要能进来管自己的两步验证。
+        // 页内的「安全策略」那一块再按 system:manage 收成只读
+      },
+
       { path: 'instances/:id/logs', name: 'logs', component: () => import('./views/instance/LogsView.vue') },
     ],
   },
@@ -50,6 +57,16 @@ router.beforeEach(async (to) => {
     const { user } = await api.me();
     if (user.mustChangePassword && to.name !== 'login') {
       return { name: 'login', query: { mustChange: '1' } };
+    }
+    /*
+     * 全站强制两步验证、而这个人还没绑：只放行设置页（绑定就在那儿）。
+     *
+     * 与改密那条的顺序一致 —— 后端 guard 也是先拦改密、再拦绑定，
+     * 两处顺序不一样会让用户在两个页面之间来回弹。
+     * 这同样只是导航体验：后端对其它接口一律回 403 TOTP_ENROLL_REQUIRED。
+     */
+    if (user.mustEnroll2fa && to.name !== 'settings') {
+      return { name: 'settings' };
     }
     /*
      * 权限不够的页面直接送回实例页，而不是让它渲染出来再满屏 403。

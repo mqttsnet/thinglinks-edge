@@ -4,7 +4,52 @@ export interface SessionUser {
   username: string;
   role: string;
   mustChangePassword: boolean;
+  /** 全站强制两步验证、而这个人还没绑。为 true 时后端只放行绑定相关接口 */
+  mustEnroll2fa: boolean;
+  totpEnabled: boolean;
 }
+
+// ── 系统设置与两步验证 ────────────────────────────────
+
+export interface SystemSettings {
+  sessionIdleMin: number;
+  loginMaxFailures: number;
+  loginLockMin: number;
+  require2fa: boolean;
+  updateCheckEnabled: boolean;
+  updatedAt: string;
+  updatedBy: string;
+}
+
+export interface SettingsView {
+  settings: SystemSettings;
+  /** 服务端当前时间，用来算浏览器与盒子的时钟偏差 —— TOTP 完全靠时钟 */
+  serverTime: string;
+  canManage: boolean;
+}
+
+export interface TotpStatus {
+  enabled: boolean;
+  /** 全站是否强制。为 true 时界面上不给「解绑」 */
+  required: boolean;
+  recoveryLeft: number;
+}
+
+/** 绑定第一步的返回。密钥只在这一刻明文出现一次，之后接口再也不回它 */
+export interface TotpSetup {
+  secret: string;
+  /** 四位一组，手输时不容易串行 */
+  grouped: string;
+  otpauth: string;
+}
+
+/**
+ * 登录结果：要么直接给会话，要么要第二因子。
+ * `mfa` 在时**没有任何 Cookie 下发** —— 那正是两步验证成立的前提。
+ */
+export type LoginResult =
+  | { user: SessionUser; mfa?: undefined }
+  | { mfa: true; ticket: string };
 
 export interface PortRecord {
   hostPort: number;
@@ -589,5 +634,34 @@ export interface ApplyResult {
   compat: CompatResult;
   /** 被替换掉的旧流程节点数；取不到时为 null */
   replacedNodeCount: number | null;
+  note: string;
+}
+
+/** 补传进度。算不出来时 etaSec 为 null 并由 reason 说明，界面不要自己编 */
+export interface ReplayProgress {
+  pending: number;
+  ratePerSec: number | null;
+  etaSec: number | null;
+  running: boolean;
+  reason: string;
+}
+
+/**
+ * 一次断网的完整记录。三个时刻不是两个 ——
+ * 「连上了但还在追欠账」那段是现场最关心的。
+ */
+export interface OutageRecord {
+  id: number;
+  startedAt: string;
+  restoredAt: string | null;
+  drainedAt: string | null;
+  outageSec: number | null;
+  recoverySec: number | null;
+  peakPending: number;
+  spooled: number;
+  replayed: number;
+  /** 非 0 就是真丢了数据 */
+  dropped: number;
+  status: 'ongoing' | 'restoring' | 'done';
   note: string;
 }

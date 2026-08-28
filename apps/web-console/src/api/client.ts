@@ -6,9 +6,10 @@
  *   401 表示未登录，由调用方跳转登录页，而不是在这里硬跳转。
  */
 import type {
-  SessionUser, Instance, InstanceHealth, HostStats, HealthSummary, CreateInstanceBody,
+  SessionUser, LoginResult, SettingsView, SystemSettings, TotpStatus, TotpSetup, Instance, InstanceHealth, HostStats, HealthSummary, CreateInstanceBody,
   MetricsRange, MetricsSeries, VersionInfo, ImageOption,
   CloudConfigView, CloudConfigInput, CloudStatus, SpoolMetrics,
+  ReplayProgress, OutageRecord,
   UserRecord, GrantRecord, MyPermissions, BackupInspect, Role, GrantLevel,
   FieldDeviceRecord, FieldTagRecord, FieldSummary, ProbeResult,
   EdgeMetrics, ReplayResult,
@@ -78,8 +79,14 @@ function qs(params: Record<string, string | undefined>): string {
 
 export const api = {
   login: (username: string, password: string) =>
-    request<{ user: SessionUser }>('/api/login', {
+    request<LoginResult>('/api/login', {
       method: 'POST', body: JSON.stringify({ username, password }),
+    }),
+
+  /** 第二因子。验证码或恢复码都收 */
+  loginSecondFactor: (ticket: string, code: string) =>
+    request<{ user: SessionUser }>('/api/login/2fa', {
+      method: 'POST', body: JSON.stringify({ ticket, code }),
     }),
 
   logout: () => request<void>('/api/logout', { method: 'POST' }),
@@ -90,6 +97,34 @@ export const api = {
     request<void>('/api/change-password', {
       method: 'POST', body: JSON.stringify({ oldPassword, newPassword }),
     }),
+
+  // ── 系统设置与两步验证 ──────────────────────────────
+
+  settings: () => request<SettingsView>('/api/settings'),
+
+  saveSettings: (input: Partial<SystemSettings>) =>
+    request<{ settings: SystemSettings }>('/api/settings', {
+      method: 'PUT', body: JSON.stringify(input),
+    }),
+
+  totpStatus: () => request<TotpStatus>('/api/me/totp'),
+
+  totpSetup: () => request<TotpSetup>('/api/me/totp/setup', { method: 'POST' }),
+
+  /** 确认绑定。恢复码只在这一次返回，之后库里只有哈希 */
+  totpConfirm: (code: string) =>
+    request<{ codes: string[] }>('/api/me/totp/confirm', {
+      method: 'POST', body: JSON.stringify({ code }),
+    }),
+
+  totpDisable: (password: string) =>
+    request<void>('/api/me/totp', {
+      method: 'DELETE', body: JSON.stringify({ password }),
+    }),
+
+  /** 管理员强制解绑别人。用于「手机丢了、恢复码也没了」 */
+  totpReset: (username: string) =>
+    request<void>(`/api/users/${encodeURIComponent(username)}/totp/reset`, { method: 'POST' }),
 
   instances: () => request<{ instances: Instance[] }>('/api/instances'),
 
@@ -132,6 +167,8 @@ export const api = {
     config: CloudConfigView | null;
     status: CloudStatus;
     spool: SpoolMetrics | null;
+    replay: ReplayProgress | null;
+    outages: OutageRecord[] | null;
   }>('/api/cloud'),
 
   saveCloud: (input: CloudConfigInput) =>
