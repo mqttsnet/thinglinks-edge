@@ -131,6 +131,12 @@ async function main() {
     ['/api/logout', '登出：未登录时也该能安全调用，不因为没会话而报错'],
     ['/api/change-password', '改密自身。guard 会拦住「未改初始口令」的用户，'
       + '改密路由若也走 guard，用户就被锁进无法改密的死循环（见 http/context.ts 的 allowPending）'],
+    ['/npm/-/catalogue.json', '私有源的节点目录：由现场浏览器里的 Node-RED 编辑器前端取。'
+      + '内容是**已批准的公开 npm 包**的名字与说明，不含任何机密'],
+    ['/npm/*', '私有源的 packument 与包体：由实例容器里的 npm 取。npm 只能靠 .npmrc 的 '
+      + '_authToken 鉴权，而**装包前那次 npm info 读不到实例的 .npmrc**（那次调用不带 cwd，'
+      + '继承 /usr/src/node-red，实测已确认）—— 加了鉴权恰恰是「一开白名单就什么都装不上」。'
+      + '权衡后放开只读：源里只有已批准的公开包，能访问到它的前提是已在 Manager 的网络里'],
   ]);
   const routeRe = /\b(?:api|app)\.(get|post|put|delete)\(\s*`?\$\{[^}]*\}([^`'"]*)/g;
   const unguarded = [];
@@ -176,6 +182,19 @@ async function main() {
         && /只从令牌反查|绝不取自请求体/.test(ingestSrc)
         && !/instanceId\s*=\s*\(?req\.body/.test(ingestSrc),
         tokenAuthed.slice(0, 3).join(' '));
+  /*
+   * 私有源是全平台唯一匿名可读的**数据**端点，所以它的边界要单独钉死：
+   * 只读、且只服务已批准的包。哪天有人给它加一条写路由，这里当场红。
+   */
+  const registrySrc = readFileSync(join(MGR, 'http/nodes/registry.ts'), 'utf8');
+  const registryVerbs = [...registrySrc.matchAll(/\bapi\.(get|post|put|delete|patch)\(/g)]
+    .map((m) => m[1]);
+  check(G3, '匿名的私有源只有 GET，没有任何写入路径',
+        registryVerbs.length > 0 && registryVerbs.every((v) => v === 'get'),
+        registryVerbs.join(' '));
+  check(G3, '私有源的节点目录只列已批准的包（配置被改坏时源里也没别的可给）',
+        /approved:\s*catalog\.names\(\)/.test(registrySrc));
+
   check(G3, '角色表未知角色按最小权限处理，不按 admin 兜底',
         can('nobody', 'instance:list') === false && can('', 'user:manage') === false);
   na(G3, '设备 connect/publish/subscribe 过 BifroMQ ACL',

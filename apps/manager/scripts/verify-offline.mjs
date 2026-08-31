@@ -12,14 +12,22 @@
  * 实例镜像保持真名：Manager 建实例时本来就**不会拉镜像**
  * （assertImagePresent 直接报错并教人 docker save/load），
  * 那条离线保证由产品结构提供，这里只验它确实随包发出去了、且真能建出实例。
+ *
+ * ## 预置节点包（01 号文 5.7）
+ *
+ * 同一趟顺带验完整条种子链路：打包带上 → install.sh 拷进数据目录 →
+ * Manager 启动扫进私有源。夹具用的是**公网 npm 上不存在**的包名，
+ * 它出现在包库里就只可能来自随包发的那份种子。
  */
 import Docker from 'dockerode';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { gzipSync } from 'node:zlib';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { TEST_EDGE_ROOT, resetRoot, resetDataDir } from './_data-root.mjs';
+import { tarArchive } from '../dist/core/archive/tar.js';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const PREFIX = 'tle-off';
@@ -30,6 +38,8 @@ const TAG = '5.0.4-24-minimal';
 const NODE_RED = `nodered/node-red:${TAG}`;
 const ID = 'off-a';
 const SETUP_PW = 'offline-verify-pass-01';
+/** 随包预置的节点包夹具 —— 公网 npm 上没有这个名字 */
+const SEED_PKG = 'node-red-contrib-tle-offline-seed';
 
 /** 互联网上不存在的仓库名：任何一次拉取尝试都会失败 —— 这正是我们要的 */
 const FAKE = {
@@ -91,13 +101,26 @@ async function main() {
     }
   }
 
-  // ── 1. 打包 ────────────────────────────────────────────
+  // ── 1. 打包（带上一个预置节点包）────────────────────────
+  const seedDir = mkdtempSync(join(tmpdir(), 'tle-seed-'));
+  writeFileSync(join(seedDir, `${SEED_PKG}-1.0.0.tgz`), gzipSync(tarArchive([
+    {
+      name: 'package/package.json',
+      content: JSON.stringify({
+        name: SEED_PKG, version: '1.0.0', description: '离线验证夹具',
+        keywords: ['node-red'], 'node-red': { nodes: { seed: 'seed.js' } },
+      }),
+    },
+    { name: 'package/seed.js', content: 'module.exports = function () {};\n' },
+  ])));
+
   const outDir = mkdtempSync(join(tmpdir(), 'tle-bundle-'));
   sh('./scripts/build-offline-bundle.sh', ['--out', outDir], {
     env: {
       ...process.env,
       MANAGER_IMAGE: FAKE.manager, PROXY_IMAGE: FAKE.proxy, INIT_IMAGE: FAKE.init,
       ALLOWED_IMAGE_TAGS: TAG,
+      NODE_SEED_DIR: seedDir,
     },
     stdio: 'pipe',
   });
@@ -123,8 +146,14 @@ async function main() {
         [FAKE.manager, FAKE.proxy, FAKE.init, NODE_RED].every((i) => listed.includes(i)),
         listed.join(' '));
 
+  check('清单列出随包的预置节点包',
+        (manifest.nodeSeed ?? []).includes(`${SEED_PKG}-1.0.0.tgz`),
+        (manifest.nodeSeed ?? []).join(' '));
+
   const sums = sh('shasum', ['-a', '256', '-c', 'SHA256SUMS'], { cwd: workDir, stdio: 'pipe' });
   check('校验和自洽（U 盘拷坏的包能当场发现）', sums.includes('images.tar: OK'));
+  // 节点包也要进校验：拷坏一个 tgz，现场只会看到「这个节点导入失败」
+  check('预置节点包也在校验和里', sums.includes(`node-seed/${SEED_PKG}-1.0.0.tgz: OK`));
 
   // ── 3. 断网条件：把这几个标签从本机删干净 ──────────────
   for (const img of Object.values(FAKE)) sh('docker', ['rmi', '-f', img], { stdio: 'pipe' });
@@ -185,6 +214,17 @@ async function main() {
   check('设置管理员后直接拿到会话', setupRes.status === 200 && Boolean(csrf), `HTTP ${setupRes.status}`);
   const H = { cookie, 'x-csrf-token': csrf, 'content-type': 'application/json' };
 
+  /*
+   * 种子链路的终点：包里的 tgz 已经在私有源里了。
+   * 这个名字公网 npm 上没有 —— 它出现在包库里就只可能来自随包发的那份。
+   */
+  const store = await (await fetch(`${B}/api/nodes/store`, { headers: H })).json();
+  const seeded = (store.packages ?? []).find((p) => p.module === SEED_PKG);
+  check('随包的节点包已自动进私有源（种子链路打通）', Boolean(seeded),
+        (store.packages ?? []).map((p) => p.module).join(' ') || '包库是空的');
+  check('导入不等于批准 —— 进了库仍要管理员批准才能装',
+        seeded?.approved === false, `approved=${seeded?.approved}`);
+
   const created = await fetch(`${B}/api/instances`, {
     method: 'POST', headers: H,
     body: JSON.stringify({ id: ID, name: '离线验证', imageTag: TAG, memoryMb: 256, cpus: 0.5, ports: [] }),
@@ -219,6 +259,7 @@ async function main() {
         outOfBundle.status === 400 && msg.includes(TAG), msg.slice(0, 70));
 
   rmSync(outDir, { recursive: true, force: true });
+  rmSync(seedDir, { recursive: true, force: true });
   await cleanup();
 
   const pass = results.filter((r) => r.ok).length;
