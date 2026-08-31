@@ -217,7 +217,16 @@ async function main() {
 
   check('代理放行 Manager 真正要用的端点', probeFrom(MGR, '/version') === 'S200', probeFrom(MGR, '/version'));
 
-  const denied = ['/info', '/events', '/swarm', '/secrets', '/plugins'];
+  /*
+   * `/info` 是**刻意放行**的（dc2cc90）：安装自检的「架构与镜像匹配」
+   * 「cgroup 内存限制」两项只能从这里读，缺了它们现场发现不了
+   * 「内存限额配了但不生效」——那种故障界面上一切正常，实例却能吃光整机内存。
+   * 它是纯只读的守护进程元信息，敏感度低于白名单里已有的 containers/json。
+   */
+  check('代理放行只读的 /info（安装自检的架构与 cgroup 两项靠它）',
+        probeFrom(MGR, '/info') === 'S200', probeFrom(MGR, '/info'));
+
+  const denied = ['/events', '/swarm', '/secrets', '/plugins'];
   const denyResults = denied.map((p) => `${p}=${probeFrom(MGR, p)}`);
   check('代理拒绝白名单外的端点',
         denyResults.every((r) => r.endsWith('=S403')), denyResults.join(' '));
