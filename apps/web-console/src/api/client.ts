@@ -8,6 +8,7 @@
 import type {
   SessionUser, LoginResult, SetupState, SettingsView, SystemSettings, TotpStatus, TotpSetup, Instance, InstanceHealth, HostStats, HealthSummary, CreateInstanceBody,
   MetricsRange, MetricsSeries, VersionInfo, ImageOption,
+  ImageUpgradeResult, TagHistory, NpmSource, NodeSearchHit,
   CloudConfigView, CloudConfigInput, CloudStatus, SpoolMetrics,
   ReplayProgress, OutageRecord,
   UserRecord, GrantRecord, MyPermissions, BackupInspect, Role, GrantLevel,
@@ -169,7 +170,30 @@ export const api = {
   version: () => request<VersionInfo>('/api/version'),
 
   /** 可选实例版本 + 本机是否已有。列表来自后端白名单，前端不再自己硬编码 */
+  /**
+   * 某个点位的历史曲线。
+   *
+   * 刻意做成**按需单点位查**而不是展开设备就把所有点位的历史都拉下来：
+   * 一台设备可能有几十个点位，那样一次就是几十个查询打在跑着采集的边缘盒子上。
+   */
+  tagHistory: (instanceId: string, nodeId: string, tagId: string, limit = 300) =>
+    request<TagHistory>(
+      `/api/field/history?instanceId=${encodeURIComponent(instanceId)}`
+      + `&nodeId=${encodeURIComponent(nodeId)}&tagId=${encodeURIComponent(tagId)}&limit=${limit}`),
+
   images: () => request<{ images: ImageOption[] }>('/api/images'),
+
+  /**
+   * 换镜像版本（现场打补丁）。
+   *
+   * 数据目录、账号、端口、访问路径一概保留，只有版本变。失败时后端已经把实例
+   * **回滚到原版本并跑起来**了，所以这里抛出的错误代表「升级没成」而不是
+   * 「实例没了」—— 界面据此措辞，别吓着现场。
+   */
+  upgradeInstanceImage: (id: string, imageTag: string) =>
+    request<ImageUpgradeResult>(`/api/instances/${id}/image`, {
+      method: 'POST', body: JSON.stringify({ imageTag }),
+    }),
 
   // ── 云平台对接 ──────────────────────────────────────
 
@@ -383,6 +407,32 @@ export const api = {
   //
   // 三个清单三条路由，别当成同一份数据的三个视图 —— 见 types.ts 的说明。
 
+  // ── 节点源（页面上增删，不必改配置重启）────────────
+  nodeSources: () => request<{ sources: NpmSource[] }>('/api/nodes/sources'),
+
+  addNodeSource: (name: string, url: string) =>
+    request<{ source: NpmSource }>('/api/nodes/sources', {
+      method: 'POST', body: JSON.stringify({ name, url }),
+    }),
+
+  setNodeSourceEnabled: (id: number, enabled: boolean) =>
+    request<{ ok: true }>(`/api/nodes/sources/${id}/enabled`, {
+      method: 'POST', body: JSON.stringify({ enabled }),
+    }),
+
+  removeNodeSource: (id: number) =>
+    request<{ ok: true }>(`/api/nodes/sources/${id}`, { method: 'DELETE' }),
+
+  /** 在启用的源里模糊搜索。未配源时回 enabled:false，界面要如实说明 */
+  searchNodes: (q: string) =>
+    request<{ enabled: boolean; hits: NodeSearchHit[]; reason?: string }>(
+      `/api/nodes/search?q=${encodeURIComponent(q)}`),
+
+  /** 某个包的可选版本；local 是本地库已有的那些（离线也装得上） */
+  nodeVersions: (module: string) =>
+    request<{ versions: { version: string; date: string }[]; local: string[] }>(
+      `/api/nodes/versions?module=${encodeURIComponent(module)}`),
+
   nodeCatalog: () => request<{ entries: CatalogEntry[] }>('/api/nodes/catalog'),
 
   /**
@@ -392,10 +442,11 @@ export const api = {
    * 下发要重启实例（会中断现场采集），不能是「点了保存」的副作用，
    * 所以后端回的 `applied` 恒为 false，由界面提示「需下发后生效」。
    */
-  approveNode: (module: string, version?: string, note?: string) =>
-    request<{ entry: CatalogEntry; applied: false }>('/api/nodes/catalog', {
-      method: 'POST', body: JSON.stringify({ module, version, note }),
-    }),
+  approveNode: (module: string, version?: string, note?: string, download = false) =>
+    request<{ entry: CatalogEntry; applied: false; downloaded?: string; downloadError?: string }>(
+      '/api/nodes/catalog', {
+        method: 'POST', body: JSON.stringify({ module, version, note, download }),
+      }),
 
   /** 撤销批准。已经装上的**不会**因此消失，只是以后装不上了 */
   revokeNode: (module: string) =>
@@ -440,6 +491,19 @@ export const api = {
     request<{ results: ApplyPolicyResult[] }>('/api/nodes/apply', {
       method: 'POST', body: JSON.stringify({ instances: instances ?? [] }),
     }),
+
+  /**
+   * 把一个节点包装进指定实例。
+   *
+   * 走实例自己的 Admin API（与在节点面板点安装是同一条路），所以**白名单照样管用** ——
+   * 没批准的包在这里也装不上，错误信息会说清下一步该干什么。
+   * 装完立即生效，不需要重启实例。
+   */
+  installNodeToInstance: (instanceId: string, module: string, version?: string) =>
+    request<{ module: string; version: string; types: string[] }>(
+      `/api/instances/${instanceId}/nodes`, {
+        method: 'POST', body: JSON.stringify({ module, version }),
+      }),
 
   nodeInventory: () =>
     request<{ instances: InstanceInventory[] }>('/api/nodes/inventory'),

@@ -17,6 +17,8 @@ import { ref, computed, onMounted, onBeforeUnmount } from 'vue';
 import { NSelect, NSpin, NEmpty, NTag, NButton, NAlert, useMessage } from 'naive-ui';
 import { useRouter } from 'vue-router';
 import { api, ApiError } from '../../api/client';
+import TrendChart from '../../components/TrendChart.vue';
+import type { TagHistory } from '../../api/types';
 import type {
   Instance, FieldDeviceRecord, FieldTagRecord, FieldSummary, ProbeResult,
 } from '../../api/types';
@@ -156,6 +158,46 @@ const probedTagsOf = computed(() => {
 });
 const orphanTags = computed(() => (probe.value?.tags ?? []).filter((t) => t.nodeId === ''));
 
+// ── 点位趋势 ────────────────────────────────────────────
+/*
+ * **点开哪个点位才查哪个**，不是展开设备就把所有点位的历史一起拉。
+ * 一台设备几十个点位很常见，那样一次就是几十个查询打在正在跑采集的盒子上 ——
+ * 而现场看趋势时，一次只关心一个点位。
+ */
+const openTag = ref('');
+const hist = ref<TagHistory | null>(null);
+const histBusy = ref(false);
+const tagKey = (instanceId: string, nodeId: string, tagId: string) =>
+  `${instanceId}\u0000${nodeId}\u0000${tagId}`;
+
+async function toggleTrend(instanceId: string, nodeId: string, tagId: string): Promise<void> {
+  const k = tagKey(instanceId, nodeId, tagId);
+  if (openTag.value === k) { openTag.value = ''; hist.value = null; return; }
+  openTag.value = k;
+  hist.value = null;
+  histBusy.value = true;
+  try {
+    hist.value = await api.tagHistory(instanceId, nodeId, tagId);
+  } catch (e) {
+    message.error(e instanceof ApiError ? e.message : '读取趋势失败');
+    openTag.value = '';
+  } finally {
+    histBusy.value = false;
+  }
+}
+
+/** TrendChart 要的是等长的时间戳与数值数组；非数值点位画不出趋势，一律给 null 断线 */
+const trendData = computed(() => {
+  const pts = hist.value?.points ?? [];
+  return {
+    timestamps: pts.map((p) => Date.parse(p.at)),
+    series: [{
+      key: 'v', name: '数值', color: 'var(--chart-1)',
+      values: pts.map((p) => (typeof p.value === 'number' ? p.value : null)),
+    }],
+  };
+});
+
 // ── 展示 ────────────────────────────────────────────────
 
 function fmtValue(v: unknown): string {
@@ -256,11 +298,12 @@ function qualityBad(q: string): boolean {
                         description="这台设备还没有点位" size="small" style="padding: 16px 0" />
                 <table v-else>
                   <thead>
-                    <tr><th>点位</th><th>标识</th><th class="r">当前值</th><th>质量</th><th>更新</th></tr>
+                    <tr><th>点位</th><th>标识</th><th class="r">当前值</th><th>质量</th><th>更新</th><th></th></tr>
                   </thead>
                   <tbody>
-                    <tr v-for="t in (tagsOf.get(keyOf(d)) ?? []).slice(0, TAG_LIMIT)"
-                        :key="t.tagId">
+                    <template v-for="t in (tagsOf.get(keyOf(d)) ?? []).slice(0, TAG_LIMIT)"
+                              :key="t.tagId">
+                    <tr>
                       <td>{{ t.name || t.tagId }}</td>
                       <td class="mono muted">{{ t.tagId }}</td>
                       <td class="r">
@@ -274,7 +317,38 @@ function qualityBad(q: string): boolean {
                         <span v-else class="muted">good</span>
                       </td>
                       <td class="muted" :title="fmtAbs(t.lastAt)">{{ fmtAgo(t.lastAt) }}</td>
+                      <td class="r">
+                        <NButton size="tiny" quaternary
+                                 @click="toggleTrend(t.instanceId, t.nodeId, t.tagId)">
+                          {{ openTag === tagKey(t.instanceId, t.nodeId, t.tagId) ? '收起' : '趋势' }}
+                        </NButton>
+                      </td>
                     </tr>
+                    <tr v-if="openTag === tagKey(t.instanceId, t.nodeId, t.tagId)" class="trend">
+                      <td colspan="6">
+                        <NSpin :show="histBusy" size="small">
+                          <!-- 未启用要说清是配置关掉的，不是采集坏了 -->
+                          <NAlert v-if="hist && !hist.enabled" type="default" :bordered="false">
+                            {{ hist.reason ?? '本部署未启用点位历史' }}
+                          </NAlert>
+                          <template v-else-if="hist">
+                            <TrendChart :timestamps="trendData.timestamps" :series="trendData.series"
+                                        :unit="t.unit" :height="150"
+                                        empty-text="这个点位还没有历史采样" />
+                            <p class="hint">
+                              共 {{ hist.points.length }} 个采样点。
+                              <template v-if="hist.oldest">
+                                全库最早一条是 {{ fmtAbs(hist.oldest) }} —— 历史按**条数**封顶
+                                （{{ hist.rows }} / {{ hist.maxRows }}），
+                                所以能看多久随点位数量浮动。
+                              </template>
+                              值没变时不重复记录，只每隔一段留一个锚点，因此曲线上的点是稀疏的。
+                            </p>
+                          </template>
+                        </NSpin>
+                      </td>
+                    </tr>
+                    </template>
                   </tbody>
                 </table>
                 <p v-if="(tagsOf.get(keyOf(d)) ?? []).length > TAG_LIMIT" class="more">
@@ -411,6 +485,8 @@ function qualityBad(q: string): boolean {
 .seen { margin-left: auto; font-size: 12px; color: var(--muted); white-space: nowrap; }
 
 .tags { padding: 4px 0 14px 26px; }
+.trend > td { padding: 10px 6px 14px; }
+.trend .hint { margin: 8px 0 0; font-size: 12px; color: var(--text-3); line-height: 1.7; }
 .more, .note, .idle { margin: 10px 0 0; font-size: 12px; color: var(--muted); }
 .empty-tip { margin: 0 0 10px; font-size: 12.5px; color: var(--muted); }
 

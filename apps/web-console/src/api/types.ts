@@ -192,8 +192,56 @@ export interface VersionInfo {
 
 export interface ImageOption {
   tag: string;
-  /** 本机是否已拉取。false 时不能用于创建实例 */
+  /** 本机是否已拉取。false 时不能用于创建实例，也不能升级到它 */
   present: boolean;
+}
+
+/** 一个节点源 */
+export interface NpmSource {
+  id: number;
+  name: string;
+  url: string;
+  enabled: boolean;
+  createdAt: string;
+  createdBy: string;
+}
+
+/** 在线搜索命中的一个包 */
+export interface NodeSearchHit {
+  name: string;
+  version: string;
+  description: string;
+  keywords: string[];
+  date: string;
+  /** 来自哪个源 —— 配了多个源时人得知道这个包是哪来的 */
+  source: string;
+}
+
+/** 点位历史的一段 */
+export interface TagHistory {
+  /**
+   * 本部署有没有开点位历史。false 时 points 必为空，界面要说明「未启用」
+   * 而不是画一张空图 —— 空图会让人以为是采集坏了。
+   */
+  enabled: boolean;
+  points: { at: string; value: unknown; quality: string }[];
+  /** 全库最早一条的时刻。历史按条数封顶，所以「能看多久」随点位数量浮动 */
+  oldest: string | null;
+  rows: number;
+  maxRows: number;
+  /** enabled 为 false 时说明原因 */
+  reason?: string;
+}
+
+/** 换镜像版本的结果 */
+export interface ImageUpgradeResult {
+  from: string;
+  to: string;
+  /**
+   * 恒为 false —— 回滚发生时后端是**抛错**而不是回一个成功响应。
+   * 保留这个字段是为了让「升级成功」这件事在类型上就是明确的。
+   */
+  rolledBack: boolean;
 }
 
 // ── 云平台对接 ────────────────────────────────────────

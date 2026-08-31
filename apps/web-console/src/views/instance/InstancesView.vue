@@ -7,7 +7,7 @@ import {
 } from 'naive-ui';
 import { useRouter } from 'vue-router';
 import { api, ApiError } from '../../api/client';
-import type { Instance, PortRecord } from '../../api/types';
+import type { ImageOption, Instance, PortRecord } from '../../api/types';
 import FieldHelp from '../../components/FieldHelp.vue';
 import { can, canOperate, loadPermissions } from '../../api/permissions';
 
@@ -188,6 +188,81 @@ function confirmRemove(inst: Instance) {
   });
 }
 
+/**
+ * 换镜像版本。
+ *
+ * 界面要替现场把三件事说清楚，因为它们都不是能猜出来的：
+ *
+ *   1. **什么会保留** —— 流程、账号、端口、访问地址都不动。不说的话，
+ *      现场多半不敢点，转而去删了重建，那才真会丢东西
+ *   2. **什么会中断** —— 实例要重启，正在跑的采集会断几秒
+ *   3. **升级不检查流程兼容性** —— Node-RED 碰到不认识的节点类型**不报错**，
+ *      表现是「升完了、跑着呢、就是不出数」。这一条必须在点之前讲
+ *
+ * 本机没有的镜像在下拉里显示但不可选：让人看见「有这个版本，只是没拉下来」，
+ * 比列表里干脆没有它更好排查 —— 后者会让人怀疑是不是自己记错了版本号。
+ */
+async function upgradeImage(inst: Instance) {
+  let images: ImageOption[];
+  try {
+    images = (await api.images()).images;
+  } catch {
+    message.error('取不到可用版本列表');
+    return;
+  }
+  const options = images
+    .filter((i) => i.tag !== inst.imageTag)
+    .map((i) => ({
+      label: i.present ? i.tag : `${i.tag}（本机未拉取，无法升级）`,
+      value: i.tag,
+      disabled: !i.present,
+    }));
+  if (options.every((o) => o.disabled)) {
+    dialog.warning({
+      title: `升级版本 · ${inst.id}`,
+      content: '本机没有其它可用版本的镜像。离线现场请先把目标版本的镜像 docker load 进来，'
+        + '平台不会自己去拉取（受限 docker 端点刻意不放行拉镜像）。',
+      positiveText: '知道了',
+    });
+    return;
+  }
+
+  const picked = ref(options.find((o) => !o.disabled)?.value ?? '');
+  dialog.warning({
+    title: `升级版本 · ${inst.id}`,
+    content: () => h('div', { style: 'display:flex;flex-direction:column;gap:10px' }, [
+      h('div', null, [
+        h('span', { class: 'muted' }, '当前版本　'),
+        h('code', { class: 'mono' }, inst.imageTag),
+      ]),
+      h(NSelect, {
+        value: picked.value, options,
+        'onUpdate:value': (v: string) => { picked.value = v; },
+      }),
+      h('div', { style: 'font-size:12px;line-height:1.7' }, [
+        h('div', null, '流程、账号、端口与访问地址全部保留，只有版本变。'),
+        h('div', null, '实例会重启，正在运行的采集会中断数秒。'),
+        h('div', { style: 'color:var(--warning)' },
+          '不检查流程与新版本的兼容性：Node-RED 遇到不认识的节点类型不会报错，'
+          + '可能出现「升完能跑但不出数」。升级后请到编辑器确认一遍。'),
+        h('div', { class: 'muted' }, '新版本起不来时会自动退回当前版本，实例不会丢。'),
+      ]),
+    ]),
+    positiveText: '升级', negativeText: '取消',
+    onPositiveClick: async () => {
+      if (!picked.value) return;
+      try {
+        const r = await api.upgradeInstanceImage(inst.id, picked.value);
+        message.success(`已从 ${r.from} 升级到 ${r.to}`);
+        await refresh();
+      } catch (e) {
+        // 后端失败时已经回滚并把实例跑起来了，措辞不要让人以为实例没了
+        message.error(e instanceof ApiError ? e.message : '升级失败，实例保持原版本运行');
+      }
+    },
+  });
+}
+
 function resetPassword(inst: Instance) {
   dialog.info({
     title: `重置口令 · ${inst.id}`,
@@ -238,7 +313,10 @@ function portTitle(i: Instance): string {
  */
 function moreOptions(inst: Instance) {
   const items: { label: string; key: string; props?: Record<string, string> }[] = [];
-  if (canOperate(inst.id)) items.push({ label: '重置口令', key: 'reset' });
+  if (canOperate(inst.id)) {
+    items.push({ label: '升级版本', key: 'upgrade' });
+    items.push({ label: '重置口令', key: 'reset' });
+  }
   // 删除是不可逆的，收进菜单后更要保住红色警示 —— 原先它是一个红色按钮
   if (can('instance:delete')) {
     items.push({ label: '删除实例', key: 'remove', props: { style: 'color: var(--error)' } });
@@ -247,6 +325,7 @@ function moreOptions(inst: Instance) {
 }
 
 function onMore(key: string | number, inst: Instance): void {
+  if (key === 'upgrade') upgradeImage(inst);
   if (key === 'reset') resetPassword(inst);
   if (key === 'remove') confirmRemove(inst);
 }

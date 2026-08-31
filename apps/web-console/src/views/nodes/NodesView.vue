@@ -19,14 +19,15 @@
  */
 import { ref, computed, onMounted } from 'vue';
 import {
-  NButton, NCard, NModal, NForm, NFormItem, NInput, NSpin, NAlert, NTag, NSpace,
+  NButton, NCard, NModal, NForm, NFormItem, NInput, NSelect, NSpin, NAlert, NTag, NSpace,
   NPopconfirm, NEmpty, NCheckbox, NRadioGroup, NRadioButton, useMessage,
 } from 'naive-ui';
 import { api, ApiError } from '../../api/client';
 import type {
   CatalogEntry, StorePackage, InstanceInventory, InventoryItem, Instance, NodeCompliance,
+  NpmSource, NodeSearchHit,
 } from '../../api/types';
-import { can, loadPermissions } from '../../api/permissions';
+import { can, canOperate, loadPermissions } from '../../api/permissions';
 // approvedAt 来自 SQLite 的 datetime('now')：是 UTC 但不带 Z，
 // 直接 new Date() 会按本地解析，东八区差 8 小时（见 api/datetime.ts）
 import { localTime } from '../../api/datetime';
@@ -34,11 +35,12 @@ import FieldHelp from '../../components/FieldHelp.vue';
 
 const message = useMessage();
 
-type Section = 'catalog' | 'store' | 'inventory';
+type Section = 'catalog' | 'store' | 'inventory' | 'sources';
 const SECTIONS: Array<{ value: Section; label: string }> = [
   { value: 'catalog', label: '批准清单' },
   { value: 'store', label: '离线包库' },
   { value: 'inventory', label: '已装台账' },
+  { value: 'sources', label: '节点源' },
 ];
 const section = ref<Section>('catalog');
 
@@ -56,6 +58,7 @@ const manage = computed(() => can('node:manage'));
 const nameOf = (id: string) => instances.value.find((i) => i.id === id)?.name ?? id;
 
 async function refresh() {
+  void loadSources();
   loading.value = true;
   loadError.value = '';
   /*
@@ -80,30 +83,207 @@ async function refresh() {
 
 // ── 批准清单 ────────────────────────────────────────────
 
+// ── 节点源 ──────────────────────────────────────────────
+const sources = ref<NpmSource[]>([]);
+const newSource = ref({ name: '', url: '' });
+const sourceBusy = ref(false);
+
+async function loadSources() {
+  try { sources.value = (await api.nodeSources()).sources; } catch { sources.value = []; }
+}
+async function addSource() {
+  sourceBusy.value = true;
+  try {
+    await api.addNodeSource(newSource.value.name, newSource.value.url);
+    newSource.value = { name: '', url: '' };
+    await loadSources();
+    message.success('已加入');
+  } catch (e) {
+    message.error(e instanceof ApiError ? e.message : '添加失败');
+  } finally { sourceBusy.value = false; }
+}
+async function toggleSource(s: NpmSource) {
+  try { await api.setNodeSourceEnabled(s.id, !s.enabled); await loadSources(); }
+  catch (e) { message.error(e instanceof ApiError ? e.message : '操作失败'); }
+}
+async function dropSource(s: NpmSource) {
+  try { await api.removeNodeSource(s.id); await loadSources(); }
+  catch (e) { message.error(e instanceof ApiError ? e.message : '删除失败'); }
+}
+
+// ── 在线搜索（批准对话框用）─────────────────────────────
+/*
+ * 防抖 300ms：每敲一个字都发一次请求，会把边缘盒子和上游源都打满，
+ * 而人打字的间隙本来就够长。
+ */
+const searchQ = ref('');
+const searchHits = ref<NodeSearchHit[]>([]);
+const searching = ref(false);
+const searchEnabled = ref(true);
+const searchReason = ref('');
+let searchTimer: ReturnType<typeof setTimeout> | undefined;
+
+function onSearchInput(v: string) {
+  searchQ.value = v;
+  if (searchTimer) clearTimeout(searchTimer);
+  if (!v.trim()) { searchHits.value = []; return; }
+  searchTimer = setTimeout(() => { void runSearch(); }, 300);
+}
+
+async function runSearch() {
+  searching.value = true;
+  try {
+    const r = await api.searchNodes(searchQ.value);
+    searchEnabled.value = r.enabled;
+    searchReason.value = r.reason ?? '';
+    searchHits.value = r.hits;
+  } catch (e) {
+    searchHits.value = [];
+    message.error(e instanceof ApiError ? e.message : '搜索失败');
+  } finally { searching.value = false; }
+}
+
+/** 选中某个搜索结果 → 拉它的版本列表 */
+const versionOptions = ref<Array<{ label: string; value: string }>>([]);
+const versionsBusy = ref(false);
+const versionsErr = ref('');
+const localVersions = ref<string[]>([]);
+async function pickHit(hit: NodeSearchHit) {
+  approveForm.value.module = hit.name;
+  approveForm.value.version = null;
+  versionOptions.value = [];
+  versionsErr.value = '';
+  versionsBusy.value = true;
+  try {
+    const r = await api.nodeVersions(hit.name);
+    localVersions.value = r.local;
+    versionOptions.value = r.versions.slice(0, 60).map((v) => ({
+      // 库里已有的标出来 —— 那些是离线也装得上的
+      label: r.local.includes(v.version)
+        ? `${v.version}（本地库已有）`
+        : `${v.version}${v.date ? ` · ${v.date.slice(0, 10)}` : ''}`,
+      value: v.version,
+    }));
+    if (versionOptions.value.length === 0) {
+      versionsErr.value = '源里没有查到这个包的版本，可留空（不限版本）或手工填写';
+    }
+  } catch (e) {
+    /*
+     * **不要吞掉**。第一版这里是 `catch {}`，结果版本拉不到时下拉就是空的，
+     * 界面一个字都不说 —— 现场只会以为功能坏了。取不到版本确实不影响批准，
+     * 但必须让人知道发生了什么、以及还能怎么办。
+     */
+    versionsErr.value = (e instanceof ApiError ? e.message : '取版本失败')
+      + '。可留空（不限版本）或手工填写版本范围';
+  } finally {
+    versionsBusy.value = false;
+  }
+}
+
+// ── 装到实例 ────────────────────────────────────────────
+/*
+ * 走实例自己的 Admin API（与在节点面板点安装是同一条路），
+ * 所以白名单照样管用 —— 没批准的包在这里也装不上。
+ * 装完立即生效，不需要重启实例。
+ */
+const showInstall = ref(false);
+const installTo = ref('');
+const installForm = ref<{ module: string; version: string | null }>({ module: '', version: null });
+const installing = ref(false);
+const installErr = ref('');
+
+/** 可选的包：已批准的清单 —— 装没批准的必然被拒，不如干脆不列出来 */
+const installOptions = computed(() =>
+  entries.value.map((e) => ({
+    label: e.inStore ? `${e.module}（本地库已有）` : e.module,
+    value: e.module,
+  })));
+
+function openInstall(instanceId: string) {
+  installTo.value = instanceId;
+  installForm.value = { module: '', version: null };
+  installErr.value = '';
+  showInstall.value = true;
+}
+
+async function submitInstall() {
+  installing.value = true;
+  installErr.value = '';
+  try {
+    const r = await api.installNodeToInstance(
+      installTo.value,
+      installForm.value.module.trim(),
+      installForm.value.version?.trim() || undefined,
+    );
+    showInstall.value = false;
+    await refresh();
+    message.success(
+      `已装到 ${nameOf(installTo.value)}：${r.module}@${r.version}`
+      + (r.types.length ? ` · 新增节点类型 ${r.types.join('、')}` : '')
+      + '。立即生效，不用重启',
+      { duration: 10000 },
+    );
+  } catch (e) {
+    installErr.value = e instanceof ApiError ? e.message : '安装失败';
+  } finally {
+    installing.value = false;
+  }
+}
+
 const showApprove = ref(false);
 const approving = ref(false);
 const approveErr = ref('');
-const approveForm = ref({ module: '', version: '', note: '' });
+/*
+ * version 用 null 表示「不限版本」，**不能用空串**。
+ * NSelect 把 '' 当成「已选中一个空值」：占位符不显示、看起来像个坏掉的输入框。
+ * 这就是它第一版的表现。
+ */
+const approveForm = ref<{ module: string; version: string | null; note: string }>(
+  { module: '', version: null, note: '' },
+);
 
 function openApprove(prefill = '') {
   approveForm.value = { module: prefill, version: '', note: '' };
   approveErr.value = '';
+  searchQ.value = '';
+  searchHits.value = [];
+  versionOptions.value = [];
+  localVersions.value = [];
+  versionsErr.value = '';
   showApprove.value = true;
 }
 
-async function submitApprove() {
+async function submitApprove(download: boolean) {
   approving.value = true;
   approveErr.value = '';
   try {
-    const { entry } = await api.approveNode(
+    const r = await api.approveNode(
       approveForm.value.module.trim(),
-      approveForm.value.version.trim() || undefined,
+      approveForm.value.version?.trim() || undefined,
       approveForm.value.note.trim() || undefined,
+      download,
     );
     showApprove.value = false;
     await refresh();
-    // 明确说「还没生效」——这是这一页最容易产生误解的地方
-    message.warning(`已批准 ${entry.module}，还需「下发到实例」才会生效`, { duration: 8000 });
+    /*
+     * 三种结果分别说清楚。最容易产生误解的是「批准了 ≠ 已生效」——
+     * 不明说的话，现场会去实例里找，找不到就以为坏了。
+     */
+    if (download && r.downloadError) {
+      message.warning(
+        `已批准 ${r.entry.module}，但包体没拉下来（${r.downloadError}）。`
+        + '离线现场装不上，请检查节点源；还需「下发到实例」才会生效',
+        { duration: 12000 },
+      );
+    } else if (r.downloaded) {
+      message.success(
+        `已批准 ${r.entry.module} 并把 ${r.downloaded} 拉进本地库（离线也装得上）。`
+        + '还需「下发到实例」才会生效',
+        { duration: 10000 },
+      );
+    } else {
+      message.warning(`已批准 ${r.entry.module}，还需「下发到实例」才会生效`, { duration: 8000 });
+    }
   } catch (e) {
     approveErr.value = e instanceof ApiError ? e.message : '批准失败';
   } finally {
@@ -459,6 +639,8 @@ onMounted(async () => {
                 {{ inv.unapproved }} 个未批准
               </NTag>
             </div>
+            <NButton v-if="inv.ok && canOperate(inv.instanceId)" size="tiny" secondary
+                     @click="openInstall(inv.instanceId)">装节点包</NButton>
           </div>
 
           <NAlert v-if="!inv.ok" type="info" :bordered="false" class="warn">
@@ -482,9 +664,111 @@ onMounted(async () => {
           </div>
         </NCard>
       </section>
+
+      <!-- ── 节点源 ─────────────────────────────────── -->
+      <section v-show="section === 'sources'" class="sec">
+        <p class="lead">
+          搜索与在线安装都走这里配置的源，<b>从上到下依次尝试</b>。
+          源在这里增删即可生效，<b>不需要改配置或重启</b>。
+        </p>
+
+        <div v-if="manage" class="add-src">
+          <NInput v-model:value="newSource.name" placeholder="名称，如 公司内网私服"
+                  style="max-width: 220px" />
+          <NInput v-model:value="newSource.url" placeholder="https://registry.npmjs.org"
+                  @keyup.enter="addSource" />
+          <NButton size="small" type="primary" :loading="sourceBusy"
+                   :disabled="!newSource.url.trim()" @click="addSource">加入</NButton>
+        </div>
+
+        <NEmpty v-if="sources.length === 0"
+                description="还没有配置任何节点源" style="padding: 28px 0">
+          <template #extra>
+            <span class="muted">
+              没有源时只能装本地库里已有的包。有外网就加
+              <code>https://registry.npmjs.org</code>；内网有私服就填私服地址。
+            </span>
+          </template>
+        </NEmpty>
+
+        <table v-else class="tbl">
+          <thead>
+            <tr><th>名称</th><th>地址</th><th>状态</th><th>加入</th><th v-if="manage"></th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="s in sources" :key="s.id" :class="{ off: !s.enabled }">
+              <td>{{ s.name }}</td>
+              <td class="mono">{{ s.url }}</td>
+              <td>
+                <NTag size="tiny" :type="s.enabled ? 'success' : 'default'">
+                  {{ s.enabled ? '启用' : '停用' }}
+                </NTag>
+              </td>
+              <td class="muted">{{ localTime(s.createdAt) }} · {{ s.createdBy }}</td>
+              <td v-if="manage" class="r">
+                <NButton size="tiny" quaternary @click="toggleSource(s)">
+                  {{ s.enabled ? '停用' : '启用' }}
+                </NButton>
+                <NButton size="tiny" quaternary type="error" @click="dropSource(s)">删除</NButton>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+
+        <p class="hint">
+          停用而不是删除，可以临时排除某个源又不丢配置 ——
+          现场排查「这个包到底哪来的」时很有用。
+        </p>
+      </section>
+
     </NSpin>
 
     <!-- 批准 -->
+    <NModal v-model:show="showInstall" preset="card" style="max-width: 520px"
+            :title="`装节点包到 ${nameOf(installTo)}`">
+      <NAlert type="info" :bordered="false" style="margin-bottom:14px">
+        走的是实例自己的安装接口，与在节点面板点「安装」完全一样 ——
+        <b>白名单照样管用</b>，没批准的包在这里也装不上。装完立即生效，不用重启实例。
+      </NAlert>
+
+      <NForm label-placement="top">
+        <NFormItem>
+          <template #label>
+            包名
+            <FieldHelp>
+              <p>下拉里是<b>已批准</b>的包 —— 没批准的装上去必然被实例拒掉，不如不列。</p>
+              <p>标着「本地库已有」的那些<b>离线也装得上</b>；其余的要现场能连上节点源。</p>
+            </FieldHelp>
+          </template>
+          <NSelect v-model:value="installForm.module" :options="installOptions"
+                   filterable tag clearable placeholder="选一个已批准的包" />
+        </NFormItem>
+
+        <NFormItem>
+          <template #label>
+            版本
+            <FieldHelp>
+              <p>留空 = 装源里的<b>最新版</b>。</p>
+              <p>要钉死某一版就填具体版本号，例如 <code>5.60.2</code>。</p>
+            </FieldHelp>
+          </template>
+          <NSelect v-model:value="installForm.version" :options="[]"
+                   filterable tag clearable placeholder="留空表示装最新版" />
+        </NFormItem>
+
+        <NAlert v-if="installErr" type="error" :bordered="false">{{ installErr }}</NAlert>
+      </NForm>
+
+      <template #footer>
+        <NSpace justify="end">
+          <NButton size="small" @click="showInstall = false">取消</NButton>
+          <NButton size="small" type="primary" :loading="installing"
+                   :disabled="!installForm.module || !installForm.module.trim()"
+                   @click="submitInstall">安装</NButton>
+        </NSpace>
+      </template>
+    </NModal>
+
     <NModal v-model:show="showApprove" preset="card" title="批准节点包" style="max-width: 620px">
       <NAlert type="info" :bordered="false" style="margin-bottom:14px">
         批准一个包 = 允许它在<b>所有</b>实例里被安装并执行代码。
@@ -494,12 +778,43 @@ onMounted(async () => {
       <NForm label-placement="top">
         <NFormItem>
           <template #label>
+            搜索节点包
+            <FieldHelp>
+              <p>在<b>节点源</b>标签页里配置的源上模糊搜索，只返回带
+                <code>node-red</code> 关键字的包 —— 不然搜 modbus 会出来一堆
+                跟 Node-RED 无关的普通库。</p>
+              <p>知道确切包名也可以直接在下面「包名」里填。</p>
+            </FieldHelp>
+          </template>
+          <NInput :value="searchQ" :loading="searching" clearable
+                  placeholder="输入关键字，如 modbus、s7、opcua"
+                  @update:value="onSearchInput" />
+        </NFormItem>
+
+        <NAlert v-if="!searchEnabled" type="warning" :bordered="false" style="margin-bottom:12px">
+          {{ searchReason || '未配置节点源' }} —— 去「节点源」标签页加一个，或直接填下面的包名。
+        </NAlert>
+
+        <div v-if="searchHits.length" class="hits">
+          <div v-for="h in searchHits" :key="h.name" class="hit"
+               :class="{ on: approveForm.module === h.name }" @click="pickHit(h)">
+            <div class="hit-top">
+              <b class="mono">{{ h.name }}</b>
+              <span class="muted">{{ h.version }}</span>
+              <span class="src">{{ h.source }}</span>
+            </div>
+            <div class="hit-desc">{{ h.description || '（无描述）' }}</div>
+            <div class="muted hit-date" v-if="h.date">最近发布 {{ h.date.slice(0, 10) }}</div>
+          </div>
+        </div>
+
+        <NFormItem>
+          <template #label>
             包名
             <FieldHelp>
               <p>npm 上的完整包名，例如 <code>node-red-contrib-modbus</code>。</p>
               <p>带 scope 的写全，例如 <code>@flowfuse/node-red-dashboard</code>。</p>
-              <p>写错不会当场报错，但现场会一直装不上那个包 —— 名字请从
-                npm 页面或包库列表里复制。</p>
+              <p>从上面搜索结果里点一下会自动填进来，也可以手工填。</p>
             </FieldHelp>
           </template>
           <NInput v-model:value="approveForm.module" placeholder="node-red-contrib-modbus" />
@@ -507,14 +822,20 @@ onMounted(async () => {
 
         <NFormItem>
           <template #label>
-            版本范围
+            版本
             <FieldHelp>
               <p>留空 = <b>不限版本</b>，这个包的任何版本都能装。</p>
-              <p>写了就只允许这个范围，例如 <code>5.x</code> 或 <code>~5.60.0</code>。
-                想钉死某个已验证过的版本时才用得上。</p>
+              <p>从下拉里选一个就是钉死那一版；标着「本地库已有」的那些
+                <b>离线也装得上</b>。</p>
+              <p>也可以直接输入范围，例如 <code>5.x</code> 或 <code>~5.60.0</code>。</p>
             </FieldHelp>
           </template>
-          <NInput v-model:value="approveForm.version" placeholder="留空表示不限版本" />
+          <NSelect v-model:value="approveForm.version" :options="versionOptions"
+                   :loading="versionsBusy" filterable tag clearable
+                   placeholder="留空表示不限版本" />
+          <template v-if="versionsErr" #feedback>
+            <span class="muted">{{ versionsErr }}</span>
+          </template>
         </NFormItem>
 
         <NFormItem>
@@ -535,9 +856,13 @@ onMounted(async () => {
       <template #footer>
         <NSpace justify="end">
           <NButton size="small" @click="showApprove = false">取消</NButton>
+          <NButton size="small" :loading="approving"
+                   :disabled="approveForm.module.trim() === ''" @click="submitApprove(false)">
+            只批准
+          </NButton>
           <NButton size="small" type="primary" :loading="approving"
-                   :disabled="approveForm.module.trim() === ''" @click="submitApprove">
-            批准
+                   :disabled="approveForm.module.trim() === ''" @click="submitApprove(true)">
+            批准并下载到本地库
           </NButton>
         </NSpace>
       </template>
@@ -643,4 +968,22 @@ h2 { margin: 0 0 4px; font-size: 20px; }
 .hint { font-size: 12px; color: var(--muted); line-height: 1.7; margin: 0; }
 /* 限定在正文内：scoped 样式会跟着插槽内容跑进 FieldHelp 的传送门（12 号文 5.1） */
 .hint code, .lead code, .n-alert code { background: var(--grey100); padding: 1px 5px; border-radius: 4px; }
+
+.add-src { display: flex; gap: 8px; align-items: center; margin-bottom: 14px; }
+.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
+.tbl th { text-align: left; font-weight: 500; color: var(--text-3); padding: 6px 8px;
+          border-bottom: 1px solid var(--border); }
+.tbl td { padding: 8px; border-bottom: 1px solid var(--border-weak); }
+.tbl tr.off td { opacity: .5; }
+.hits { max-height: 230px; overflow-y: auto; margin: -4px 0 14px;
+        border: 1px solid var(--border); border-radius: 6px; }
+.hit { padding: 8px 10px; cursor: pointer; border-bottom: 1px solid var(--border-weak); }
+.hit:last-child { border-bottom: none; }
+.hit:hover { background: var(--hover); }
+.hit.on { background: var(--primary-soft); }
+.hit-top { display: flex; gap: 8px; align-items: baseline; }
+.hit-top .src { margin-left: auto; font-size: 11px; color: var(--text-3); }
+.hit-desc { font-size: 12px; color: var(--text-2); margin-top: 2px;
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hit-date { font-size: 11px; margin-top: 2px; }
 </style>
