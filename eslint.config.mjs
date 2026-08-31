@@ -138,6 +138,17 @@ export default tseslint.config(
     },
     rules: {
       // 组件名单文件即单组件，不强制多词命名
+      /*
+       * 模板里用了没引入的组件 —— 2026-08-31 真的踩了：`NSelect` 忘了加进
+       * naive-ui 的 import，Vue 把它当未知组件渲染成一个空元素，
+       * 界面上是个既无占位符也无下拉箭头的空框。
+       *
+       * **vue-tsc 和 vite build 都不会报错**（模板里的未知标签在运行期才解析），
+       * 所以只能靠这条规则挡。忽略以 `router-` 开头的内置组件与本地注册的。
+       */
+      'vue/no-undef-components': ['error', {
+        ignorePatterns: ['router-view', 'router-link'],
+      }],
       'vue/multi-word-component-names': 'off',
       // 模板属性换行是风格，不管
       'vue/max-attributes-per-line': 'off',
