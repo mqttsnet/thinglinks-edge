@@ -58,6 +58,11 @@ export interface DockerClientOptions {
    * 由 core/proxy.ts 生成 —— 其中 NO_PROXY 已补齐内部条目，不要自己拼。
    */
   proxyEnv?: readonly string[] | undefined;
+  /**
+   * 私有 npm 源在**实例网络内**的地址（01 号文 5.7）。
+   * 与 managerUrl 同源同理：靠容器名解析，Manager 跑在宿主上时留空。
+   */
+  npmRegistry?: string | undefined;
 }
 
 export interface InstanceStatus {
@@ -196,8 +201,9 @@ export class DockerClient {
    * settings.js 在容器启动前经 putArchive 落进数据卷，避免运行时再改配置。
    */
   async createInstance(spec: InstanceSpec, settingsJs: string): Promise<void> {
-    // managerUrl 由客户端统一补，调用方不必关心 Manager 自己是不是容器
+    // managerUrl / npmRegistry 由客户端统一补，调用方不必关心 Manager 自己是不是容器
     if (this.opts.managerUrl) spec = { ...spec, managerUrl: this.opts.managerUrl };
+    if (this.opts.npmRegistry) spec = { ...spec, npmRegistry: this.opts.npmRegistry };
     assertValidSpec(spec, this.opts.portRange);
     const options = buildCreateOptions(spec, {
       network: this.instanceNetwork(spec.id),

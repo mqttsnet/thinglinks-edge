@@ -11,6 +11,7 @@ import { adminRootFor } from '../config.ts';
 import { InstanceRepo, type PortRecord } from './repo.ts';
 import { DockerClient } from './docker-client.ts';
 import { renderSettings } from './settings-template.ts';
+import type { PalettePolicy } from '../nodes/policy.ts';
 import { assertValidId } from './container-spec.ts';
 import { generatePassword } from '../auth/crypto.ts';
 import { validatePortMappings, recommendPorts, type PortRange, type PortMapping } from './ports.ts';
@@ -65,6 +66,14 @@ export interface InstanceServiceOptions {
   probeHostPorts?: boolean;
   /** 实例 HTTP 基址解析；生产按容器名，验证时可注入 */
   upstreamFor?: ((instanceId: string) => string) | undefined;
+  /**
+   * 当前的节点安装策略（01 号文 5.7）。
+   *
+   * 传的是**函数**而不是值：批准清单随时可改，而实例配置是在创建、
+   * 重置口令、下发策略这些时刻各自现算的。传值会让先启动的服务
+   * 一直用着进程启动那一刻的旧清单，且没有任何症状。
+   */
+  palettePolicy?: (() => PalettePolicy) | undefined;
 }
 
 export class InstanceService {
@@ -184,6 +193,7 @@ export class InstanceService {
         adminRoot,
         credentialSecret: credSecret,
         credentials: [{ username: 'admin', passwordHash: bcrypt.hashSync(password, 8), permissions: '*' }],
+        palette: this.o.palettePolicy?.(),
       });
       await this.o.docker.createInstance(
         { id: input.id, imageTag: input.imageTag, memoryMb: input.memoryMb, cpus: input.cpus,
@@ -268,12 +278,52 @@ export class InstanceService {
         passwordHash: bcrypt.hashSync(c.password, 8),
         permissions: c.permissions,
       })),
+      palette: this.o.palettePolicy?.(),
     });
     await this.o.docker.writeSettings(id, settings);
     await this.o.docker.restart(id);
 
     recordAudit(this.o.db, { actor, action: 'reset-instance-credential', target: `${id}/${username}`, result: 'ok' });
     return password;
+  }
+
+  /**
+   * 把当前的节点批准清单下发到实例（01 号文 5.7）。
+   *
+   * **必须重启实例**：Node-RED 只在启动时读一次 settings.js，
+   * 只写文件不重启的话，界面上显示「已下发」而闸门其实还是旧的 ——
+   * 那种不一致比没下发更危险，所以这里不提供「只写不重启」的选项。
+   *
+   * 停着的实例只写文件不启动 —— 它下次起来自然会读到新配置，
+   * 而替用户把停掉的实例拉起来是越权的动作（人家可能是故意停的）。
+   */
+  async applyNodePolicy(id: string, actor: string): Promise<{ restarted: boolean }> {
+    const inst = this.o.repo.get(id);
+    if (!inst) throw new ServiceError(`实例 ${id} 不存在`);
+    await this.o.docker.assertManaged(id);
+
+    const creds = this.o.repo.credentials(id);
+    const settings = renderSettings({
+      instanceId: id,
+      adminRoot: inst.adminRoot,
+      credentialSecret: inst.credSecret,
+      credentials: creds.map((c) => ({
+        username: c.username,
+        passwordHash: bcrypt.hashSync(c.password, 8),
+        permissions: c.permissions,
+      })),
+      palette: this.o.palettePolicy?.(),
+    });
+    await this.o.docker.writeSettings(id, settings);
+
+    const running = (await this.o.docker.list()).find((x) => x.id === id)?.running === true;
+    if (running) await this.o.docker.restart(id);
+
+    recordAudit(this.o.db, {
+      actor, action: 'apply-node-policy', target: id,
+      result: 'ok', detail: running ? '已重启生效' : '实例未运行，下次启动生效',
+    });
+    return { restarted: running };
   }
 
   async logs(id: string, tail = 200): Promise<string> {

@@ -9,6 +9,8 @@
  * 由固定模板生成最终配置，并在下发前二次校验。
  */
 
+import { registryEnv } from '../nodes/policy.ts';
+
 export class SpecError extends Error {
   constructor(message: string) {
     super(message);
@@ -44,6 +46,14 @@ export interface InstanceSpec {
    * Manager 跑在宿主上时解析不到容器名，此处留空 —— 节点会打一条警告后静默跳过回报。
    */
   managerUrl?: string | undefined;
+  /**
+   * 私有 npm 源地址（形如 `http://tle-mgr:19100/nodered/npm/`）。
+   *
+   * 必须是**容器内**可达的地址：取它的是容器里的 npm 进程，不是浏览器。
+   * 留空则实例沿用镜像默认的公网源 —— 有外网的现场可以这样，
+   * 但白名单仍然生效（那是 settings.js 管的，与源无关）。
+   */
+  npmRegistry?: string | undefined;
 }
 
 /** 实例 id 严格字符集 —— 它会进入容器名、卷名、网络名与访问路径 */
@@ -136,6 +146,12 @@ export function buildCreateOptions(
       ...(spec.ingestToken && spec.managerUrl
         ? [`TLE_INGEST_TOKEN=${spec.ingestToken}`, `TLE_MANAGER_URL=${spec.managerUrl}`]
         : []),
+      /*
+       * 私有 npm 源。用环境变量而不是往 /data/.npmrc 里写 registry= ——
+       * 后者够不着 Node-RED 装包前那次版本预检（`npm info` 的 cwd 是
+       * /usr/src/node-red，不是 /data），详见 core/nodes/policy.ts 的 registryEnv。
+       */
+      ...registryEnv(spec.npmRegistry ?? ''),
       /*
        * 出网代理。NO_PROXY 由平台补齐过内部条目（见 core/proxy.ts）——
        * 漏了容器名的话，实例回报台账、Manager 反代实例都会被绕去代理，
