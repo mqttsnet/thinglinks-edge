@@ -36,6 +36,13 @@ const routes: RouteRecordRaw[] = [
       },
 
       {
+        path: 'nodes', name: 'nodes', component: () => import('./views/nodes/NodesView.vue'),
+        // 只要求 view：能看清单的人就该看得到这一页（排障要知道装了什么），
+        // 批准与下发的按钮在页内再按 node:manage 收起来
+        meta: { need: 'node:view' },
+      },
+
+      {
         path: 'settings', name: 'settings',
         component: () => import('./views/auth/SettingsView.vue'),
         // 不设 need：每个人都要能进来管自己的两步验证。

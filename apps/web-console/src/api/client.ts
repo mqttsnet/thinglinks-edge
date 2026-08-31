@@ -15,6 +15,7 @@ import type {
   EdgeMetrics, ReplayResult,
   DiagProbeResponse,
   FlowTemplate, ApplyPreview, ApplyResult,
+  CatalogEntry, StoreListResult, ImportResult, InstanceInventory, ApplyPolicyResult,
 } from './types';
 import { filenameFrom } from './filename';
 
@@ -378,6 +379,71 @@ export const api = {
    * **整体替换**它的全部流程。两个分支返回不同结构，故拆成两个方法，
    * 免得调用方拿到联合类型还要自己收窄。
    */
+  // ── 节点管理（01 号文 5.7）────────────────────────────
+  //
+  // 三个清单三条路由，别当成同一份数据的三个视图 —— 见 types.ts 的说明。
+
+  nodeCatalog: () => request<{ entries: CatalogEntry[] }>('/api/nodes/catalog'),
+
+  /**
+   * 批准一个节点包。
+   *
+   * `version` 留空表示不限版本。**批准不会自动下发到实例** ——
+   * 下发要重启实例（会中断现场采集），不能是「点了保存」的副作用，
+   * 所以后端回的 `applied` 恒为 false，由界面提示「需下发后生效」。
+   */
+  approveNode: (module: string, version?: string, note?: string) =>
+    request<{ entry: CatalogEntry; applied: false }>('/api/nodes/catalog', {
+      method: 'POST', body: JSON.stringify({ module, version, note }),
+    }),
+
+  /** 撤销批准。已经装上的**不会**因此消失，只是以后装不上了 */
+  revokeNode: (module: string) =>
+    request<{ ok: true; applied: false }>(
+      `/api/nodes/catalog/${encodeURIComponent(module)}`, { method: 'DELETE' }),
+
+  nodeStore: () => request<StoreListResult>('/api/nodes/store'),
+
+  /**
+   * 往离线包库导入一个 .tgz。
+   *
+   * 请求体是**文件字节本身**（application/octet-stream），不是 multipart。
+   * 因此不能走 `request` 的 JSON 序列化 —— 它会把 Blob 变成 "[object Blob]"。
+   */
+  importNodePackage: async (file: File | Blob): Promise<ImportResult> => {
+    const res = await fetch(`${basePath}/api/nodes/store`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/octet-stream', 'x-csrf-token': csrfToken() },
+      credentials: 'same-origin',
+      body: file,
+    });
+    const text = await res.text();
+    if (!res.ok) {
+      let message = `导入失败（HTTP ${res.status}）`;
+      try { message = String(JSON.parse(text).error) || message; } catch { /* 非 JSON 用默认 */ }
+      throw new ApiError(res.status, message);
+    }
+    return JSON.parse(text) as ImportResult;
+  },
+
+  removeNodePackage: (module: string, version: string) =>
+    request<{ ok: true }>(
+      `/api/nodes/store/${encodeURIComponent(`${module}@${version}`)}`, { method: 'DELETE' }),
+
+  /**
+   * 把当前批准清单写进实例并**重启**它们。
+   *
+   * `instances` 留空就是全部。逐台做且一台失败不中断，结果里逐台给成败 ——
+   * 现场常有停着的实例，让一台挡住其余会逼人一台台手工来。
+   */
+  applyNodePolicy: (instances?: string[]) =>
+    request<{ results: ApplyPolicyResult[] }>('/api/nodes/apply', {
+      method: 'POST', body: JSON.stringify({ instances: instances ?? [] }),
+    }),
+
+  nodeInventory: () =>
+    request<{ instances: InstanceInventory[] }>('/api/nodes/inventory'),
+
   previewApply: (instanceId: string, templateId: string) =>
     request<ApplyPreview>(`/api/instances/${instanceId}/flows`, {
       method: 'POST', body: JSON.stringify({ templateId, dryRun: true }),

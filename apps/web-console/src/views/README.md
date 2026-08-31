@@ -11,6 +11,9 @@
 | `cloud/` | `CloudView` 云平台对接 · `broker-url.ts` 地址拆拼（纯逻辑，有单测） |
 | `health/` | `HealthView` 健康监测 |
 | `archive/` | `BackupView` 备份下载 |
+| `flows/` | `TemplatesView` 流程模板 |
+| `diag/` | `DiagView` 远程诊断 |
+| `nodes/` | `NodesView` 节点管理（批准清单 / 离线包库 / 已装台账） |
 
 文件名保留 `*View.vue` 后缀 —— 它是 Vue 生态的既有约定，devtools 里也按这个名字显示。
 

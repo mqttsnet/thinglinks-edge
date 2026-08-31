@@ -674,3 +674,91 @@ export interface OutageRecord {
   status: 'ongoing' | 'restoring' | 'done';
   note: string;
 }
+
+// ── 节点管理（01 号文 5.7）──────────────────────────────────
+//
+// 这一块有三张不同的清单，名字很像但回答的是**不同的问题**，界面上也别混：
+//
+//   批准清单 CatalogEntry   ——「**允许**装什么」（闸门本身，写进实例 settings.js）
+//   离线包库 StorePackage   ——「**有**什么可装」（私有 npm 源里的 tgz）
+//   已装台账 InstanceInventory ——「实际**装了**什么」（各实例现答）
+//
+// 三者不一致是常态，而**发现不一致**正是这一页存在的理由。
+
+/** 一条已批准的节点包 */
+export interface CatalogEntry {
+  module: string;
+  /** 版本范围。留空表示不限版本 */
+  version?: string;
+  note: string;
+  approvedBy: string;
+  approvedAt: string;
+  /** 离线包库里有没有它。批了但库里没有 = 无外网现场装不上 */
+  inStore: boolean;
+  storeVersions: string[];
+}
+
+/** 离线包库里的一个包 */
+export interface StorePackage {
+  module: string;
+  versions: string[];
+  latest: string;
+  description: string;
+  /** 该包提供的节点类型。依赖包为空 */
+  types: string[];
+  /** 有 node-red.nodes 才算节点包；其余是被它拖进来的普通依赖 */
+  isNodeRedNode: boolean;
+  size: number;
+  updatedAt: string;
+  approved: boolean;
+  /** 必需依赖缺口。非空 = 现场点安装会失败 */
+  missingDeps: string[];
+  /**
+   * 可选依赖缺口。非空 = 装得上，但**少一部分功能**，而且不会报错。
+   * modbus 的串口（RTU）支持就在这里，所以不能和 missingDeps 一样对待。
+   */
+  missingOptionalDeps: string[];
+}
+
+export interface StoreListResult {
+  packages: StorePackage[];
+  /** 包库在 Manager 上的绝对路径，排障时要照着它去看盘 */
+  root: string;
+}
+
+/** 导入一个 tgz 之后的回执 */
+export interface ImportResult {
+  package: { name: string; version: string; isNodeRedNode: boolean; types: string[] };
+  missingDeps: string[];
+  missingOptionalDeps: string[];
+}
+
+/** 一条节点在合规意义上的判定 */
+export type NodeCompliance = 'builtin' | 'platform' | 'approved' | 'unapproved';
+
+export interface InventoryItem {
+  module: string;
+  version: string;
+  local: boolean;
+  types: string[];
+  enabled: boolean;
+  compliance: NodeCompliance;
+}
+
+export interface InstanceInventory {
+  instanceId: string;
+  /** 读取成功与否。停机的实例读不到，那不是错误，是常态 */
+  ok: boolean;
+  reason: string;
+  modules: InventoryItem[];
+  unapproved: number;
+}
+
+/** 下发策略到某台实例的结果。逐台给，一台失败不影响其余 */
+export interface ApplyPolicyResult {
+  instanceId: string;
+  ok: boolean;
+  /** 实例是否真的重启了 —— 不重启就没生效 */
+  restarted: boolean;
+  error: string;
+}

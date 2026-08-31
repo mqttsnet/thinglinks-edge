@@ -59,6 +59,11 @@ const NAV_GROUPS: NavGroup[] = [
     // 整组挂 need 会把「备份」也一起藏掉
     items: [
       { name: 'users', title: '用户与权限', need: 'user:manage', icon: 'M2.6 16.5a5 5 0 0 1 9.8 0M7.5 8.6a2.9 2.9 0 1 0 0-5.8 2.9 2.9 0 0 0 0 5.8Zm6.2 0a2.4 2.4 0 1 0 0-4.8M14 11.4a4.4 4.4 0 0 1 3.4 5.1' },
+      // 放在「系统」而不是「运行」：这一页的主体是「允许装什么」，
+      // 和用户与权限一样是治理动作，不是产线上的日常操作。
+      // 用 node:view（三种角色都有）—— 排障时要能查这台装了什么
+      { name: 'nodes', title: '节点管理', need: 'node:view',
+        icon: 'M9 2.5 15.5 6v7L9 16.5 2.5 13V6ZM9 2.5V9m0 0 6.5-3M9 9l-6.5-3M9 9v7.5' },
       // 运维也有 diag:run —— 现场第一响应人就是他们，不能只给管理员
       { name: 'diag', title: '远程诊断', need: 'diag:run', icon: 'M2 10h3l2.5-6 3.5 12 2.5-6h3' },
       { name: 'backup', title: '备份', need: 'backup:run', icon: 'M3 5.5C3 4.4 5.5 3.5 9 3.5s6 .9 6 2v7c0 1.1-2.5 2-6 2s-6-.9-6-2ZM3 9c0 1.1 2.5 2 6 2s6-.9 6-2' },
