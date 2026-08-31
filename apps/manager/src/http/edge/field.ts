@@ -54,6 +54,43 @@ export function registerField(api: FastifyInstance, ctx: HttpContext): void {
    * 界面必须标「未纳管」，且不能把这些数字和真实台账加在一起显示 ——
    * 让用户以为看到的是全部，是诚信问题（06 号文原话）。
    */
+  /**
+   * 某个点位的历史曲线（断网时现场最想看的东西）。
+   *
+   * **必须指名实例**，走那台实例的授权矩阵 —— 历史里是现场的真实读数，
+   * 和台账同级敏感；只要有 field:view 就能换 instanceId 读别人的，那是越权旁路。
+   *
+   * 没开历史记录时如实回 `enabled: false`，界面据此说明「未启用」，
+   * 而不是画一张空图让人以为系统坏了。
+   */
+  api.get(`${config.basePath}/api/field/history`, async (req, reply) => {
+    const q = req.query as {
+      instanceId?: string; nodeId?: string; tagId?: string;
+      since?: string; until?: string; limit?: string;
+    };
+    if (!q.instanceId || !q.nodeId || !q.tagId) {
+      return reply.code(400).send({ error: '必须同时给出 instanceId、nodeId、tagId' });
+    }
+    if (!guard(req, reply, { csrf: false, need: 'instance:view', instance: q.instanceId })) return;
+
+    const history = ctx.valueHistory;
+    if (!history?.enabled) {
+      return reply.send({
+        enabled: false, points: [], oldest: null, rows: 0, maxRows: 0,
+        reason: '本部署未启用点位历史（EDGE_HISTORY_MAX_ROWS=0）',
+      });
+    }
+    const limit = Number(q.limit ?? '500');
+    return reply.send({
+      enabled: true,
+      ...history.series({
+        instanceId: q.instanceId, nodeId: q.nodeId, tagId: q.tagId,
+        since: q.since, until: q.until,
+        limit: Number.isFinite(limit) ? limit : 500,
+      }),
+    });
+  });
+
   api.get(`${config.basePath}/api/field/southbound`, async (req, reply) => {
     const { instanceId } = req.query as { instanceId?: string };
     // 这条**必须**指名实例：它读的是那台实例的 flows.json，

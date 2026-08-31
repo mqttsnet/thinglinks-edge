@@ -298,6 +298,51 @@ const MIGRATIONS: string[] = [
     approved_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
   `,
+  /*
+   * v11 —— 点位历史（断网期间现场也要能看趋势）。
+   *
+   * **上限用条数而不是保留天数**：边缘盒子的硬约束是磁盘容量与 SD 卡写入量，
+   * 而条数直接对应这两者，天数不对应 —— 同样保留 7 天，10 个点位和 500 个点位
+   * 差着两个数量级。按条数封顶，最坏情况可预期。
+   * 代价是「能看多久」随点位数量浮动，所以接口要如实回报最早一条的时间，
+   * 界面据此说「只有最近 X 起的数据」，而不是让人以为看到的是全部。
+   *
+   * **只建一条索引**：每多一条索引，每次写入就多一份放大。查询只有一种形状
+   * （某个点位按时间倒序取一段），一条复合索引就够。
+   *
+   * hist_at 记在 field_tag 上，用来判断「这个点位上次存历史是什么时候」——
+   * 放在这里而不是去查历史表，是为了避免每次写入都扫一次历史。
+   */
+  `
+  CREATE TABLE field_value_history (
+    instance_id TEXT NOT NULL,
+    node_id     TEXT NOT NULL,
+    tag_id      TEXT NOT NULL,
+    at          TEXT NOT NULL,
+    value       TEXT,
+    quality     TEXT NOT NULL DEFAULT 'good',
+    FOREIGN KEY (instance_id) REFERENCES instance(id) ON DELETE CASCADE
+  );
+  CREATE INDEX idx_fvh_series ON field_value_history(instance_id, node_id, tag_id, at DESC);
+  ALTER TABLE field_tag ADD COLUMN hist_at TEXT;
+  `,
+  /*
+   * v12 —— 节点源（01 号文 5.7）。
+   *
+   * 源的增删改必须在页面上完成，不能每次都改编排文件重启 ——
+   * 现场加一个内网私服是常规运维动作，不是一次发布。
+   * 环境变量 EDGE_NPM_UPSTREAM 退化成**全新安装时的初始值**，之后以库为准。
+   */
+  `
+  CREATE TABLE npm_source (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT    NOT NULL,
+    url        TEXT    NOT NULL UNIQUE,
+    enabled    INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT    NOT NULL DEFAULT (datetime('now')),
+    created_by TEXT    NOT NULL DEFAULT ''
+  );
+  `,
 ];
 export function openDb(file: string): Db {
   if (file !== ':memory:') mkdirSync(dirname(file), { recursive: true });

@@ -16,6 +16,7 @@ import { InstanceRepo } from '../dist/core/instance/repo.js';
 import { InstanceService } from '../dist/core/instance/service.js';
 import { DockerClient } from '../dist/core/instance/docker-client.js';
 import { buildServer } from '../dist/http/app.js';
+import { ValueHistory } from '../dist/core/edge/history.js';
 import { Spool } from '../dist/core/spool/spool.js';
 import { containerName } from '../dist/core/instance/container-spec.js';
 import { TEST_DATA_ROOT, ensureRoot, resetDataDir, dataDirExists, TEST_EDGE_ROOT } from './_data-root.mjs';
@@ -31,7 +32,14 @@ const PORT_B = 30833;
 const ID2 = 'api-b';
 const TAG = '5.0.4-24-minimal';
 /** 白名单内、但本机不会去拉的版本。verify 环境不联网拉镜像，这一点是稳定的 */
-const MISSING_TAG = '4.1.13-22-minimal';
+/*
+ * 用一个**永远不会存在**的 tag，而不是某个「本机碰巧没拉」的真实版本。
+ *
+ * 原先这里写的是 4.1.13-22-minimal，前提是「开发机上没有它」——
+ * 而 verify-upgrade 要跨大版本升级，必须把它拉下来，于是这条断言就红了。
+ * 断言的前提一旦依赖「机器上恰好没有什么」，它迟早会被另一个脚本的正当需要打翻。
+ */
+const MISSING_TAG = '0.0.0-never-published';
 
 const raw = new Docker();
 const results = [];
@@ -81,8 +89,9 @@ async function main() {
   let cloudUp = true;
   const spoolDir = join(mkdtempSync(join(tmpdir(), 'tle-spool-')), 'spool');
   const spool = await Spool.open({ dir: spoolDir, flushIntervalMs: 5, fullPolicy: 'drop-oldest' });
+  const valueHistory = new ValueHistory(db, { maxRows: 1000, minGapSec: 300 });
   const app = buildServer({
-    config, db, auth, repo, service, spool,
+    config, db, auth, repo, service, spool, valueHistory,
     cloudSink: async (payload) => {
       if (!cloudUp) throw new Error('模拟断网');
       cloudBatches.push(payload);
@@ -349,6 +358,37 @@ async function main() {
   check('点位元数据与质量码正确',
         byTag['temp']?.unit === '°C' && byTag['pressure']?.quality === 'uncertain',
         `${byTag['temp']?.unit} / ${byTag['pressure']?.quality}`);
+
+  /*
+   * ── 点位历史：这里盯的是**接线**，不是模块本身 ──
+   *
+   * history.test.ts 已经把写入策略测透了。这几条要证的是另一件事：
+   * 上报走 ingest 之后，历史真的被顺手落盘、并且能从控制台读回来。
+   * 「模块验过」不等于「链路是通的」—— 云链路就栽过这一次（交接文档 B7）。
+   */
+  const hist = (q) => fetch(`${B}/api/field/history?instanceId=${ID}&${q}`, { headers: { cookie } })
+    .then((r) => r.json());
+
+  const h1 = await hist('nodeId=plc-1&tagId=temp');
+  check('上报之后趋势接口就有数据（写入链路是通的）',
+        h1.enabled === true && h1.points?.length === 1 && h1.points[0].value === 218.5,
+        `enabled=${h1.enabled} points=${h1.points?.length} v=${JSON.stringify(h1.points?.[0]?.value)}`);
+
+  await ingest('values', { values: [{ nodeId: 'plc-1', tagId: 'temp', value: 219.5 }] });
+  await ingest('values', { values: [{ nodeId: 'plc-1', tagId: 'temp', value: 219.5 }] });
+  const h2 = await hist('nodeId=plc-1&tagId=temp');
+  check('值变了记一条、没变不重复记（省 SD 卡写入）',
+        h2.points?.length === 2 && h2.points.map((p) => p.value).join(',') === '218.5,219.5',
+        `${h2.points?.length} 条：${(h2.points ?? []).map((p) => p.value).join(',')}`);
+
+  check('趋势回报最早时刻与容量，界面才能说清「只有最近这些」',
+        typeof h2.oldest === 'string' && h2.maxRows === 1000, `oldest=${h2.oldest} max=${h2.maxRows}`);
+
+  const histNoTag = await fetch(`${B}/api/field/history?instanceId=${ID}`, { headers: { cookie } });
+  check('趋势必须指名点位，缺参数回 400', histNoTag.status === 400, `HTTP ${histNoTag.status}`);
+
+  const histAnon = await fetch(`${B}/api/field/history?instanceId=${ID}&nodeId=plc-1&tagId=temp`);
+  check('未登录读不到历史（里面是现场真实读数）', histAnon.status === 401, `HTTP ${histAnon.status}`);
 
   // 越权：拿 ID 的令牌不能写到别的实例名下 —— 请求体里根本没有实例字段
   const crossWrite = await ingest('devices', { nodeId: 'intruder', name: '越权', instanceId: ID2 });

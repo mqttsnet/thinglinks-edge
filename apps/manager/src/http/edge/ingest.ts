@@ -38,7 +38,9 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
    * 才退回看 sink。
    */
   const cloudReady = () => (cloud ? cloud.configured : Boolean(cloudSink));
-  const registry = new FieldRegistry(db);
+  // 历史由这里的写入顺手落盘 —— 忘了传就是「趋势永远是空的」，
+  // 而采集与当前值一切正常，从现象上完全看不出少了什么
+  const registry = new FieldRegistry(db, ctx.valueHistory);
 
   /*
    * 微批。1.4k 点/秒的现场负载聚合后约 5 条消息/秒（08 号文第 2 节）。
