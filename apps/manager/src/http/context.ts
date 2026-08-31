@@ -20,6 +20,8 @@ import { UserRepo } from '../core/auth/user-repo.ts';
 import { can, canInstance, isInstanceScoped, type Action } from '../core/auth/authz.ts';
 import { SettingsRepo } from '../core/auth/settings.ts';
 import type { MetricsHistory } from '../core/health/metrics-history.ts';
+import type { NodeStore } from '../core/nodes/store.ts';
+import type { NodeCatalog } from '../core/nodes/catalog.ts';
 
 export const SID = 'tle_sid';
 export const CSRF = 'tle_csrf';
@@ -64,6 +66,14 @@ export interface ServerDeps {
    * 界面据此说明「未启用」，而不是画一张空图让人以为系统坏了。
    */
   metrics?: MetricsHistory | undefined;
+  /**
+   * 私有节点源（01 号文 5.7）。留空则不挂载节点管理相关路由 ——
+   * 单测装配用不到它，而挂一套空路由只会让「404 还是没权限」更难分辨。
+   */
+  nodeStore?: NodeStore | undefined;
+  nodeCatalog?: NodeCatalog | undefined;
+  /** 实例容器视角的私有源地址，用于生成 packument 里的包体 URL */
+  npmRegistryUrl?: string | undefined;
 }
 
 const defaultUpstream = (id: string) => `http://${containerName(id)}:1880`;
@@ -164,8 +174,9 @@ export function createContext(deps: ServerDeps): HttpContext {
        * 强制改密必须在**后端**拦。
        *
        * 之前只有 Vue 路由守卫在做这件事 —— 那只是界面上的引导，
-       * 会话本身完全有效：拿着初始口令直接 curl 后端接口就能绕过去，
-       * 而初始口令是打印在启动日志里的。
+       * 会话本身完全有效：拿着初始口令直接 curl 后端接口就能绕过去。
+       * 而初始口令是**无人值守装机时由 INITIAL_PASSWORD 给的那一个**，
+       * 它写在编排文件或 CI 变量里，见过它的人比该有权限的人多。
        *
        * 例外只有会话自身那三条（me / logout / change-password），
        * 它们不走 guard，天然放行 —— 否则用户会被锁死在无法改密的死循环里。
@@ -182,8 +193,8 @@ export function createContext(deps: ServerDeps): HttpContext {
        * 全站强制两步验证、而这个人还没绑 —— 同样拦在后端。
        *
        * 顺序在改密之后：先把初始口令换掉，再绑第二因子。反过来的话，
-       * 用户会拿着日志里印过的那个初始口令去绑定，等于给一把已经暴露的钥匙
-       * 加了第二道锁。
+       * 用户会拿着 INITIAL_PASSWORD 那个初始口令去绑定，等于给一把
+       * 已经躺在编排文件里的钥匙加了第二道锁。
        *
        * 例外是绑定本身那几条路由（`allowEnroll`）—— 不放行就成了死循环：
        * 要绑定得先能调接口，能调接口又得先绑定。

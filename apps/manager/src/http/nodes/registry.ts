@@ -1,0 +1,143 @@
+/**
+ * 私有 npm 源的只读端点（01 号文 5.7「内置私有 npm registry」）。
+ *
+ * 服务两类完全不同的客户端，**它们看到的地址不一样**，这是本文件最容易搞错的地方：
+ *
+ *   · 实例容器里的 **npm**  → `http://<manager 容器名>:19100<basePath>/npm/`
+ *     由 NPM_CONFIG_REGISTRY 注入（见 core/nodes/policy.ts）
+ *   · 现场浏览器里的**编辑器前端** → `<basePath>/npm/-/catalogue.json`
+ *     由实例 settings.js 的 editorTheme.palette.catalogues 注入
+ *
+ * 编辑器是 Manager 反代出去的，所以对浏览器而言两者同源，catalogue 用相对路径即可；
+ * 而 npm 在容器里，只能靠 docker 网络的容器名解析。把其中一个填成另一个的地址，
+ * 症状分别是「面板一直转圈」和「装包报连不上」——两次都指不到根因。
+ *
+ * ## 为什么不鉴权
+ *
+ * npm 取包时的鉴权只能靠 .npmrc 里的 `_authToken`，而**装包前那次
+ * `npm info` 读不到实例的 .npmrc**（cwd 不是 /data，见 policy.ts 的实测）。
+ * 也就是说加了鉴权，恰恰是开启白名单之后的版本预检会 401 —— 又一个
+ * 「配得越严越用不了」的陷阱。
+ *
+ * 权衡后放开只读：这里的内容是**已批准的公开 npm 包**，不含任何机密；
+ * 能访问到它的前提是已经在 Manager 的网络里（宿主端口默认只发布到回环）。
+ * 写入口（导入包、改批准清单）在 ./catalog.ts，全部要 node:manage。
+ */
+import type { FastifyInstance } from 'fastify';
+import { buildPackument, buildCatalogue } from '../../core/nodes/packument.ts';
+import { assertModuleName } from '../../core/nodes/policy.ts';
+import type { NodeStore } from '../../core/nodes/store.ts';
+import type { NodeCatalog } from '../../core/nodes/catalog.ts';
+import type { HttpContext } from '../context.ts';
+
+export interface RegistryDeps {
+  store: NodeStore;
+  catalog: NodeCatalog;
+  /** npm 视角的源地址，用于生成 packument 里的 tarball URL */
+  internalBase: string;
+}
+
+/**
+ * 从 `/npm/` 之后的路径里解出包名与可选的 tarball 文件名。
+ *
+ * 要处理的形状：
+ *
+ *     node-red-contrib-modbus                     普通包
+ *     @scope/pkg  或  @scope%2fpkg                 带 scope（npm 两种写法都会发）
+ *     node-red-contrib-modbus/-/xxx-5.7.0.tgz     包体下载
+ */
+export function parseNpmPath(rest: string):
+  { module: string; tarball?: string } | undefined {
+  const path = decodeURIComponent(rest.replace(/^\/+/, ''));
+  if (path === '') return undefined;
+
+  const marker = path.indexOf('/-/');
+  if (marker >= 0) {
+    const module = path.slice(0, marker);
+    const tarball = path.slice(marker + 3);
+    // 文件名里出现路径分隔符一律拒绝：它只该是个纯文件名
+    if (tarball === '' || tarball.includes('/')) return undefined;
+    return { module, tarball };
+  }
+  return { module: path };
+}
+
+/**
+ * 从 tarball 文件名里取版本。
+ *
+ * 文件名形如 `<basename>-<version>.tgz`，而 basename 自己也含连字符，
+ * 所以从**右边**找最后一个连字符 —— 版本号里不会有连字符之外的分隔，
+ * 有预发布标记时（1.0.0-beta.1）才会，那种情况下按包名长度切更可靠。
+ */
+export function versionFromTarball(module: string, file: string): string | undefined {
+  if (!file.endsWith('.tgz')) return undefined;
+  const base = module.split('/').pop() ?? module;
+  const stem = file.slice(0, -4);
+  if (!stem.startsWith(`${base}-`)) return undefined;
+  const version = stem.slice(base.length + 1);
+  return version === '' ? undefined : version;
+}
+
+export function registerNpmRegistry(
+  api: FastifyInstance, ctx: HttpContext, deps: RegistryDeps,
+): void {
+  const { config } = ctx;
+  const { store, catalog, internalBase } = deps;
+
+  /**
+   * 编辑器节点目录。
+   *
+   * 路径放在 `/-/` 下：npm 的包名不允许以 `-` 开头，所以这个前缀
+   * 永远不会和某个真实包撞上。
+   */
+  api.get(`${config.basePath}/npm/-/catalogue.json`, async (_req, reply) =>
+    reply
+      // 编辑器每次打开面板都会带缓存破坏参数重取，明确禁缓存免得中间层自作主张
+      .header('cache-control', 'no-store')
+      .send(buildCatalogue(store, {
+        name: 'ThingLinks Edge 私有节点源',
+        approved: catalog.names(),
+      })));
+
+  /**
+   * packument 与包体。
+   *
+   * 用通配路由而不是 `:module` 参数，因为包名可能自带一层 `@scope/`，
+   * 而 Fastify 的具名参数不跨斜杠。
+   */
+  api.get(`${config.basePath}/npm/*`, async (req, reply) => {
+    const rest = (req.params as { '*': string })['*'] ?? '';
+    const parsed = parseNpmPath(rest);
+    if (!parsed) return reply.code(404).send({ error: 'not found' });
+
+    try {
+      assertModuleName(parsed.module);
+    } catch {
+      // 包名非法一律回 404 而不是 400：npm 对 404 有明确处理，
+      // 对 400 会打出一大段无关的排障建议
+      return reply.code(404).send({ error: 'not found' });
+    }
+
+    if (parsed.tarball !== undefined) {
+      const version = versionFromTarball(parsed.module, parsed.tarball);
+      const body = version ? store.tarball(parsed.module, version) : undefined;
+      if (!body) return reply.code(404).send({ error: 'not found' });
+      return reply
+        .header('content-type', 'application/octet-stream')
+        .header('content-length', String(body.length))
+        .send(body);
+    }
+
+    const doc = buildPackument(store, parsed.module, internalBase);
+    if (!doc) {
+      /*
+       * npm 把「404 且响应体带 error 字段」认成「这个包不存在」，
+       * 从而给出 E404 —— 那正是我们要的语义（Node-RED 会把它翻成
+       * 「Module not found」）。回空体的话 npm 会报解析失败，
+       * 现场看到的是一句莫名其妙的 JSON 错误。
+       */
+      return reply.code(404).send({ error: 'Not found' });
+    }
+    return reply.header('cache-control', 'no-store').send(doc);
+  });
+}

@@ -20,6 +20,10 @@ import { OutageLog } from './core/cloud/outage.ts';
 import { runPreflight, renderReport, adaptDocker } from './core/preflight/run.ts';
 import { readHostStats } from './core/health/host-stats.ts';
 import { MetricsHistory, MetricsSampler } from './core/health/metrics-history.ts';
+import { NodeStore } from './core/nodes/store.ts';
+import { NodeCatalog } from './core/nodes/catalog.ts';
+import { buildPolicy } from './core/nodes/policy.ts';
+import { seedFromDir, describeSeed } from './core/nodes/seed.ts';
 import {
   readProxySettings, proxyConfigured, proxyEnvFor, proxyHasCredentials, missingInternalNoProxy,
 } from './core/proxy.ts';
@@ -270,6 +274,34 @@ export async function main(): Promise<void> {
     }
   }
 
+  /*
+   * 私有 npm 源（01 号文 5.7）。
+   *
+   * 两个地址来源不同，别混：
+   *   internal —— 实例容器里的 npm 用，靠容器名解析，Manager 非容器时为空
+   *   catalogue —— 现场浏览器里的编辑器前端用，与控制台同源，永远是相对路径
+   */
+  const nodeStore = new NodeStore(join(config.dataDir, 'npm'));
+  const nodeCatalog = new NodeCatalog(db);
+
+  /*
+   * 预置节点包（01 号文 5.7「离线场景下节点可用」）。两个来源都扫：
+   *
+   *   <dataDir>/npm-seed  —— bind 挂进来的目录，现场拷个 .tgz 进去重启即可。
+   *                          离线现场最需要的就是这条不依赖任何工具的路子。
+   *   NODE_SEED_DIR       —— 镜像里随包发的那份（离线安装包用）
+   *
+   * 只导入进库，**不自动批准** —— 批准是管理员的动作，见 core/nodes/seed.ts。
+   */
+  for (const seedDir of [join(config.dataDir, 'npm-seed'), process.env['NODE_SEED_DIR'] ?? '']) {
+    const line = describeSeed(seedDir, seedFromDir(nodeStore, seedDir));
+    if (line) console.log(`[nodes] ${line}`);
+  }
+  const npmRegistryUrl = managerContainer
+    ? `http://${managerContainer}:${config.listenPort}${config.basePath}/npm/`
+    : '';
+  const nodeCatalogueUrl = `${config.basePath}/npm/-/catalogue.json`;
+
   const docker = new DockerClient({
     connection,
     network: instanceNetwork,
@@ -288,6 +320,7 @@ export async function main(): Promise<void> {
     managerUrl: managerContainer
       ? `http://${managerContainer}:${config.listenPort}${config.basePath}`
       : undefined,
+    npmRegistry: npmRegistryUrl || undefined,
   });
   const service = new InstanceService({
     db, repo, docker,
@@ -295,6 +328,15 @@ export async function main(): Promise<void> {
     portRange: config.portRange,
     allowedImageTags: (process.env['ALLOWED_IMAGE_TAGS'] ??
       '5.0.4-24-minimal,4.1.13-22-minimal').split(',').map((s) => s.trim()).filter(Boolean),
+    /*
+     * 传函数不传值：批准清单随时会改，而实例配置是在创建、重置口令、
+     * 下发策略这几个时刻各自现算的。传值会让服务一直用着进程启动那一刻的
+     * 旧清单 —— 而且没有任何症状，只是新批的节点永远装不上。
+     */
+    palettePolicy: () => buildPolicy(nodeCatalog.approved(), {
+      allowInstall: true,
+      catalogueUrl: nodeCatalogueUrl,
+    }),
   });
 
   // WEB_ROOT 由镜像设定（/app/web）；宿主开发态不设，前端走 Vite
@@ -495,6 +537,13 @@ export async function main(): Promise<void> {
     cloud, cloudConfig,
     cloudSink: (payload) => cloud.publish(payload),
     webRoot: process.env['WEB_ROOT']?.trim() || undefined,
+    nodeStore, nodeCatalog,
+    /*
+     * packument 里的包体地址要写成实例视角的绝对地址 —— 取它的是容器里的 npm。
+     * Manager 跑在宿主上（开发态）时给不出这个地址，此时私有源仍可读，
+     * 只是实例侧本来也没配 registry，用不到。
+     */
+    npmRegistryUrl,
   });
   await app.listen({ host: config.listenAddr, port: config.listenPort });
   console.log(
