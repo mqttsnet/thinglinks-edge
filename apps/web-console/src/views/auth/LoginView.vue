@@ -215,7 +215,7 @@ async function submitChange() {
           <NFormItem label="用户名"><NInput v-model:value="username" placeholder="admin" /></NFormItem>
           <NFormItem label="口令">
             <NInput v-model:value="password" type="password" show-password-on="click"
-                    placeholder="初始口令见首次启动日志" @keyup.enter="signIn" />
+                    placeholder="请输入口令" @keyup.enter="signIn" />
           </NFormItem>
           <NButton type="primary" block :loading="busy" @click="signIn">登录</NButton>
         </NForm>
