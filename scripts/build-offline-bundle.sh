@@ -5,6 +5,7 @@
 #   ./scripts/build-offline-bundle.sh                    # 用当前架构、compose 里钉的版本
 #   ./scripts/build-offline-bundle.sh --out /tmp/pkg     # 换输出目录
 #   ALLOWED_IMAGE_TAGS=5.0.4-24-minimal ./scripts/build-offline-bundle.sh   # 只带一个实例镜像
+#   NODE_SEED_DIR=dist-nodes ./scripts/build-offline-bundle.sh   # 随包带上预置节点包
 #
 # 产出一个自包含的 tar.gz：现场机器只要装了 docker，拷过去解开、跑 install.sh 即可，
 # **全程不需要外网**。
@@ -37,6 +38,10 @@ PROXY_IMAGE="${PROXY_IMAGE:-wollomatic/socket-proxy:1.13.1}"
 INIT_IMAGE="${INIT_IMAGE:-alpine:3.22}"
 NODE_RED_REPO="${NODE_RED_IMAGE_REPO:-nodered/node-red}"
 ALLOWED_IMAGE_TAGS="${ALLOWED_IMAGE_TAGS:-5.0.4-24-minimal,4.1.13-22-minimal}"
+# 预置节点包目录（01 号文 5.7）。留空就不带 —— 绝大多数部署用不上，
+# 而带上一堆用不到的 tgz 只会让本来就要拷 U 盘的包更大。
+# 目录由 scripts/pack-nodes.sh 产出，里面是节点包**连同依赖闭包**的 .tgz。
+NODE_SEED_DIR="${NODE_SEED_DIR:-}"
 
 ARCH="$(docker version --format '{{.Server.Arch}}')"
 NAME="thinglinks-edge-offline-${VERSION}-linux-${ARCH}"
@@ -97,23 +102,48 @@ cp scripts/offline/install.sh "${STAGE}/install.sh"
 cp scripts/offline/README.md "${STAGE}/README.md"
 chmod +x "${STAGE}/install.sh"
 
+# 3b) 预置节点包。放进包里的 node-seed/，由 install.sh 拷进数据目录，
+#     Manager 启动时扫 <dataDir>/npm-seed 自动入库（见 core/nodes/seed.ts）。
+#
+#     **导入不等于批准**：进了库只是「有得装」，装不装得上还要管理员在
+#     控制台批准。合在一起等于把白名单的钥匙交给打包的人。
+SEED_COUNT=0
+if [ -n "$NODE_SEED_DIR" ]; then
+  [ -d "$NODE_SEED_DIR" ] || { echo "✗ NODE_SEED_DIR 不是目录：$NODE_SEED_DIR" >&2; exit 1; }
+  SEED_COUNT="$(find "$NODE_SEED_DIR" -maxdepth 1 -name '*.tgz' | wc -l | tr -d ' ')"
+  [ "$SEED_COUNT" -gt 0 ] || { echo "✗ $NODE_SEED_DIR 里没有 .tgz —— 先跑 scripts/pack-nodes.sh" >&2; exit 1; }
+  mkdir -p "${STAGE}/node-seed"
+  find "$NODE_SEED_DIR" -maxdepth 1 -name '*.tgz' -exec cp {} "${STAGE}/node-seed/" \;
+  echo
+  echo "  ✓ 预置节点包 ${SEED_COUNT} 个（来自 ${NODE_SEED_DIR}）"
+fi
+
 # 4) 清单：装了什么、什么架构、什么时候打的。现场核对与售后追溯都靠它
 node -e '
 const { execFileSync } = require("node:child_process");
+const { readdirSync, existsSync, writeFileSync } = require("node:fs");
 const [stage, version, arch, ...images] = process.argv.slice(1);
 const digest = (img) => JSON.parse(execFileSync("docker",
   ["image", "inspect", img, "--format", "{{json .Id}}"], { encoding: "utf8" }));
-require("node:fs").writeFileSync(`${stage}/manifest.json`, JSON.stringify({
+const seedDir = `${stage}/node-seed`;
+const nodeSeed = existsSync(seedDir)
+  ? readdirSync(seedDir).filter((f) => f.endsWith(".tgz")).sort()
+  : [];
+writeFileSync(`${stage}/manifest.json`, JSON.stringify({
   product: "thinglinks-edge",
   version, platform: `linux/${arch}`,
   createdAt: new Date().toISOString(),
   images: images.map((image) => ({ image, id: digest(image) })),
+  // 现场要能回答「这批包里到底带了哪些节点」，而不是去数目录
+  nodeSeed,
 }, null, 2) + "\n");
 ' "$STAGE" "$VERSION" "$ARCH" "${IMAGES[@]}"
 
-# 5) 校验和 —— 见约束 3
+# 5) 校验和 —— 见约束 3。节点包也要进校验：U 盘拷坏一个 tgz，
+#    现场表现是「这个节点导入失败」，同样看不出是文件坏了
 ( cd "$STAGE" && shasum -a 256 images.tar docker-compose.yml docker-compose.offline.yml \
-    install.sh manifest.json .env.example > SHA256SUMS )
+    install.sh manifest.json .env.example $(find node-seed -name '*.tgz' 2>/dev/null | sort) \
+    > SHA256SUMS )
 
 # 6) 打包
 tar -C "$OUT_DIR" -czf "${OUT_DIR}/${NAME}.tar.gz" "$NAME"

@@ -87,10 +87,17 @@ RUN apk add --no-cache tzdata
 # 出网代理（03 号文 2.10）：Node 24 的内置开关，读 HTTP_PROXY/HTTPS_PROXY/NO_PROXY。
 # 常开是安全的 —— 没配那几个变量时它什么都不做，离线部署完全不受影响；
 # 而做成「按需开」就得在启动脚本里判断，反而多一处会配错的地方。
+# NODE_SEED_DIR（01 号文 5.7）：预置节点包的第二个来源。
+# 启动时扫这里的 .tgz 进私有源，目录不存在就静默跳过（见 core/nodes/seed.ts），
+# 所以无条件设上是安全的 —— 它给的是一个**约定好的挂载点**：
+#     -v /path/to/tgz:/app/npm-seed:ro
+# 离线安装包走的是另一条路（install.sh 把包拷进 <dataDir>/npm-seed），
+# 两处都扫，互不影响。
 ENV NODE_USE_ENV_PROXY=1 \
     NODE_ENV=production \
     WEB_ROOT=/app/web \
     TLE_NODE_PACKAGE_DIR=/app/nodes \
+    NODE_SEED_DIR=/app/npm-seed \
     LISTEN_ADDR=0.0.0.0 \
     LISTEN_PORT=19100
 

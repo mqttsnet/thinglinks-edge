@@ -16,6 +16,12 @@ data/
 .env.*
 !.env.example
 
+# 离线交付的产出目录。
+#   dist-offline/ —— build-offline-bundle.sh 打出来的安装包（几百 MB 镜像）
+#   dist-nodes/   —— pack-nodes.sh 取下来的节点包 tgz（第三方包体，不该进版本库）
+dist-offline/
+dist-nodes/
+
 # 运行期产出的归档：备份包、诊断包、安装自检报告。
 # 这三样都可能含现场拓扑与日志，即便脱敏过也不该进版本库
 *.tar
