@@ -22,8 +22,11 @@ import { readHostStats } from './core/health/host-stats.ts';
 import { MetricsHistory, MetricsSampler } from './core/health/metrics-history.ts';
 import { NodeStore } from './core/nodes/store.ts';
 import { NodeCatalog } from './core/nodes/catalog.ts';
-import { buildPolicy } from './core/nodes/policy.ts';
+import { buildPolicy, installModeFromEnv } from './core/nodes/policy.ts';
+import { UpstreamRegistry } from './core/nodes/upstream.ts';
+import { NpmSourceRepo } from './core/nodes/sources.ts';
 import { seedFromDir, describeSeed } from './core/nodes/seed.ts';
+import { ValueHistory, limitsFromEnv } from './core/edge/history.ts';
 import {
   readProxySettings, proxyConfigured, proxyEnvFor, proxyHasCredentials, missingInternalNoProxy,
 } from './core/proxy.ts';
@@ -302,6 +305,37 @@ export async function main(): Promise<void> {
     : '';
   const nodeCatalogueUrl = `${config.basePath}/npm/-/catalogue.json`;
 
+  /*
+   * 上游回源与安装策略。两个都在编排文件里配，不放 Web 设置页 ——
+   * 一个决定实例能不能出网取包，一个是安全闸门，都该有文件、有版本、有人 review。
+   */
+  const nodeSources = new NpmSourceRepo(db);
+  // 环境变量只作为**全新安装**时的初始值；之后源以库为准，在页面上增删
+  nodeSources.seed(process.env['EDGE_NPM_UPSTREAM']?.trim() ?? '');
+  const nodeUpstream = new UpstreamRegistry({
+    sources: () => nodeSources.active().map((s) => ({ name: s.name, url: s.url })),
+  });
+  const installMode = installModeFromEnv();
+  console.log(
+    `[nodes] 安装策略 ${installMode === 'open' ? 'open（不限制）' : 'allowlist（只装已批准）'}`
+    + ` · 节点源 ${nodeUpstream.enabled ? nodeUpstream.urls.join(' / ') : '未配置（纯离线，只服务本地库）'}`,
+  );
+
+  /*
+   * 点位历史（断网期间现场也要能看趋势）。
+   *
+   * 上限按**条数**不按天数 —— 边缘盒子的硬约束是磁盘与 SD 卡写入量，
+   * 只有条数直接对应这两者。EDGE_HISTORY_MAX_ROWS=0 即彻底关闭记录，
+   * 给最低配的设备留一条退路。理由详见 core/edge/history.ts。
+   */
+  const historyLimits = limitsFromEnv();
+  const valueHistory = new ValueHistory(db, historyLimits);
+  console.log(
+    valueHistory.enabled
+      ? `[history] 点位历史已启用：上限 ${historyLimits.maxRows} 条 · 恒定信号每 ${historyLimits.minGapSec}s 留一个锚点`
+      : '[history] 点位历史未启用（EDGE_HISTORY_MAX_ROWS=0），趋势界面会如实说明',
+  );
+
   const docker = new DockerClient({
     connection,
     network: instanceNetwork,
@@ -336,6 +370,7 @@ export async function main(): Promise<void> {
     palettePolicy: () => buildPolicy(nodeCatalog.approved(), {
       allowInstall: true,
       catalogueUrl: nodeCatalogueUrl,
+      mode: installMode,
     }),
   });
 
@@ -537,7 +572,7 @@ export async function main(): Promise<void> {
     cloud, cloudConfig,
     cloudSink: (payload) => cloud.publish(payload),
     webRoot: process.env['WEB_ROOT']?.trim() || undefined,
-    nodeStore, nodeCatalog,
+    nodeStore, nodeCatalog, valueHistory, nodeUpstream, nodeSources,
     /*
      * packument 里的包体地址要写成实例视角的绝对地址 —— 取它的是容器里的 npm。
      * Manager 跑在宿主上（开发态）时给不出这个地址，此时私有源仍可读，

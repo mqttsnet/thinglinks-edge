@@ -17,7 +17,10 @@ import { recordAudit } from '../../core/db.ts';
 import { NodePolicyError } from '../../core/nodes/policy.ts';
 import { closureReport, type NodeStore } from '../../core/nodes/store.ts';
 import { inventoryOf } from '../../core/nodes/inventory.ts';
+import { installModule, AdminApiError } from '../../core/flows/admin-client.ts';
 import type { NodeCatalog } from '../../core/nodes/catalog.ts';
+import type { NpmSourceRepo } from '../../core/nodes/sources.ts';
+import type { UpstreamRegistry } from '../../core/nodes/upstream.ts';
 import { targetFor } from '../instance/flows-target.ts';
 import type { HttpContext } from '../context.ts';
 
@@ -27,13 +30,16 @@ const MAX_TGZ_BYTES = 64 * 1024 * 1024;
 export interface CatalogDeps {
   store: NodeStore;
   catalog: NodeCatalog;
+  /** 节点源清单。留空则不挂源管理与在线搜索（纯离线部署） */
+  sources?: NpmSourceRepo | undefined;
+  upstream?: UpstreamRegistry | undefined;
 }
 
 export function registerNodeCatalog(
   api: FastifyInstance, ctx: HttpContext, deps: CatalogDeps,
 ): void {
   const { config, db, guard } = ctx;
-  const { store, catalog } = deps;
+  const { store, catalog, sources, upstream } = deps;
 
   /*
    * 节点包是二进制。只在本插件作用域内加这一个解析器 ——
@@ -87,12 +93,49 @@ export function registerNodeCatalog(
         actor: user.username, action: 'approve-node', target: entry.module,
         result: 'ok', detail: entry.version ?? '不限版本',
       });
+
+      /*
+       * 顺手把包体拉进本地库（`download` 为真时）。
+       *
+       * 批准之后包仍不在库里的话，实例第一次安装还得联网 —— 而现场装节点
+       * 常常正是在网络不稳的时候。批准时就拉下来，之后离线也装得上，
+       * 打离线包时也直接带走。
+       *
+       * 拉失败**不影响批准**：批准是管理动作，已经成立；下载只是预热。
+       * 但要如实告诉调用方，界面据此提示「已批准，但包体还没拉下来」。
+       */
+      let downloaded: string | undefined;
+      let downloadError = '';
+      const wantDownload = (req.body as { download?: unknown } | undefined)?.download === true;
+      if (wantDownload && upstream?.enabled) {
+        try {
+          const vs = await upstream.versions(entry.module);
+          const pick = vs[0]?.version;
+          if (!pick) throw new Error('源里没有可用版本');
+          if (!store.has(entry.module, pick)) {
+            const body = await upstream.tarball(entry.module, pick);
+            if (!body) throw new Error(`源里没有 ${entry.module}@${pick}`);
+            store.add(body);
+          }
+          downloaded = pick;
+          recordAudit(db, {
+            actor: user.username, action: 'cache-node-package',
+            target: `${entry.module}@${pick}`, result: 'ok', detail: '批准时预下载',
+          });
+        } catch (e) {
+          downloadError = (e as Error).message;
+          recordAudit(db, {
+            actor: user.username, action: 'cache-node-package',
+            target: entry.module, result: 'fail', detail: downloadError,
+          });
+        }
+      }
       /*
        * 批准只改库，**不自动下发到实例** —— 下发要重启实例，
        * 那是会中断现场采集的动作，不能作为「点了保存」的副作用发生。
        * 界面据此提示「已批准，需下发后生效」。
        */
-      return reply.send({ entry, applied: false });
+      return reply.send({ entry, applied: false, downloaded, downloadError });
     } catch (e) {
       return fail(reply, e);
     }
@@ -111,6 +154,91 @@ export function registerNodeCatalog(
      * 撤销只让它「以后装不上」。想清掉已装的得去实例里卸载。
      */
     return reply.send({ ok: true, applied: false });
+  });
+
+  // ── 节点源 ────────────────────────────────────────
+  //
+  // 源的增删改必须在页面上完成 —— 现场加一个内网私服是常规运维动作，
+  // 不该每次都改编排文件重启。环境变量只在全新安装时用作初始值。
+
+  api.get(`${config.basePath}/api/nodes/sources`, async (req, reply) => {
+    if (!guard(req, reply, { csrf: false, need: 'node:view' })) return;
+    return reply.send({ sources: sources?.list() ?? [] });
+  });
+
+  api.post(`${config.basePath}/api/nodes/sources`, async (req, reply) => {
+    const user = guard(req, reply, { csrf: true, need: 'node:manage' });
+    if (!user) return;
+    if (!sources) return reply.code(400).send({ error: '本部署未启用节点源管理' });
+    const b = (req.body ?? {}) as { name?: string; url?: string };
+    if (typeof b.url !== 'string') return reply.code(400).send({ error: '缺少 url' });
+    try {
+      const src = sources.add({ name: String(b.name ?? ''), url: b.url, actor: user.username });
+      recordAudit(db, {
+        actor: user.username, action: 'add-node-source', target: src.url,
+        result: 'ok', detail: src.name,
+      });
+      return reply.send({ source: src });
+    } catch (e) { return fail(reply, e); }
+  });
+
+  api.post(`${config.basePath}/api/nodes/sources/:id/enabled`, async (req, reply) => {
+    const user = guard(req, reply, { csrf: true, need: 'node:manage' });
+    if (!user) return;
+    if (!sources) return reply.code(400).send({ error: '本部署未启用节点源管理' });
+    const id = Number((req.params as { id: string }).id);
+    const enabled = (req.body as { enabled?: unknown } | undefined)?.enabled === true;
+    if (!sources.setEnabled(id, enabled)) return reply.code(404).send({ error: '源不存在' });
+    recordAudit(db, {
+      actor: user.username, action: 'toggle-node-source', target: String(id),
+      result: 'ok', detail: enabled ? '启用' : '停用',
+    });
+    return reply.send({ ok: true });
+  });
+
+  api.delete(`${config.basePath}/api/nodes/sources/:id`, async (req, reply) => {
+    const user = guard(req, reply, { csrf: true, need: 'node:manage' });
+    if (!user) return;
+    if (!sources) return reply.code(400).send({ error: '本部署未启用节点源管理' });
+    const id = Number((req.params as { id: string }).id);
+    if (!sources.remove(id)) return reply.code(404).send({ error: '源不存在' });
+    recordAudit(db, { actor: user.username, action: 'remove-node-source', target: String(id), result: 'ok' });
+    return reply.send({ ok: true });
+  });
+
+  // ── 在线搜索 ──────────────────────────────────────
+
+  /**
+   * 在启用的源里模糊搜索节点包。
+   *
+   * 搜索本身不改任何东西，所以只要 node:view —— 让运维能先看看有什么，
+   * 再决定要不要找管理员批。
+   */
+  api.get(`${config.basePath}/api/nodes/search`, async (req, reply) => {
+    if (!guard(req, reply, { csrf: false, need: 'node:view' })) return;
+    const q = String((req.query as { q?: string }).q ?? '').trim();
+    if (!upstream?.enabled) {
+      return reply.send({ enabled: false, hits: [], reason: '未配置任何启用中的节点源' });
+    }
+    if (!q) return reply.send({ enabled: true, hits: [] });
+    try {
+      return reply.send({ enabled: true, hits: await upstream.search(q) });
+    } catch (e) { return fail(reply, e); }
+  });
+
+  /** 某个包的可选版本，新的在前。批准对话框的版本下拉用它 */
+  api.get(`${config.basePath}/api/nodes/versions`, async (req, reply) => {
+    if (!guard(req, reply, { csrf: false, need: 'node:view' })) return;
+    const module = String((req.query as { module?: string }).module ?? '').trim();
+    if (!module) return reply.code(400).send({ error: '缺少 module' });
+    if (!upstream?.enabled) return reply.send({ versions: [], local: store.versions(module) });
+    try {
+      return reply.send({
+        versions: await upstream.versions(module),
+        // 库里已有的版本要标出来：那些是离线也装得上的
+        local: store.versions(module),
+      });
+    } catch (e) { return fail(reply, e); }
   });
 
   // ── 离线包库 ──────────────────────────────────────
@@ -258,6 +386,52 @@ export function registerNodeCatalog(
       out.push(await inventoryOf(id, t, approved));
     }
     return reply.send({ instances: out });
+  });
+
+  /**
+   * 把一个节点包装进指定实例（01 号文 5.7）。
+   *
+   * 路径按资源写成 `/api/instances/:id/nodes`，代码放在节点管理这个文件里 ——
+   * 它属于节点管理这条业务线，与批准、下发、台账是一套。
+   *
+   * 权限用 `instance:operate`：这是往**那台实例**里装会执行的代码，
+   * 必须过它的授权矩阵；只有全局的 node:view 是不够的。
+   *
+   * 走实例自己的 Admin API，**不绕过白名单** —— 绕过去就成了
+   * 「面板装受管控、控制台装不受管控」，两套规则迟早出事。
+   */
+  api.post(`${config.basePath}/api/instances/:id/nodes`, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const user = guard(req, reply, { csrf: true, need: 'instance:operate', instance: id });
+    if (!user) return;
+
+    const b = (req.body ?? {}) as { module?: string; version?: string };
+    const module = String(b.module ?? '').trim();
+    if (!module) return reply.code(400).send({ error: '缺少 module' });
+    const version = String(b.version ?? '').trim() || undefined;
+
+    const t = targetFor(ctx, id);
+    if ('error' in t) return reply.code(t.code).send({ error: t.error });
+
+    try {
+      const r = await installModule(t, module, version);
+      recordAudit(db, {
+        actor: user.username, action: 'install-node', target: `${id}/${r.module}@${r.version}`,
+        result: 'ok', detail: r.types.join(', '),
+      });
+      return reply.send(r);
+    } catch (e) {
+      recordAudit(db, {
+        actor: user.username, action: 'install-node', target: `${id}/${module}`,
+        result: 'fail', detail: (e as Error).message,
+      });
+      if (e instanceof AdminApiError) {
+        // 实例说不行是 400（配置问题，现场能改）；连不上实例是 502（不是现场的错）
+        return reply.code(e.status >= 400 && e.status < 500 ? 400 : 502)
+          .send({ error: e.message });
+      }
+      return fail(reply, e);
+    }
   });
 
   api.get(`${config.basePath}/api/nodes/inventory/:id`, async (req, reply) => {

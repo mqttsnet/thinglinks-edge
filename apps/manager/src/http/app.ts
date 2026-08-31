@@ -85,9 +85,11 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         store: deps.nodeStore,
         catalog: deps.nodeCatalog,
         internalBase: deps.npmRegistryUrl ?? `${ctx.config.basePath}/npm/`,
+        upstream: deps.nodeUpstream,
       });
       registerNodeCatalog(api, ctx, {
         store: deps.nodeStore, catalog: deps.nodeCatalog,
+        sources: deps.nodeSources, upstream: deps.nodeUpstream,
       });
     }
   });

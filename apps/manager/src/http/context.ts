@@ -22,6 +22,9 @@ import { SettingsRepo } from '../core/auth/settings.ts';
 import type { MetricsHistory } from '../core/health/metrics-history.ts';
 import type { NodeStore } from '../core/nodes/store.ts';
 import type { NodeCatalog } from '../core/nodes/catalog.ts';
+import type { ValueHistory } from '../core/edge/history.ts';
+import type { UpstreamRegistry } from '../core/nodes/upstream.ts';
+import type { NpmSourceRepo } from '../core/nodes/sources.ts';
 
 export const SID = 'tle_sid';
 export const CSRF = 'tle_csrf';
@@ -74,6 +77,18 @@ export interface ServerDeps {
   nodeCatalog?: NodeCatalog | undefined;
   /** 实例容器视角的私有源地址，用于生成 packument 里的包体 URL */
   npmRegistryUrl?: string | undefined;
+  /**
+   * 私有源的上游。留空即纯离线：库里没有的包一律 404，不去公网找。
+   * 配了则库里没有时回源下载并入库，之后离线可用。
+   */
+  nodeUpstream?: UpstreamRegistry | undefined;
+  /** 节点源清单仓储。页面上增删源走它 */
+  nodeSources?: NpmSourceRepo | undefined;
+  /**
+   * 点位历史。留空或未启用时，趋势接口如实回 `enabled: false` ——
+   * 界面据此说明「未启用」，而不是画一张空图让人以为系统坏了。
+   */
+  valueHistory?: ValueHistory | undefined;
 }
 
 const defaultUpstream = (id: string) => `http://${containerName(id)}:1880`;
@@ -87,6 +102,7 @@ export interface HttpContext {
   drainer: SpoolDrainer | undefined;
   outages: OutageLog | undefined;
   metrics: MetricsHistory | undefined;
+  valueHistory: ValueHistory | undefined;
   db: Db;
   auth: AuthService;
   repo: InstanceRepo;
@@ -152,6 +168,7 @@ export function createContext(deps: ServerDeps): HttpContext {
     drainer: deps.drainer,
     outages: deps.outages,
     metrics: deps.metrics,
+    valueHistory: deps.valueHistory,
     db: deps.db,
     auth,
     repo: deps.repo,

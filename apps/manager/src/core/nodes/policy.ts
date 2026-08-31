@@ -74,6 +74,23 @@ export interface ApprovedModule {
   version?: string | undefined;
 }
 
+/**
+ * 安装策略。
+ *
+ * 01 号文 5.7 的原话是「**可**限制实例只能安装经批准的节点」—— 是一项能力，
+ * 不是强制。早先做成了恒开且默认拒全部，结果是新装的现场打开节点面板一片空白，
+ * 而界面不解释为什么。那比不做白名单更糟：它让人以为功能坏了。
+ *
+ * 现在两档，由部署方在编排文件里选，**不放进 Web 设置页** ——
+ * 这是安全闸门，改它应当有文件、有版本、有人 review，
+ * 与 EXTERNAL_URL / MASTER_KEY 同级（见 core/auth/settings.ts 的取舍说明）。
+ */
+export type InstallPolicyMode =
+  /** 只能装批准清单里的（默认）。清单为空 = 什么都装不了 */
+  | 'allowlist'
+  /** 不限制，任何包都能装。有外网、由现场自己把关的部署可以这样 */
+  | 'open';
+
 /** 生成进 settings.js 的安装管控配置 */
 export interface PalettePolicy {
   /** 是否允许实例侧自助安装节点。false 时编辑器连面板都不显示 */
@@ -144,23 +161,49 @@ export function assertVersionRange(range: string): void {
  */
 export function buildPolicy(
   approved: readonly ApprovedModule[],
-  opts: { allowInstall: boolean; catalogueUrl?: string | undefined },
+  opts: {
+    allowInstall: boolean;
+    catalogueUrl?: string | undefined;
+    /** 缺省 allowlist —— 漏传时取严的那一档 */
+    mode?: InstallPolicyMode | undefined;
+  },
 ): PalettePolicy {
-  const allowList = approved.map(ruleOf);
+  const catalogues = opts.catalogueUrl ? [opts.catalogueUrl] : [];
+
+  if (opts.mode === 'open') {
+    /*
+     * 不限制。denyList 必须**留空**：Node-RED 只在 denyList 非空时才跑白名单校验
+     * （见文件头第一条），留空正是「整段跳过」的正确写法。
+     * allowList 给 ['*'] 只是让下发的配置读起来意图明确，实际不参与判定。
+     */
+    return { allowInstall: opts.allowInstall, allowList: ['*'], denyList: [], catalogues };
+  }
 
   return {
     allowInstall: opts.allowInstall,
-    allowList,
+    allowList: approved.map(ruleOf),
     /*
-     * 恒为 ['*']，**即使白名单是空的**。
+     * 恒为 ['*']，**即使批准清单是空的**。
      *
      * 空 denyList 会让整段校验被跳过（见文件头第一条），那时候
-     * 「白名单为空」的含义会从「什么都不许装」翻转成「什么都能装」——
+     * 「清单为空」的含义会从「什么都不许装」翻转成「什么都能装」——
      * 恰恰在管理员还没批准任何节点的初始状态下门是敞开的。
+     * 要放开必须显式选 `open` 档，不能靠清空清单误打误撞得到。
      */
     denyList: ['*'],
-    catalogues: opts.catalogueUrl ? [opts.catalogueUrl] : [],
+    catalogues,
   };
+}
+
+/** 从环境变量读安装策略。非法值取严的那一档并留警告，不让进程起不来 */
+export function installModeFromEnv(env: NodeJS.ProcessEnv = process.env): InstallPolicyMode {
+  const raw = env['EDGE_NODE_INSTALL_POLICY']?.trim().toLowerCase();
+  if (raw === undefined || raw === '') return 'allowlist';
+  if (raw === 'allowlist' || raw === 'open') return raw;
+  console.warn(
+    `[warn] EDGE_NODE_INSTALL_POLICY=${raw} 非法（只接受 allowlist / open），按 allowlist 处理`,
+  );
+  return 'allowlist';
 }
 
 /**

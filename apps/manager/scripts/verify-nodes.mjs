@@ -24,6 +24,8 @@
  */
 import Docker from 'dockerode';
 import { gzipSync } from 'node:zlib';
+import { createServer } from 'node:http';
+import { createHash } from 'node:crypto';
 
 import { openDb } from '../dist/core/db.js';
 import { deriveKey } from '../dist/core/auth/crypto.js';
@@ -36,6 +38,7 @@ import { containerName } from '../dist/core/instance/container-spec.js';
 import { NodeStore } from '../dist/core/nodes/store.js';
 import { NodeCatalog } from '../dist/core/nodes/catalog.js';
 import { buildPolicy } from '../dist/core/nodes/policy.js';
+import { UpstreamRegistry } from '../dist/core/nodes/upstream.js';
 import { tarArchive } from '../dist/core/archive/tar.js';
 import { TEST_DATA_ROOT, TEST_EDGE_ROOT, ensureRoot, resetDataDir } from './_data-root.mjs';
 import { adminSession } from './_session.mjs';
@@ -54,6 +57,9 @@ const TAG = '5.0.4-24-minimal';
 const OK_PKG = 'node-red-contrib-tle-fixture-ok';
 /** 库里有、但**没批准**的夹具 —— 用来隔离出「白名单」这一个变量 */
 const DENIED_PKG = 'node-red-contrib-tle-fixture-denied';
+/** 批准了、但**不放进库**的夹具 —— 用来验回源下载 */
+const UPSTREAM_PKG = 'node-red-contrib-tle-fixture-upstream';
+const UPSTREAM_PORT = 13291;
 /**
  * 依赖被写成 **tarball URL** 的夹具（对着 node-red-contrib-modbus 5.60.2 实测后加的）。
  *
@@ -156,7 +162,45 @@ async function cleanup() {
   await resetDataDir(ID);
 }
 
+/**
+ * 一个只服务单个夹具包的假 registry。
+ *
+ * 不打公网：验证不该依赖外网，而且用真实公网包会让「到底走没走回源」变得说不清
+ * —— 公网上存在的包，装成功了也可能是别处来的。假上游 + 公网不存在的包名，
+ * 装成功就只可能是回源拿到的。
+ */
+function startFakeUpstream(body) {
+  const sri = `sha512-${createHash('sha512').update(body).digest('base64')}`;
+  const srv = createServer((req, res) => {
+    const url = req.url ?? '';
+    if (url === `/${encodeURIComponent(UPSTREAM_PKG)}` || url === `/${UPSTREAM_PKG}`) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        name: UPSTREAM_PKG,
+        'dist-tags': { latest: '1.0.0' },
+        versions: { '1.0.0': {
+          name: UPSTREAM_PKG, version: '1.0.0',
+          dist: { tarball: `http://127.0.0.1:${UPSTREAM_PORT}/tgz`, integrity: sri },
+        } },
+      }));
+      return;
+    }
+    if (url.startsWith('/-/v1/search')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ objects: [{ package: {
+        name: UPSTREAM_PKG, version: '1.0.0', description: '回源验证夹具',
+        keywords: ['node-red'], date: '2026-08-31T00:00:00.000Z',
+      } }] }));
+      return;
+    }
+    if (url === '/tgz') { res.writeHead(200); res.end(body); return; }
+    res.writeHead(404); res.end('{"error":"not found"}');
+  });
+  return new Promise((resolve) => srv.listen(UPSTREAM_PORT, '127.0.0.1', () => resolve(srv)));
+}
+
 let server;
+let upstreamServer;
 async function main() {
   await cleanup();
   await ensureRoot();
@@ -196,11 +240,15 @@ async function main() {
     portRange: { min: 30000, max: 30999 }, timezone: 'Asia/Shanghai', updateCheckUrl: '',
   };
 
+  upstreamServer = await startFakeUpstream(fixture(UPSTREAM_PKG));
   const app = buildServer({
     config, db, auth, repo, service,
     upstreamFor: () => `http://127.0.0.1:${NR_PORT}`,
     nodeStore: store, nodeCatalog: catalog,
     npmRegistryUrl: `http://${BRIDGE_OUT}:${REG_PORT}/npm/`,
+    nodeUpstream: new UpstreamRegistry({
+      sources: () => [{ name: '假上游', url: `http://127.0.0.1:${UPSTREAM_PORT}` }],
+    }),
   });
   /*
    * 监听 0.0.0.0 而不是 127.0.0.1：出向边车要从容器里连进来。
@@ -388,6 +436,94 @@ async function main() {
     deniedInstall.status === 400 && deniedInstall.body.includes('install_not_allowed'),
     `HTTP ${deniedInstall.status} ${deniedInstall.body.slice(0, 200)}`);
 
+  // ── 在线搜索与版本列表（批准对话框全靠这两条）──
+  const searched = await fetch(`${B}/api/nodes/search?q=fixture`, { headers: { cookie: admin.cookie } })
+    .then((r) => r.json());
+  check('在线搜索能搜到源里的包',
+    searched.enabled === true && searched.hits?.some((h) => h.name === UPSTREAM_PKG),
+    `enabled=${searched.enabled} hits=${(searched.hits ?? []).map((h) => h.name).join(',')}`);
+  check('搜索结果带来源，多源时人得知道包是哪来的',
+    searched.hits?.[0]?.source === '假上游', searched.hits?.[0]?.source);
+
+  const vers = await fetch(
+    `${B}/api/nodes/versions?module=${encodeURIComponent(UPSTREAM_PKG)}`,
+    { headers: { cookie: admin.cookie } },
+  ).then((r) => r.json());
+  check('**选中一个包能列出它的版本**（批准对话框的版本下拉靠它）',
+    Array.isArray(vers.versions) && vers.versions.length > 0
+      && vers.versions[0].version === '1.0.0',
+    JSON.stringify(vers).slice(0, 200));
+
+  // ── 上游回源：批准了但库里没有的包，应当自动下载并入库 ──
+  await fetch(`${B}/api/nodes/catalog`, {
+    method: 'POST', headers: H(admin),
+    body: JSON.stringify({ module: UPSTREAM_PKG, note: '回源验证' }),
+  });
+  // 批准改了要重新下发，实例侧的 allowList 才认它
+  await fetch(`${B}/api/nodes/apply`, {
+    method: 'POST', headers: H(admin), body: JSON.stringify({ instances: [ID] }),
+  });
+  await sleep(3000);
+  await ready();
+
+  const beforeStore = await fetch(`${B}/api/nodes/store`, { headers: { cookie: admin.cookie } })
+    .then((r) => r.json());
+  check('回源前库里确实没有这个包（否则下面证明不了什么）',
+    !beforeStore.packages?.some((p) => p.module === UPSTREAM_PKG));
+
+  const token2 = await fetch(`http://127.0.0.1:${NR_PORT}/red/${ID}/auth/token`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      client_id: 'node-red-editor', grant_type: 'password', scope: '*',
+      username: 'admin', password: repo.credentials(ID)[0].password,
+    }),
+  }).then((r) => r.json()).catch(() => ({}));
+
+  const upInstall = await fetch(`http://127.0.0.1:${NR_PORT}/red/${ID}/nodes`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      ...(token2.access_token ? { authorization: `Bearer ${token2.access_token}` } : {}),
+    },
+    body: JSON.stringify({ module: UPSTREAM_PKG }),
+  });
+  const upBody = await upInstall.text();
+  check('**库里没有的包能从上游下载并装上**（公网无此包 ⇒ 只能来自假上游）',
+    upInstall.status >= 200 && upInstall.status < 300,
+    `HTTP ${upInstall.status} ${upBody.slice(0, 160)}`);
+
+  const afterStore = await fetch(`${B}/api/nodes/store`, { headers: { cookie: admin.cookie } })
+    .then((r) => r.json());
+  check('**下载的包顺手入库了**（下次即离线可用）',
+    afterStore.packages?.some((p) => p.module === UPSTREAM_PKG),
+    (afterStore.packages ?? []).map((p) => p.module).join(', '));
+
+  // ── 从控制台直接装到实例 ──
+  const viaConsole = await fetch(`${B}/api/instances/${ID}/nodes`, {
+    method: 'POST', headers: H(admin),
+    body: JSON.stringify({ module: OK_PKG }),
+  });
+  const viaBody = await viaConsole.json().catch(() => ({}));
+  check('控制台装到实例：已装过的包如实回报，不是静默成功',
+    viaConsole.status === 400 && /已经装过/.test(viaBody.error ?? ''),
+    `HTTP ${viaConsole.status} ${(viaBody.error ?? '').slice(0, 80)}`);
+
+  const denyViaConsole = await fetch(`${B}/api/instances/${ID}/nodes`, {
+    method: 'POST', headers: H(admin),
+    body: JSON.stringify({ module: DENIED_PKG }),
+  });
+  const denyBody = await denyViaConsole.json().catch(() => ({}));
+  check('**从控制台装也过白名单**（不能绕过实例侧的闸门）',
+    denyViaConsole.status === 400 && /批准清单/.test(denyBody.error ?? ''),
+    `HTTP ${denyViaConsole.status} ${(denyBody.error ?? '').slice(0, 100)}`);
+
+  const installNoCsrf = await fetch(`${B}/api/instances/${ID}/nodes`, {
+    method: 'POST',
+    headers: { cookie: admin.cookie, 'content-type': 'application/json' },
+    body: JSON.stringify({ module: OK_PKG }),
+  });
+  check('控制台装节点要过 CSRF', installNoCsrf.status === 403, `HTTP ${installNoCsrf.status}`);
+
   // tgz 上传：老写法拦不住，必须靠 externalModules.palette.allowUpload
   const upload = await fetch(`http://127.0.0.1:${NR_PORT}/red/${ID}/nodes`, {
     method: 'POST',
@@ -461,6 +597,7 @@ main()
   .catch((e) => { console.error('\n验证脚本自身出错：', e); results.push({ name: '脚本执行', ok: false }); })
   .finally(async () => {
     await server?.close().catch(() => {});
+    upstreamServer?.close();
     await cleanup();
     const bad = results.filter((r) => !r.ok);
     console.log(`\n节点管理验证：${results.length - bad.length}/${results.length} 通过`);

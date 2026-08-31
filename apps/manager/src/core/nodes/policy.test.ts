@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildPolicy, assertModuleName, assertVersionRange, registryEnv, NodePolicyError }
+import { buildPolicy, assertModuleName, assertVersionRange, registryEnv, installModeFromEnv, NodePolicyError }
   from './policy.ts';
 
 /*
@@ -70,4 +70,32 @@ test('registryEnv 用环境变量而不是 .npmrc —— npm info 读不到 /dat
   assert.ok(env.includes('NPM_CONFIG_REGISTRY=http://mgr:19100/x/npm/'));
   // 留空表示不配私有源，此时一个变量都不该注入（沿用镜像默认）
   assert.deepEqual(registryEnv(''), []);
+});
+
+// ── 安装策略两档 ────────────────────────────────────────
+
+test('open 档必须把 denyList 留空 —— 那才是「整段跳过校验」的正确写法', () => {
+  const p = buildPolicy([{ module: 'a' }], { allowInstall: true, mode: 'open' });
+  assert.deepEqual(p.denyList, []);
+  assert.deepEqual(p.allowList, ['*']);
+});
+
+test('不传 mode 时取严的那一档', () => {
+  const p = buildPolicy([], { allowInstall: true });
+  assert.deepEqual(p.denyList, ['*']);
+  assert.deepEqual(p.allowList, []);
+});
+
+test('清空批准清单不等于放开 —— 放开必须显式选 open', () => {
+  // 早先的实现里，denyList 恒为 ['*'] 就是为了防这个误打误撞
+  const p = buildPolicy([], { allowInstall: true, mode: 'allowlist' });
+  assert.deepEqual(p.denyList, ['*']);
+});
+
+test('策略从环境变量读，非法值取严并不让进程挂掉', () => {
+  assert.equal(installModeFromEnv({}), 'allowlist');
+  assert.equal(installModeFromEnv({ EDGE_NODE_INSTALL_POLICY: 'open' }), 'open');
+  assert.equal(installModeFromEnv({ EDGE_NODE_INSTALL_POLICY: 'OPEN' }), 'open');
+  assert.equal(installModeFromEnv({ EDGE_NODE_INSTALL_POLICY: '随便写' }), 'allowlist');
+  assert.equal(installModeFromEnv({ EDGE_NODE_INSTALL_POLICY: '' }), 'allowlist');
 });

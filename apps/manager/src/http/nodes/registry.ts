@@ -28,6 +28,9 @@ import { buildPackument, buildCatalogue } from '../../core/nodes/packument.ts';
 import { assertModuleName } from '../../core/nodes/policy.ts';
 import type { NodeStore } from '../../core/nodes/store.ts';
 import type { NodeCatalog } from '../../core/nodes/catalog.ts';
+import { tarballUrl } from '../../core/nodes/packument.ts';
+import type { UpstreamRegistry } from '../../core/nodes/upstream.ts';
+import { recordAudit } from '../../core/db.ts';
 import type { HttpContext } from '../context.ts';
 
 export interface RegistryDeps {
@@ -35,6 +38,11 @@ export interface RegistryDeps {
   catalog: NodeCatalog;
   /** npm 视角的源地址，用于生成 packument 里的 tarball URL */
   internalBase: string;
+  /**
+   * 上游回源。留空或未启用时，库里没有的包一律 404（纯离线现场就是这个形态）。
+   * 启用后库里没有的包会转发上游并**在取包体时入库**，之后即离线可用。
+   */
+  upstream?: UpstreamRegistry | undefined;
 }
 
 /**
@@ -82,7 +90,7 @@ export function registerNpmRegistry(
   api: FastifyInstance, ctx: HttpContext, deps: RegistryDeps,
 ): void {
   const { config } = ctx;
-  const { store, catalog, internalBase } = deps;
+  const { store, catalog, internalBase, upstream } = deps;
 
   /**
    * 编辑器节点目录。
@@ -120,7 +128,38 @@ export function registerNpmRegistry(
 
     if (parsed.tarball !== undefined) {
       const version = versionFromTarball(parsed.module, parsed.tarball);
-      const body = version ? store.tarball(parsed.module, version) : undefined;
+      let body = version ? store.tarball(parsed.module, version) : undefined;
+
+      /*
+       * 库里没有就回源下载，**下完入库**。
+       *
+       * 入库只发生在这里、不发生在 packument 那条分支：Node-RED 校验白名单
+       * **之前**会先 `npm info` 一次，那次会问到未批准的包；按包体入库才能保证
+       * 库里留下的都是真正装过的东西。详见 core/nodes/upstream.ts 文件头。
+       */
+      if (!body && version && upstream?.enabled) {
+        try {
+          const fetched = await upstream.tarball(parsed.module, version);
+          if (fetched) {
+            const meta = store.add(fetched);        // add 内部会再解析一次并校验形状
+            body = fetched;
+            recordAudit(ctx.db, {
+              actor: 'system', action: 'cache-node-package',
+              target: `${meta.name}@${meta.version}`,
+              detail: `自上游源下载并入库（${upstream.urls.join(' / ')}）`, result: 'ok',
+            });
+          }
+        } catch (e) {
+          // 回源失败要留痕：现场看到的只是「装不上」，得有地方查到底是网络还是校验
+          recordAudit(ctx.db, {
+            actor: 'system', action: 'cache-node-package',
+            target: `${parsed.module}@${version}`,
+            detail: (e as Error).message, result: 'fail',
+          });
+          req.log.warn(`[npm] 回源失败 ${parsed.module}@${version}：${(e as Error).message}`);
+        }
+      }
+
       if (!body) return reply.code(404).send({ error: 'not found' });
       return reply
         .header('content-type', 'application/octet-stream')
@@ -128,7 +167,43 @@ export function registerNpmRegistry(
         .send(body);
     }
 
-    const doc = buildPackument(store, parsed.module, internalBase);
+    const local = buildPackument(store, parsed.module, internalBase);
+    if (local) return reply.header('cache-control', 'no-store').send(local);
+
+    /*
+     * 库里没有 → 回源取 packument。**不入库**（见上面包体分支的说明）。
+     *
+     * 关键一步是把每个版本的 `dist.tarball` 改写成指向我们自己 ——
+     * 不改写的话 npm 会直接去上游下载，包体永远不会经过我们，
+     * 也就永远进不了本地库，「装过一次之后离线可用」这件事就不成立了。
+     */
+    if (upstream?.enabled) {
+      try {
+        const up = await upstream.packument(parsed.module);
+        if (up) {
+          const versions: Record<string, unknown> = {};
+          for (const [v, manifest] of Object.entries(up.versions ?? {})) {
+            versions[v] = {
+              ...manifest,
+              dist: {
+                ...(manifest.dist ?? {}),
+                tarball: tarballUrl(internalBase, parsed.module, v),
+              },
+            };
+          }
+          return reply.header('cache-control', 'no-store').send({ ...up, versions });
+        }
+      } catch (e) {
+        req.log.warn(`[npm] 上游 packument 失败 ${parsed.module}：${(e as Error).message}`);
+        /*
+         * 回源出错时回 502 而不是 404：404 会让 Node-RED 报「模块不存在」，
+         * 而真实原因是上游连不上 —— 现场会照着「是不是名字打错了」查半天。
+         */
+        return reply.code(502).send({ error: `上游源不可用：${(e as Error).message}` });
+      }
+    }
+
+    const doc = local;
     if (!doc) {
       /*
        * npm 把「404 且响应体带 error 字段」认成「这个包不存在」，

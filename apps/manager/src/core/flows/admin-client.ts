@@ -211,6 +211,70 @@ export async function getInstalledModules(
 }
 
 /**
+ * 往实例里装一个节点包（01 号文 5.7）。
+ *
+ * 走实例自己的 `POST /nodes` —— 也就是节点面板点「安装」时走的那条路。
+ * **刻意不绕过它**：白名单、私有源、依赖解析全在那条路上，绕过去就等于
+ * 让控制台装的包不受任何管控，而现场从面板装的却受管控。两套规则迟早出事。
+ *
+ * 装完立即生效，不需要重启实例 —— Node-RED 的节点安装是热加载的。
+ *
+ * 错误按 code 翻译成人话：实例回的是 `install_not_allowed` 这种机器码，
+ * 直接透出去的话，现场看到一串英文完全不知道下一步该干什么。
+ */
+export async function installModule(
+  t: AdminTarget,
+  module: string,
+  version: string | undefined,
+  fetchImpl: FetchLike = fetch,
+  timeoutMs = 120_000,          // 装包要下载与解压，比其它调用慢得多
+): Promise<{ module: string; version: string; types: string[] }> {
+  const headers = await authHeaders(t, fetchImpl, timeoutMs);
+  const { signal, done } = withTimeout(timeoutMs);
+  try {
+    const res = await fetchImpl(`${t.upstream}${t.adminRoot}nodes`, {
+      method: 'POST',
+      headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify(version ? { module, version } : { module }),
+      signal,
+    });
+    const text = await res.text();
+    if (!res.ok) throw new AdminApiError(explainInstallError(module, res.status, text), res.status);
+
+    const info = JSON.parse(text) as { name?: string; version?: string; nodes?: Array<{ types?: string[] }> };
+    return {
+      module: info.name ?? module,
+      version: info.version ?? '',
+      types: [...new Set((info.nodes ?? []).flatMap((n) => n.types ?? []))].sort(),
+    };
+  } catch (e) {
+    if (e instanceof AdminApiError) throw e;
+    throw new AdminApiError(`装节点包失败：${(e as Error).message}`);
+  } finally {
+    done();
+  }
+}
+
+/** 把实例回的机器码翻成现场能照着做的话 */
+function explainInstallError(module: string, status: number, body: string): string {
+  let code = '';
+  try { code = String((JSON.parse(body) as { code?: unknown }).code ?? ''); } catch { /* 非 JSON */ }
+  switch (code) {
+    case 'install_not_allowed':
+      return `${module} 不在这台实例的批准清单里。请先在「批准清单」批准它，`
+        + '再点右上角「下发到实例」，然后重试';
+    case 'module_already_loaded':
+      return `${module} 已经装过了`;
+    case 'invalid_module_name':
+      return `包名不合法：${module}`;
+    case 'invalid_module_url':
+      return `包地址不合法：${module}`;
+    default:
+      return `装 ${module} 失败（HTTP ${status}）：${body.slice(0, 300)}`;
+  }
+}
+
+/**
  * 部署流程。
  *
  * `Node-RED-Deployment-Type: full` 是刻意的：`nodes` / `flows` 那两种增量部署

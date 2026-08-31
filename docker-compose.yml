@@ -145,6 +145,23 @@ services:
       NO_PROXY: localhost,127.0.0.1,::1,${EDGE_NAME_PREFIX:-thinglinks-edge}-manager,${EDGE_NAME_PREFIX:-thinglinks-edge}-docker-proxy,tle-nr-,${INSTANCE_NETWORK:-thinglinks-edge},${EDGE_NO_PROXY:-localhost}
       # 企业内网网段，供自检比对 Docker 网段冲突（03 号文 2.9）
       CORPORATE_CIDRS: ${CORPORATE_CIDRS:-}
+      # 节点安装策略（01 号文 5.7）：
+      #   allowlist  只能装控制台批准过的（默认，出厂即最严）
+      #   open       不限制，任何包都能装 —— 有外网、由现场自己把关的部署可以这样
+      # 这是安全闸门，刻意只放在编排文件里，不做成 Web 开关：改它应当有文件、有版本、有人 review
+      EDGE_NODE_INSTALL_POLICY: ${EDGE_NODE_INSTALL_POLICY:-allowlist}
+      # 私有节点源的上游。**留空 = 纯离线**：库里没有的包一律装不上，不去公网找。
+      # 填了则库里没有时回源下载并顺手入库 —— 第一次装要联网，之后这个包永久离线可用。
+      # 公网填 https://registry.npmjs.org ；内网有私服就填私服地址。
+      # 走企业代理的现场只要配了 EDGE_HTTP_PROXY 即自动生效，这里不必重复配。
+      EDGE_NPM_UPSTREAM: ${EDGE_NPM_UPSTREAM:-}
+      # 点位历史条数上限。0 = 不记历史（最低配设备的退路）。
+      # 按条数而不是天数封顶：边缘盒子的硬约束是磁盘与 SD 卡写入量，
+      # 而同样保留 7 天，10 个点位和 500 个点位差两个数量级 —— 只有条数可预期。
+      EDGE_HISTORY_MAX_ROWS: ${EDGE_HISTORY_MAX_ROWS:-500000}
+      # 值没变时最长多久也留一个采样点（秒）。不留的话，恒定信号在图上是一条
+      # 从远古拉过来的直线，区分不了「一直没变」和「早就没数据了」
+      EDGE_HISTORY_MIN_GAP_SEC: ${EDGE_HISTORY_MIN_GAP_SEC:-300}
       # 健康监测趋势曲线的采样间隔（秒）。0 关闭采样，界面会明说趋势未启用。
       # 历史只存内存：重启即清零，换来的是不去磨盒子的 SD 卡
       EDGE_METRICS_INTERVAL_SEC: ${EDGE_METRICS_INTERVAL_SEC:-10}
