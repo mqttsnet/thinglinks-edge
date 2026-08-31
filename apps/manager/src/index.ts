@@ -11,6 +11,7 @@ import { AuthService } from './core/auth/service.ts';
 import { InstanceRepo } from './core/instance/repo.ts';
 import { InstanceService } from './core/instance/service.ts';
 import { DockerClient } from './core/instance/docker-client.ts';
+import { reconcileInstanceNetworks } from './core/instance/network-reconcile.ts';
 import { buildServer } from './http/app.ts';
 import { Spool, type FullPolicy } from './core/spool/spool.ts';
 import { SpoolDrainer } from './core/spool/drainer.ts';
@@ -373,6 +374,28 @@ export async function main(): Promise<void> {
       mode: installMode,
     }),
   });
+
+  /*
+   * 单独重建 Manager 不会重启历史实例，Docker 也不会把新 Manager 自动接回
+   * 各实例的私有网络。HTTP 开始服务前并发补接，保证反代和实例侧回报使用的
+   * 容器名解析立即可用。每个实例最多等待 5 秒；单个网络可能已被人工清理，
+   * 只告警并继续，不能因此阻止控制台启动或影响其它实例的隔离网络。
+   */
+  if (managerContainer) {
+    const reconciled = await reconcileInstanceNetworks(
+      repo.list().map((instance) => instance.id),
+      (id, signal) => docker.reconnectManager(id, signal),
+      5_000,
+    );
+    for (const result of reconciled) {
+      if (!result.ok) {
+        console.warn(
+          `[warn] 实例 ${result.id} 的网络 ${docker.instanceNetwork(result.id)} 未能重新接入 Manager：`
+          + result.error,
+        );
+      }
+    }
+  }
 
   // WEB_ROOT 由镜像设定（/app/web）；宿主开发态不设，前端走 Vite
   /*

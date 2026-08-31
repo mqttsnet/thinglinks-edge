@@ -44,7 +44,7 @@ services:
       # 敏感度低于已经放行的 containers/json —— 不放行的话那两项在装完之后
       # 永远报「读不到 docker info」，而现场恰恰要靠它们发现「限额配了不生效」。
       # 「No such image」，那句话对现场人员毫无指导意义。
-      - '-allowGET=^(/v1\.[0-9]+)?/(_ping|version|info|containers/json|containers/[a-zA-Z0-9][a-zA-Z0-9_.-]*/(json|logs|stats)|images/json|images/[a-zA-Z0-9][a-zA-Z0-9_.:@/-]*/json|volumes/[a-zA-Z0-9][a-zA-Z0-9_.-]*|networks)(\?.*)?$$'
+      - '-allowGET=^(/v1\.[0-9]+)?/(_ping|version|info|containers/json|containers/[a-zA-Z0-9][a-zA-Z0-9_.-]*/(json|logs|stats)|images/json|images/[a-zA-Z0-9][a-zA-Z0-9_.:@/-]*/json|volumes/[a-zA-Z0-9][a-zA-Z0-9_.-]*|networks|networks/[a-zA-Z0-9][a-zA-Z0-9_.-]*)(\?.*)?$$'
       - '-allowPOST=^(/v1\.[0-9]+)?/(containers/create|containers/[a-zA-Z0-9][a-zA-Z0-9_.-]*/(start|stop|restart)|networks/create|networks/[a-zA-Z0-9][a-zA-Z0-9_.-]*/(connect|disconnect)|volumes/create)(\?.*)?$$'
       - '-allowPUT=^(/v1\.[0-9]+)?/containers/[a-zA-Z0-9][a-zA-Z0-9_.-]*/archive(\?.*)?$$'
       - '-allowDELETE=^(/v1\.[0-9]+)?/(containers/[a-zA-Z0-9][a-zA-Z0-9_.-]*|networks/[a-zA-Z0-9][a-zA-Z0-9_.-]*|volumes/[a-zA-Z0-9][a-zA-Z0-9_.-]*)(\?.*)?$$'

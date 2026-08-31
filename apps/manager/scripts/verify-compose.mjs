@@ -15,6 +15,8 @@
 import Docker from 'dockerode';
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, mkdtempSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -35,6 +37,7 @@ const PORT = 13211;
 /** 首次设置时现场指定的口令。这一串**不该出现在任何日志里** */
 const SETUP_PW = 'compose-verify-pass-01';
 const ID = 'cv-a';
+const BROKEN_ID = 'cv-bad';
 const TAG = '5.0.4-24-minimal';
 const B = `http://127.0.0.1:${PORT}`;
 
@@ -65,9 +68,11 @@ function socketGid() {
 
 async function cleanup() {
   try { compose('down', '-v', '--remove-orphans'); } catch { /* 未起过 */ }
-  await raw.getContainer(`tle-nr-${ID}`).remove({ force: true }).catch(() => {});
-  await resetDataDir(ID);
-  await raw.getNetwork(`${NET}-${ID}`).remove().catch(() => {});
+  for (const id of [ID, BROKEN_ID]) {
+    await raw.getContainer(`tle-nr-${id}`).remove({ force: true }).catch(() => {});
+    await resetDataDir(id);
+    await raw.getNetwork(`${NET}-${id}`).remove().catch(() => {});
+  }
 }
 
 async function main() {
@@ -176,6 +181,41 @@ async function main() {
         `HTTP ${setupRes.status}`);
   const H = { cookie, 'x-csrf-token': csrf, 'content-type': 'application/json' };
 
+  /*
+   * 先登记一个随后损坏的实例，保证启动恢复会先处理它。用同名但错误标签的
+   * 网络模拟手工误建/残留：Manager 必须拒绝接入它，同时不能耽误健康实例。
+   */
+  const brokenCreated = await fetch(`${B}/api/instances`, {
+    method: 'POST', headers: H,
+    body: JSON.stringify({ id: BROKEN_ID, name: '损坏网络验证', imageTag: TAG,
+                           ports: [{ hostPort: 31301, containerPort: 1883, protocol: 'tcp', hostIp: '127.0.0.1', purpose: 'MQTT' }] }),
+  });
+  const brokenDetail = brokenCreated.status === 201 ? '' : (await brokenCreated.text()).slice(0, 160);
+  check('先创建将损坏的历史实例', brokenCreated.status === 201,
+        `HTTP ${brokenCreated.status}${brokenDetail ? ` ${brokenDetail}` : ''}`);
+  if (brokenCreated.status !== 201) throw new Error('无法创建损坏网络验证实例');
+  await raw.getContainer(`tle-nr-${BROKEN_ID}`).remove({ force: true });
+  await raw.getNetwork(`${NET}-${BROKEN_ID}`).disconnect({ Container: MGR, Force: true });
+  await raw.getNetwork(`${NET}-${BROKEN_ID}`).remove();
+  const foreignContainer = await raw.createContainer({
+    name: `tle-nr-${BROKEN_ID}`,
+    Image: `nodered/node-red:${TAG}`,
+    Cmd: ['node', '-e', 'setInterval(() => {}, 1000)'],
+    Labels: {
+      'com.mqttsnet.thinglinks-edge.managed': 'false',
+      'com.mqttsnet.thinglinks-edge.instance': BROKEN_ID,
+    },
+  });
+  await foreignContainer.start();
+  await raw.createNetwork({
+    Name: `${NET}-${BROKEN_ID}`,
+    Driver: 'bridge',
+    Labels: {
+      'com.mqttsnet.thinglinks-edge.managed': 'false',
+      'com.mqttsnet.thinglinks-edge.instance': BROKEN_ID,
+    },
+  });
+
   const created = await fetch(`${B}/api/instances`, {
     method: 'POST', headers: H,
     body: JSON.stringify({ id: ID, name: 'compose 验证', imageTag: TAG,
@@ -189,6 +229,17 @@ async function main() {
   const netInfo = await raw.getNetwork(`${NET}-${ID}`).inspect();
   const attached = Object.values(netInfo.Containers ?? {}).map((c) => c.Name);
   check('MANAGER_CONTAINER 生效：Manager 接入了实例网络', attached.includes(MGR), attached.join(' + '));
+  const nodeRedBeforeRecreate = await raw.getContainer(`tle-nr-${ID}`).inspect();
+  const nodeRedStateBeforeRecreate = {
+    id: nodeRedBeforeRecreate.Id,
+    status: nodeRedBeforeRecreate.State.Status,
+    running: nodeRedBeforeRecreate.State.Running,
+    startedAt: nodeRedBeforeRecreate.State.StartedAt,
+    restartCount: nodeRedBeforeRecreate.RestartCount,
+  };
+  // settings.js 是 Manager 下发且实例运行必需的数据；只比哈希，避免验证输出任何凭据。
+  const settingsDigestBeforeRecreate = createHash('sha256')
+    .update(await readFile(`${TEST_DATA_ROOT}/${ID}/settings.js`)).digest('hex');
 
   // ── 受限 docker 代理 ────────────────────────────────────
   // 走到这里说明整条生命周期（建网络/建卷/建容器/塞 settings.js/启停/取日志/取 stats）
@@ -225,6 +276,9 @@ async function main() {
    */
   check('代理放行只读的 /info（安装自检的架构与 cgroup 两项靠它）',
         probeFrom(MGR, '/info') === 'S200', probeFrom(MGR, '/info'));
+  check('代理放行单实例网络 inspect（恢复时核验网络归属）',
+        probeFrom(MGR, `/networks/${NET}-${ID}`) === 'S200',
+        probeFrom(MGR, `/networks/${NET}-${ID}`));
 
   const denied = ['/events', '/swarm', '/secrets', '/plugins'];
   const denyResults = denied.map((p) => `${p}=${probeFrom(MGR, p)}`);
@@ -250,7 +304,131 @@ async function main() {
   }
   check('打开编辑器可用（反代按容器名解析到实例）', editor === 200, `HTTP ${editor}`);
 
-  await fetch(`${B}/api/instances/${ID}`, { method: 'DELETE', headers: H });
+  /*
+   * 复现已运行实例的关键场景：部署升级或运维修复可能只 force-recreate
+   * Manager，实例容器和数据根则必须原样保留。若新 Manager 没有重新加入
+   * 实例专属网络，/red/:id/sso 会因反代无法解析实例而变成 502。
+   */
+  const managerBeforeRecreate = (await raw.getContainer(MGR).inspect()).Id;
+  compose('up', '-d', '--force-recreate', '--no-deps', 'manager');
+
+  let recreatedReady = false;
+  for (let i = 0; i < 40 && !recreatedReady; i++) {
+    await sleep(500);
+    recreatedReady = await fetch(`${B}/healthz`).then((r) => r.ok).catch(() => false);
+  }
+  check('只重建 Manager 后仍就绪', recreatedReady);
+
+  const managerAfterRecreate = await raw.getContainer(MGR).inspect();
+  check('只重建 Manager 确实替换了容器',
+        managerAfterRecreate.Id !== managerBeforeRecreate);
+
+  const recreatedNet = await raw.getNetwork(`${NET}-${ID}`).inspect();
+  const recreatedAttached = Object.values(recreatedNet.Containers ?? {}).map((c) => c.Name);
+  check('重建后的 Manager 重新接入实例网络', recreatedAttached.includes(MGR),
+        recreatedAttached.join(' + '));
+
+  const nodeRedAfterRecreate = await raw.getContainer(`tle-nr-${ID}`).inspect();
+  const nodeRedStateAfterRecreate = {
+    id: nodeRedAfterRecreate.Id,
+    status: nodeRedAfterRecreate.State.Status,
+    running: nodeRedAfterRecreate.State.Running,
+    startedAt: nodeRedAfterRecreate.State.StartedAt,
+    restartCount: nodeRedAfterRecreate.RestartCount,
+  };
+  check('重建 Manager 不重启健康实例',
+        JSON.stringify(nodeRedStateAfterRecreate) === JSON.stringify(nodeRedStateBeforeRecreate));
+  const settingsDigestAfterRecreate = createHash('sha256')
+    .update(await readFile(`${TEST_DATA_ROOT}/${ID}/settings.js`)).digest('hex');
+  check('重建 Manager 不改实例持久化 settings 数据',
+        settingsDigestAfterRecreate === settingsDigestBeforeRecreate);
+
+  const impostor = await raw.getNetwork(`${NET}-${BROKEN_ID}`).inspect();
+  const impostorMembers = Object.values(impostor.Containers ?? {}).map((c) => c.Name);
+  check('重建 Manager 不接入同名错误归属网络', !impostorMembers.includes(MGR), impostorMembers.join(' + ') || '无成员');
+
+  // Manager 重建会令旧会话失效；重新登录后再测 SSO，避免把会话语义误判成网络回归。
+  const reloginRes = await fetch(`${B}/api/login`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'admin', password: SETUP_PW }),
+  });
+  const recreatedCookie = (reloginRes.headers.getSetCookie?.() ?? [])
+    .map((c) => c.split(';')[0]).join('; ');
+  const recreatedCsrf = /tle_csrf=([^;]+)/.exec(recreatedCookie)?.[1] ?? '';
+  check('重建 Manager 后重新登录成功并取得新会话',
+        reloginRes.status === 200 && recreatedCookie.includes('tle_sid') && Boolean(recreatedCsrf),
+        `HTTP ${reloginRes.status}`);
+  const ssoAfterRecreate = await fetch(`${B}/red/${ID}/sso`, {
+    headers: { cookie: recreatedCookie }, redirect: 'manual',
+  }).then((r) => r.status).catch(() => 0);
+  check('重建 Manager 后重新登录访问实例 SSO 仍成功', ssoAfterRecreate === 200,
+        `HTTP ${ssoAfterRecreate}`);
+
+  // 同一容器仍在网络中时重启，覆盖 connect 的幂等路径而不重建 Manager 容器。
+  compose('restart', 'manager');
+  let restartedReady = false;
+  for (let i = 0; i < 40 && !restartedReady; i++) {
+    await sleep(500);
+    restartedReady = await fetch(`${B}/healthz`).then((r) => r.ok).catch(() => false);
+  }
+  check('已接入网络的 Manager 重启后仍就绪', restartedReady);
+  const restartedNet = await raw.getNetwork(`${NET}-${ID}`).inspect();
+  check('已接入网络的 Manager 重启不重复或断开端点',
+        Object.values(restartedNet.Containers ?? {}).map((c) => c.Name).includes(MGR));
+  const restartedLogin = await fetch(`${B}/api/login`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'admin', password: SETUP_PW }),
+  });
+  const restartedCookie = (restartedLogin.headers.getSetCookie?.() ?? [])
+    .map((c) => c.split(';')[0]).join('; ');
+  const restartedCsrf = /tle_csrf=([^;]+)/.exec(restartedCookie)?.[1] ?? '';
+  const ssoAfterRestart = await fetch(`${B}/red/${ID}/sso`, {
+    headers: { cookie: restartedCookie }, redirect: 'manual',
+  }).then((r) => r.status).catch(() => 0);
+  check('已接入网络的 Manager 重启后实例 SSO 仍成功', ssoAfterRestart === 200,
+        `HTTP ${ssoAfterRestart}`);
+
+  const restartedH = {
+    cookie: restartedCookie, 'x-csrf-token': restartedCsrf, 'content-type': 'application/json',
+  };
+  const brokenDeleted = await fetch(`${B}/api/instances/${BROKEN_ID}`, { method: 'DELETE', headers: restartedH });
+  const healthyDeleted = await fetch(`${B}/api/instances/${ID}`, { method: 'DELETE', headers: restartedH });
+  check('删除健康实例返回 204', healthyDeleted.status === 204,
+        `HTTP ${healthyDeleted.status}`);
+
+  // 必须在兜底 cleanup 之前核对真实 Docker 状态，否则 remove() 吞掉清理错误也会假绿。
+  const healthyContainerInspectStatus = await raw.getContainer(`tle-nr-${ID}`).inspect()
+    .then(() => 200).catch((e) => e.statusCode ?? 0);
+  const healthyNetworkInspectStatus = await raw.getNetwork(`${NET}-${ID}`).inspect()
+    .then(() => 200).catch((e) => e.statusCode ?? 0);
+  check('删除健康实例后容器已不存在', healthyContainerInspectStatus === 404,
+        `inspect HTTP ${healthyContainerInspectStatus}`);
+  check('删除健康实例后网络已不存在', healthyNetworkInspectStatus === 404,
+        `inspect HTTP ${healthyNetworkInspectStatus}`);
+
+  const afterDeleteListRes = await fetch(`${B}/api/instances`, {
+    headers: { cookie: restartedCookie },
+  });
+  const afterDeleteList = await afterDeleteListRes.json().catch(() => ({}));
+  const afterDeleteIds = Array.isArray(afterDeleteList.instances)
+    ? afterDeleteList.instances.map((instance) => instance.id)
+    : [];
+  check('删除后实例列表不再包含健康或损坏实例记录',
+        afterDeleteListRes.status === 200
+          && Array.isArray(afterDeleteList.instances)
+          && !afterDeleteIds.includes(ID)
+          && !afterDeleteIds.includes(BROKEN_ID),
+        `HTTP ${afterDeleteListRes.status}; IDs=${afterDeleteIds.join(',') || '空'}`);
+
+  const impostorAfterDelete = await raw.getNetwork(`${NET}-${BROKEN_ID}`).inspect().catch(() => undefined);
+  const foreignContainerAfterDelete = await raw.getContainer(`tle-nr-${BROKEN_ID}`).inspect().catch(() => undefined);
+  check('删除损坏实例只删数据库记录，冒名容器和网络仍保留',
+        brokenDeleted.status === 204
+          && foreignContainerAfterDelete?.Config.Labels?.['com.mqttsnet.thinglinks-edge.managed'] === 'false'
+          && impostorAfterDelete?.Labels?.['com.mqttsnet.thinglinks-edge.managed'] === 'false',
+        `HTTP ${brokenDeleted.status}`);
+  await raw.getContainer(`tle-nr-${BROKEN_ID}`).remove({ force: true });
+  await raw.getNetwork(`${NET}-${BROKEN_ID}`).remove();
   await sleep(500);
 
   compose('down', '-v');

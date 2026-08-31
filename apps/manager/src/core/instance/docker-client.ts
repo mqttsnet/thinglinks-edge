@@ -18,6 +18,7 @@ import { dockerLogToText } from './log-stream.ts';
 
 /** 平台管理的容器统一打这个标签，列举与操作一律按标签过滤 */
 export const MANAGED_LABEL = 'com.mqttsnet.thinglinks-edge.managed';
+const INSTANCE_LABEL = 'com.mqttsnet.thinglinks-edge.instance';
 /** 官方镜像内 node-red 用户的 uid/gid */
 const NODE_RED_UID = 1000;
 
@@ -103,27 +104,80 @@ export class DockerClient {
     return `${this.opts.network}-${instanceId}`;
   }
 
-  async ensureNetwork(instanceId: string): Promise<void> {
+  async ensureNetwork(instanceId: string): Promise<string> {
     const name = this.instanceNetwork(instanceId);
     const found = await this.docker.listNetworks({ filters: { name: [name] } });
-    if (found.some((n) => n.Name === name)) return;
-    await this.docker.createNetwork({
+    if (found.some((n) => n.Name === name)) {
+      return (await this.assertOwnedNetwork(instanceId)).Id;
+    }
+    const created = await this.docker.createNetwork({
       Name: name,
       Driver: 'bridge',
-      Labels: { [MANAGED_LABEL]: 'true', 'com.mqttsnet.thinglinks-edge.instance': instanceId },
+      Labels: { [MANAGED_LABEL]: 'true', [INSTANCE_LABEL]: instanceId },
     });
+    return created.id;
+  }
+
+  /** 网络名可被宿主上其它人抢占，标签才是实例归属的权威。 */
+  private async assertOwnedNetwork(instanceId: string): Promise<Docker.NetworkInspectInfo> {
+    const network = await this.docker.getNetwork(this.instanceNetwork(instanceId)).inspect();
+    this.assertNetworkOwnership(instanceId, network);
+    return network;
+  }
+
+  private assertNetworkOwnership(instanceId: string, network: Docker.NetworkInspectInfo): void {
+    const labels = network.Labels ?? {};
+    if (labels[MANAGED_LABEL] !== 'true' || labels[INSTANCE_LABEL] !== instanceId) {
+      throw new Error(
+        `实例网络 ${this.instanceNetwork(instanceId)} 归属不匹配，拒绝接入：` +
+        `需要 ${MANAGED_LABEL}=true 且 ${INSTANCE_LABEL}=${instanceId}`,
+      );
+    }
+  }
+
+  private static hasContainer(network: Docker.NetworkInspectInfo, containerId: string): boolean {
+    return Object.keys(network.Containers ?? {}).some((id) => id === containerId);
   }
 
   /** 把 Manager 接入实例网络，使其可达实例；实例之间仍互不可达 */
-  private async attachManager(instanceId: string): Promise<void> {
+  private async attachManager(instanceId: string, signal?: AbortSignal): Promise<void> {
     const mgr = this.opts.managerContainer;
     if (!mgr) return;
-    await this.docker.getNetwork(this.instanceNetwork(instanceId))
-      .connect({ Container: mgr })
-      .catch((e: Error) => {
-        // 已连接时 Docker 报错，属正常
-        if (!/already exists|already connected/i.test(e.message)) throw e;
+    if (signal?.aborted) throw signal.reason;
+    const managerRef = this.docker.getContainer(mgr);
+    const manager = signal
+      ? await managerRef.inspect({ abortSignal: signal })
+      : await managerRef.inspect();
+    const network = await this.assertOwnedNetwork(instanceId);
+    if (signal?.aborted) throw signal.reason;
+    // 先按名字核验当前对象，再固定到不可变的容器/网络 ID；之后绝不再用名字连接。
+    const networkRef = this.docker.getNetwork(network.Id);
+    if (DockerClient.hasContainer(network, manager.Id)) return;
+    try {
+      // dockerode 5 会把 args.opts.abortSignal 转发给 modem，但 @types 尚未声明该字段。
+      await networkRef.connect({ Container: manager.Id, abortSignal: signal } as Docker.NetworkConnectOptions & {
+        abortSignal?: AbortSignal;
       });
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      // Docker 可能在 inspect 与 connect 之间完成了另一次并发接入；只以当前
+      // Manager 的精确容器 ID 已在该网络为准，不能靠错误文案猜测。
+      const after = await networkRef.inspect().catch(() => undefined);
+      if (after) this.assertNetworkOwnership(instanceId, after);
+      if (after && after.Id === network.Id && DockerClient.hasContainer(after, manager.Id)) return;
+      throw error;
+    }
+  }
+
+  /**
+   * 启动恢复时把当前 Manager 补接回一个既有实例的独立网络。
+   *
+   * Manager 被单独重建后，Docker 会移除旧容器的网络端点；实例本身仍在运行，
+   * 因此不会重新走 createInstance() 里的接入路径。复用同一幂等连接逻辑，
+   * 只恢复 Manager 到该实例网络的可达性，不会创建网络或触碰实例容器。
+   */
+  async reconnectManager(instanceId: string, signal?: AbortSignal): Promise<void> {
+    await this.attachManager(instanceId, signal);
   }
 
   /** 实例镜像仓库名，供上层拼完整镜像名 */
@@ -213,17 +267,16 @@ export class DockerClient {
     if (this.opts.managerUrl) spec = { ...spec, managerUrl: this.opts.managerUrl };
     if (this.opts.npmRegistry) spec = { ...spec, npmRegistry: this.opts.npmRegistry };
     assertValidSpec(spec, this.opts.portRange);
+    await this.assertImagePresent(this.imageRef(spec.imageTag));
+    const networkId = await this.ensureNetwork(spec.id);
     const options = buildCreateOptions(spec, {
-      network: this.instanceNetwork(spec.id),
+      network: networkId,
       imageRepo: this.opts.imageRepo,
       instanceDataRoot: this.opts.instanceDataRoot,
       timezone: this.opts.timezone,
       proxyEnv: this.opts.proxyEnv ?? [],
     });
     assertSafeCreateOptions(options, { instanceDataRoot: this.opts.instanceDataRoot });
-
-    await this.assertImagePresent(options['Image'] as string);
-    await this.ensureNetwork(spec.id);
     await this.ensureDataDir(spec.id);
 
     const container = await this.docker.createContainer(options as Docker.ContainerCreateOptions);
@@ -268,12 +321,18 @@ export class DockerClient {
    * 那个端点。漏了这一步没有任何报错（删网络的失败是被吞掉的），
    * 只会一次删一个实例、攒一堆空网络。
    */
-  private async detachManager(instanceId: string): Promise<void> {
+  private async detachManager(networkRef: Docker.Network, instanceId: string): Promise<void> {
     const mgr = this.opts.managerContainer;
     if (!mgr) return;
-    await this.docker.getNetwork(this.instanceNetwork(instanceId))
-      .disconnect({ Container: mgr, Force: true })
-      .catch(() => undefined);
+    try {
+      const manager = await this.docker.getContainer(mgr).inspect();
+      await networkRef.disconnect({ Container: manager.Id, Force: true });
+    } catch (e) {
+      const error = e as Error & { statusCode?: number };
+      if (error.statusCode !== 404) {
+        console.warn(`[warn] 实例网络 ${this.instanceNetwork(instanceId)} 未能摘除 Manager：${error.message}`);
+      }
+    }
   }
 
   /**
@@ -286,21 +345,45 @@ export class DockerClient {
    */
   async remove(instanceId: string, opts: { removeData: boolean }): Promise<void> {
     let containerError: Error | null = null;
-    await this.docker.getContainer(containerName(instanceId)).remove({ force: true })
-      .catch((e: Error & { statusCode?: number }) => {
-        // 404 = 已经不在了，属于期望结果而非失败
-        if (e.statusCode !== 404) containerError = e;
-      });
+    try {
+      const container = await this.docker.getContainer(containerName(instanceId)).inspect();
+      const labels = container.Config.Labels ?? {};
+      if (labels[MANAGED_LABEL] !== 'true' || labels[INSTANCE_LABEL] !== instanceId) {
+        console.warn(
+          `[warn] 容器 ${containerName(instanceId)} 归属不匹配，保留不动：` +
+          `需要 ${MANAGED_LABEL}=true 且 ${INSTANCE_LABEL}=${instanceId}`,
+        );
+      } else {
+        await this.docker.getContainer(container.Id).remove({ force: true });
+      }
+    } catch (e) {
+      const error = e as Error & { statusCode?: number };
+      // 404 = 已经不在了，属于期望结果而非失败
+      if (error.statusCode !== 404) {
+        containerError = error;
+        console.warn(`[warn] 容器 ${containerName(instanceId)} 未能核验或删除，保留不动：${error.message}`);
+      }
+    }
 
-    // 实例网络随实例一并回收，避免残留大量空网络
-    await this.detachManager(instanceId);
-    await this.docker.getNetwork(this.instanceNetwork(instanceId)).remove()
-      .catch((e: Error & { statusCode?: number }) => {
-        // 404 同样是期望结果。常态就会响的告警会让人学会忽略告警，所以只报真异常
-        if (e.statusCode !== 404) {
-          console.warn(`[warn] 实例网络 ${this.instanceNetwork(instanceId)} 未能回收：${e.message}`);
-        }
-      });
+    // 网络名不是权限边界。只有核验过标签归属的 network ID 才允许摘端点或删除。
+    let ownedNetwork: Docker.NetworkInspectInfo | undefined;
+    try {
+      ownedNetwork = await this.assertOwnedNetwork(instanceId);
+    } catch (e) {
+      if ((e as { statusCode?: number }).statusCode !== 404) {
+        console.warn(`[warn] 实例网络 ${this.instanceNetwork(instanceId)} 未能核验归属，保留不动：${(e as Error).message}`);
+      }
+    }
+    if (ownedNetwork) {
+      const networkRef = this.docker.getNetwork(ownedNetwork.Id);
+      await this.detachManager(networkRef, instanceId);
+      await networkRef.remove()
+        .catch((e: Error & { statusCode?: number }) => {
+          if (e.statusCode !== 404) {
+            console.warn(`[warn] 实例网络 ${this.instanceNetwork(instanceId)} 未能回收：${e.message}`);
+          }
+        });
+    }
 
     if (opts.removeData) {
       // 目录是我们自己建的宿主路径，直接删。不要指望 docker 帮忙回收 ——
@@ -335,7 +418,8 @@ export class DockerClient {
   /** 校验容器确属本平台管理，防止越权操作宿主上任意容器 */
   async assertManaged(instanceId: string): Promise<void> {
     const info = await this.docker.getContainer(containerName(instanceId)).inspect();
-    if (info.Config.Labels?.[MANAGED_LABEL] !== 'true') {
+    const labels = info.Config.Labels ?? {};
+    if (labels[MANAGED_LABEL] !== 'true' || labels[INSTANCE_LABEL] !== instanceId) {
       throw new Error(`容器 ${containerName(instanceId)} 不受本平台管理，拒绝操作`);
     }
   }
