@@ -67,6 +67,15 @@ export type Action =
    */
   | 'template:view'
   | 'template:manage'
+  /**
+   * 节点管理（01 号文 5.7）。看与批分成两档，而且这一刀比模板那刀更硬：
+   *
+   * 批准一个节点包 = 允许它在**所有**实例里被安装并执行代码。
+   * 那不是运维动作，是引入第三方代码进现场，必须落在管理员头上。
+   * 运维能看清单（排障要知道装了什么），但批不了。
+   */
+  | 'node:view'
+  | 'node:manage'
   | 'user:manage';
 
 export type Role = 'admin' | 'operator' | 'viewer';
@@ -81,14 +90,16 @@ const ROLE_ACTIONS: Record<Role, ReadonlySet<Action>> = {
     'system:view', 'system:manage', 'instance:list', 'instance:view', 'instance:operate', 'instance:create', 'instance:delete',
     'field:view', 'replay:run', 'backup:run', 'user:manage',
     'cloud:view', 'cloud:manage', 'diag:run', 'template:view', 'template:manage',
+    'node:view', 'node:manage',
   ]),
   // 运维：管得了运行，建不了也删不了，更管不了用户
   operator: new Set<Action>([
     'system:view', 'instance:list', 'instance:view', 'instance:operate', 'field:view', 'replay:run',
-    'cloud:view', 'diag:run', 'template:view', 'template:manage',
+    'cloud:view', 'diag:run', 'template:view', 'template:manage', 'node:view',
   ]),
   viewer: new Set<Action>([
     'system:view', 'instance:list', 'instance:view', 'field:view', 'cloud:view', 'template:view',
+    'node:view',
   ]),
 };
 
