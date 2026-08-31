@@ -305,6 +305,8 @@ export async function main(): Promise<void> {
     ? `http://${managerContainer}:${config.listenPort}${config.basePath}/npm/`
     : '';
   const nodeCatalogueUrl = `${config.basePath}/npm/-/catalogue.json`;
+  // 编辑器公开搜索目录；仅 open 策略会使用，不能拿来作容器 npm registry。
+  const publicNodeCatalogueUrl = 'https://catalogue.nodered.org/catalogue.json';
 
   /*
    * 上游回源与安装策略。两个都在编排文件里配，不放 Web 设置页 ——
@@ -371,6 +373,7 @@ export async function main(): Promise<void> {
     palettePolicy: () => buildPolicy(nodeCatalog.approved(), {
       allowInstall: true,
       catalogueUrl: nodeCatalogueUrl,
+      publicCatalogueUrl: publicNodeCatalogueUrl,
       mode: installMode,
     }),
   });

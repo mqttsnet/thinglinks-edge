@@ -146,8 +146,9 @@ services:
       # 企业内网网段，供自检比对 Docker 网段冲突（03 号文 2.9）
       CORPORATE_CIDRS: ${CORPORATE_CIDRS:-}
       # 节点安装策略（01 号文 5.7）：
-      #   allowlist  只能装控制台批准过的（默认，出厂即最严）
-      #   open       不限制，任何包都能装 —— 有外网、由现场自己把关的部署可以这样
+      #   allowlist  只能装控制台批准过的（默认，出厂即最严）；浏览器只加载私有 catalogue
+      #   open       不限制，任何包都能装；浏览器同时加载官方公共 catalogue
+      # 两种模式下实例 npm 下载仍经过 Manager registry，不把 catalogue 当 npm 源。
       # 这是安全闸门，刻意只放在编排文件里，不做成 Web 开关：改它应当有文件、有版本、有人 review
       EDGE_NODE_INSTALL_POLICY: ${EDGE_NODE_INSTALL_POLICY:-allowlist}
       # 私有节点源的上游。**留空 = 纯离线**：库里没有的包一律装不上，不去公网找。

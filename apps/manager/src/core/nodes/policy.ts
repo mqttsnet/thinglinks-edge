@@ -97,7 +97,7 @@ export interface PalettePolicy {
   allowInstall: boolean;
   allowList: string[];
   denyList: string[];
-  /** 私有 catalogue 地址；空数组表示编辑器里不提供可浏览的节点目录 */
+  /** 编辑器可浏览的 catalogue 候选目录；allowlist 只含私有目录，open 可追加公共目录 */
   catalogues: string[];
 }
 
@@ -164,11 +164,13 @@ export function buildPolicy(
   opts: {
     allowInstall: boolean;
     catalogueUrl?: string | undefined;
+    /** open 模式下附加的公共目录；只影响编辑器搜索，不改变安装 registry */
+    publicCatalogueUrl?: string | undefined;
     /** 缺省 allowlist —— 漏传时取严的那一档 */
     mode?: InstallPolicyMode | undefined;
   },
 ): PalettePolicy {
-  const catalogues = opts.catalogueUrl ? [opts.catalogueUrl] : [];
+  const privateCatalogues = opts.catalogueUrl ? [opts.catalogueUrl] : [];
 
   if (opts.mode === 'open') {
     /*
@@ -176,7 +178,14 @@ export function buildPolicy(
      * （见文件头第一条），留空正是「整段跳过」的正确写法。
      * allowList 给 ['*'] 只是让下发的配置读起来意图明确，实际不参与判定。
      */
-    return { allowInstall: opts.allowInstall, allowList: ['*'], denyList: [], catalogues };
+    return {
+      allowInstall: opts.allowInstall,
+      allowList: ['*'],
+      denyList: [],
+      catalogues: opts.publicCatalogueUrl
+        ? [...privateCatalogues, opts.publicCatalogueUrl]
+        : privateCatalogues,
+    };
   }
 
   return {
@@ -191,7 +200,7 @@ export function buildPolicy(
      * 要放开必须显式选 `open` 档，不能靠清空清单误打误撞得到。
      */
     denyList: ['*'],
-    catalogues,
+    catalogues: privateCatalogues,
   };
 }
 

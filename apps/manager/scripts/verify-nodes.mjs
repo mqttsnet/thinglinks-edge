@@ -52,6 +52,7 @@ const REG_PORT = 19100;
 const ADMIN_PW = 'initial-password-123';
 const ID = 'nodes-a';
 const TAG = '5.0.4-24-minimal';
+const PUBLIC_CATALOGUE_URL = 'https://catalogue.nodered.org/catalogue.json';
 
 /** 批准的夹具 —— 公网上不存在这个名字 */
 const OK_PKG = 'node-red-contrib-tle-fixture-ok';
@@ -79,6 +80,11 @@ const results = [];
 const check = (name, ok, detail = '') => {
   results.push({ name, ok });
   console.log(`  ${ok ? '✓' : '✗'} ${name}${detail ? '  — ' + detail : ''}`);
+};
+const cataloguesFromSettings = (settings) => {
+  const match = /^\s*catalogues:\s*(\[[^\r\n]*\])/m.exec(settings);
+  if (!match) return undefined;
+  try { return JSON.parse(match[1]); } catch { return undefined; }
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const containerState = async (id) =>
@@ -218,6 +224,7 @@ async function main() {
     for (const v of store.versions(m)) store.remove(m, v);
   }
   const catalog = new NodeCatalog(db);
+  let paletteMode = 'allowlist';
 
   const docker = new DockerClient({
     network: NET, imageRepo: 'nodered/node-red',
@@ -231,6 +238,8 @@ async function main() {
     allowedImageTags: [TAG],
     palettePolicy: () => buildPolicy(catalog.approved(), {
       allowInstall: true, catalogueUrl: '/npm/-/catalogue.json',
+      publicCatalogueUrl: PUBLIC_CATALOGUE_URL,
+      mode: paletteMode,
     }),
   });
   const config = {
@@ -577,7 +586,49 @@ async function main() {
   check('下发后实例白名单已清空（撤销真的传导到了实例）',
     settings2.includes('allowList: []') && /denyList:\s*\["\*"\]/.test(settings2));
 
-  // ── 8. 权限 ──────────────────────────────────────
+  // ── 8. open：公共目录只在显式放开时出现，下载仍由私有 registry 完成 ──
+  paletteMode = 'open';
+  const opened = await fetch(`${B}/api/nodes/apply`, {
+    method: 'POST', headers: H(admin), body: JSON.stringify({ instances: [ID] }),
+  }).then((r) => r.json());
+  check('切到 open 后下发策略并重启实例',
+    opened.results?.[0]?.ok === true && opened.results[0].restarted === true,
+    JSON.stringify(opened.results?.[0] ?? null));
+
+  await sleep(3000);
+  await ready();
+  const openSettings = await catInContainer(ID, '/data/settings.js');
+  check('open settings 放开安装并保留上传和更新禁用',
+    openSettings.includes('allowList: ["*"]')
+      && /denyList:\s*\[\]/.test(openSettings)
+      && /allowUpload:\s*false/.test(openSettings)
+      && /allowUpdate:\s*false/.test(openSettings));
+  const openCatalogues = cataloguesFromSettings(openSettings);
+  check('open settings catalogue 精确为私有目录后接官方目录',
+    JSON.stringify(openCatalogues) === JSON.stringify(['/npm/-/catalogue.json', PUBLIC_CATALOGUE_URL]),
+    `实际 ${JSON.stringify(openCatalogues)}`);
+
+  const token3 = await fetch(`http://127.0.0.1:${NR_PORT}/red/${ID}/auth/token`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      client_id: 'node-red-editor', grant_type: 'password', scope: '*',
+      username: 'admin', password: repo.credentials(ID)[0].password,
+    }),
+  }).then((r) => r.json()).catch(() => ({}));
+  const openInstall = await fetch(`http://127.0.0.1:${NR_PORT}/red/${ID}/nodes`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      ...(token3.access_token ? { authorization: `Bearer ${token3.access_token}` } : {}),
+    },
+    body: JSON.stringify({ module: DENIED_PKG }),
+  });
+  const openBody = await openInstall.text();
+  check('open 模式可从私有 registry 自助安装此前未批准的包（不依赖公网包存在）',
+    openInstall.status >= 200 && openInstall.status < 300,
+    `HTTP ${openInstall.status} ${openBody.slice(0, 200)}`);
+
+  // ── 9. 权限 ──────────────────────────────────────
   const anon = await fetch(`${B}/api/nodes/catalog`);
   check('未登录读不到批准清单', anon.status === 401, `HTTP ${anon.status}`);
   const anonApprove = await fetch(`${B}/api/nodes/catalog`, {

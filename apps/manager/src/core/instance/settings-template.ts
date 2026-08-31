@@ -9,8 +9,8 @@
  *    锁死在 Node-RED 1.x API 上，是「安装时选版本」做不了的根因。
  * 3. 节点安装管控（externalModules）的取值**违反直觉**，改之前先读
  *    core/nodes/policy.ts 的文件头 —— 那里记着每一条的实测依据。
- *    尤其别把 denyList 清空「因为看起来多余」：清空之后整段白名单校验
- *    会被跳过，而界面上一切正常。
+ *    allowlist 必须用 denyList:["*"] 触发白名单校验；open 则必须用 [] 显式
+ *    跳过该校验。不要按直觉在两种策略之间挪用这两个取值。
  */
 import type { PalettePolicy } from '../nodes/policy.ts';
 
@@ -110,10 +110,11 @@ ${users}
      * 节点安装管控（01 号文 5.7）。三个键缺一不可，取值理由见
      * core/nodes/policy.ts —— 每条都在真实 5.0.4 上验过。
      *
-     *   denyList  恒为 ["*"]。它为空时 Node-RED 会把整段白名单校验**跳过**，
-     *             届时 allowList 写什么都没用（installAllAllowed 只看 denyList）
-     *   allowList 已批准清单。与 denyList 同时命中时按「通配符位置靠后者胜」
-     *             决胜，精确包名记为 Infinity，所以能从 "*" 里捞出来
+     *   allowlist  denyList 必须为 ["*"]，才能执行白名单校验；allowList 是批准清单。
+     *              两边同时命中时按「通配符位置靠后者胜」决胜，精确包名记为
+     *              Infinity，所以能从 "*" 里捞出来。
+     *   open       denyList 必须为 []，让 Node-RED 跳过整段白名单校验；allowList
+     *              的 ["*"] 只用于明确表达下发意图。
      *   allowUpload  这才是拦 tgz 上传的键。老写法 editorTheme.palette.upload
      *             在 5.0.4 已经拦不住（实测请求照样走到解包阶段）
      */
@@ -147,8 +148,8 @@ ${users}
              * 这个地址是**浏览器**去取的（编辑器前端发起），所以填的是
              * 外部可见路径 —— 与实例里 npm 用的容器名地址不是一个东西。
              *
-             * 注意别在这个文件里写出官方目录的域名字面量：验证脚本会检查
-             * 生成的 settings.js 中不含它，用来确保没有哪台实例还挂着公网源。
+             * allowlist 策略只保留私有目录；open 策略可额外带公共目录。
+             * 无论目录如何配置，实例 npm 下载仍走容器里的 registry 配置。
              */
             catalogues: ${JSON.stringify(palette.catalogues)}
         }

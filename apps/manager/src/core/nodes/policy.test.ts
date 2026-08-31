@@ -39,6 +39,33 @@ test('catalogue 不给就是空数组，而不是回落公网源', () => {
   );
 });
 
+test('公共搜索只在 open 放开：私有目录在前追加公网 catalogue', () => {
+  const opts = {
+    allowInstall: true,
+    mode: 'open' as const,
+    catalogueUrl: '/npm/-/catalogue.json',
+    publicCatalogueUrl: 'https://catalogue.nodered.org/catalogue.json',
+  };
+  const p = buildPolicy([], opts);
+
+  assert.deepEqual(p.catalogues, [
+    '/npm/-/catalogue.json',
+    'https://catalogue.nodered.org/catalogue.json',
+  ]);
+});
+
+test('allowlist 即使提供公共搜索地址也只保留私有 catalogue', () => {
+  const opts = {
+    allowInstall: true,
+    mode: 'allowlist' as const,
+    catalogueUrl: '/npm/-/catalogue.json',
+    publicCatalogueUrl: 'https://catalogue.nodered.org/catalogue.json',
+  };
+  const p = buildPolicy([], opts);
+
+  assert.deepEqual(p.catalogues, ['/npm/-/catalogue.json']);
+});
+
 test('包名里的通配符与正则元字符一律拒绝', () => {
   // 规则字符串会被 Node-RED 拼进正则，放行通配符等于放行一切
   for (const bad of ['*', 'node-red-*', 'a.b*', 'A-Upper', 'has space', '../etc', 'a/b/c', '@s/a/b']) {
