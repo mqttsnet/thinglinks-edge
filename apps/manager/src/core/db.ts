@@ -279,6 +279,25 @@ const MIGRATIONS: string[] = [
   );
   CREATE INDEX idx_outage_started ON cloud_outage(started_at DESC);
   `,
+  /*
+   * v10 —— 节点白名单（01 号文 5.7）。
+   *
+   * 只存**审批结果**，不存包体 —— 包体在 <dataDir>/npm 下，由 NodeStore 管。
+   * 两者刻意分开：审批是管理动作要留痕（谁批的、什么时候、为什么），
+   * 而包体是几十 MB 的二进制，塞进 SQLite 只会让备份变慢、WAL 变大。
+   *
+   * version 空串表示不限版本。用空串而不是 NULL，是为了让主键与查询
+   * 都不必处理三值逻辑 —— 这张表的语义里没有「未知版本」这回事。
+   */
+  `
+  CREATE TABLE node_catalog (
+    module      TEXT PRIMARY KEY,
+    version     TEXT NOT NULL DEFAULT '',
+    note        TEXT NOT NULL DEFAULT '',
+    approved_by TEXT NOT NULL,
+    approved_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+  `,
 ];
 export function openDb(file: string): Db {
   if (file !== ':memory:') mkdirSync(dirname(file), { recursive: true });

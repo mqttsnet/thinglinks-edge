@@ -144,6 +144,72 @@ export async function getInstalledTypes(
   }
 }
 
+/** 实例上装着的一个节点模块 */
+export interface InstalledModule {
+  module: string;
+  version: string;
+  /**
+   * 是否**不是**镜像自带的。
+   *
+   * 实测 5.0.4：`node-red` 本体回 `local:false`，从节点面板装进 userDir 的包回
+   * `local:true`。注意由 `nodesDir` 扫目录加载的 `@thinglinks` 节点集也算 local ——
+   * 它确实不是镜像自带的，只是来路不是 npm。要再细分就看包名。
+   */
+  local: boolean;
+  /** 该模块提供的节点类型 */
+  types: string[];
+  /** 是否全部节点都处于启用状态 */
+  enabled: boolean;
+}
+
+/**
+ * 读实例已安装的**模块**清单（含版本），供平台侧节点台账用。
+ *
+ * 与 getInstalledTypes 的区别：那个只要类型名，用来做模板兼容性比对；
+ * 这个要模块与版本，用来回答「这台机器上装了哪些节点、什么版本」。
+ * 同一个接口两种投影，各取所需，不合并成一个「什么都返回」的函数。
+ */
+export async function getInstalledModules(
+  t: AdminTarget,
+  fetchImpl: FetchLike = fetch,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+): Promise<InstalledModule[]> {
+  const headers = await authHeaders(t, fetchImpl, timeoutMs);
+  const { signal, done } = withTimeout(timeoutMs);
+  try {
+    const res = await fetchImpl(`${t.upstream}${t.adminRoot}nodes`, {
+      headers: { ...headers, accept: 'application/json' },
+      signal,
+    });
+    if (!res.ok) throw new AdminApiError(`读取实例节点清单失败（HTTP ${res.status}）`, res.status);
+    const sets = await res.json() as Array<{
+      module?: string; version?: string; local?: boolean; types?: string[]; enabled?: boolean;
+    }>;
+
+    // 一个模块可以含多个节点集（每个 .js 一个），按模块归并
+    const byModule = new Map<string, InstalledModule>();
+    for (const s of sets) {
+      if (!s.module) continue;
+      const cur = byModule.get(s.module) ?? {
+        module: s.module, version: s.version ?? '', local: s.local === true,
+        types: [], enabled: true,
+      };
+      cur.types = [...new Set([...cur.types, ...(s.types ?? [])])];
+      // 有任意一个节点集被停用，就不算「全部启用」——现场要看到这个差别
+      cur.enabled = cur.enabled && s.enabled !== false;
+      byModule.set(s.module, cur);
+    }
+    return [...byModule.values()]
+      .map((m) => ({ ...m, types: m.types.sort() }))
+      .sort((a, b) => a.module.localeCompare(b.module));
+  } catch (e) {
+    if (e instanceof AdminApiError) throw e;
+    throw new AdminApiError(`读取实例节点清单失败：${(e as Error).message}`);
+  } finally {
+    done();
+  }
+}
+
 /**
  * 部署流程。
  *
