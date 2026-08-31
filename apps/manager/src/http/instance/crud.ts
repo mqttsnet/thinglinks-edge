@@ -113,6 +113,26 @@ export function registerInstances(api: FastifyInstance, ctx: HttpContext): void 
     } catch (e) { return fail(reply, e); }
   });
 
+  /**
+   * 换镜像版本（01 号文 5.2）。
+   *
+   * 用 `instance:operate` 而不是 `instance:create`：这是对**已存在实例**的运行管理，
+   * 与启停、重置口令同一类，而且第一个到现场打补丁的通常就是运维。
+   * 要求管理员才能升级，等于让安全补丁等一通电话。
+   *
+   * 破坏性由实例授权矩阵兜住 —— 只能升级自己有 operate 权限的那几台。
+   */
+  api.post(`${config.basePath}/api/instances/:id/image`, async (req, reply) => {
+    const user = guard(req, reply, { csrf: true, need: 'instance:operate', instance: (req.params as { id: string }).id });
+    if (!user) return;
+    const { id } = req.params as { id: string };
+    const imageTag = String((req.body as Record<string, unknown> | undefined)?.['imageTag'] ?? '');
+    if (!imageTag) return reply.code(400).send({ error: '缺少 imageTag' });
+    try {
+      return reply.send(await service.upgradeImage(id, imageTag, user.username));
+    } catch (e) { return fail(reply, e); }
+  });
+
   // ── 健康 ────────────────────────────────────────────────
 
   api.get(`${config.basePath}/api/health`, async (req, reply) => {

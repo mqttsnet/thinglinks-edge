@@ -61,6 +61,7 @@ run "实例创建 子路径"      scripts/verify-instance.mjs /nodered
 run "反代端到端 根路径"    scripts/verify-proxy.mjs
 run "反代端到端 子路径"    scripts/verify-proxy.mjs /nodered
 run "实例 CRUD API"        scripts/verify-api.mjs
+run "实例版本升级"        scripts/verify-upgrade.mjs
 run "健康探针"             scripts/verify-health.mjs
 run "实例间网络隔离"       scripts/verify-isolation.mjs
 run "Manager 容器化 根路径" scripts/verify-container.mjs

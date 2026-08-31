@@ -138,6 +138,14 @@ export class DockerClient {
    * 必须抛出去：把它们一并当成「镜像不存在」，会让一个配置问题伪装成
    * 「本机没有镜像」，照着提示去 docker pull 也解决不了，现场会卡死在这里。
    */
+  /**
+   * tag → 完整镜像名。升级前要判断新版本在不在本机，而 tag 到镜像名的拼法
+   * 只有本类知道（imageRepo 是它的配置）—— 让调用方自己拼迟早拼错一处。
+   */
+  imageRef(tag: string): string {
+    return `${this.opts.imageRepo}:${tag}`;
+  }
+
   async imagePresent(image: string): Promise<boolean> {
     try {
       await this.docker.getImage(image).inspect();

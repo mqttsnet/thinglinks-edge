@@ -100,6 +100,16 @@ export class InstanceRepo {
   // ── 端口 ────────────────────────────────────────────────
 
   /** 绑定端口；宿主端口全局唯一，冲突时报出占用方便于排查 */
+  /**
+   * 换镜像版本。只改这一个字段 —— 端口、凭据、adminRoot、credSecret 一概不动，
+   * 因为升级的定义就是「换个版本继续跑同一台实例」，其余任何改动都是别的操作。
+   */
+  setImageTag(instanceId: string, imageTag: string): void {
+    const info = this.db.prepare('UPDATE instance SET image_tag = ? WHERE id = ?')
+      .run(imageTag, instanceId);
+    if (info.changes === 0) throw new RepoError(`实例 ${instanceId} 不存在`);
+  }
+
   bindPort(instanceId: string, p: PortRecord): void {
     const owner = this.db.prepare(
       'SELECT instance_id FROM port_map WHERE host_port = ?',

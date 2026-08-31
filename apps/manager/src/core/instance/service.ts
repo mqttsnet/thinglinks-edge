@@ -268,23 +268,35 @@ export class InstanceService {
     const password = generatePassword();
     this.o.repo.resetCredential(id, username, password);
 
-    const creds = this.o.repo.credentials(id);
-    const settings = renderSettings({
+    const settings = this.#renderFor(id);
+    await this.o.docker.writeSettings(id, settings);
+    await this.o.docker.restart(id);
+
+    recordAudit(this.o.db, { actor, action: 'reset-instance-credential', target: `${id}/${username}`, result: 'ok' });
+    return password;
+  }
+
+  /**
+   * 按仓储里的当前状态渲染一份 settings.js。
+   *
+   * 重置口令、下发节点策略、换镜像版本三处都要这份东西，且内容必须**完全一致** ——
+   * 各写一份的话，改了其中一处（比如加了个新的 palette 字段）另外两处会悄悄落后，
+   * 表现是「重置口令之后白名单变回旧的了」这种没人能一眼看懂的现象。
+   */
+  #renderFor(id: string): string {
+    const inst = this.o.repo.get(id);
+    if (!inst) throw new ServiceError(`实例 ${id} 不存在`);
+    return renderSettings({
       instanceId: id,
       adminRoot: inst.adminRoot,
       credentialSecret: inst.credSecret,
-      credentials: creds.map((c) => ({
+      credentials: this.o.repo.credentials(id).map((c) => ({
         username: c.username,
         passwordHash: bcrypt.hashSync(c.password, 8),
         permissions: c.permissions,
       })),
       palette: this.o.palettePolicy?.(),
     });
-    await this.o.docker.writeSettings(id, settings);
-    await this.o.docker.restart(id);
-
-    recordAudit(this.o.db, { actor, action: 'reset-instance-credential', target: `${id}/${username}`, result: 'ok' });
-    return password;
   }
 
   /**
@@ -302,18 +314,7 @@ export class InstanceService {
     if (!inst) throw new ServiceError(`实例 ${id} 不存在`);
     await this.o.docker.assertManaged(id);
 
-    const creds = this.o.repo.credentials(id);
-    const settings = renderSettings({
-      instanceId: id,
-      adminRoot: inst.adminRoot,
-      credentialSecret: inst.credSecret,
-      credentials: creds.map((c) => ({
-        username: c.username,
-        passwordHash: bcrypt.hashSync(c.password, 8),
-        permissions: c.permissions,
-      })),
-      palette: this.o.palettePolicy?.(),
-    });
+    const settings = this.#renderFor(id);
     await this.o.docker.writeSettings(id, settings);
 
     const running = (await this.o.docker.list()).find((x) => x.id === id)?.running === true;
@@ -324,6 +325,100 @@ export class InstanceService {
       result: 'ok', detail: running ? '已重启生效' : '实例未运行，下次启动生效',
     });
     return { restarted: running };
+  }
+
+  /**
+   * 换镜像版本 —— 现场给已经在跑的实例打补丁（01 号文 5.2）。
+   *
+   * 保留一切属于「这台实例」的东西：数据目录（流程、凭据文件、已装节点）、
+   * 账号、adminRoot、credentialSecret、端口映射。只有镜像 tag 变。
+   *
+   * ## 顺序是这个方法最重要的部分
+   *
+   * **先确认新镜像在本机，再动旧容器。** 反过来的话，镜像不在时旧容器已经删了、
+   * 新容器又建不起来，现场就只剩一个跑不起来的实例 —— 而这台机器很可能没有外网，
+   * 拉不到镜像，等于把生产线停在那儿。受限 docker 代理刻意不放行 `images/create`
+   * （见 docker-compose 的白名单），所以「拉一下就好了」这条路在现场根本不存在。
+   *
+   * ## 失败必须回滚
+   *
+   * 新版本起不来（架构不符、配置不兼容、内存不够）时自动用旧 tag 重建并启动。
+   * 升级失败是可以接受的，升级失败之后实例没了是不可接受的 —— 现场对前者能重试，
+   * 对后者只能打电话。
+   *
+   * ## 不做的事
+   *
+   * 不校验流程与新版本的兼容性。Node-RED 遇到不认识的节点类型**不报错**
+   * （见 T4.6 的实测结论），所以「装上了、跑起来了」不等于流程还能工作。
+   * 真要判断得比对 `GET /nodes`，那是套用模板那条路的事；这里如实把风险交给调用方，
+   * 由界面在升级前提示，而不是假装检查过。
+   */
+  async upgradeImage(
+    id: string, imageTag: string, actor: string,
+  ): Promise<{ from: string; to: string; rolledBack: boolean }> {
+    const inst = this.o.repo.get(id);
+    if (!inst) throw new ServiceError(`实例 ${id} 不存在`);
+    if (!this.o.allowedImageTags.includes(imageTag)) {
+      throw new ServiceError(
+        `镜像 ${imageTag} 不在白名单内。可用：${this.o.allowedImageTags.join('、')}`,
+      );
+    }
+    const from = inst.imageTag;
+    if (from === imageTag) {
+      throw new ServiceError(`实例 ${id} 已经是 ${imageTag}，无需升级`);
+    }
+    await this.o.docker.assertManaged(id);
+
+    // ① 先确认新镜像在本机 —— 见上面「顺序」那段，这一步绝不能挪到后面
+    await this.o.docker.assertImagePresent(this.o.docker.imageRef(imageTag));
+
+    const ports = this.o.repo.ports(id);
+    const ingestToken = this.o.repo.ingestToken(id);
+    const settings = this.#renderFor(id);
+    const spec = (tag: string) => ({
+      id, imageTag: tag, memoryMb: inst.memLimit, cpus: inst.cpuLimit,
+      ports, adminRoot: inst.adminRoot, ingestToken,
+    });
+
+    // ② 删容器**保数据**。数据目录是 bind 挂载，不随容器走
+    await this.o.docker.remove(id, { removeData: false });
+
+    try {
+      await this.o.docker.createInstance(spec(imageTag), settings);
+      await this.o.docker.start(id);
+    } catch (e) {
+      // ③ 起不来就退回旧版本，别把实例丢在半路
+      let rollbackError = '';
+      try {
+        await this.o.docker.remove(id, { removeData: false });
+        await this.o.docker.createInstance(spec(from), settings);
+        await this.o.docker.start(id);
+      } catch (re) {
+        rollbackError = (re as Error).message;
+      }
+      recordAudit(this.o.db, {
+        actor, action: 'upgrade-instance-image', target: id, result: 'fail',
+        detail: `${from} → ${imageTag} 失败：${(e as Error).message}`
+          + (rollbackError ? `；回滚也失败：${rollbackError}` : '；已回滚到原版本'),
+      });
+      if (rollbackError) {
+        throw new ServiceError(
+          `升级 ${id} 到 ${imageTag} 失败：${(e as Error).message}。`
+          + `**回滚也失败了**：${rollbackError}。实例当前不可用，数据目录仍在，`
+          + `请人工用原版本 ${from} 重建`,
+        );
+      }
+      throw new ServiceError(
+        `升级 ${id} 到 ${imageTag} 失败：${(e as Error).message}。已回滚到 ${from}，实例照常运行`,
+      );
+    }
+
+    this.o.repo.setImageTag(id, imageTag);
+    recordAudit(this.o.db, {
+      actor, action: 'upgrade-instance-image', target: id,
+      result: 'ok', detail: `${from} → ${imageTag}`,
+    });
+    return { from, to: imageTag, rolledBack: false };
   }
 
   async logs(id: string, tail = 200): Promise<string> {
