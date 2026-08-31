@@ -41,6 +41,37 @@ test('从真实结构的 tgz 里读出元数据与校验值', () => {
   assert.equal(meta.size, tgz.length);
 });
 
+test('根目录不叫 package/ 的真实包也要认（@types/* 就是这样）', () => {
+  /*
+   * 2026-08-31 实测：从 registry 直接下载的 @types/semver@7.7.1，根目录是
+   * `semver/` 而不是 `package/`。写死 package/ 前缀会让这类包全部导入失败，
+   * 表现是依赖闭包缺一块，而缺口要到现场点安装时才暴露。
+   * 一次真包导入里 358 个包有 13 个是这种形状，全是 @types/*。
+   */
+  const tgz = gzipSync(tarArchive([
+    { name: 'semver/LICENSE', content: 'MIT' },
+    { name: 'semver/package.json', content: JSON.stringify({ name: '@types/semver', version: '7.7.1' }) },
+  ]));
+  const meta = readPackage(tgz);
+  assert.equal(meta.name, '@types/semver');
+  assert.equal(meta.version, '7.7.1');
+});
+
+test('有多个第一层 package.json 时优先规范的 package/', () => {
+  const tgz = gzipSync(tarArchive([
+    { name: 'other/package.json', content: JSON.stringify({ name: 'wrong', version: '9.9.9' }) },
+    { name: 'package/package.json', content: JSON.stringify({ name: 'right', version: '1.0.0' }) },
+  ]));
+  assert.equal(readPackage(tgz).name, 'right');
+});
+
+test('只有深层 package.json 不算 —— 那是包内的测试夹具', () => {
+  const tgz = gzipSync(tarArchive([
+    { name: 'pkg/test/fixtures/package.json', content: JSON.stringify({ name: 'fixture', version: '1.0.0' }) },
+  ]));
+  assert.throws(() => readPackage(tgz), /第一层目录下没有 package.json/);
+});
+
 test('普通 npm 库（节点包的依赖）也收，只是不算节点包', () => {
   // 这条是刻意的：只收节点包会让离线现场装不上依赖，见 store.ts 的说明
   const meta = readPackage(pack({ name: 'jsmodbus', version: '4.0.6' }));
@@ -62,7 +93,7 @@ test('依赖与 engines 原样透传 —— packument 靠它解析依赖闭包',
 
 test('坏文件给出能懂的错，而不是抛底层异常', () => {
   assert.throws(() => readPackage(Buffer.from('not gzip')), /不是有效的 gzip/);
-  assert.throws(() => readPackage(gzipSync(Buffer.alloc(1024))), /没有 package\/package.json/);
+  assert.throws(() => readPackage(gzipSync(Buffer.alloc(1024))), /第一层目录下没有 package.json/);
   assert.throws(
     () => readPackage(pack({ name: 'a' } as Record<string, unknown>)),
     /缺 name 或 version/,

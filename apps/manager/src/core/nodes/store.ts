@@ -61,11 +61,20 @@ export interface PackageMeta {
 }
 
 /**
- * npm 包的 tar 内所有条目都在 `package/` 前缀下（npm 打包时固定如此）。
- * 找 package.json 认这个前缀，而不是找任意路径下的同名文件 ——
- * 一个包里完全可能有 `package/test/fixtures/package.json`。
+ * 从 tar 条目里挑出包自己的 package.json。
+ *
+ * **不能写死 `package/package.json`**（曾经就是这么写的，被真包打脸）：
+ * npm 的实际行为是**剥掉第一层目录，不管它叫什么**。`npm pack` 产出的确实是
+ * `package/`，但从 registry 直接下载的已发布包不一定 —— 实测 DefinitelyTyped 的
+ * `@types/semver@7.7.1` 根目录是 `semver/`，`@types/node` 等 13 个包同理。
+ * 写死前缀的表现是这些包一律被判成「不像 npm pack 出来的文件」，
+ * 于是依赖闭包缺一块，而缺口要到现场点安装时才暴露。
+ *
+ * 仍然只认**第一层**下的 package.json，不是任意路径下的同名文件 ——
+ * 一个包里完全可能有 `xxx/test/fixtures/package.json`。
+ * 有多个候选时优先 `package/`，那是规范写法。
  */
-const PKG_JSON = 'package/package.json';
+const ROOT_PKG_JSON = /^[^/]+\/package\.json$/;
 
 /** 解析一个 .tgz，读出元数据。文件损坏或不是 npm 包时抛错 */
 export function readPackage(tgz: Buffer): Omit<PackageMeta, 'updatedAt'> {
@@ -83,9 +92,12 @@ export function readPackage(tgz: Buffer): Omit<PackageMeta, 'updatedAt'> {
     throw new NodePolicyError(`tar 解析失败：${(e as Error).message}`);
   }
 
-  const entry = entries.find((f) => f.name === PKG_JSON);
+  const candidates = entries.filter((f) => ROOT_PKG_JSON.test(f.name));
+  const entry = candidates.find((f) => f.name === 'package/package.json') ?? candidates[0];
   if (!entry) {
-    throw new NodePolicyError(`包里没有 ${PKG_JSON} —— 这不像是 npm pack 出来的文件`);
+    throw new NodePolicyError(
+      '包里第一层目录下没有 package.json —— 这不像是一个 npm 包',
+    );
   }
 
   let pkg: Record<string, unknown>;
