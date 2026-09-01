@@ -38,7 +38,7 @@ export interface CatalogDeps {
 export function registerNodeCatalog(
   api: FastifyInstance, ctx: HttpContext, deps: CatalogDeps,
 ): void {
-  const { config, db, guard } = ctx;
+  const { config, db, guard, operationGate } = ctx;
   const { store, catalog, sources, upstream } = deps;
 
   /*
@@ -405,32 +405,38 @@ export function registerNodeCatalog(
     const user = guard(req, reply, { csrf: true, need: 'instance:operate', instance: id });
     if (!user) return;
 
-    const b = (req.body ?? {}) as { module?: string; version?: string };
-    const module = String(b.module ?? '').trim();
-    if (!module) return reply.code(400).send({ error: '缺少 module' });
-    const version = String(b.version ?? '').trim() || undefined;
-
-    const t = targetFor(ctx, id);
-    if ('error' in t) return reply.code(t.code).send({ error: t.error });
-
     try {
-      const r = await installModule(t, module, version);
-      recordAudit(db, {
-        actor: user.username, action: 'install-node', target: `${id}/${r.module}@${r.version}`,
-        result: 'ok', detail: r.types.join(', '),
+      return await operationGate.run(id, 'install-node', async () => {
+        const b = (req.body ?? {}) as { module?: string; version?: string };
+        const module = String(b.module ?? '').trim();
+        if (!module) return reply.code(400).send({ error: '缺少 module' });
+        const version = String(b.version ?? '').trim() || undefined;
+
+        const t = targetFor(ctx, id);
+        if ('error' in t) return reply.code(t.code).send({ error: t.error });
+
+        try {
+          const r = await installModule(t, module, version);
+          recordAudit(db, {
+            actor: user.username, action: 'install-node', target: `${id}/${r.module}@${r.version}`,
+            result: 'ok', detail: r.types.join(', '),
+          });
+          return reply.send(r);
+        } catch (e) {
+          recordAudit(db, {
+            actor: user.username, action: 'install-node', target: `${id}/${module}`,
+            result: 'fail', detail: (e as Error).message,
+          });
+          if (e instanceof AdminApiError) {
+            // 实例说不行是 400（配置问题，现场能改）；连不上实例是 502（不是现场的错）
+            return reply.code(e.status >= 400 && e.status < 500 ? 400 : 502)
+              .send({ error: e.message });
+          }
+          return fail(reply, e);
+        }
       });
-      return reply.send(r);
     } catch (e) {
-      recordAudit(db, {
-        actor: user.username, action: 'install-node', target: `${id}/${module}`,
-        result: 'fail', detail: (e as Error).message,
-      });
-      if (e instanceof AdminApiError) {
-        // 实例说不行是 400（配置问题，现场能改）；连不上实例是 502（不是现场的错）
-        return reply.code(e.status >= 400 && e.status < 500 ? 400 : 502)
-          .send({ error: e.message });
-      }
-      return fail(reply, e);
+      return ctx.fail(reply, e);
     }
   });
 

@@ -17,6 +17,8 @@ import { generatePassword } from '../auth/crypto.ts';
 import { validatePortMappings, recommendPorts, type PortRange, type PortMapping } from './ports.ts';
 import { HealthProbe, analyzeLogs, judge, type InstanceHealth } from '../health/probes.ts';
 import { readHostStats, isExhausted, type HostStats } from '../health/host-stats.ts';
+import type { InstanceOperationLease } from './operation-gate.ts';
+import { InstanceOperationGate } from './operation-gate.ts';
 
 export class ServiceError extends Error {
   constructor(message: string) {
@@ -58,6 +60,7 @@ export interface InstanceServiceOptions {
   db: Db;
   repo: InstanceRepo;
   docker: DockerClient;
+  gate: InstanceOperationGate;
   basePath: string;
   portRange: PortRange;
   /** 允许创建的镜像 tag 白名单 */
@@ -147,6 +150,15 @@ export class InstanceService {
   }
 
   async create(input: CreateInstanceInput): Promise<InstanceView> {
+    return this.o.gate.run(input.id, 'create-instance',
+      async (lease) => this.createUnderLease(input, lease));
+  }
+
+  async createUnderLease(
+    input: CreateInstanceInput,
+    lease: InstanceOperationLease,
+  ): Promise<InstanceView> {
+    this.o.gate.assertLease(lease, input.id, ['create-instance']);
     assertValidId(input.id);
     if (!input.name.trim()) throw new ServiceError('实例名称不能为空');
     if (!this.o.allowedImageTags.includes(input.imageTag)) {
@@ -235,6 +247,16 @@ export class InstanceService {
   }
 
   async start(id: string, actor: string): Promise<void> {
+    return this.o.gate.run(id, 'start-instance',
+      async (lease) => this.startUnderLease(id, lease, actor));
+  }
+
+  async startUnderLease(
+    id: string,
+    lease: InstanceOperationLease,
+    actor: string,
+  ): Promise<void> {
+    this.o.gate.assertLease(lease, id, ['start-instance']);
     this.assertExists(id);
     await this.o.docker.assertManaged(id);
     await this.o.docker.start(id);
@@ -242,6 +264,16 @@ export class InstanceService {
   }
 
   async stop(id: string, actor: string): Promise<void> {
+    return this.o.gate.run(id, 'stop-instance',
+      async (lease) => this.stopUnderLease(id, lease, actor));
+  }
+
+  async stopUnderLease(
+    id: string,
+    lease: InstanceOperationLease,
+    actor: string,
+  ): Promise<void> {
+    this.o.gate.assertLease(lease, id, ['stop-instance']);
     this.assertExists(id);
     await this.o.docker.assertManaged(id);
     await this.o.docker.stop(id);
@@ -250,6 +282,16 @@ export class InstanceService {
 
   /** 删除实例；是否连带删除数据卷由调用方显式指定，绝不默认删数据 */
   async remove(id: string, opts: { removeData: boolean; actor: string }): Promise<void> {
+    return this.o.gate.run(id, 'remove-instance',
+      async (lease) => this.removeUnderLease(id, lease, opts));
+  }
+
+  async removeUnderLease(
+    id: string,
+    lease: InstanceOperationLease,
+    opts: { removeData: boolean; actor: string },
+  ): Promise<void> {
+    this.o.gate.assertLease(lease, id, ['remove-instance']);
     this.assertExists(id);
     await this.o.docker.assertManaged(id).catch(() => undefined);
     await this.o.docker.remove(id, { removeData: opts.removeData }).catch(() => undefined);
@@ -262,6 +304,17 @@ export class InstanceService {
 
   /** 重置实例账号口令：改仓储 → 重写 settings.js → 重启实例 */
   async resetCredential(id: string, username: string, actor: string): Promise<string> {
+    return this.o.gate.run(id, 'reset-credential',
+      async (lease) => this.resetCredentialUnderLease(id, lease, username, actor));
+  }
+
+  async resetCredentialUnderLease(
+    id: string,
+    lease: InstanceOperationLease,
+    username: string,
+    actor: string,
+  ): Promise<string> {
+    this.o.gate.assertLease(lease, id, ['reset-credential']);
     const inst = this.o.repo.get(id);
     if (!inst) throw new ServiceError(`实例 ${id} 不存在`);
 
@@ -310,6 +363,16 @@ export class InstanceService {
    * 而替用户把停掉的实例拉起来是越权的动作（人家可能是故意停的）。
    */
   async applyNodePolicy(id: string, actor: string): Promise<{ restarted: boolean }> {
+    return this.o.gate.run(id, 'apply-node-policy',
+      async (lease) => this.applyNodePolicyUnderLease(id, lease, actor));
+  }
+
+  async applyNodePolicyUnderLease(
+    id: string,
+    lease: InstanceOperationLease,
+    actor: string,
+  ): Promise<{ restarted: boolean }> {
+    this.o.gate.assertLease(lease, id, ['apply-node-policy']);
     const inst = this.o.repo.get(id);
     if (!inst) throw new ServiceError(`实例 ${id} 不存在`);
     await this.o.docker.assertManaged(id);
@@ -356,6 +419,17 @@ export class InstanceService {
   async upgradeImage(
     id: string, imageTag: string, actor: string,
   ): Promise<{ from: string; to: string; rolledBack: boolean }> {
+    return this.o.gate.run(id, 'upgrade-image',
+      async (lease) => this.upgradeImageUnderLease(id, lease, imageTag, actor));
+  }
+
+  async upgradeImageUnderLease(
+    id: string,
+    lease: InstanceOperationLease,
+    imageTag: string,
+    actor: string,
+  ): Promise<{ from: string; to: string; rolledBack: boolean }> {
+    this.o.gate.assertLease(lease, id, ['upgrade-image']);
     const inst = this.o.repo.get(id);
     if (!inst) throw new ServiceError(`实例 ${id} 不存在`);
     if (!this.o.allowedImageTags.includes(imageTag)) {

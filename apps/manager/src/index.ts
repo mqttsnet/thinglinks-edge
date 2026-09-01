@@ -10,6 +10,11 @@ import { requireMasterKey, deriveKey } from './core/auth/crypto.ts';
 import { AuthService } from './core/auth/service.ts';
 import { InstanceRepo } from './core/instance/repo.ts';
 import { InstanceService } from './core/instance/service.ts';
+import {
+  InstanceOperationGate,
+  InstanceRepositoryOperationPolicy,
+} from './core/instance/operation-gate.ts';
+import { ProxySessionRegistry } from './core/instance/proxy-session-registry.ts';
 import { DockerClient } from './core/instance/docker-client.ts';
 import { reconcileInstanceNetworks } from './core/instance/network-reconcile.ts';
 import { buildServer, type ServerDeps } from './http/app.ts';
@@ -243,6 +248,8 @@ export async function main(): Promise<void> {
   // 主密钥同时用于两步验证的 TOTP 密钥加密，与实例凭据同一套
   const auth = new AuthService(db, key);
   const repo = new InstanceRepo(db, key);
+  const operationGate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repo));
+  const proxySessions = new ProxySessionRegistry();
 
   /*
    * 账号从哪来，两条路：
@@ -392,7 +399,7 @@ export async function main(): Promise<void> {
     npmRegistry: npmRegistryUrl || undefined,
   });
   const service = new InstanceService({
-    db, repo, docker,
+    db, repo, docker, gate: operationGate,
     basePath: config.basePath,
     portRange: config.portRange,
     allowedImageTags: (process.env['ALLOWED_IMAGE_TAGS'] ??
@@ -627,7 +634,8 @@ export async function main(): Promise<void> {
 
   const app = buildServer({
     ...platformNodeServices.serverDeps,
-    config, db, auth, repo, service, spool, metrics, drainer, outages,
+    config, db, auth, repo, service, operationGate, proxySessions,
+    spool, metrics, drainer, outages,
     cloud, cloudConfig,
     cloudSink: (payload) => cloud.publish(payload),
     webRoot: process.env['WEB_ROOT']?.trim() || undefined,

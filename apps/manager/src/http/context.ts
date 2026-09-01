@@ -26,6 +26,8 @@ import type { ValueHistory } from '../core/edge/history.ts';
 import type { UpstreamRegistry } from '../core/nodes/upstream.ts';
 import type { NpmSourceRepo } from '../core/nodes/sources.ts';
 import type { PlatformPackageService } from '../core/nodes/platform-package.ts';
+import { InstanceBusyError, type InstanceOperationGate } from '../core/instance/operation-gate.ts';
+import type { ProxySessionRegistry } from '../core/instance/proxy-session-registry.ts';
 
 export const SID = 'tle_sid';
 export const CSRF = 'tle_csrf';
@@ -36,6 +38,10 @@ export interface ServerDeps {
   auth: AuthService;
   repo: InstanceRepo;
   service: InstanceService;
+  /** 所有运行期实例写操作共用的唯一闸门；路由不得自行构造。 */
+  operationGate: InstanceOperationGate;
+  /** 反代层现存 WebSocket 的唯一登记表；迁移核心只依赖这个 core port。 */
+  proxySessions: ProxySessionRegistry;
   /** 实例上游地址；默认按容器名解析（Manager 与实例同处一个 docker 网络） */
   upstreamFor?: (instanceId: string) => string;
   /** 控制台前端产物目录。留空则不托管（宿主开发态走 Vite） */
@@ -110,6 +116,8 @@ export interface HttpContext {
   auth: AuthService;
   repo: InstanceRepo;
   service: InstanceService;
+  operationGate: InstanceOperationGate;
+  proxySessions: ProxySessionRegistry;
   upstreamFor: (instanceId: string) => string;
   currentUser: (req: { cookies: Record<string, string | undefined> }) => ReturnType<AuthService['resolve']>;
   /**
@@ -176,6 +184,8 @@ export function createContext(deps: ServerDeps): HttpContext {
     auth,
     repo: deps.repo,
     service: deps.service,
+    operationGate: deps.operationGate,
+    proxySessions: deps.proxySessions,
     upstreamFor: deps.upstreamFor ?? defaultUpstream,
     currentUser,
     canSeeInstance: (user, instanceId) =>
@@ -249,7 +259,12 @@ export function createContext(deps: ServerDeps): HttpContext {
       }
       return user;
     },
-    fail: (reply, e) => reply.code(400).send({ error: (e as Error).message }),
+    fail: (reply, e) => reply
+      .code(e instanceof InstanceBusyError ? 409 : 400)
+      .send({
+        error: (e as Error).message,
+        ...(e instanceof InstanceBusyError ? { code: e.code } : {}),
+      }),
     instanceIdFromUrl: (url: string) => {
       const re = new RegExp(`^${config.basePath}/red/([^/?]+)`);
       return re.exec(url)?.[1];

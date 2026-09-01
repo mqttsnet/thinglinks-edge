@@ -22,7 +22,7 @@ import type { HttpContext } from '../context.ts';
 import { targetFor, failTemplate as fail } from './flows-target.ts';
 
 export function registerFlows(api: FastifyInstance, ctx: HttpContext): void {
-  const { config, db, guard } = ctx;
+  const { config, db, guard, operationGate } = ctx;
   const templates = new TemplateRepo(db);
 
   // ── 从实例导出 ────────────────────────────────────
@@ -64,84 +64,89 @@ export function registerFlows(api: FastifyInstance, ctx: HttpContext): void {
     const user = guard(req, reply, { csrf: true, need: 'instance:operate', instance: id });
     if (!user) return;
 
-    const b = (req.body ?? {}) as Record<string, unknown>;
-    const templateId = typeof b['templateId'] === 'string' ? b['templateId'] : '';
-    const dryRun = b['dryRun'] === true;
-
-    const t = targetFor(ctx, id);
-    if ('error' in t) return reply.code(t.code).send({ error: t.error });
-
     try {
-      let flows;
-      let label: string;
-      if (templateId !== '') {
-        const tpl = templates.getWithContent(templateId);
-        if (!tpl) return reply.code(404).send({ error: '模板不存在' });
-        flows = tpl.flows;
-        label = tpl.name;
-      } else if (b['flows'] !== undefined) {
-        flows = parseFlows(b['flows']);
-        label = '直接提交的流程';
-      } else {
-        return reply.code(400).send({ error: '需要 templateId 或 flows 之一' });
-      }
+      return await operationGate.run(id, 'flow-write', async () => {
+        const b = (req.body ?? {}) as Record<string, unknown>;
+        const templateId = typeof b['templateId'] === 'string' ? b['templateId'] : '';
+        const dryRun = b['dryRun'] === true;
+        const t = targetFor(ctx, id);
+        if ('error' in t) return reply.code(t.code).send({ error: t.error });
 
-      const s = summarize(flows);
-      /*
-       * 兼容性检查取不到清单时不阻断部署：拿不到不等于不兼容，
-       * 硬拦会让「实例的 /nodes 暂时不可达」变成「模板永远套不上」。
-       *
-       * 但**默认值必须标成 `checked: false`**：这时的 `ok: true` 是
-       * 「没查」而不是「查过没问题」，两者混在一起，界面就会对着一次
-       * 没做成的检查显示绿色的「节点齐全，可以套用」。
-       */
-      let compat: CompatResult = { ok: true, checked: false, missing: [] };
-      try {
-        compat = checkCompatibility(s.nodeTypes, await getInstalledTypes(t));
-      } catch { /* 拿不到清单就跳过这一步，下面照常部署 */ }
+        try {
+          let flows;
+          let label: string;
+          if (templateId !== '') {
+            const tpl = templates.getWithContent(templateId);
+            if (!tpl) return reply.code(404).send({ error: '模板不存在' });
+            flows = tpl.flows;
+            label = tpl.name;
+          } else if (b['flows'] !== undefined) {
+            flows = parseFlows(b['flows']);
+            label = '直接提交的流程';
+          } else {
+            return reply.code(400).send({ error: '需要 templateId 或 flows 之一' });
+          }
 
-      if (dryRun) {
-        return reply.send({
-          dryRun: true, ...s, compat,
-          warnings: scanInlineSecrets(flows),
-          note: !compat.checked
-            ? '没能读到目标实例已装的节点清单，所以这次并没有确认过节点是否齐全。'
-              + '可以继续套用，但万一缺节点，Node-RED 不会报错——流程会套上、就是不出数。'
-            : compat.ok
-              ? '目标实例已装齐所需节点，可以套用'
-              : `目标实例缺少 ${compat.missing.length} 种节点，套上去这些节点会变成坏节点且不报错`,
-        });
-      }
+          const s = summarize(flows);
+          /*
+           * 兼容性检查取不到清单时不阻断部署：拿不到不等于不兼容，
+           * 硬拦会让「实例的 /nodes 暂时不可达」变成「模板永远套不上」。
+           *
+           * 但**默认值必须标成 `checked: false`**：这时的 `ok: true` 是
+           * 「没查」而不是「查过没问题」，两者混在一起，界面就会对着一次
+           * 没做成的检查显示绿色的「节点齐全，可以套用」。
+           */
+          let compat: CompatResult = { ok: true, checked: false, missing: [] };
+          try {
+            compat = checkCompatibility(s.nodeTypes, await getInstalledTypes(t));
+          } catch { /* 拿不到清单就跳过这一步，下面照常部署 */ }
 
-      const before = await getFlows(t).catch(() => null);
-      const { status } = await setFlows(t, flows);
+          if (dryRun) {
+            return reply.send({
+              dryRun: true, ...s, compat,
+              warnings: scanInlineSecrets(flows),
+              note: !compat.checked
+                ? '没能读到目标实例已装的节点清单，所以这次并没有确认过节点是否齐全。'
+                  + '可以继续套用，但万一缺节点，Node-RED 不会报错——流程会套上、就是不出数。'
+                : compat.ok
+                  ? '目标实例已装齐所需节点，可以套用'
+                  : `目标实例缺少 ${compat.missing.length} 种节点，套上去这些节点会变成坏节点且不报错`,
+            });
+          }
 
-      recordAudit(db, {
-        actor: user.username, action: 'template-apply', target: id,
-        detail: `套用「${label}」：${s.nodeCount} 节点 / ${s.tabCount} 标签页`
-          + (compat.ok ? '' : ` · 缺节点 ${compat.missing.join(' ')}`),
-        result: 'ok',
-      });
+          const before = await getFlows(t).catch(() => null);
+          const { status } = await setFlows(t, flows);
 
-      return reply.send({
-        applied: true,
-        deployStatus: status,      // 实测 5.0.4 是 204
-        ...s,
-        compat,
-        replacedNodeCount: Array.isArray(before) ? before.length : null,
-        note: !compat.checked
-          ? '已整体替换并部署。没能读到目标实例的节点清单，未能确认节点是否齐全——'
-            + '到实例编辑器里看一眼有没有标红的节点。'
-          : compat.ok
-            ? '已整体替换并部署'
-            : `已部署，但目标实例缺少节点：${compat.missing.join('、')}——这些节点不会工作`,
+          recordAudit(db, {
+            actor: user.username, action: 'template-apply', target: id,
+            detail: `套用「${label}」：${s.nodeCount} 节点 / ${s.tabCount} 标签页`
+              + (compat.ok ? '' : ` · 缺节点 ${compat.missing.join(' ')}`),
+            result: 'ok',
+          });
+
+          return reply.send({
+            applied: true,
+            deployStatus: status,      // 实测 5.0.4 是 204
+            ...s,
+            compat,
+            replacedNodeCount: Array.isArray(before) ? before.length : null,
+            note: !compat.checked
+              ? '已整体替换并部署。没能读到目标实例的节点清单，未能确认节点是否齐全——'
+                + '到实例编辑器里看一眼有没有标红的节点。'
+              : compat.ok
+                ? '已整体替换并部署'
+                : `已部署，但目标实例缺少节点：${compat.missing.join('、')}——这些节点不会工作`,
+          });
+        } catch (e) {
+          recordAudit(db, {
+            actor: user.username, action: 'template-apply', target: id,
+            detail: (e as Error).message, result: 'fail',
+          });
+          return fail(reply, e);
+        }
       });
     } catch (e) {
-      recordAudit(db, {
-        actor: user.username, action: 'template-apply', target: id,
-        detail: (e as Error).message, result: 'fail',
-      });
-      return fail(reply, e);
+      return ctx.fail(reply, e);
     }
   });
 }
