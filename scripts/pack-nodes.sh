@@ -70,7 +70,32 @@ command -v npm >/dev/null || { echo "✗ 需要 npm" >&2; exit 1; }
 command -v curl >/dev/null || { echo "✗ 需要 curl（按 lock 里的 resolved 地址取包体）" >&2; exit 1; }
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+NEXT_DIR=""
+BACKUP_DIR=""
+OUT_ABS=""
+HAD_TARGET=0
+
+cleanup() {
+  status=$?
+  trap - EXIT
+  # 中断恰好落在 old→backup 与 next→target 之间时，把上一份放回去。
+  if [ "$HAD_TARGET" -eq 1 ] && [ -n "$BACKUP_DIR" ] \
+      && [ -e "$BACKUP_DIR" ] && [ -n "$OUT_ABS" ] && [ ! -e "$OUT_ABS" ]; then
+    mv -- "$BACKUP_DIR" "$OUT_ABS" || {
+      echo "✗ 自动回滚失败；上一份种子仍在 ${BACKUP_DIR}" >&2
+    }
+  fi
+  [ -z "$NEXT_DIR" ] || rm -rf -- "$NEXT_DIR"
+  if [ -n "$BACKUP_DIR" ] && [ -e "$BACKUP_DIR" ] \
+      && { [ -z "$OUT_ABS" ] || [ -e "$OUT_ABS" ]; }; then
+    rm -rf -- "$BACKUP_DIR"
+  fi
+  rm -rf -- "$WORK"
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 DOWNLOAD_DIR="$WORK/downloads"
 mkdir -p "$DOWNLOAD_DIR"
 
@@ -89,23 +114,40 @@ LOCK="$WORK/node_modules/.package-lock.json"
 
 # 2) 从 lock 文件里列出闭包：每行 `<name>\t<version>\t<resolved>\t<integrity>`。
 #    见文件头「闭包从 .package-lock.json 取」——嵌套的重复版本必须一个不漏。
-RESOLVED="$(node -e '
+if ! RESOLVED="$(node -e '
 const lock = require(process.argv[1]);
 const seen = new Set();
 const out = [];
+const errors = [];
 for (const [path, e] of Object.entries(lock.packages ?? {})) {
   if (path === "" || e.link || e.dev) continue;          // 根条目、软链、devDep 都不要
   const at = path.lastIndexOf("node_modules/");
   if (at < 0) continue;
   const name = e.name ?? path.slice(at + "node_modules/".length);
-  if (!e.version || !e.resolved) continue;               // 没有下载地址就打不了包
+  const missing = ["version", "resolved", "integrity"]
+    .filter((field) => typeof e[field] !== "string" || e[field].trim() === "");
+  if (missing.length > 0) {
+    errors.push(`${path} 缺 ${missing.join("/")}`);
+    continue;
+  }
   const key = `${name}@${e.version}`;
   if (seen.has(key)) continue;                           // 同名同版本在树里会出现多次
   seen.add(key);
-  out.push([name, e.version, e.resolved, e.integrity ?? ""].join("\t"));
+  out.push([name, e.version, e.resolved, e.integrity].join("\t"));
+}
+if (errors.length > 0) {
+  console.error(errors.map((error) => `✗ lock 闭包条目 ${error}`).join("\n"));
+  process.exit(1);
+}
+if (out.length === 0) {
+  console.error("✗ lock 里的可打包依赖闭包为空");
+  process.exit(1);
 }
 console.log(out.sort().join("\n"));
-' "$LOCK")"
+' "$LOCK")"; then
+  echo "✗ lock 闭包不完整，拒绝生成种子" >&2
+  exit 1
+fi
 
 COUNT="$(printf '%s\n' "$RESOLVED" | grep -c . || true)"
 echo "  闭包共 ${COUNT} 个包"
@@ -123,6 +165,23 @@ if [ ${#EXPECT_KEYS[@]} -gt 0 ]; then
 fi
 while IFS="$(printf '\t')" read -r name version url integrity; do
   [ -n "$name" ] || continue
+  package_key="${name}@${version}"
+  EXPECT_INDEX=-1
+  if [ ${#EXPECT_KEYS[@]} -gt 0 ]; then
+    for i in "${!EXPECT_KEYS[@]}"; do
+      if [ "${EXPECT_KEYS[$i]}" = "$package_key" ]; then
+        EXPECT_INDEX=$i
+        break
+      fi
+    done
+    if [ "$EXPECT_INDEX" -lt 0 ]; then
+      echo "  ✗ 未声明的闭包包 ${package_key}（expectation 模式要求集合完全一致）" >&2
+      FAIL=$((FAIL + 1))
+      continue
+    fi
+    SEEN_EXPECTS[$EXPECT_INDEX]=1
+  fi
+
   # 与 npm pack 同款文件名：去掉 scope 的 @、把斜杠换成连字符
   file="$(printf '%s' "$name" | sed 's|^@||; s|/|-|g')-${version}.tgz"
   target="${DOWNLOAD_DIR}/${file}"
@@ -150,12 +209,8 @@ while IFS="$(printf '\t')" read -r name version url integrity; do
     continue
   fi
 
-  package_key="${name}@${version}"
-  if [ ${#EXPECT_KEYS[@]} -gt 0 ]; then
-    for i in "${!EXPECT_KEYS[@]}"; do
-      [ "${EXPECT_KEYS[$i]}" = "$package_key" ] || continue
-      SEEN_EXPECTS[$i]=1
-      if ! node -e '
+  if [ "$EXPECT_INDEX" -ge 0 ]; then
+    if ! node -e '
       const { createHash } = require("node:crypto");
       const [file, integrity] = process.argv.slice(1);
       const dash = integrity.indexOf("-");
@@ -164,12 +219,11 @@ while IFS="$(printf '\t')" read -r name version url integrity; do
       const expect = integrity.slice(dash + 1);
       const got = createHash(algo).update(require("node:fs").readFileSync(file)).digest("base64");
       process.exit(got === expect ? 0 : 1);
-      ' "$target" "${EXPECT_INTEGRITIES[$i]}"; then
-        echo "  ✗ ${package_key}  expectation integrity 不匹配" >&2
-        rm -f "$target"
-        FAIL=$((FAIL + 1))
-      fi
-    done
+    ' "$target" "${EXPECT_INTEGRITIES[$EXPECT_INDEX]}"; then
+      echo "  ✗ ${package_key}  expectation integrity 不匹配" >&2
+      rm -f "$target"
+      FAIL=$((FAIL + 1))
+    fi
   fi
   [ -f "$target" ] && echo "  ✓ ${name}@${version}"
 done <<< "$RESOLVED"
@@ -189,13 +243,56 @@ if [ "$FAIL" -gt 0 ]; then
   exit 1
 fi
 
-# 只有闭包完整且所有 expectation 都匹配，才替换目标目录里的旧 tgz。
-# 失败时保持上一份可用种子不动；成功时则保证重复运行不会残留旧版本。
-mkdir -p "$OUT_DIR"
-find "$OUT_DIR" -maxdepth 1 -type f -name '*.tgz' -delete
-find "$DOWNLOAD_DIR" -maxdepth 1 -type f -name '*.tgz' -exec cp {} "$OUT_DIR/" \;
+# 只有闭包完整且所有 expectation 都匹配，才替换目标目录。
+# next 与 target 是同一父目录的兄弟，rename 不跨文件系统；old 先改名为 backup，
+# next 再原子占位。任一步失败或进程中断，EXIT trap 都会把 old 放回去。
+OUT_PARENT="$(dirname -- "$OUT_DIR")"
+OUT_BASE="$(basename -- "$OUT_DIR")"
+mkdir -p "$OUT_PARENT"
+OUT_PARENT="$(cd "$OUT_PARENT" && pwd -P)"
+OUT_ABS="${OUT_PARENT}/${OUT_BASE}"
+NEXT_DIR="$(mktemp -d "${OUT_PARENT}/.${OUT_BASE}.next.XXXXXX")"
 
-echo "  ✓ $(find "$OUT_DIR" -maxdepth 1 -type f -name '*.tgz' | wc -l | tr -d ' ') 个 .tgz 已放在 ${OUT_DIR}/"
+COPY_FAIL=0
+while IFS= read -r -d '' source; do
+  if ! cp -- "$source" "$NEXT_DIR/"; then
+    COPY_FAIL=1
+    break
+  fi
+done < <(find "$DOWNLOAD_DIR" -maxdepth 1 -type f -name '*.tgz' -print0)
+if [ "$COPY_FAIL" -ne 0 ]; then
+  echo "✗ 无法完整写入同盘候选目录；上一份种子保持不变" >&2
+  exit 1
+fi
+
+if [ -e "$OUT_ABS" ]; then
+  [ -d "$OUT_ABS" ] || { echo "✗ 输出路径不是目录：${OUT_ABS}" >&2; exit 1; }
+  BACKUP_DIR="$(mktemp -d "${OUT_PARENT}/.${OUT_BASE}.backup.XXXXXX")"
+  rmdir -- "$BACKUP_DIR"
+  HAD_TARGET=1
+  if ! mv -- "$OUT_ABS" "$BACKUP_DIR"; then
+    echo "✗ 无法暂存上一份种子；目标保持不变" >&2
+    exit 1
+  fi
+fi
+
+if ! mv -- "$NEXT_DIR" "$OUT_ABS"; then
+  if [ "$HAD_TARGET" -eq 1 ] && mv -- "$BACKUP_DIR" "$OUT_ABS"; then
+    BACKUP_DIR=""
+    echo "✗ 替换种子目录失败，已恢复上一份" >&2
+  else
+    echo "✗ 替换种子目录失败；自动回滚也失败，请从 ${BACKUP_DIR} 恢复" >&2
+  fi
+  exit 1
+fi
+NEXT_DIR=""
+
+if [ "$HAD_TARGET" -eq 1 ]; then
+  rm -rf -- "$BACKUP_DIR"
+  BACKUP_DIR=""
+fi
+
+echo "  ✓ $(find "$OUT_ABS" -maxdepth 1 -type f -name '*.tgz' | wc -l | tr -d ' ') 个 .tgz 已放在 ${OUT_DIR}/"
 echo
 echo "  用法一（随离线包发）： NODE_SEED_DIR=${OUT_DIR} ./scripts/build-offline-bundle.sh"
 echo "  用法二（现场直接放）： 拷进 <EDGE_DATA_ROOT>/manager/npm-seed/ 后重启 manager"

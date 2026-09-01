@@ -30,7 +30,9 @@ const packScript = join(import.meta.dirname, '../../../../../scripts/pack-nodes.
 
 interface PackerFixture {
   root: string;
+  bin: string;
   out: string;
+  lock: string;
   edge: Buffer;
   common: Buffer;
   edgeKey: string;
@@ -78,7 +80,7 @@ function packerFixture(): PackerFixture {
   chmodSync(npm, 0o755);
 
   return {
-    root, out, edge, common, edgeKey, commonKey,
+    root, bin, out, lock, edge, common, edgeKey, commonKey,
     edgeIntegrity: sri(edge), commonIntegrity: sri(common),
     env: {
       ...process.env,
@@ -170,6 +172,18 @@ test('pack-nodes 按 expectation 保留原始闭包字节并清除旧 tgz', () =
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
+test('pack-nodes 不带 expectation 时仍保留通用依赖闭包行为', () => {
+  const f = packerFixture();
+  try {
+    const r = runPacker(f, [f.edgeKey]);
+    assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+    assert.deepEqual(readdirSync(f.out).sort(), [
+      'fixture-common-1.0.0.tgz',
+      'fixture-edge-1.0.0.tgz',
+    ]);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
 test('pack-nodes 拒绝 expectation 中缺失的闭包条目', () => {
   const f = packerFixture();
   try {
@@ -193,4 +207,213 @@ test('pack-nodes 拒绝 expectation 与原始 tarball 字节漂移', () => {
     assert.notEqual(r.status, 0);
     assert.match(r.stderr, /expectation integrity 不匹配/);
   } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('pack-nodes 替换目录失败时回滚并完整保留上一份种子', () => {
+  const f = packerFixture();
+  try {
+    const old = Buffer.from('previous-valid-seed');
+    writeFileSync(join(f.out, 'previous-1.0.0.tgz'), old);
+    writeFileSync(join(f.out, 'release.txt'), 'previous');
+
+    const countFile = join(f.root, 'mv-count');
+    const fakeMv = join(f.bin, 'mv');
+    writeFileSync(fakeMv, [
+      '#!/usr/bin/env sh',
+      'count=0',
+      '[ ! -f "$FAKE_MV_COUNT" ] || count="$(cat "$FAKE_MV_COUNT")"',
+      'count=$((count + 1))',
+      'printf "%s" "$count" > "$FAKE_MV_COUNT"',
+      '[ "$count" -ne 2 ] || exit 73',
+      'exec /bin/mv "$@"',
+      '',
+    ].join('\n'));
+    chmodSync(fakeMv, 0o755);
+    f.env['FAKE_MV_COUNT'] = countFile;
+
+    const r = runPacker(f, [
+      '--expect', `${f.edgeKey}=${f.edgeIntegrity}`,
+      '--expect', `${f.commonKey}=${f.commonIntegrity}`,
+      f.edgeKey,
+    ]);
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /替换种子目录失败.*已恢复上一份/);
+    assert.deepEqual(readdirSync(f.out).sort(), ['previous-1.0.0.tgz', 'release.txt']);
+    assert.deepEqual(readFileSync(join(f.out, 'previous-1.0.0.tgz')), old);
+    assert.equal(readFileSync(join(f.out, 'release.txt'), 'utf8'), 'previous');
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('pack-nodes 候选目录复制失败时不触碰上一份种子', () => {
+  const f = packerFixture();
+  try {
+    const old = Buffer.from('previous-valid-seed');
+    writeFileSync(join(f.out, 'previous-1.0.0.tgz'), old);
+
+    const fakeCp = join(f.bin, 'cp');
+    writeFileSync(fakeCp, [
+      '#!/usr/bin/env sh',
+      'case "$*" in *.next.*) exit 74 ;; esac',
+      'exec /bin/cp "$@"',
+      '',
+    ].join('\n'));
+    chmodSync(fakeCp, 0o755);
+
+    const r = runPacker(f, [f.edgeKey]);
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /无法完整写入同盘候选目录.*上一份种子保持不变/);
+    assert.deepEqual(readdirSync(f.out), ['previous-1.0.0.tgz']);
+    assert.deepEqual(readFileSync(join(f.out, 'previous-1.0.0.tgz')), old);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('pack-nodes 拒绝缺 version、resolved 或 integrity 的闭包条目', async (t) => {
+  for (const field of ['version', 'resolved', 'integrity'] as const) {
+    await t.test(`缺 ${field}`, () => {
+      const f = packerFixture();
+      try {
+        const lock = JSON.parse(readFileSync(f.lock, 'utf8')) as {
+          packages: Record<string, Record<string, unknown>>;
+        };
+        delete lock.packages['node_modules/@fixture/edge']![field];
+        writeFileSync(f.lock, JSON.stringify(lock));
+        const r = runPacker(f, [f.edgeKey]);
+        assert.notEqual(r.status, 0);
+        assert.match(r.stderr, new RegExp(`缺 ${field}`));
+        assert.deepEqual(readdirSync(f.out), []);
+      } finally { rmSync(f.root, { recursive: true, force: true }); }
+    });
+  }
+});
+
+test('pack-nodes 有 expectation 时拒绝闭包中的额外包', () => {
+  const f = packerFixture();
+  try {
+    const r = runPacker(f, [
+      '--expect', `${f.edgeKey}=${f.edgeIntegrity}`,
+      f.edgeKey,
+    ]);
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /未声明的闭包包.*@fixture\/common@1\.0\.0/);
+    assert.deepEqual(readdirSync(f.out), []);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+const productionSeed = {
+  'mqttsnet-thinglinks-edge-nodes-0.0.1.tgz':
+    'sha512-NKsIKyUHNyB+xuXNpCrOqzEYbYflEFeXqC/IgjM2/+AzktSTb7+TZFBWHoqp9FjLDX2crpoah6gn8n+Uy32AkA==',
+  'mqttsnet-thinglinks-node-red-common-0.0.1.tgz':
+    'sha512-T6QN9RlBF0qbvujaAKNY81BjrcIdbqeqFkLfQsGuKHI8UY2cgad9prF8xUC5n4BbHbNJ7ftBmSBkj+IEZvTJWQ==',
+} as const;
+
+test('Docker builder 带 bash、curl 与精确生产种子', {
+  skip: process.env['TLE_PLATFORM_BUILDER_IMAGE'] ? false : '仅发布制品门禁运行',
+}, () => {
+  const image = process.env['TLE_PLATFORM_BUILDER_IMAGE']!;
+  const r = spawnSync('docker', [
+    'run', '--rm', '--entrypoint', 'sh', image, '-c',
+    'command -v bash; command -v curl; find /out/npm-seed -maxdepth 1 -type f -name "*.tgz" -print',
+  ], { encoding: 'utf8' });
+  assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+  const lines = r.stdout.trim().split('\n').sort();
+  assert.deepEqual(lines, [
+    '/bin/bash',
+    '/out/npm-seed/mqttsnet-thinglinks-edge-nodes-0.0.1.tgz',
+    '/out/npm-seed/mqttsnet-thinglinks-node-red-common-0.0.1.tgz',
+    '/usr/bin/curl',
+  ].sort());
+});
+
+test('Docker runtime 只有精确生产种子、保留 raw bundle 且没有 bash/curl', {
+  skip: process.env['TLE_PLATFORM_RUNTIME_IMAGE'] ? false : '仅发布制品门禁运行',
+}, () => {
+  const image = process.env['TLE_PLATFORM_RUNTIME_IMAGE']!;
+  const inspect = `
+    import { createHash } from 'node:crypto';
+    import { existsSync, readFileSync, readdirSync } from 'node:fs';
+    import { spawnSync } from 'node:child_process';
+    import { readPackage } from '/app/dist/core/nodes/store.js';
+    const files = readdirSync('/app/npm-seed').filter((f) => f.endsWith('.tgz')).sort();
+    const buffers = Object.fromEntries(files.map((file) => [file, readFileSync('/app/npm-seed/' + file)]));
+    const integrities = Object.fromEntries(files.map((file) => [file,
+      'sha512-' + createHash('sha512').update(buffers[file]).digest('base64')]));
+    const metadata = Object.fromEntries(files.map((file) => {
+      const meta = readPackage(buffers[file]);
+      return [file, { name: meta.name, version: meta.version,
+        hasNodeRedMetadata: meta.hasNodeRedMetadata, types: meta.types }];
+    }));
+    console.log(JSON.stringify({
+      files, integrities, metadata,
+      rawBundle: existsSync('/app/nodes/tl-device.js'),
+      bash: spawnSync('bash').error?.code ?? 'present',
+      curl: spawnSync('curl').error?.code ?? 'present',
+    }));
+  `;
+  const r = spawnSync('docker', [
+    'run', '--rm', '--entrypoint', 'node', image, '--input-type=module', '-e', inspect,
+  ], { encoding: 'utf8' });
+  assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+  const observed = JSON.parse(r.stdout) as {
+    files: string[];
+    integrities: Record<string, string>;
+    metadata: Record<string, {
+      name: string;
+      version: string;
+      hasNodeRedMetadata: boolean;
+      types: string[];
+    }>;
+    rawBundle: boolean;
+    bash: string;
+    curl: string;
+  };
+  assert.deepEqual(observed.files, Object.keys(productionSeed).sort());
+  assert.deepEqual(observed.integrities, productionSeed);
+  assert.deepEqual(observed.metadata['mqttsnet-thinglinks-edge-nodes-0.0.1.tgz'], {
+    name: '@mqttsnet/thinglinks-edge-nodes',
+    version: '0.0.1',
+    hasNodeRedMetadata: true,
+    types: ['tl-device', 'tl-tag', 'tl-uplink'],
+  });
+  assert.deepEqual(observed.metadata['mqttsnet-thinglinks-node-red-common-0.0.1.tgz'], {
+    name: '@mqttsnet/thinglinks-node-red-common',
+    version: '0.0.1',
+    hasNodeRedMetadata: false,
+    types: [],
+  });
+  assert.equal(observed.rawBundle, true);
+  assert.equal(observed.bash, 'ENOENT');
+  assert.equal(observed.curl, 'ENOENT');
+});
+
+test('离线包 manifest SRI 与 SHA256SUMS 精确覆盖两个生产 tarball', {
+  skip: process.env['TLE_PLATFORM_OFFLINE_BUNDLE'] ? false : '仅发布制品门禁运行',
+}, () => {
+  const bundle = process.env['TLE_PLATFORM_OFFLINE_BUNDLE']!;
+  const listed = spawnSync('tar', ['-tzf', bundle], { encoding: 'utf8' });
+  assert.equal(listed.status, 0, listed.stderr);
+  const entries = listed.stdout.trim().split('\n');
+  const entry = (suffix: string) => {
+    const found = entries.find((candidate) => candidate.endsWith(suffix));
+    assert.ok(found, `离线包缺 ${suffix}`);
+    return found;
+  };
+  const readEntry = (suffix: string): Buffer => {
+    const r = spawnSync('tar', ['-xOzf', bundle, entry(suffix)]);
+    assert.equal(r.status, 0, String(r.stderr));
+    return r.stdout;
+  };
+
+  const manifest = JSON.parse(readEntry('/manifest.json').toString()) as {
+    nodeSeed: string[];
+    nodeSeedIntegrity: Record<string, string>;
+  };
+  assert.deepEqual(manifest.nodeSeed, Object.keys(productionSeed).sort());
+  assert.deepEqual(manifest.nodeSeedIntegrity, productionSeed);
+
+  const sums = readEntry('/SHA256SUMS').toString();
+  for (const file of Object.keys(productionSeed)) {
+    const tarball = readEntry(`/node-seed/${file}`);
+    const sha256 = createHash('sha256').update(tarball).digest('hex');
+    assert.match(sums, new RegExp(`^${sha256}  node-seed/${file.replaceAll('.', '\\.')}$`, 'm'));
+  }
 });
