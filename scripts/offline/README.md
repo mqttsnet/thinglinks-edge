@@ -37,18 +37,21 @@ docker-compose.offline.yml  离线覆盖层：pull_policy: never
 .env.example                配置模板
 install.sh                  安装脚本
 manifest.json               版本、架构、各镜像 ID —— 现场核对与售后追溯用
-SHA256SUMS                  校验和
+SHA256SUMS                  镜像、部署文件以及每个 node-seed/*.tgz 的校验和
 changelogs/                 变更说明
 ```
 
 `manifest.json` 里列了随包的 Node-RED 版本，创建实例时只能选这几个 ——
 白名单之外的版本在离线现场没有镜像，创建会被当场拒绝并说明原因。
+`nodeSeed` 与 `nodeSeedIntegrity` 还会列出随包节点的文件名和原始 SHA-512 SRI；
+平台 Edge/common 两个固定包可以据此与发布合同逐字核对。
 
 ## 第三方 Node-RED 节点
 
 离线现场也装得上 —— Manager 自带一个私有 npm 源，实例的节点安装走它，
-不需要连 npmjs.org。包里另外还带着 `@thinglinks` 自有节点
-（设备注册、点位上报、上行出口），它们随镜像发布、不走 npm。
+不需要连 npmjs.org。镜像固定预置已发布的
+`@mqttsnet/thinglinks-edge-nodes@0.0.1` 及其 common 依赖；第一版兼容镜像仍保留
+`/app/nodes` 原始节点副本，现有 legacy 实例继续按原路径使用，二者不能混作一份包。
 
 节点要经过**两道闸**才装得上，两道都要过：
 

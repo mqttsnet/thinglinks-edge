@@ -25,6 +25,7 @@ import type { NodeCatalog } from '../core/nodes/catalog.ts';
 import type { ValueHistory } from '../core/edge/history.ts';
 import type { UpstreamRegistry } from '../core/nodes/upstream.ts';
 import type { NpmSourceRepo } from '../core/nodes/sources.ts';
+import type { PlatformPackageService } from '../core/nodes/platform-package.ts';
 
 export const SID = 'tle_sid';
 export const CSRF = 'tle_csrf';
@@ -75,6 +76,8 @@ export interface ServerDeps {
    */
   nodeStore?: NodeStore | undefined;
   nodeCatalog?: NodeCatalog | undefined;
+  /** 启动时已校验并建立基线的唯一平台包服务；固定包 HTTP 响应必须复用它。 */
+  platformPackages: PlatformPackageService;
   /** 实例容器视角的私有源地址，用于生成 packument 里的包体 URL */
   npmRegistryUrl?: string | undefined;
   /**

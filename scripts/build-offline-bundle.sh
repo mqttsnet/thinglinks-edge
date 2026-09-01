@@ -121,7 +121,8 @@ fi
 # 4) 清单：装了什么、什么架构、什么时候打的。现场核对与售后追溯都靠它
 node -e '
 const { execFileSync } = require("node:child_process");
-const { readdirSync, existsSync, writeFileSync } = require("node:fs");
+const { createHash } = require("node:crypto");
+const { readdirSync, readFileSync, existsSync, writeFileSync } = require("node:fs");
 const [stage, version, arch, ...images] = process.argv.slice(1);
 const digest = (img) => JSON.parse(execFileSync("docker",
   ["image", "inspect", img, "--format", "{{json .Id}}"], { encoding: "utf8" }));
@@ -129,6 +130,10 @@ const seedDir = `${stage}/node-seed`;
 const nodeSeed = existsSync(seedDir)
   ? readdirSync(seedDir).filter((f) => f.endsWith(".tgz")).sort()
   : [];
+const nodeSeedIntegrity = Object.fromEntries(nodeSeed.map((file) => [
+  file,
+  `sha512-${createHash("sha512").update(readFileSync(`${seedDir}/${file}`)).digest("base64")}`,
+]));
 writeFileSync(`${stage}/manifest.json`, JSON.stringify({
   product: "thinglinks-edge",
   version, platform: `linux/${arch}`,
@@ -136,6 +141,8 @@ writeFileSync(`${stage}/manifest.json`, JSON.stringify({
   images: images.map((image) => ({ image, id: digest(image) })),
   // 现场要能回答「这批包里到底带了哪些节点」，而不是去数目录
   nodeSeed,
+  // 与 Manager 的固定 SRI 合同可以直接对照；SHA256SUMS 另管整个离线包传输完整性
+  nodeSeedIntegrity,
 }, null, 2) + "\n");
 ' "$STAGE" "$VERSION" "$ARCH" "${IMAGES[@]}"
 

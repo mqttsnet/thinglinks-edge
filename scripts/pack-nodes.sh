@@ -4,6 +4,7 @@
 #
 #   ./scripts/pack-nodes.sh node-red-contrib-modbus node-red-node-serialport
 #   ./scripts/pack-nodes.sh --out /tmp/seed node-red-contrib-s7
+#   ./scripts/pack-nodes.sh --expect name@1.0.0=sha512-... name@1.0.0
 #
 # 产出目录里全是 .tgz，直接拷进现场的 <EDGE_DATA_ROOT>/manager/npm-seed/ 重启即可，
 # 或者由 build-offline-bundle.sh 随离线包一起发。
@@ -32,23 +33,46 @@ set -euo pipefail
 
 OUT_DIR="dist-nodes"
 PKGS=()
+EXPECT_KEYS=()
+EXPECT_INTEGRITIES=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --out) shift; OUT_DIR="${1:?--out 后面要跟目录}" ;;
+    --expect)
+      shift
+      spec="${1:?--expect 后面要跟 name@version=integrity}"
+      key="${spec%%=*}"
+      integrity="${spec#*=}"
+      if [ "$key" = "$spec" ] || [ -z "$key" ] || [ -z "$integrity" ]; then
+        echo "--expect 格式错误：${spec}（应为 name@version=integrity）" >&2
+        exit 2
+      fi
+      if [ ${#EXPECT_KEYS[@]} -gt 0 ]; then
+        for existing in "${EXPECT_KEYS[@]}"; do
+          [ "$existing" != "$key" ] || { echo "重复 expectation：${key}" >&2; exit 2; }
+        done
+      fi
+      EXPECT_KEYS+=("$key")
+      EXPECT_INTEGRITIES+=("$integrity")
+      ;;
     -*) echo "未知参数：$1" >&2; exit 2 ;;
     *) PKGS+=("$1") ;;
   esac
   shift
 done
 
-[ ${#PKGS[@]} -gt 0 ] || { echo "用法：$0 [--out 目录] <包名>..." >&2; exit 2; }
+[ ${#PKGS[@]} -gt 0 ] || {
+  echo "用法：$0 [--out 目录] [--expect name@version=integrity] <包名>..." >&2
+  exit 2
+}
 
 command -v npm >/dev/null || { echo "✗ 需要 npm" >&2; exit 1; }
 command -v curl >/dev/null || { echo "✗ 需要 curl（按 lock 里的 resolved 地址取包体）" >&2; exit 1; }
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
-mkdir -p "$OUT_DIR"
+DOWNLOAD_DIR="$WORK/downloads"
+mkdir -p "$DOWNLOAD_DIR"
 
 echo "── 解析依赖闭包 ──"
 printf '  %s\n' "${PKGS[@]}"
@@ -57,7 +81,7 @@ echo
 # 1) 先装一遍，让 npm 自己把闭包解出来。
 #    --ignore-scripts：我们只要清单，不要在打包机上跑陌生包的安装脚本
 echo '{"name":"tle-node-seed","version":"1.0.0","private":true}' > "$WORK/package.json"
-( cd "$WORK" && npm install --omit=dev --ignore-scripts --no-audit --no-fund \
+( cd "$WORK" && npm install --cache "$WORK/npm-cache" --omit=dev --ignore-scripts --no-audit --no-fund \
     --loglevel=error -- "${PKGS[@]}" ) || { echo "✗ 依赖解析失败" >&2; exit 1; }
 
 LOCK="$WORK/node_modules/.package-lock.json"
@@ -92,15 +116,19 @@ echo
 #    的处理差异产生与上游不一致的内容，内容一变校验值就对不上上游，
 #    将来想核对来源就无从下手。下完立刻按 integrity 核对。
 echo "── 下载包体 ──"
-cd "$OUT_DIR"
 FAIL=0
+SEEN_EXPECTS=()
+if [ ${#EXPECT_KEYS[@]} -gt 0 ]; then
+  for _ in "${EXPECT_KEYS[@]}"; do SEEN_EXPECTS+=(0); done
+fi
 while IFS="$(printf '\t')" read -r name version url integrity; do
   [ -n "$name" ] || continue
   # 与 npm pack 同款文件名：去掉 scope 的 @、把斜杠换成连字符
   file="$(printf '%s' "$name" | sed 's|^@||; s|/|-|g')-${version}.tgz"
-  if ! curl -fsSL --retry 2 -o "$file" -- "$url"; then
+  target="${DOWNLOAD_DIR}/${file}"
+  if ! curl -fsSL --retry 2 -o "$target" -- "$url"; then
     echo "  ✗ ${name}@${version}  取不到： $url" >&2
-    rm -f "$file"
+    rm -f "$target"
     FAIL=$((FAIL + 1))
     continue
   fi
@@ -115,22 +143,60 @@ while IFS="$(printf '\t')" read -r name version url integrity; do
     const expect = first.slice(dash + 1);
     const got = createHash(algo).update(require("node:fs").readFileSync(file)).digest("base64");
     process.exit(got === expect ? 0 : 1);
-  ' "$file" "$integrity"; then
+  ' "$target" "$integrity"; then
     echo "  ✗ ${name}@${version}  校验值不符（下坏了或上游被改过）" >&2
-    rm -f "$file"
+    rm -f "$target"
     FAIL=$((FAIL + 1))
     continue
   fi
-  echo "  ✓ ${name}@${version}"
+
+  package_key="${name}@${version}"
+  if [ ${#EXPECT_KEYS[@]} -gt 0 ]; then
+    for i in "${!EXPECT_KEYS[@]}"; do
+      [ "${EXPECT_KEYS[$i]}" = "$package_key" ] || continue
+      SEEN_EXPECTS[$i]=1
+      if ! node -e '
+      const { createHash } = require("node:crypto");
+      const [file, integrity] = process.argv.slice(1);
+      const dash = integrity.indexOf("-");
+      if (dash <= 0) process.exit(2);
+      const algo = integrity.slice(0, dash);
+      const expect = integrity.slice(dash + 1);
+      const got = createHash(algo).update(require("node:fs").readFileSync(file)).digest("base64");
+      process.exit(got === expect ? 0 : 1);
+      ' "$target" "${EXPECT_INTEGRITIES[$i]}"; then
+        echo "  ✗ ${package_key}  expectation integrity 不匹配" >&2
+        rm -f "$target"
+        FAIL=$((FAIL + 1))
+      fi
+    done
+  fi
+  [ -f "$target" ] && echo "  ✓ ${name}@${version}"
 done <<< "$RESOLVED"
+
+if [ ${#EXPECT_KEYS[@]} -gt 0 ]; then
+  for i in "${!EXPECT_KEYS[@]}"; do
+    if [ "${SEEN_EXPECTS[$i]}" != 1 ]; then
+      echo "  ✗ expectation ${EXPECT_KEYS[$i]} 不在依赖闭包" >&2
+      FAIL=$((FAIL + 1))
+    fi
+  done
+fi
 
 echo
 if [ "$FAIL" -gt 0 ]; then
-  echo "✗ 有 ${FAIL} 个包没取到 —— 缺包的种子目录到现场会装不上，请先解决" >&2
+  echo "✗ 有 ${FAIL} 项闭包下载或 expectation 校验失败 —— 目标种子目录保持不变" >&2
   exit 1
 fi
-echo "  ✓ $(ls -1 *.tgz 2>/dev/null | wc -l | tr -d ' ') 个 .tgz 已放在 ${OUT_DIR}/"
+
+# 只有闭包完整且所有 expectation 都匹配，才替换目标目录里的旧 tgz。
+# 失败时保持上一份可用种子不动；成功时则保证重复运行不会残留旧版本。
+mkdir -p "$OUT_DIR"
+find "$OUT_DIR" -maxdepth 1 -type f -name '*.tgz' -delete
+find "$DOWNLOAD_DIR" -maxdepth 1 -type f -name '*.tgz' -exec cp {} "$OUT_DIR/" \;
+
+echo "  ✓ $(find "$OUT_DIR" -maxdepth 1 -type f -name '*.tgz' | wc -l | tr -d ' ') 个 .tgz 已放在 ${OUT_DIR}/"
 echo
-echo "  用法一（随离线包发）： NODE_SEED_DIR=$(pwd) ./scripts/build-offline-bundle.sh"
+echo "  用法一（随离线包发）： NODE_SEED_DIR=${OUT_DIR} ./scripts/build-offline-bundle.sh"
 echo "  用法二（现场直接放）： 拷进 <EDGE_DATA_ROOT>/manager/npm-seed/ 后重启 manager"
 echo

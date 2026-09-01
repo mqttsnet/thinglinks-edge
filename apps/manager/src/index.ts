@@ -12,7 +12,7 @@ import { InstanceRepo } from './core/instance/repo.ts';
 import { InstanceService } from './core/instance/service.ts';
 import { DockerClient } from './core/instance/docker-client.ts';
 import { reconcileInstanceNetworks } from './core/instance/network-reconcile.ts';
-import { buildServer } from './http/app.ts';
+import { buildServer, type ServerDeps } from './http/app.ts';
 import { Spool, type FullPolicy } from './core/spool/spool.ts';
 import { SpoolDrainer } from './core/spool/drainer.ts';
 import { CloudConfigRepo } from './core/cloud/config-repo.ts';
@@ -27,6 +27,8 @@ import { buildPolicy, installModeFromEnv } from './core/nodes/policy.ts';
 import { UpstreamRegistry } from './core/nodes/upstream.ts';
 import { NpmSourceRepo } from './core/nodes/sources.ts';
 import { seedFromDir, describeSeed } from './core/nodes/seed.ts';
+import { PlatformPackageService } from './core/nodes/platform-package.ts';
+import type { RegistryDeps } from './http/nodes/registry.ts';
 import { ValueHistory, limitsFromEnv } from './core/edge/history.ts';
 import {
   readProxySettings, proxyConfigured, proxyEnvFor, proxyHasCredentials, missingInternalNoProxy,
@@ -43,6 +45,32 @@ import { hostname } from 'node:os';
 // 不会把名字带进本模块作用域。
 import { VERSION, describe } from './core/version.ts';
 export { VERSION, describe };
+
+/**
+ * 装配平台节点包的唯一运行期信任服务。
+ *
+ * generic seed 必须由调用方先导入；这里随即校验固定字节并建立 Edge 基线批准。
+ * 返回的两个依赖片段刻意都持有同一对象，避免 HTTP 层或后续实例服务各造一个
+ * 信任根，导致启动校验和请求时校验读到不同状态。
+ */
+export function assemblePlatformNodeServices(deps: {
+  store: NodeStore;
+  catalog: NodeCatalog;
+}): {
+  platformPackages: PlatformPackageService;
+  serverDeps: Pick<ServerDeps, 'platformPackages'>;
+  registryDeps: Pick<RegistryDeps, 'platformPackages'> & {
+    platformPackages: PlatformPackageService;
+  };
+} {
+  const platformPackages = new PlatformPackageService(deps);
+  platformPackages.bootstrap('system');
+  return {
+    platformPackages,
+    serverDeps: { platformPackages },
+    registryDeps: { platformPackages },
+  };
+}
 
 /**
  * 解析 Manager 自身的容器标识，用于把自己接入每个实例的独立网络。
@@ -301,6 +329,10 @@ export async function main(): Promise<void> {
     const line = describeSeed(seedDir, seedFromDir(nodeStore, seedDir));
     if (line) console.log(`[nodes] ${line}`);
   }
+  const platformNodeServices = assemblePlatformNodeServices({
+    store: nodeStore,
+    catalog: nodeCatalog,
+  });
   const npmRegistryUrl = managerContainer
     ? `http://${managerContainer}:${config.listenPort}${config.basePath}/npm/`
     : '';
@@ -594,6 +626,7 @@ export async function main(): Promise<void> {
   drainer.start();
 
   const app = buildServer({
+    ...platformNodeServices.serverDeps,
     config, db, auth, repo, service, spool, metrics, drainer, outages,
     cloud, cloudConfig,
     cloudSink: (payload) => cloud.publish(payload),
