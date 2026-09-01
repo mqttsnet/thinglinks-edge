@@ -16,6 +16,7 @@
  * 「200」是宽泛说法）。所以判断成功要看 2xx，写死 200 会把正常部署判成失败。
  */
 import { authTokenKeyFor } from '../config.ts';
+import { PLATFORM_NODE_TYPES } from '../nodes/platform-contract.ts';
 
 export class AdminApiError extends Error {
   readonly status: number;
@@ -39,6 +40,7 @@ export interface AdminTarget {
 export type FetchLike = typeof fetch;
 
 const DEFAULT_TIMEOUT_MS = 15_000;
+const PLATFORM_TYPES = new Set<string>(PLATFORM_NODE_TYPES);
 
 function withTimeout(timeoutMs: number): { signal: AbortSignal; done: () => void } {
   const ac = new AbortController();
@@ -134,8 +136,8 @@ export async function getInstalledTypes(
       signal,
     });
     if (!res.ok) throw new AdminApiError(`读取实例节点清单失败（HTTP ${res.status}）`, res.status);
-    const modules = await res.json() as Array<{ types?: string[] }>;
-    return [...new Set(modules.flatMap((m) => m.types ?? []))].sort();
+    const sets = parseNodeSets(await res.text());
+    return [...new Set(sets.flatMap((set) => set.types))].sort();
   } catch (e) {
     if (e instanceof AdminApiError) throw e;
     throw new AdminApiError(`读取实例节点清单失败：${(e as Error).message}`);
@@ -144,7 +146,21 @@ export async function getInstalledTypes(
   }
 }
 
-/** 实例上装着的一个节点模块 */
+/** Node-RED Admin API 返回的一条 node set；`file` 是可选观察证据，不是所有权证明。 */
+export interface InstalledNodeSet {
+  id: string;
+  name: string;
+  module: string;
+  version: string;
+  types: string[];
+  enabled: boolean;
+  err: string;
+  file?: string;
+  /** Node-RED 5 返回的实际字段；缺失时不猜测其安装来源。 */
+  local?: boolean;
+}
+
+/** 实例上装着的一个节点模块。 */
 export interface InstalledModule {
   module: string;
   version: string;
@@ -160,6 +176,103 @@ export interface InstalledModule {
   types: string[];
   /** 是否全部节点都处于启用状态 */
   enabled: boolean;
+  /** 每个 node set 的原始加载错误；空数组才表示没有观察到加载错误。 */
+  errors: string[];
+  /** 原始 node set，不能只靠扁平 types 推断加载或所有权状态。 */
+  nodeSets: InstalledNodeSet[];
+  /** Admin API 实际提供的 file 字段；可能为空，且不是 npm 路径证明。 */
+  observedFiles: string[];
+  source: 'builtin' | 'raw' | 'npm' | 'mixed' | 'unknown';
+  health: 'healthy' | 'conflict' | 'failed';
+}
+
+type NodeSetResponse = {
+  id?: unknown; name?: unknown; module?: unknown; version?: unknown; types?: unknown;
+  enabled?: unknown; err?: unknown; file?: unknown; local?: unknown;
+};
+
+function asNodeSet(value: unknown, fallbackModule = '', fallbackVersion = ''): InstalledNodeSet {
+  const set = (value ?? {}) as NodeSetResponse;
+  return {
+    id: typeof set.id === 'string' ? set.id : '',
+    name: typeof set.name === 'string' ? set.name : '',
+    module: typeof set.module === 'string' ? set.module : fallbackModule,
+    version: typeof set.version === 'string' ? set.version : fallbackVersion,
+    types: Array.isArray(set.types) ? set.types.filter((type): type is string => typeof type === 'string').sort() : [],
+    enabled: set.enabled !== false,
+    err: typeof set.err === 'string' ? set.err : '',
+    ...(typeof set.file === 'string' ? { file: set.file } : {}),
+    ...(typeof set.local === 'boolean' ? { local: set.local } : {}),
+  };
+}
+
+function parseNodeSets(text: string, fallbackModule = '', fallbackVersion = ''): InstalledNodeSet[] {
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    throw new AdminApiError('实例返回的节点清单不是 JSON');
+  }
+  const record = body as { name?: unknown; version?: unknown; nodes?: unknown };
+  const module = typeof record?.name === 'string' ? record.name : fallbackModule;
+  const version = typeof record?.version === 'string' ? record.version : fallbackVersion;
+  const entries = Array.isArray(body) ? body : Array.isArray(record?.nodes) ? record.nodes : undefined;
+  if (!entries) throw new AdminApiError('实例返回的节点清单格式不正确');
+  return entries.map((entry) => asNodeSet(entry, module, version));
+}
+
+function sourceForNodeSets(module: string, types: string[]): InstalledModule['source'] {
+  if (!module) return 'unknown';
+  if (module !== 'node-red') return 'npm';
+  const hasPlatformType = types.some((type) => PLATFORM_TYPES.has(type));
+  const hasBuiltinType = types.some((type) => !PLATFORM_TYPES.has(type));
+  if (hasPlatformType && hasBuiltinType) return 'mixed';
+  return hasPlatformType ? 'raw' : 'builtin';
+}
+
+/** 将同一模块的原始 node set 归并；更严格的来源与冲突判定由 inventory.ts 完成。 */
+export function moduleFromNodeSets(module: string, nodeSets: InstalledNodeSet[]): InstalledModule {
+  const orderedSets = [...nodeSets].sort((a, b) => a.id.localeCompare(b.id) || a.name.localeCompare(b.name));
+  const versions = [...new Set(orderedSets.map((set) => set.version).filter(Boolean))].sort();
+  const errors = orderedSets.map((set) => set.err).filter(Boolean);
+  const types = [...new Set(orderedSets.flatMap((set) => set.types))].sort();
+  const observedFiles = [...new Set(orderedSets.flatMap((set) => set.file ? [set.file] : []))].sort();
+  return {
+    module,
+    // Admin API does not guarantee a single version record. Pick deterministically; nodeSets retain all evidence.
+    version: versions[0] ?? '',
+    local: orderedSets.some((set) => set.local === true),
+    types,
+    enabled: orderedSets.every((set) => set.enabled),
+    errors,
+    nodeSets: orderedSets,
+    observedFiles,
+    source: sourceForNodeSets(module, types),
+    health: errors.length > 0 ? 'failed' : 'healthy',
+  };
+}
+
+/** 读 Admin API 的原始 node set，保留每条加载错误和可选 file 观察字段。 */
+export async function getInstalledNodeSets(
+  t: AdminTarget,
+  fetchImpl: FetchLike = fetch,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+): Promise<InstalledNodeSet[]> {
+  const headers = await authHeaders(t, fetchImpl, timeoutMs);
+  const { signal, done } = withTimeout(timeoutMs);
+  try {
+    const res = await fetchImpl(`${t.upstream}${t.adminRoot}nodes`, {
+      headers: { ...headers, accept: 'application/json' }, signal,
+    });
+    const text = await res.text();
+    if (!res.ok) throw new AdminApiError(`读取实例节点清单失败（HTTP ${res.status}）`, res.status);
+    return parseNodeSets(text);
+  } catch (e) {
+    if (e instanceof AdminApiError) throw e;
+    throw new AdminApiError(`读取实例节点清单失败：${(e as Error).message}`);
+  } finally {
+    done();
+  }
 }
 
 /**
@@ -174,40 +287,17 @@ export async function getInstalledModules(
   fetchImpl: FetchLike = fetch,
   timeoutMs = DEFAULT_TIMEOUT_MS,
 ): Promise<InstalledModule[]> {
-  const headers = await authHeaders(t, fetchImpl, timeoutMs);
-  const { signal, done } = withTimeout(timeoutMs);
-  try {
-    const res = await fetchImpl(`${t.upstream}${t.adminRoot}nodes`, {
-      headers: { ...headers, accept: 'application/json' },
-      signal,
-    });
-    if (!res.ok) throw new AdminApiError(`读取实例节点清单失败（HTTP ${res.status}）`, res.status);
-    const sets = await res.json() as Array<{
-      module?: string; version?: string; local?: boolean; types?: string[]; enabled?: boolean;
-    }>;
-
-    // 一个模块可以含多个节点集（每个 .js 一个），按模块归并
-    const byModule = new Map<string, InstalledModule>();
-    for (const s of sets) {
-      if (!s.module) continue;
-      const cur = byModule.get(s.module) ?? {
-        module: s.module, version: s.version ?? '', local: s.local === true,
-        types: [], enabled: true,
-      };
-      cur.types = [...new Set([...cur.types, ...(s.types ?? [])])];
-      // 有任意一个节点集被停用，就不算「全部启用」——现场要看到这个差别
-      cur.enabled = cur.enabled && s.enabled !== false;
-      byModule.set(s.module, cur);
-    }
-    return [...byModule.values()]
-      .map((m) => ({ ...m, types: m.types.sort() }))
-      .sort((a, b) => a.module.localeCompare(b.module));
-  } catch (e) {
-    if (e instanceof AdminApiError) throw e;
-    throw new AdminApiError(`读取实例节点清单失败：${(e as Error).message}`);
-  } finally {
-    done();
+  const sets = await getInstalledNodeSets(t, fetchImpl, timeoutMs);
+  const byModule = new Map<string, InstalledNodeSet[]>();
+  for (const set of sets) {
+    if (!set.module) continue;
+    const current = byModule.get(set.module) ?? [];
+    current.push(set);
+    byModule.set(set.module, current);
   }
+  return [...byModule.entries()]
+    .map(([module, moduleSets]) => moduleFromNodeSets(module, moduleSets))
+    .sort((a, b) => a.module.localeCompare(b.module));
 }
 
 /**
@@ -228,7 +318,30 @@ export async function installModule(
   version: string | undefined,
   fetchImpl: FetchLike = fetch,
   timeoutMs = 120_000,          // 装包要下载与解压，比其它调用慢得多
-): Promise<{ module: string; version: string; types: string[] }> {
+): Promise<InstalledModule> {
+  const installed = await stageModule(t, module, version, fetchImpl, timeoutMs);
+  if (installed.errors.length > 0) {
+    // HTTP 200 only says the installer answered. A node-set err means Node-RED did not load it.
+    throw new AdminApiError(
+      `装 ${module} 后节点未成功加载：${installed.errors.join('; ')}`,
+      409,
+    );
+  }
+  return installed;
+}
+
+/**
+ * 调用 Node-RED 安装接口并保留它返回的原始 node-set 证据。
+ *
+ * 迁移流程可用它记录重复注册等现场状态；只有 installModule 才把这种状态收紧为失败。
+ */
+export async function stageModule(
+  t: AdminTarget,
+  module: string,
+  version: string | undefined,
+  fetchImpl: FetchLike = fetch,
+  timeoutMs = 120_000,
+): Promise<InstalledModule> {
   const headers = await authHeaders(t, fetchImpl, timeoutMs);
   const { signal, done } = withTimeout(timeoutMs);
   try {
@@ -240,16 +353,65 @@ export async function installModule(
     });
     const text = await res.text();
     if (!res.ok) throw new AdminApiError(explainInstallError(module, res.status, text), res.status);
-
-    const info = JSON.parse(text) as { name?: string; version?: string; nodes?: Array<{ types?: string[] }> };
-    return {
-      module: info.name ?? module,
-      version: info.version ?? '',
-      types: [...new Set((info.nodes ?? []).flatMap((n) => n.types ?? []))].sort(),
-    };
+    const nodeSets = parseNodeSets(text, module, version ?? '');
+    const responseModule = nodeSets.find((set) => set.module)?.module || module;
+    return moduleFromNodeSets(responseModule, nodeSets);
   } catch (e) {
     if (e instanceof AdminApiError) throw e;
     throw new AdminApiError(`装节点包失败：${(e as Error).message}`);
+  } finally {
+    done();
+  }
+}
+
+/** 读取一个模块的 Admin API 详情；不把缺少的 file 字段伪造成 node_modules 路径。 */
+export async function getModuleDetail(
+  t: AdminTarget,
+  module: string,
+  fetchImpl: FetchLike = fetch,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+): Promise<InstalledModule> {
+  const headers = await authHeaders(t, fetchImpl, timeoutMs);
+  const { signal, done } = withTimeout(timeoutMs);
+  try {
+    const res = await fetchImpl(`${t.upstream}${t.adminRoot}nodes/${encodeURIComponent(module)}`, {
+      headers: { ...headers, accept: 'application/json' }, signal,
+    });
+    const text = await res.text();
+    if (!res.ok) throw new AdminApiError(`读取节点模块 ${module} 失败（HTTP ${res.status}）`, res.status);
+    const nodeSets = parseNodeSets(text, module);
+    return moduleFromNodeSets(module, nodeSets);
+  } catch (e) {
+    if (e instanceof AdminApiError) throw e;
+    throw new AdminApiError(`读取节点模块 ${module} 失败：${(e as Error).message}`);
+  } finally {
+    done();
+  }
+}
+
+/** 卸载只能以 Node-RED 的非 2xx 响应为失败，成功不猜测其重载或文件清理结果。 */
+export async function uninstallModule(
+  t: AdminTarget,
+  module: string,
+  fetchImpl: FetchLike = fetch,
+  timeoutMs = 120_000,
+): Promise<void> {
+  const headers = await authHeaders(t, fetchImpl, timeoutMs);
+  const { signal, done } = withTimeout(timeoutMs);
+  try {
+    const res = await fetchImpl(`${t.upstream}${t.adminRoot}nodes/${encodeURIComponent(module)}`, {
+      method: 'DELETE', headers, signal,
+    });
+    if (!res.ok) {
+      const detail = await res.text().catch(() => '');
+      throw new AdminApiError(
+        `卸载 ${module} 失败（HTTP ${res.status}）${detail ? `：${detail.slice(0, 300)}` : ''}`,
+        res.status,
+      );
+    }
+  } catch (e) {
+    if (e instanceof AdminApiError) throw e;
+    throw new AdminApiError(`卸载 ${module} 失败：${(e as Error).message}`);
   } finally {
     done();
   }
