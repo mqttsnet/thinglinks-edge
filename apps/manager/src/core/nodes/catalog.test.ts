@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { openDb } from '../db.ts';
 import { NodeCatalog } from './catalog.ts';
 import { NodePolicyError } from './policy.ts';
+import { PLATFORM_NODE_PACKAGE } from './platform-contract.ts';
+import { ensurePlatformApproval } from './platform-package.ts';
 
 const fresh = () => new NodeCatalog(openDb(':memory:'));
 
@@ -48,6 +50,27 @@ test('撤销', () => {
   assert.equal(c.revoke('a-node'), true);
   assert.equal(c.revoke('a-node'), false);
   assert.deepEqual(c.list(), []);
+});
+
+test('通用目录接口不能更新或撤销平台基线批准', () => {
+  const c = fresh();
+  const baseline = ensurePlatformApproval(c, 'system');
+  assert.throws(() => c.approve({
+    module: PLATFORM_NODE_PACKAGE.name,
+    version: '^0.0.1',
+    note: 'changed',
+    actor: 'operator',
+  }), NodePolicyError);
+  assert.throws(() => c.revoke(PLATFORM_NODE_PACKAGE.name), NodePolicyError);
+  assert.deepEqual(c.get(PLATFORM_NODE_PACKAGE.name), baseline);
+});
+
+test('非平台目录条目仍可更新和撤销', () => {
+  const c = fresh();
+  c.approve({ module: 'ordinary-node', version: '1.0.0', actor: 'a' });
+  c.approve({ module: 'ordinary-node', version: '2.0.0', actor: 'b' });
+  assert.equal(c.get('ordinary-node')?.version, '2.0.0');
+  assert.equal(c.revoke('ordinary-node'), true);
 });
 
 test('备注超长截断，不让一条记录撑爆列表', () => {

@@ -8,6 +8,7 @@ import { createHash } from 'node:crypto';
 import { tarArchive } from '../archive/tar.ts';
 import { NodeStore, readPackage, compareVersions, closureGaps, closureReport } from './store.ts';
 import { NodePolicyError } from './policy.ts';
+import { PLATFORM_COMMON_PACKAGE, PLATFORM_NODE_PACKAGE } from './platform-contract.ts';
 
 /** 造一个形状与 `npm pack` 一致的 tgz */
 function pack(pkg: Record<string, unknown>, extra: Array<[string, string]> = []): Buffer {
@@ -181,6 +182,35 @@ test('删除一个版本', () => {
     store.add(pack(nodePkg('n', '1.0.0')));
     assert.equal(store.remove('n', '1.0.0'), true);
     assert.equal(store.remove('n', '1.0.0'), false);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('通用存储接口不能覆盖或删除固定平台包', () => {
+  const dir = tmp();
+  try {
+    const store = new NodeStore(dir);
+    for (const fixed of [PLATFORM_NODE_PACKAGE, PLATFORM_COMMON_PACKAGE]) {
+      store.add(pack({ name: fixed.name, version: fixed.version }, [['marker', 'first']]));
+      assert.throws(
+        () => store.add(pack({ name: fixed.name, version: fixed.version }, [['marker', 'changed']])),
+        NodePolicyError,
+      );
+      assert.throws(() => store.remove(fixed.name, fixed.version), NodePolicyError);
+      assert.ok(store.has(fixed.name, fixed.version));
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('非平台包仍可覆盖和删除', () => {
+  const dir = tmp();
+  try {
+    const store = new NodeStore(dir);
+    const first = pack({ name: 'ordinary-node', version: '1.0.0' }, [['marker', 'first']]);
+    const changed = pack({ name: 'ordinary-node', version: '1.0.0' }, [['marker', 'changed']]);
+    store.add(first);
+    store.add(changed);
+    assert.deepEqual(store.tarball('ordinary-node', '1.0.0'), changed);
+    assert.equal(store.remove('ordinary-node', '1.0.0'), true);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
