@@ -28,11 +28,47 @@ export type NodeMigrationState =
 type NodeMigrationPhase = Exclude<NodeMigrationState, 'idle'>;
 type NodeMigrationOperationKind = 'bootstrap' | 'migration';
 
+export type NodeMigrationErrorCode =
+  | 'none'
+  | 'preflight'
+  | 'checkpoint'
+  | 'install'
+  | 'cutover'
+  | 'verification'
+  | 'rollback'
+  | 'compensation'
+  | 'state-inconsistent';
+
+export type NodeMigrationFileFact =
+  | { exists: true; sha256: string }
+  | { exists: false };
+
+export interface BootstrapNodeMigrationSnapshot {
+  version: 1;
+  kind: 'bootstrap';
+}
+
+export interface MigrationNodeMigrationSnapshot {
+  version: 1;
+  kind: 'migration';
+  settings: NodeMigrationFileFact;
+  flows: NodeMigrationFileFact;
+  credentials: NodeMigrationFileFact;
+  packageManifest: NodeMigrationFileFact;
+  lock: NodeMigrationFileFact;
+  legacyManifestSha256: string;
+  nodeInventorySha256: string;
+}
+
+export type NodeMigrationSnapshot =
+  | BootstrapNodeMigrationSnapshot
+  | MigrationNodeMigrationSnapshot;
+
 export interface InstanceNodeRuntime {
   mode: NodeRuntimeMode;
   platformVersion: string;
   migrationState: NodeMigrationState;
-  migrationError: string;
+  migrationError: NodeMigrationErrorCode;
 }
 
 export interface InstanceNodeMigrationJournal {
@@ -46,26 +82,28 @@ export interface InstanceNodeMigrationJournal {
   imageIdBefore: string;
   targetIntegrity: string;
   checkpointDir: string;
-  snapshotJson: string;
+  snapshot: NodeMigrationSnapshot;
   actor: string;
   startedAt: string;
   updatedAt: string;
-  error: string;
+  error: NodeMigrationErrorCode;
 }
 
 export interface BeginNodeMigrationInput {
   instanceId: string;
   txId: string;
   operationKind: NodeMigrationOperationKind;
-  phase: NodeMigrationPhase;
+  phase: 'preparing';
   originalRunning: boolean;
   stagedBefore: boolean;
   modeBefore: NodeRuntimeMode;
   imageIdBefore: string;
   targetIntegrity: string;
   checkpointDir: string;
-  snapshotJson: string;
+  snapshot: NodeMigrationSnapshot;
   actor: string;
+  /** 仅允许显式替换该实例一个已 clean rolled_back 的旧事务 */
+  replaceRolledBackTxId?: string;
 }
 
 const NODE_RUNTIME_MODES = ['legacy', 'npm'] as const;
@@ -75,15 +113,20 @@ const NODE_MIGRATION_PHASES = [
   'rolled_back', 'rolled_back_dirty', 'manual_required',
 ] as const;
 const NODE_MIGRATION_KINDS = ['bootstrap', 'migration'] as const;
-const SNAPSHOT_HASH_KEYS = new Set([
-  'settingsSha256', 'flowsSha256', 'credentialsSha256', 'packageSha256', 'lockSha256',
-]);
+const NODE_MIGRATION_ERROR_CODES = [
+  'none', 'preflight', 'checkpoint', 'install', 'cutover',
+  'verification', 'rollback', 'compensation', 'state-inconsistent',
+] as const;
 const TX_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const PATH_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const SHA512_INTEGRITY = /^sha512-[A-Za-z0-9+/]+={0,2}$/;
 const SHA256_HEX = /^[a-f0-9]{64}$/;
-const MAX_MIGRATION_ERROR = 2_000;
-const PROJECTION_MISMATCH_ERROR = '迁移日志与实例状态投影不一致，已停止自动恢复';
+const BOOTSTRAP_SNAPSHOT_KEYS = ['version', 'kind'] as const;
+const MIGRATION_SNAPSHOT_KEYS = [
+  'version', 'kind', 'settings', 'flows', 'credentials', 'packageManifest', 'lock',
+  'legacyManifestSha256', 'nodeInventorySha256',
+] as const;
+const PROJECTION_MISMATCH_ERROR: NodeMigrationErrorCode = 'state-inconsistent';
 
 function requireEnum(value: string, allowed: readonly string[], label: string): void {
   if (!allowed.includes(value)) throw new RepoError(`${label} 无效：${value}`);
@@ -96,40 +139,95 @@ function requireSafeText(value: string, label: string, maxLength: number): void 
   if (redact(value) !== value) throw new RepoError(`${label} 不得包含凭据`);
 }
 
-function safeMigrationError(error: string): string {
-  if (typeof error !== 'string') throw new RepoError('迁移错误必须是字符串');
-  return redact(error).slice(0, MAX_MIGRATION_ERROR);
+function requireExactKeys(value: Record<string, unknown>, keys: readonly string[], label: string): void {
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  if (actual.length !== expected.length || actual.some((key, i) => key !== expected[i])) {
+    throw new RepoError(`${label} 字段不完整或包含未授权字段`);
+  }
 }
 
-function safeSnapshotJson(snapshotJson: string): string {
-  if (typeof snapshotJson !== 'string' || Buffer.byteLength(snapshotJson, 'utf8') > 2_048) {
-    throw new RepoError('迁移快照无效');
+function requireRecord(value: unknown, label: string): Record<string, unknown> {
+  if (value === null || Array.isArray(value) || typeof value !== 'object') {
+    throw new RepoError(`${label} 必须是对象`);
   }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(snapshotJson);
-  } catch {
-    throw new RepoError('迁移快照必须是 JSON 对象');
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new RepoError(`${label} 必须是普通对象`);
   }
-  if (parsed === null || Array.isArray(parsed) || typeof parsed !== 'object') {
-    throw new RepoError('迁移快照必须是 JSON 对象');
-  }
-  for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
-    if (!SNAPSHOT_HASH_KEYS.has(key) || typeof value !== 'string' || !SHA256_HEX.test(value)) {
-      throw new RepoError(`迁移快照字段无效：${key}`);
+  return value as Record<string, unknown>;
+}
+
+function safeFileFact(value: unknown, label: string): NodeMigrationFileFact {
+  const fact = requireRecord(value, label);
+  if (fact['exists'] === true) {
+    requireExactKeys(fact, ['exists', 'sha256'], label);
+    if (typeof fact['sha256'] !== 'string' || !SHA256_HEX.test(fact['sha256'])) {
+      throw new RepoError(`${label}.sha256 无效`);
     }
+    return { exists: true, sha256: fact['sha256'] };
   }
-  return JSON.stringify(parsed);
+  if (fact['exists'] === false) {
+    requireExactKeys(fact, ['exists'], label);
+    return { exists: false };
+  }
+  throw new RepoError(`${label}.exists 必须是布尔值`);
 }
 
-function validateCheckpointDir(input: BeginNodeMigrationInput, snapshotJson: string): void {
+function safeSnapshot(
+  value: unknown,
+  operationKind: NodeMigrationOperationKind,
+): NodeMigrationSnapshot {
+  const snapshot = requireRecord(value, '迁移快照');
+  if (snapshot['version'] !== 1) throw new RepoError('迁移快照版本无效');
+  if (snapshot['kind'] !== operationKind) throw new RepoError('迁移快照类型与操作类型不一致');
+
+  if (operationKind === 'bootstrap') {
+    requireExactKeys(snapshot, BOOTSTRAP_SNAPSHOT_KEYS, 'bootstrap 快照');
+    return { version: 1, kind: 'bootstrap' };
+  }
+
+  requireExactKeys(snapshot, MIGRATION_SNAPSHOT_KEYS, 'migration 快照');
+  const legacyManifestSha256 = snapshot['legacyManifestSha256'];
+  const nodeInventorySha256 = snapshot['nodeInventorySha256'];
+  if (typeof legacyManifestSha256 !== 'string' || !SHA256_HEX.test(legacyManifestSha256)) {
+    throw new RepoError('legacyManifestSha256 无效');
+  }
+  if (typeof nodeInventorySha256 !== 'string' || !SHA256_HEX.test(nodeInventorySha256)) {
+    throw new RepoError('nodeInventorySha256 无效');
+  }
+  return {
+    version: 1,
+    kind: 'migration',
+    settings: safeFileFact(snapshot['settings'], 'settings'),
+    flows: safeFileFact(snapshot['flows'], 'flows'),
+    credentials: safeFileFact(snapshot['credentials'], 'credentials'),
+    packageManifest: safeFileFact(snapshot['packageManifest'], 'packageManifest'),
+    lock: safeFileFact(snapshot['lock'], 'lock'),
+    legacyManifestSha256,
+    nodeInventorySha256,
+  };
+}
+
+function parseSnapshotJson(
+  snapshotJson: string,
+  operationKind: NodeMigrationOperationKind,
+): NodeMigrationSnapshot {
+  try {
+    return safeSnapshot(JSON.parse(snapshotJson), operationKind);
+  } catch (error) {
+    if (error instanceof RepoError) throw error;
+    throw new RepoError('迁移快照 JSON 无效');
+  }
+}
+
+function validateCheckpointDir(input: BeginNodeMigrationInput): void {
   if (input.checkpointDir === '') {
     if (
       input.operationKind === 'bootstrap'
       && input.modeBefore === 'legacy'
       && input.originalRunning === false
       && input.stagedBefore === false
-      && snapshotJson === '{}'
     ) return;
     throw new RepoError('只有尚无旧数据的 bootstrap 可使用空检查点路径');
   }
@@ -351,31 +449,92 @@ export class InstanceRepo {
       mode: row['node_runtime_mode'] as NodeRuntimeMode,
       platformVersion: row['platform_node_version'] as string,
       migrationState: row['node_migration_state'] as NodeMigrationState,
-      migrationError: row['node_migration_error'] as string,
+      migrationError: row['node_migration_error'] as NodeMigrationErrorCode,
     };
   }
 
   beginNodeMigration(input: BeginNodeMigrationInput): void {
     requireEnum(input.operationKind, NODE_MIGRATION_KINDS, '迁移操作类型');
-    requireEnum(input.phase, NODE_MIGRATION_PHASES, '迁移阶段');
+    if (input.phase !== 'preparing') throw new RepoError('迁移只能从 preparing 开始');
     requireEnum(input.modeBefore, NODE_RUNTIME_MODES, '迁移前运行模式');
     if (!TX_ID.test(input.txId)) throw new RepoError('迁移事务 id 无效');
+    if (input.replaceRolledBackTxId !== undefined && !TX_ID.test(input.replaceRolledBackTxId)) {
+      throw new RepoError('待替换的迁移事务 id 无效');
+    }
     if (typeof input.originalRunning !== 'boolean' || typeof input.stagedBefore !== 'boolean') {
       throw new RepoError('迁移运行状态必须是布尔值');
     }
     requireSafeText(input.imageIdBefore, '迁移前镜像 id', 256);
     if (!SHA512_INTEGRITY.test(input.targetIntegrity)) throw new RepoError('目标包完整性无效');
     requireSafeText(input.actor, '操作人', 128);
-    const snapshotJson = safeSnapshotJson(input.snapshotJson);
-    validateCheckpointDir(input, snapshotJson);
+    const snapshot = safeSnapshot(input.snapshot, input.operationKind);
+    const snapshotJson = JSON.stringify(snapshot);
+    validateCheckpointDir(input);
 
     this.db.transaction(() => {
-      const instance = this.db.prepare('SELECT 1 FROM instance WHERE id = ?').get(input.instanceId);
+      const instance = this.db.prepare(
+        `SELECT node_runtime_mode, node_migration_state, node_migration_error
+         FROM instance WHERE id = ?`,
+      ).get(input.instanceId) as {
+        node_runtime_mode: NodeRuntimeMode;
+        node_migration_state: NodeMigrationState;
+        node_migration_error: NodeMigrationErrorCode;
+      } | undefined;
       if (!instance) throw new RepoError(`实例 ${input.instanceId} 不存在`);
+      if (instance.node_runtime_mode !== input.modeBefore) {
+        throw new RepoError(`迁移前运行模式与实例当前运行模式不一致`);
+      }
+
+      const txOwner = this.db.prepare(
+        'SELECT instance_id FROM instance_node_migration WHERE tx_id = ?',
+      ).get(input.txId) as { instance_id: string } | undefined;
+      if (txOwner && txOwner.instance_id !== input.instanceId) {
+        throw new RepoError(`迁移事务 ${input.txId} 已被实例 ${txOwner.instance_id} 使用`);
+      }
       const existing = this.db.prepare(
-        'SELECT 1 FROM instance_node_migration WHERE instance_id = ?',
-      ).get(input.instanceId);
-      if (existing) throw new RepoError(`实例 ${input.instanceId} 已有迁移日志`);
+        'SELECT * FROM instance_node_migration WHERE instance_id = ?',
+      ).get(input.instanceId) as Record<string, unknown> | undefined;
+
+      if (existing?.['tx_id'] === input.txId) {
+        const identical = existing['operation_kind'] === input.operationKind
+          && existing['phase'] === 'preparing'
+          && existing['original_running'] === (input.originalRunning ? 1 : 0)
+          && existing['staged_before'] === (input.stagedBefore ? 1 : 0)
+          && existing['mode_before'] === input.modeBefore
+          && existing['image_id_before'] === input.imageIdBefore
+          && existing['target_integrity'] === input.targetIntegrity
+          && existing['checkpoint_dir'] === input.checkpointDir
+          && existing['snapshot_json'] === snapshotJson
+          && existing['actor'] === input.actor
+          && existing['error'] === 'none'
+          && instance.node_migration_state === 'preparing'
+          && instance.node_migration_error === 'none';
+        if (identical) return;
+        throw new RepoError(`迁移事务 ${input.txId} 的重试事实不一致`);
+      }
+
+      if (existing) {
+        if (
+          existing['phase'] !== 'rolled_back'
+          || input.replaceRolledBackTxId !== existing['tx_id']
+          || instance.node_migration_state !== 'rolled_back'
+          || instance.node_migration_error !== existing['error']
+        ) {
+          throw new RepoError(`实例 ${input.instanceId} 已有不可替换的迁移日志`);
+        }
+        const deleted = this.db.prepare(
+          `DELETE FROM instance_node_migration
+           WHERE instance_id = ? AND tx_id = ? AND phase = 'rolled_back'`,
+        ).run(input.instanceId, input.replaceRolledBackTxId);
+        if (deleted.changes !== 1) throw new RepoError('clean rolled_back 迁移日志已变化');
+      } else {
+        if (input.replaceRolledBackTxId !== undefined) {
+          throw new RepoError('没有可替换的 clean rolled_back 迁移日志');
+        }
+        if (instance.node_migration_state !== 'idle' || instance.node_migration_error !== 'none') {
+          throw new RepoError(`实例 ${input.instanceId} 的迁移投影不是 idle`);
+        }
+      }
 
       // 日志是恢复依据，必须先落库，再在同一事务内推进 UI 投影。
       this.db.prepare(
@@ -383,7 +542,7 @@ export class InstanceRepo {
           (instance_id, tx_id, operation_kind, phase, original_running, staged_before,
            mode_before, image_id_before, target_integrity, checkpoint_dir,
            snapshot_json, actor, error)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '')`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'none')`,
       ).run(
         input.instanceId, input.txId, input.operationKind, input.phase,
         input.originalRunning ? 1 : 0, input.stagedBefore ? 1 : 0,
@@ -392,28 +551,32 @@ export class InstanceRepo {
       );
       this.db.prepare(
         `UPDATE instance
-         SET node_migration_state = ?, node_migration_error = ''
+         SET node_migration_state = ?, node_migration_error = 'none'
          WHERE id = ?`,
       ).run(input.phase, input.instanceId);
     })();
   }
 
-  updateNodeMigration(instanceId: string, phase: NodeMigrationPhase, error = ''): void {
+  updateNodeMigration(
+    instanceId: string,
+    phase: NodeMigrationPhase,
+    error: NodeMigrationErrorCode = 'none',
+  ): void {
     requireEnum(phase, NODE_MIGRATION_PHASES, '迁移阶段');
     if (phase === 'committed') throw new RepoError('committed 必须通过最终提交事务写入');
-    const safeError = safeMigrationError(error);
+    requireEnum(error, NODE_MIGRATION_ERROR_CODES, '迁移错误码');
     this.db.transaction(() => {
       const journal = this.db.prepare(
         `UPDATE instance_node_migration
          SET phase = ?, error = ?, updated_at = datetime('now')
          WHERE instance_id = ?`,
-      ).run(phase, safeError, instanceId);
+      ).run(phase, error, instanceId);
       if (journal.changes === 0) throw new RepoError(`实例 ${instanceId} 没有迁移日志`);
       const projection = this.db.prepare(
         `UPDATE instance
          SET node_migration_state = ?, node_migration_error = ?
          WHERE id = ?`,
-      ).run(phase, safeError, instanceId);
+      ).run(phase, error, instanceId);
       if (projection.changes === 0) throw new RepoError(`实例 ${instanceId} 不存在`);
     })();
   }
@@ -422,19 +585,31 @@ export class InstanceRepo {
     requireSafeText(platformVersion, '平台节点版本', 128);
     requireSafeText(actor, '操作人', 128);
     this.db.transaction(() => {
+      const ready = this.db.prepare(
+        `SELECT m.mode_before
+         FROM instance_node_migration m
+         JOIN instance i ON i.id = m.instance_id
+         WHERE m.instance_id = ?
+           AND m.phase = 'verifying' AND m.error = 'none'
+           AND i.node_migration_state = 'verifying' AND i.node_migration_error = 'none'
+           AND i.node_runtime_mode = m.mode_before`,
+      ).get(instanceId) as { mode_before: NodeRuntimeMode } | undefined;
+      if (!ready) throw new RepoError(`实例 ${instanceId} 不是可提交的 verifying 状态`);
+
       const journal = this.db.prepare(
         `UPDATE instance_node_migration
-         SET phase = 'committed', error = '', updated_at = datetime('now')
-         WHERE instance_id = ?`,
+         SET phase = 'committed', error = 'none', updated_at = datetime('now')
+         WHERE instance_id = ? AND phase = 'verifying' AND error = 'none'`,
       ).run(instanceId);
-      if (journal.changes === 0) throw new RepoError(`实例 ${instanceId} 没有迁移日志`);
+      if (journal.changes !== 1) throw new RepoError(`实例 ${instanceId} 的迁移日志已变化`);
       const projection = this.db.prepare(
         `UPDATE instance
          SET node_runtime_mode = 'npm', platform_node_version = ?,
-             node_migration_state = 'committed', node_migration_error = ''
-         WHERE id = ?`,
-      ).run(platformVersion, instanceId);
-      if (projection.changes === 0) throw new RepoError(`实例 ${instanceId} 不存在`);
+             node_migration_state = 'committed', node_migration_error = 'none'
+         WHERE id = ? AND node_runtime_mode = ?
+           AND node_migration_state = 'verifying' AND node_migration_error = 'none'`,
+      ).run(platformVersion, instanceId, ready.mode_before);
+      if (projection.changes !== 1) throw new RepoError(`实例 ${instanceId} 的迁移投影已变化`);
       recordAudit(this.db, {
         actor,
         action: 'commit-node-migration',
@@ -473,11 +648,14 @@ export class InstanceRepo {
       imageIdBefore: row['image_id_before'] as string,
       targetIntegrity: row['target_integrity'] as string,
       checkpointDir: row['checkpoint_dir'] as string,
-      snapshotJson: row['snapshot_json'] as string,
+      snapshot: parseSnapshotJson(
+        row['snapshot_json'] as string,
+        row['operation_kind'] as NodeMigrationOperationKind,
+      ),
       actor: row['actor'] as string,
       startedAt: row['started_at'] as string,
       updatedAt: row['updated_at'] as string,
-      error: row['error'] as string,
+      error: row['error'] as NodeMigrationErrorCode,
     };
   }
 

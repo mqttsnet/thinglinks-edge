@@ -359,7 +359,11 @@ const MIGRATIONS: string[] = [
       'pending_start_verification','rolling_back','committed',
       'rolled_back','rolled_back_dirty','manual_required'
     ));
-  ALTER TABLE instance ADD COLUMN node_migration_error TEXT NOT NULL DEFAULT '';
+  ALTER TABLE instance ADD COLUMN node_migration_error TEXT NOT NULL DEFAULT 'none'
+    CHECK (node_migration_error IN (
+      'none','preflight','checkpoint','install','cutover','verification',
+      'rollback','compensation','state-inconsistent'
+    ));
 
   CREATE TABLE instance_node_migration (
     instance_id TEXT PRIMARY KEY REFERENCES instance(id) ON DELETE CASCADE,
@@ -380,7 +384,10 @@ const MIGRATIONS: string[] = [
     actor TEXT NOT NULL,
     started_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    error TEXT NOT NULL DEFAULT ''
+    error TEXT NOT NULL DEFAULT 'none' CHECK (error IN (
+      'none','preflight','checkpoint','install','cutover','verification',
+      'rollback','compensation','state-inconsistent'
+    ))
   );
   `,
 ];
