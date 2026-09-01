@@ -9,13 +9,18 @@ import { openDb } from './core/db.ts';
 import { requireMasterKey, deriveKey } from './core/auth/crypto.ts';
 import { AuthService } from './core/auth/service.ts';
 import { InstanceRepo } from './core/instance/repo.ts';
-import { InstanceService } from './core/instance/service.ts';
+import { InstanceService, type InstanceServiceOptions } from './core/instance/service.ts';
 import {
   InstanceOperationGate,
   InstanceRepositoryOperationPolicy,
 } from './core/instance/operation-gate.ts';
 import { ProxySessionRegistry } from './core/instance/proxy-session-registry.ts';
 import { DockerClient } from './core/instance/docker-client.ts';
+import { containerName } from './core/instance/container-spec.ts';
+import {
+  RepositoryInstanceAdminRuntime,
+  type InstanceAdminRuntime,
+} from './core/instance/admin-runtime.ts';
 import { reconcileInstanceNetworks } from './core/instance/network-reconcile.ts';
 import { buildServer, type ServerDeps } from './http/app.ts';
 import { Spool, type FullPolicy } from './core/spool/spool.ts';
@@ -33,6 +38,7 @@ import { UpstreamRegistry } from './core/nodes/upstream.ts';
 import { NpmSourceRepo } from './core/nodes/sources.ts';
 import { seedFromDir, describeSeed } from './core/nodes/seed.ts';
 import { PlatformPackageService } from './core/nodes/platform-package.ts';
+import { NOOP_PLATFORM_NODE_BARRIER } from './core/nodes/platform-operation-barrier.ts';
 import type { RegistryDeps } from './http/nodes/registry.ts';
 import { ValueHistory, limitsFromEnv } from './core/edge/history.ts';
 import {
@@ -75,6 +81,41 @@ export function assemblePlatformNodeServices(deps: {
     serverDeps: { platformPackages },
     registryDeps: { platformPackages },
   };
+}
+
+export function assembleInstanceAdminRuntime(deps: {
+  repo: InstanceRepo;
+  upstreamFor: (instanceId: string) => string;
+}): {
+  adminRuntime: InstanceAdminRuntime;
+  instanceServiceDeps: Pick<InstanceServiceOptions, 'adminRuntime'>;
+  serverDeps: Pick<ServerDeps, 'adminRuntime'>;
+} {
+  const adminRuntime = new RepositoryInstanceAdminRuntime(deps);
+  return {
+    adminRuntime,
+    instanceServiceDeps: { adminRuntime },
+    serverDeps: { adminRuntime },
+  };
+}
+
+export interface ManagerStartupHooks<Server = unknown> {
+  reconcileNetworks: () => Promise<void>;
+  recoverInterruptedBootstraps: () => Promise<void>;
+  startBackground: () => Promise<void> | void;
+  buildServer: () => Promise<Server> | Server;
+  listen: (server: Server) => Promise<void>;
+}
+
+export async function startManagerRuntime<Server>(
+  hooks: ManagerStartupHooks<Server>,
+): Promise<Server> {
+  await hooks.reconcileNetworks();
+  await hooks.recoverInterruptedBootstraps();
+  await hooks.startBackground();
+  const server = await hooks.buildServer();
+  await hooks.listen(server);
+  return server;
 }
 
 /**
@@ -250,6 +291,8 @@ export async function main(): Promise<void> {
   const repo = new InstanceRepo(db, key);
   const operationGate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repo));
   const proxySessions = new ProxySessionRegistry();
+  const instanceUpstreamFor = (id: string) => `http://${containerName(id)}:1880`;
+  const instanceAdmin = assembleInstanceAdminRuntime({ repo, upstreamFor: instanceUpstreamFor });
 
   /*
    * 账号从哪来，两条路：
@@ -399,7 +442,11 @@ export async function main(): Promise<void> {
     npmRegistry: npmRegistryUrl || undefined,
   });
   const service = new InstanceService({
+    ...instanceAdmin.instanceServiceDeps,
     db, repo, docker, gate: operationGate,
+    instanceDataRoot: config.instanceDataRoot,
+    platformPackages: platformNodeServices.platformPackages,
+    barrier: NOOP_PLATFORM_NODE_BARRIER,
     basePath: config.basePath,
     portRange: config.portRange,
     allowedImageTags: (process.env['ALLOWED_IMAGE_TAGS'] ??
@@ -423,21 +470,23 @@ export async function main(): Promise<void> {
    * 容器名解析立即可用。每个实例最多等待 5 秒；单个网络可能已被人工清理，
    * 只告警并继续，不能因此阻止控制台启动或影响其它实例的隔离网络。
    */
-  if (managerContainer) {
-    const reconciled = await reconcileInstanceNetworks(
-      repo.list().map((instance) => instance.id),
-      (id, signal) => docker.reconnectManager(id, signal),
-      5_000,
-    );
-    for (const result of reconciled) {
-      if (!result.ok) {
-        console.warn(
-          `[warn] 实例 ${result.id} 的网络 ${docker.instanceNetwork(result.id)} 未能重新接入 Manager：`
-          + result.error,
-        );
+  const reconcileNetworks = async () => {
+    if (managerContainer) {
+      const reconciled = await reconcileInstanceNetworks(
+        repo.list().map((instance) => instance.id),
+        (id, signal) => docker.reconnectManager(id, signal),
+        5_000,
+      );
+      for (const result of reconciled) {
+        if (!result.ok) {
+          console.warn(
+            `[warn] 实例 ${result.id} 的网络 ${docker.instanceNetwork(result.id)} 未能重新接入 Manager：`
+            + result.error,
+          );
+        }
       }
     }
-  }
+  };
 
   // WEB_ROOT 由镜像设定（/app/web）；宿主开发态不设，前端走 Vite
   /*
@@ -495,10 +544,11 @@ export async function main(): Promise<void> {
    */
   const metricsIntervalSec = resolveMetricsIntervalSec();
   const metrics = metricsIntervalSec > 0 ? new MetricsHistory({ fineStepSec: metricsIntervalSec }) : undefined;
+  let startMetrics = () => undefined;
   if (metrics) {
     // 采样出错每 10 秒一条会把日志刷爆，同一个原因只报第一次
     let lastError = '';
-    new MetricsSampler({
+    const sampler = new MetricsSampler({
       history: metrics,
       source: service,
       intervalMs: metricsIntervalSec * 1000,
@@ -508,7 +558,8 @@ export async function main(): Promise<void> {
         lastError = msg;
         console.error(`[metrics] 采样失败：${msg}（同样的原因不再重复打印）`);
       },
-    }).start();
+    });
+    startMetrics = () => { sampler.start(); };
   }
 
   /*
@@ -587,13 +638,6 @@ export async function main(): Promise<void> {
       }
     },
   });
-  try {
-    await cloud.apply(cloudConfig.get());
-  } catch (e) {
-    // 配置坏了不该拖垮启动：本地实例管理与采集不依赖云
-    console.error(`[cloud] 接入配置无法应用：${(e as Error).message}`);
-  }
-
   /*
    * 补传调度。
    *
@@ -630,24 +674,48 @@ export async function main(): Promise<void> {
     },
   });
   drainerRef = drainer;
-  drainer.start();
 
-  const app = buildServer({
-    ...platformNodeServices.serverDeps,
-    config, db, auth, repo, service, operationGate, proxySessions,
-    spool, metrics, drainer, outages,
-    cloud, cloudConfig,
-    cloudSink: (payload) => cloud.publish(payload),
-    webRoot: process.env['WEB_ROOT']?.trim() || undefined,
-    nodeStore, nodeCatalog, valueHistory, nodeUpstream, nodeSources,
-    /*
-     * packument 里的包体地址要写成实例视角的绝对地址 —— 取它的是容器里的 npm。
-     * Manager 跑在宿主上（开发态）时给不出这个地址，此时私有源仍可读，
-     * 只是实例侧本来也没配 registry，用不到。
-     */
-    npmRegistryUrl,
+  await startManagerRuntime({
+    reconcileNetworks,
+    recoverInterruptedBootstraps: async () => {
+      const recovered = await service.recoverInterruptedBootstraps();
+      for (const result of recovered) {
+        if (result.residuals.length > 0) {
+          console.warn(
+            `[warn] 实例 ${result.instanceId} 的 bootstrap 补偿仍有残留：${result.residuals.join(',')}`,
+          );
+        }
+      }
+    },
+    startBackground: async () => {
+      startMetrics();
+      try {
+        await cloud.apply(cloudConfig.get());
+      } catch (e) {
+        // 配置坏了不该拖垮启动：本地实例管理与采集不依赖云
+        console.error(`[cloud] 接入配置无法应用：${(e as Error).message}`);
+      }
+      drainer.start();
+    },
+    buildServer: () => buildServer({
+      ...platformNodeServices.serverDeps,
+      ...instanceAdmin.serverDeps,
+      config, db, auth, repo, service, operationGate, proxySessions,
+      upstreamFor: instanceUpstreamFor,
+      spool, metrics, drainer, outages,
+      cloud, cloudConfig,
+      cloudSink: (payload) => cloud.publish(payload),
+      webRoot: process.env['WEB_ROOT']?.trim() || undefined,
+      nodeStore, nodeCatalog, valueHistory, nodeUpstream, nodeSources,
+      /*
+       * packument 里的包体地址要写成实例视角的绝对地址 —— 取它的是容器里的 npm。
+       * Manager 跑在宿主上（开发态）时给不出这个地址，此时私有源仍可读，
+       * 只是实例侧本来也没配 registry，用不到。
+       */
+      npmRegistryUrl,
+    }),
+    listen: (app) => app.listen({ host: config.listenAddr, port: config.listenPort }).then(() => undefined),
   });
-  await app.listen({ host: config.listenAddr, port: config.listenPort });
   console.log(
     `[ready] ${describe()} 监听 ${config.listenAddr}:${config.listenPort}` +
       ` · 外部地址 ${config.externalUrl}` +

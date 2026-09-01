@@ -7,14 +7,15 @@
  *
  * 所有创建请求都必须经 assertSafeCreateOptions 二次校验后才下发。
  */
-import { mkdir, rm, cp } from 'node:fs/promises';
+import { mkdir, rm, cp, lstat } from 'node:fs/promises';
 import Docker from 'dockerode';
 import {
   buildCreateOptions, assertSafeCreateOptions, assertValidSpec,
-  containerName, instanceDataDir, type InstanceSpec,
+  assertValidId, containerName, instanceDataDir, type InstanceSpec,
 } from './container-spec.ts';
 import { tarFile } from '../archive/tar.ts';
 import { dockerLogToText } from './log-stream.ts';
+import type { NodeRuntimeMode } from './repo.ts';
 
 /** 平台管理的容器统一打这个标签，列举与操作一律按标签过滤 */
 export const MANAGED_LABEL = 'com.mqttsnet.thinglinks-edge.managed';
@@ -64,6 +65,8 @@ export interface DockerClientOptions {
    * 与 managerUrl 同源同理：靠容器名解析，Manager 跑在宿主上时留空。
    */
   npmRegistry?: string | undefined;
+  /** 文件复制 seam；生产使用 fs.cp，测试只记录精确源/目标。 */
+  copyDir?: ((source: string, destination: string) => Promise<void>) | undefined;
 }
 
 export interface InstanceStatus {
@@ -73,6 +76,12 @@ export interface InstanceStatus {
   running: boolean;
   imageTag: string;
   startedAt: string | null;
+}
+
+export type BootstrapResourceResidual = 'container' | 'network' | 'data';
+
+export interface BootstrapCleanupResult {
+  residuals: BootstrapResourceResidual[];
 }
 
 export class DockerClient {
@@ -186,6 +195,32 @@ export class DockerClient {
   }
 
   /**
+   * 新实例补偿的所有权前提：首个副作用前，三类实例命名资源必须都不存在。
+   * 这样后续出现的资源才属于本次 bootstrap；旧的孤儿资源绝不被当成本次产物删除。
+   */
+  async assertBootstrapResourcesAbsent(instanceId: string): Promise<void> {
+    assertValidId(instanceId);
+    try {
+      await this.docker.getContainer(containerName(instanceId)).inspect();
+      throw new Error(`实例 ${instanceId} 已有同名容器，拒绝覆盖`);
+    } catch (error) {
+      if ((error as { statusCode?: number }).statusCode !== 404) throw error;
+    }
+    try {
+      await this.docker.getNetwork(this.instanceNetwork(instanceId)).inspect();
+      throw new Error(`实例 ${instanceId} 已有同名网络，拒绝覆盖`);
+    } catch (error) {
+      if ((error as { statusCode?: number }).statusCode !== 404) throw error;
+    }
+    try {
+      await lstat(instanceDataDir(this.opts.instanceDataRoot, instanceId));
+      throw new Error(`实例 ${instanceId} 已有数据目录，拒绝覆盖`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+
+  /**
    * 本机是否已有该镜像。走只读的 images/<name>/json，不具备拉取能力。
    *
    * **只有 404 才算「没有」。** 其它错误（受限代理没放行 → 403、端点不通 → 网络错误）
@@ -242,7 +277,7 @@ export class DockerClient {
    * 0o770 而非 0o777：同组可读写即可，不给其它用户。Manager 与 Node-RED 官方镜像
    * 都以 uid 1000 运行，因此这里建出来的目录实例能直接写。
    */
-  async ensureDataDir(instanceId: string): Promise<void> {
+  async ensureDataDir(instanceId: string, runtimeMode: NodeRuntimeMode): Promise<void> {
     const dir = instanceDataDir(this.opts.instanceDataRoot, instanceId);
     await mkdir(dir, { recursive: true, mode: 0o770 });
 
@@ -253,8 +288,10 @@ export class DockerClient {
      * Node-RED 的 nodesDir 本来就是扫目录，不需要 package.json。
      * 每次创建都覆盖，保证节点集版本跟着 Manager 走。
      */
-    if (this.opts.nodePackageDir) {
-      await cp(this.opts.nodePackageDir, `${dir}/nodes`, { recursive: true, force: true });
+    if (runtimeMode === 'legacy' && this.opts.nodePackageDir) {
+      const copyDir = this.opts.copyDir
+        ?? ((source: string, destination: string) => cp(source, destination, { recursive: true, force: true }));
+      await copyDir(this.opts.nodePackageDir, `${dir}/nodes`);
     }
   }
 
@@ -262,7 +299,11 @@ export class DockerClient {
    * 创建实例容器并写入 settings.js。
    * settings.js 在容器启动前经 putArchive 落进数据卷，避免运行时再改配置。
    */
-  async createInstance(spec: InstanceSpec, settingsJs: string): Promise<void> {
+  async createInstance(
+    spec: InstanceSpec,
+    settingsJs: string,
+    runtimeMode: NodeRuntimeMode,
+  ): Promise<void> {
     // managerUrl / npmRegistry 由客户端统一补，调用方不必关心 Manager 自己是不是容器
     if (this.opts.managerUrl) spec = { ...spec, managerUrl: this.opts.managerUrl };
     if (this.opts.npmRegistry) spec = { ...spec, npmRegistry: this.opts.npmRegistry };
@@ -277,7 +318,7 @@ export class DockerClient {
       proxyEnv: this.opts.proxyEnv ?? [],
     });
     assertSafeCreateOptions(options, { instanceDataRoot: this.opts.instanceDataRoot });
-    await this.ensureDataDir(spec.id);
+    await this.ensureDataDir(spec.id, runtimeMode);
 
     const container = await this.docker.createContainer(options as Docker.ContainerCreateOptions);
     await this.attachManager(spec.id);
@@ -397,6 +438,63 @@ export class DockerClient {
     }
 
     if (containerError) throw containerError;
+  }
+
+  /**
+   * 全新实例失败后的严格补偿：三类资源分别删除，再分别核验确实不存在。
+   * 只返回受控资源名，不把 Docker/fs 原始错误或环境细节带入持久化日志。
+   */
+  async cleanupBootstrap(instanceId: string): Promise<BootstrapCleanupResult> {
+    assertValidId(instanceId);
+    const residuals = new Set<BootstrapResourceResidual>();
+
+    try {
+      const inspected = await this.docker.getContainer(containerName(instanceId)).inspect();
+      const labels = inspected.Config.Labels ?? {};
+      if (labels[MANAGED_LABEL] !== 'true' || labels[INSTANCE_LABEL] !== instanceId) {
+        residuals.add('container');
+      } else {
+        await this.docker.getContainer(inspected.Id).remove({ force: true });
+      }
+    } catch (error) {
+      if ((error as { statusCode?: number }).statusCode !== 404) residuals.add('container');
+    }
+    try {
+      await this.docker.getContainer(containerName(instanceId)).inspect();
+      residuals.add('container');
+    } catch (error) {
+      if ((error as { statusCode?: number }).statusCode !== 404) residuals.add('container');
+    }
+
+    try {
+      const network = await this.assertOwnedNetwork(instanceId);
+      const networkRef = this.docker.getNetwork(network.Id);
+      await this.detachManager(networkRef, instanceId);
+      await networkRef.remove();
+    } catch (error) {
+      if ((error as { statusCode?: number }).statusCode !== 404) residuals.add('network');
+    }
+    try {
+      await this.docker.getNetwork(this.instanceNetwork(instanceId)).inspect();
+      residuals.add('network');
+    } catch (error) {
+      if ((error as { statusCode?: number }).statusCode !== 404) residuals.add('network');
+    }
+
+    const dataDir = instanceDataDir(this.opts.instanceDataRoot, instanceId);
+    try {
+      await rm(dataDir, { recursive: true, force: true });
+    } catch {
+      residuals.add('data');
+    }
+    try {
+      await lstat(dataDir);
+      residuals.add('data');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') residuals.add('data');
+    }
+
+    return { residuals: ['container', 'network', 'data'].filter((kind) => residuals.has(kind as BootstrapResourceResidual)) as BootstrapResourceResidual[] };
   }
 
   /** 只列举带平台标签的容器，避免误操作宿主上的其它容器 */

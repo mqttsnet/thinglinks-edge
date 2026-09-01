@@ -4,7 +4,15 @@ import { openDb } from './core/db.ts';
 import { NodeCatalog } from './core/nodes/catalog.ts';
 import { PlatformPackageService } from './core/nodes/platform-package.ts';
 import { NodeStore } from './core/nodes/store.ts';
-import { VERSION, assemblePlatformNodeServices, describe } from './index.ts';
+import {
+  VERSION,
+  assembleInstanceAdminRuntime,
+  assemblePlatformNodeServices,
+  describe,
+  startManagerRuntime,
+} from './index.ts';
+import { InstanceRepo } from './core/instance/repo.ts';
+import { deriveKey } from './core/auth/crypto.ts';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -41,4 +49,36 @@ test('平台包装配只 bootstrap 一个服务并把同一引用交给 server �
     PlatformPackageService.prototype.bootstrap = original;
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('Admin runtime composition shares one object with InstanceService and HttpContext deps', () => {
+  const repo = new InstanceRepo(openDb(':memory:'), deriveKey('index-admin-runtime', 'instance'));
+  const assembled = assembleInstanceAdminRuntime({
+    repo,
+    upstreamFor: (id) => `http://instance-${id}:1880`,
+  });
+  assert.strictEqual(assembled.instanceServiceDeps.adminRuntime, assembled.adminRuntime);
+  assert.strictEqual(assembled.serverDeps.adminRuntime, assembled.adminRuntime);
+});
+
+test('manager startup awaits network reconciliation then bootstrap recovery before serving', async () => {
+  const events: string[] = [];
+  const server = { name: 'server' };
+  await startManagerRuntime({
+    reconcileNetworks: async () => { events.push('network'); },
+    recoverInterruptedBootstraps: async () => {
+      events.push('recovery:start');
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      events.push('recovery:end');
+    },
+    startBackground: async () => { events.push('background'); },
+    buildServer: async () => { events.push('build'); return server; },
+    listen: async (built) => {
+      assert.strictEqual(built, server);
+      events.push('listen');
+    },
+  });
+  assert.deepEqual(events, [
+    'network', 'recovery:start', 'recovery:end', 'background', 'build', 'listen',
+  ]);
 });

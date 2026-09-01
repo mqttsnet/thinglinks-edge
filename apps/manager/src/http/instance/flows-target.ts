@@ -6,21 +6,19 @@
  */
 import { AdminApiError, type AdminTarget } from '../../core/flows/admin-client.ts';
 import { TemplateError } from '../../core/flows/types.ts';
+import { InstanceAdminRuntimeError } from '../../core/instance/admin-runtime.ts';
 import type { HttpContext } from '../context.ts';
 
 export type TargetOrError = AdminTarget | { error: string; code: number };
 
 export function targetFor(ctx: HttpContext, id: string): TargetOrError {
-  const inst = ctx.repo.get(id);
-  if (!inst) return { error: `实例 ${id} 不存在`, code: 404 };
-  const cred = ctx.repo.credentials(id)[0];
-  if (!cred) return { error: `实例 ${id} 无可用账号`, code: 500 };
-  return {
-    upstream: ctx.upstreamFor(id),
-    adminRoot: inst.adminRoot,
-    username: cred.username,
-    password: cred.password,
-  };
+  try {
+    return ctx.adminRuntime.target(id);
+  } catch (error) {
+    if (!(error instanceof InstanceAdminRuntimeError)) throw error;
+    const code = error.reason === 'instance-not-found' ? 404 : 500;
+    return { error: error.message, code };
+  }
 }
 
 /** 统一的错误映射：实例连不上是 502（我们没问题、上游有问题），不是 500 */

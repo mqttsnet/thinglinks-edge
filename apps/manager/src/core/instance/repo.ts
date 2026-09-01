@@ -225,7 +225,6 @@ function validateCheckpointDir(input: BeginNodeMigrationInput): void {
   if (input.checkpointDir === '') {
     if (
       input.operationKind === 'bootstrap'
-      && input.modeBefore === 'legacy'
       && input.originalRunning === false
       && input.stagedBefore === false
     ) return;
@@ -312,6 +311,26 @@ export class InstanceRepo {
     })();
   }
 
+  /**
+   * 为全新实例原子写入实例行与 bootstrap 恢复日志。
+   *
+   * 外层事务包住现有两个经过校验的仓储原语；better-sqlite3 会在已有事务内
+   * 使用保存点，因此任一端失败都会回滚实例、端口、凭据、日志与投影。
+   */
+  createWithNodeMigration(
+    rec: InstanceRecord,
+    ports: PortRecord[],
+    creds: CredRecord[],
+    input: BeginNodeMigrationInput & { operationKind: 'bootstrap' },
+  ): void {
+    if (input.operationKind !== 'bootstrap') throw new RepoError('新实例只能创建 bootstrap 日志');
+    if (input.instanceId !== rec.id) throw new RepoError('bootstrap 日志实例与新实例不一致');
+    this.db.transaction(() => {
+      this.create(rec, ports, creds);
+      this.beginNodeMigration(input);
+    })();
+  }
+
   get(id: string): InstanceRecord | undefined {
     const r = this.db.prepare('SELECT * FROM instance WHERE id = ?').get(id) as Record<string, unknown> | undefined;
     if (!r) return undefined;
@@ -324,6 +343,7 @@ export class InstanceRepo {
       adminRoot: r['admin_root'] as string,
       credSecret: r['cred_secret'] as string,
       notes: r['notes'] as string,
+      nodeRuntimeMode: r['node_runtime_mode'] as NodeRuntimeMode,
     };
   }
 

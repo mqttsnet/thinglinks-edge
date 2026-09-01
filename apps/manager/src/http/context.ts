@@ -28,6 +28,7 @@ import type { NpmSourceRepo } from '../core/nodes/sources.ts';
 import type { PlatformPackageService } from '../core/nodes/platform-package.ts';
 import { InstanceBusyError, type InstanceOperationGate } from '../core/instance/operation-gate.ts';
 import type { ProxySessionRegistry } from '../core/instance/proxy-session-registry.ts';
+import type { InstanceAdminRuntime } from '../core/instance/admin-runtime.ts';
 
 export const SID = 'tle_sid';
 export const CSRF = 'tle_csrf';
@@ -38,6 +39,8 @@ export interface ServerDeps {
   auth: AuthService;
   repo: InstanceRepo;
   service: InstanceService;
+  /** Core 与 HTTP 共用的同一个 Admin API runtime；路由只做错误映射。 */
+  adminRuntime: InstanceAdminRuntime;
   /** 所有运行期实例写操作共用的唯一闸门；路由不得自行构造。 */
   operationGate: InstanceOperationGate;
   /** 反代层现存 WebSocket 的唯一登记表；迁移核心只依赖这个 core port。 */
@@ -116,6 +119,7 @@ export interface HttpContext {
   auth: AuthService;
   repo: InstanceRepo;
   service: InstanceService;
+  adminRuntime: InstanceAdminRuntime;
   operationGate: InstanceOperationGate;
   proxySessions: ProxySessionRegistry;
   upstreamFor: (instanceId: string) => string;
@@ -184,6 +188,7 @@ export function createContext(deps: ServerDeps): HttpContext {
     auth,
     repo: deps.repo,
     service: deps.service,
+    adminRuntime: deps.adminRuntime,
     operationGate: deps.operationGate,
     proxySessions: deps.proxySessions,
     upstreamFor: deps.upstreamFor ?? defaultUpstream,

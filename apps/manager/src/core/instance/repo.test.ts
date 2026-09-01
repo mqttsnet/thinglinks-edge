@@ -163,6 +163,56 @@ test('创建失败时整体回滚，不留半条记录', () => {
   assert.equal(repo.get('line-b'), undefined, '冲突后不应残留实例记录');
 });
 
+test('npm bootstrap instance row and preparing journal are created in one SQLite transaction', () => {
+  const db = openDb(':memory:');
+  const repo = new InstanceRepo(db, KEY);
+  const bootstrap = {
+    ...bootstrapBegin('line-a', 'tx-bootstrap-create'),
+    modeBefore: 'npm' as const,
+  };
+
+  repo.createWithNodeMigration(
+    rec({ nodeRuntimeMode: 'npm' }),
+    [port()],
+    cred(),
+    bootstrap,
+  );
+
+  assert.deepEqual(repo.nodeRuntime('line-a'), {
+    mode: 'npm',
+    platformVersion: '',
+    migrationState: 'preparing',
+    migrationError: 'none',
+  });
+  assert.deepEqual(repo.nodeMigration('line-a')?.snapshot, bootstrapSnapshot());
+  assert.equal(repo.ports('line-a').length, 1);
+  assert.equal(repo.credentials('line-a').length, 1);
+});
+
+test('failed bootstrap journal insert rolls back the instance row ports and credentials', () => {
+  const db = openDb(':memory:');
+  const repo = new InstanceRepo(db, KEY);
+  db.exec(`CREATE TRIGGER reject_bootstrap_journal BEFORE INSERT ON instance_node_migration
+    BEGIN SELECT RAISE(ABORT, 'bootstrap journal rejected'); END;`);
+
+  assert.throws(
+    () => repo.createWithNodeMigration(
+      rec({ nodeRuntimeMode: 'npm' }),
+      [port()],
+      cred(),
+      {
+        ...bootstrapBegin('line-a', 'tx-bootstrap-rejected'),
+        modeBefore: 'npm',
+      },
+    ),
+    /bootstrap journal rejected/,
+  );
+  assert.equal(repo.get('line-a'), undefined);
+  assert.equal(repo.ports('line-a').length, 0);
+  assert.equal(repo.credentials('line-a').length, 0);
+  assert.equal(repo.nodeMigration('line-a'), undefined);
+});
+
 test('审计可写入且带时间戳', () => {
   const db = openDb(':memory:');
   recordAudit(db, { actor: 'admin', action: 'create-instance', target: 'line-a', result: 'ok' });
