@@ -103,7 +103,7 @@ export function registerNpmRegistry(
       // 编辑器每次打开面板都会带缓存破坏参数重取，明确禁缓存免得中间层自作主张
       .header('cache-control', 'no-store')
       .send(buildCatalogue(store, {
-        name: 'ThingLinks Edge 私有节点源',
+        name: 'ThingLinks Edge Community catalogue',
         approved: catalog.names(),
       })));
 

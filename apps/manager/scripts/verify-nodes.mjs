@@ -332,6 +332,9 @@ async function main() {
 
   const cat = await fetch(`${B}/npm/-/catalogue.json`).then((r) => r.json());
   const catIds = (cat.modules ?? []).map((m) => m.id).sort();
+  check('Community catalogue 使用统一英文命名',
+    cat.name === 'ThingLinks Edge Community catalogue',
+    `实际 ${JSON.stringify(cat.name)}`);
   check('私有 catalogue 只列已批准的节点包',
     catIds.length === 2 && catIds.includes(OK_PKG) && catIds.includes(URLDEP_PKG),
     `实际 ${JSON.stringify(catIds)}`);
