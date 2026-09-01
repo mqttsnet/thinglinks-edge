@@ -13,6 +13,8 @@
  *    跳过该校验。不要按直觉在两种策略之间挪用这两个取值。
  */
 import type { PalettePolicy } from '../nodes/policy.ts';
+import { LEGACY_RUNTIME_EXCLUDES } from '../nodes/platform-contract.ts';
+import type { NodeRuntimeMode } from './repo.ts';
 
 export interface InstanceCredential {
   username: string;
@@ -23,6 +25,8 @@ export interface InstanceCredential {
 
 export interface SettingsInput {
   instanceId: string;
+  /** 不传保持旧实例兼容；新实例由 Task 7 显式选择 npm */
+  nodeRuntimeMode?: NodeRuntimeMode;
   /** 形如 /nodered/red/line-a/ ，必须以斜杠结尾 */
   adminRoot: string;
   credentials: InstanceCredential[];
@@ -61,12 +65,19 @@ export function renderSettings(input: SettingsInput): string {
       throw new Error(`账号 ${c.username} 的口令必须是 bcrypt 哈希，不接受明文`);
     }
   }
+  const nodeRuntimeMode = input.nodeRuntimeMode ?? 'legacy';
+  if (nodeRuntimeMode !== 'legacy' && nodeRuntimeMode !== 'npm') {
+    throw new Error(`无效的节点运行模式 ${nodeRuntimeMode}`);
+  }
 
   const users = input.credentials
     .map((c) => `        { username: ${js(c.username)}, password: ${js(c.passwordHash)}, permissions: ${js(c.permissions)} }`)
     .join(',\n');
 
-  const excludes = input.excludeRiskyNodes === false ? '[]' : JSON.stringify(RISKY_NODES);
+  const excludes = [
+    ...(input.excludeRiskyNodes === false ? [] : RISKY_NODES),
+    ...(nodeRuntimeMode === 'npm' ? LEGACY_RUNTIME_EXCLUDES : []),
+  ];
   // 不传 palette 就是「什么都不许装」——见 SettingsInput.palette 的说明
   const palette: PalettePolicy = input.palette
     ?? { allowInstall: false, allowList: [], denyList: ['*'], catalogues: [] };
@@ -94,13 +105,11 @@ ${users}
     flowFile: "flows.json",
     flowFilePretty: true,
 
-    // @thinglinks 节点集：由 Manager 拷进数据目录，扫目录加载，不走 npm
-    nodesDir: "/data/nodes",
-
     // 不启用外部模块，收敛 Function 节点的可达面
     functionExternalModules: false,
     functionGlobalContext: {},
-    nodesExcludes: ${excludes},
+    // npm 模式屏蔽 userDir/nodes 下的三份旧平台 JS，避免与已安装包重复注册
+    nodesExcludes: ${JSON.stringify(excludes)},
 
     logging: {
         console: { level: "info", metrics: false, audit: false }
