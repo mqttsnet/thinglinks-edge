@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   assertValidId, assertValidSpec, buildCreateOptions, assertSafeCreateOptions,
-  SpecError, containerName, instanceDataDir, type InstanceSpec,
+  SpecError, containerName, instanceDataDir, BOOTSTRAP_TX_LABEL, type InstanceSpec,
 } from './container-spec.ts';
 
 const RANGE = { min: 30000, max: 30999 };
@@ -52,6 +52,22 @@ test('生成的配置默认安全：非 root、只读根、能力全裁、配额
   assert.equal(hc['NanoCpus'], 5e8);
   assert.deepEqual(hc['Binds'], [`${DATA_ROOT}/line-a:/data`]);
   guard(o);
+});
+
+test('bootstrap container gets the exact tx owner label while ordinary rebuilds never do', () => {
+  const ordinary = build(spec());
+  assert.equal((ordinary['Labels'] as Record<string, unknown>)[BOOTSTRAP_TX_LABEL], undefined);
+
+  const bootstrap = buildCreateOptions(spec(), {
+    network: 'tle-net', imageRepo: 'nodered/node-red',
+    instanceDataRoot: DATA_ROOT, timezone: 'Asia/Shanghai',
+    bootstrapTxId: 'bootstrap-tx-01',
+  });
+  assert.equal(
+    (bootstrap['Labels'] as Record<string, unknown>)[BOOTSTRAP_TX_LABEL],
+    'bootstrap-tx-01',
+  );
+  guard(bootstrap);
 });
 
 test('1880 绝不映射宿主 —— 唯一入口必须是 Manager 反代', () => {

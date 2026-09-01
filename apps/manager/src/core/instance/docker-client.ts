@@ -7,11 +7,11 @@
  *
  * 所有创建请求都必须经 assertSafeCreateOptions 二次校验后才下发。
  */
-import { mkdir, rm, cp, lstat } from 'node:fs/promises';
+import { mkdir, rm, cp, lstat, open, readFile } from 'node:fs/promises';
 import Docker from 'dockerode';
 import {
   buildCreateOptions, assertSafeCreateOptions, assertValidSpec,
-  assertValidId, containerName, instanceDataDir, type InstanceSpec,
+  assertValidId, BOOTSTRAP_TX_LABEL, containerName, instanceDataDir, type InstanceSpec,
 } from './container-spec.ts';
 import { tarFile } from '../archive/tar.ts';
 import { dockerLogToText } from './log-stream.ts';
@@ -20,6 +20,8 @@ import type { NodeRuntimeMode } from './repo.ts';
 /** 平台管理的容器统一打这个标签，列举与操作一律按标签过滤 */
 export const MANAGED_LABEL = 'com.mqttsnet.thinglinks-edge.managed';
 const INSTANCE_LABEL = 'com.mqttsnet.thinglinks-edge.instance';
+export const BOOTSTRAP_OWNER_FILE = '.thinglinks-bootstrap-owner';
+const BOOTSTRAP_TX_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 /** 官方镜像内 node-red 用户的 uid/gid */
 const NODE_RED_UID = 1000;
 
@@ -67,6 +69,8 @@ export interface DockerClientOptions {
   npmRegistry?: string | undefined;
   /** 文件复制 seam；生产使用 fs.cp，测试只记录精确源/目标。 */
   copyDir?: ((source: string, destination: string) => Promise<void>) | undefined;
+  /** bootstrap 数据目录删除 seam；生产使用 fs.rm，测试注入确定性失败。 */
+  removeDir?: ((path: string) => Promise<void>) | undefined;
 }
 
 export interface InstanceStatus {
@@ -100,6 +104,19 @@ export class DockerClient {
   constructor(opts: DockerClientOptions) {
     this.opts = opts;
     this.docker = new Docker(opts.connection ?? {});
+  }
+
+  private requireBootstrapTxId(txId: string): void {
+    if (!BOOTSTRAP_TX_ID.test(txId)) throw new Error('bootstrap tx id 无效');
+  }
+
+  private async syncDirectory(path: string): Promise<void> {
+    const handle = await open(path, 'r');
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
   }
 
   /**
@@ -296,6 +313,102 @@ export class DockerClient {
   }
 
   /**
+   * 全新实例专用数据根创建：child mkdir 必须独占成功，随后持久化 tx owner marker。
+   * 普通升级/legacy 仍走 ensureDataDir，永远不会获得 bootstrap owner。
+   */
+  async prepareBootstrapDataDir(instanceId: string, txId: string): Promise<void> {
+    assertValidId(instanceId);
+    this.requireBootstrapTxId(txId);
+    await mkdir(this.opts.instanceDataRoot, { recursive: true, mode: 0o770 });
+    const dir = instanceDataDir(this.opts.instanceDataRoot, instanceId);
+    await mkdir(dir, { mode: 0o770 });
+
+    const marker = await open(`${dir}/${BOOTSTRAP_OWNER_FILE}`, 'wx', 0o600);
+    try {
+      await marker.writeFile(txId, 'utf8');
+      await marker.sync();
+    } finally {
+      await marker.close();
+    }
+    await this.syncDirectory(dir);
+    await this.syncDirectory(this.opts.instanceDataRoot);
+  }
+
+  private async bootstrapDataOwnership(
+    instanceId: string,
+    txId: string,
+  ): Promise<'absent' | 'owned' | 'foreign'> {
+    const dir = instanceDataDir(this.opts.instanceDataRoot, instanceId);
+    let dirStat;
+    try {
+      dirStat = await lstat(dir);
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'absent' : 'foreign';
+    }
+    if (!dirStat.isDirectory() || dirStat.isSymbolicLink()) return 'foreign';
+
+    const markerPath = `${dir}/${BOOTSTRAP_OWNER_FILE}`;
+    let markerStat;
+    try {
+      markerStat = await lstat(markerPath);
+    } catch {
+      return 'foreign';
+    }
+    if (!markerStat.isFile() || markerStat.isSymbolicLink()) return 'foreign';
+    try {
+      return await readFile(markerPath, 'utf8') === txId ? 'owned' : 'foreign';
+    } catch {
+      return 'foreign';
+    }
+  }
+
+  private async createBootstrapNetwork(instanceId: string, txId: string): Promise<string> {
+    const created = await this.docker.createNetwork({
+      Name: this.instanceNetwork(instanceId),
+      Driver: 'bridge',
+      Labels: {
+        [MANAGED_LABEL]: 'true',
+        [INSTANCE_LABEL]: instanceId,
+        [BOOTSTRAP_TX_LABEL]: txId,
+      },
+    });
+    return created.id;
+  }
+
+  /** 新实例专用创建路径；tx owner 不存在于普通 createInstance 的签名中。 */
+  async createBootstrapInstance(
+    spec: InstanceSpec,
+    settingsJs: string,
+    txId: string,
+  ): Promise<void> {
+    this.requireBootstrapTxId(txId);
+    if (this.opts.managerUrl) spec = { ...spec, managerUrl: this.opts.managerUrl };
+    if (this.opts.npmRegistry) spec = { ...spec, npmRegistry: this.opts.npmRegistry };
+    assertValidSpec(spec, this.opts.portRange);
+    await this.assertImagePresent(this.imageRef(spec.imageTag));
+    if (await this.bootstrapDataOwnership(spec.id, txId) !== 'owned') {
+      throw new Error(`实例 ${spec.id} 的 bootstrap 数据 owner 不匹配`);
+    }
+    // 不查找或复用同名网络：createNetwork 的独占冲突关闭 preflight→create 竞态。
+    const networkId = await this.createBootstrapNetwork(spec.id, txId);
+    const options = buildCreateOptions(spec, {
+      network: networkId,
+      imageRepo: this.opts.imageRepo,
+      instanceDataRoot: this.opts.instanceDataRoot,
+      timezone: this.opts.timezone,
+      proxyEnv: this.opts.proxyEnv ?? [],
+      bootstrapTxId: txId,
+    });
+    assertSafeCreateOptions(options, { instanceDataRoot: this.opts.instanceDataRoot });
+    const container = await this.docker.createContainer(options as Docker.ContainerCreateOptions);
+    await this.attachManager(spec.id);
+    await container.putArchive(
+      tarFile('settings.js', settingsJs, { uid: NODE_RED_UID, gid: NODE_RED_UID, mode: 0o644 }),
+      { path: '/data' },
+    );
+  }
+
+  /**
    * 创建实例容器并写入 settings.js。
    * settings.js 在容器启动前经 putArchive 落进数据卷，避免运行时再改配置。
    */
@@ -444,14 +557,19 @@ export class DockerClient {
    * 全新实例失败后的严格补偿：三类资源分别删除，再分别核验确实不存在。
    * 只返回受控资源名，不把 Docker/fs 原始错误或环境细节带入持久化日志。
    */
-  async cleanupBootstrap(instanceId: string): Promise<BootstrapCleanupResult> {
+  async cleanupBootstrap(instanceId: string, txId: string): Promise<BootstrapCleanupResult> {
     assertValidId(instanceId);
+    this.requireBootstrapTxId(txId);
     const residuals = new Set<BootstrapResourceResidual>();
 
     try {
       const inspected = await this.docker.getContainer(containerName(instanceId)).inspect();
       const labels = inspected.Config.Labels ?? {};
-      if (labels[MANAGED_LABEL] !== 'true' || labels[INSTANCE_LABEL] !== instanceId) {
+      if (
+        labels[MANAGED_LABEL] !== 'true'
+        || labels[INSTANCE_LABEL] !== instanceId
+        || labels[BOOTSTRAP_TX_LABEL] !== txId
+      ) {
         residuals.add('container');
       } else {
         await this.docker.getContainer(inspected.Id).remove({ force: true });
@@ -468,9 +586,13 @@ export class DockerClient {
 
     try {
       const network = await this.assertOwnedNetwork(instanceId);
-      const networkRef = this.docker.getNetwork(network.Id);
-      await this.detachManager(networkRef, instanceId);
-      await networkRef.remove();
+      if (network.Labels?.[BOOTSTRAP_TX_LABEL] !== txId) {
+        residuals.add('network');
+      } else {
+        const networkRef = this.docker.getNetwork(network.Id);
+        await this.detachManager(networkRef, instanceId);
+        await networkRef.remove();
+      }
     } catch (error) {
       if ((error as { statusCode?: number }).statusCode !== 404) residuals.add('network');
     }
@@ -482,19 +604,27 @@ export class DockerClient {
     }
 
     const dataDir = instanceDataDir(this.opts.instanceDataRoot, instanceId);
-    try {
-      await rm(dataDir, { recursive: true, force: true });
-    } catch {
+    const dataOwnership = await this.bootstrapDataOwnership(instanceId, txId);
+    if (dataOwnership === 'foreign') {
       residuals.add('data');
-    }
-    try {
-      await lstat(dataDir);
-      residuals.add('data');
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') residuals.add('data');
+    } else if (dataOwnership === 'owned') {
+      try {
+        const removeDir = this.opts.removeDir
+          ?? ((path: string) => rm(path, { recursive: true, force: false }));
+        await removeDir(dataDir);
+      } catch {
+        residuals.add('data');
+      }
+      try {
+        await lstat(dataDir);
+        residuals.add('data');
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') residuals.add('data');
+      }
     }
 
-    return { residuals: ['container', 'network', 'data'].filter((kind) => residuals.has(kind as BootstrapResourceResidual)) as BootstrapResourceResidual[] };
+    const ordered: BootstrapResourceResidual[] = ['container', 'network', 'data'];
+    return { residuals: ordered.filter((kind) => residuals.has(kind)) };
   }
 
   /** 只列举带平台标签的容器，避免误操作宿主上的其它容器 */

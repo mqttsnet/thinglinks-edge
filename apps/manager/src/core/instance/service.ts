@@ -52,13 +52,22 @@ export class BootstrapCompensationError extends ServiceError {
   readonly residuals: BootstrapResourceResidual[];
 
   constructor(instanceId: string, residuals: BootstrapResourceResidual[]) {
-    super(`实例 ${instanceId} 创建补偿未完成，需人工处理：${residuals.join(',')}`);
+    super(
+      residuals.length > 0
+        ? `实例 ${instanceId} 创建补偿未完成，需人工处理：${residuals.join(',')}`
+        : `实例 ${instanceId} 创建补偿收尾未完成，需人工处理`,
+    );
     this.name = 'BootstrapCompensationError';
     this.residuals = [...residuals];
   }
 }
 
 const BOOTSTRAP_RESOURCES = ['container', 'network', 'data'] as const;
+const RECOVERABLE_BOOTSTRAP_PHASES = new Set([
+  'preparing',
+  'verifying',
+  'rolling_back',
+]);
 
 function controlledResiduals(value: unknown): BootstrapResourceResidual[] {
   if (!Array.isArray(value)) return [...BOOTSTRAP_RESOURCES];
@@ -286,7 +295,7 @@ export class InstanceService {
       });
       this.o.repo.setIngestToken(input.id, ingestToken);
       failureCode = 'install';
-      await this.o.docker.ensureDataDir(input.id, 'npm');
+      await this.o.docker.prepareBootstrapDataDir(input.id, txId);
       const settings = renderSettings({
         instanceId: input.id,
         adminRoot,
@@ -295,11 +304,11 @@ export class InstanceService {
         palette: this.o.palettePolicy?.(),
         nodeRuntimeMode: 'npm',
       });
-      await this.o.docker.createInstance(
+      await this.o.docker.createBootstrapInstance(
         { id: input.id, imageTag: input.imageTag, memoryMb: input.memoryMb, cpus: input.cpus,
             ports, adminRoot, ingestToken },
         settings,
-        'npm',
+        txId,
       );
       await this.o.barrier.reach({
         instanceId: input.id,
@@ -331,7 +340,12 @@ export class InstanceService {
       this.o.repo.updateNodeMigration(input.id, 'verifying');
       this.o.repo.commitNodeMigration(input.id, PLATFORM_NODE_PACKAGE.version, input.actor);
     } catch {
-      const residuals = await this.compensateBootstrap(input.id, input.actor, failureCode);
+      const residuals = await this.compensateBootstrap(
+        input.id,
+        txId,
+        input.actor,
+        failureCode,
+      );
       if (residuals.length > 0) {
         throw new BootstrapCompensationError(input.id, residuals);
       }
@@ -343,6 +357,7 @@ export class InstanceService {
 
   private async compensateBootstrap(
     instanceId: string,
+    txId: string,
     actor: string,
     failureCode: NodeMigrationErrorCode,
   ): Promise<BootstrapResourceResidual[]> {
@@ -350,7 +365,7 @@ export class InstanceService {
     let residuals: BootstrapResourceResidual[];
     try {
       residuals = controlledResiduals(
-        (await this.o.docker.cleanupBootstrap(instanceId)).residuals,
+        (await this.o.docker.cleanupBootstrap(instanceId, txId)).residuals,
       );
     } catch {
       // 清理器本应把三类结果闭合返回；若边界自身异常，保守地全部标残留。
@@ -358,29 +373,50 @@ export class InstanceService {
     }
     if (residuals.length === 0) {
       // 资源均已核验不存在后，才允许删除实例行；journal/凭据/令牌随 FK 级联。
-      this.o.db.transaction(() => {
-        this.o.repo.remove(instanceId);
-        recordAudit(this.o.db, {
-          actor,
-          action: 'create-instance',
-          target: instanceId,
-          result: 'fail',
-          detail: JSON.stringify({ code: failureCode }),
-        });
-      })();
+      try {
+        this.o.db.transaction(() => {
+          this.o.repo.remove(instanceId);
+          recordAudit(this.o.db, {
+            actor,
+            action: 'create-instance',
+            target: instanceId,
+            result: 'fail',
+            detail: JSON.stringify({ code: failureCode }),
+          });
+        })();
+      } catch {
+        this.preserveManualCompensation(instanceId);
+        throw new BootstrapCompensationError(instanceId, []);
+      }
       return [];
     }
-    this.o.db.transaction(() => {
-      this.o.repo.updateNodeMigration(instanceId, 'manual_required', 'compensation');
-      recordAudit(this.o.db, {
-        actor,
-        action: 'bootstrap-compensation',
-        target: instanceId,
-        result: 'fail',
-        detail: JSON.stringify({ code: 'compensation', residuals }),
-      });
-    })();
+    try {
+      this.o.db.transaction(() => {
+        this.o.repo.updateNodeMigration(instanceId, 'manual_required', 'compensation');
+        recordAudit(this.o.db, {
+          actor,
+          action: 'bootstrap-compensation',
+          target: instanceId,
+          result: 'fail',
+          detail: JSON.stringify({ code: 'compensation', residuals }),
+        });
+      })();
+    } catch {
+      this.preserveManualCompensation(instanceId);
+      throw new BootstrapCompensationError(instanceId, residuals);
+    }
     return residuals;
+  }
+
+  /** Audit finalization fallback: persist only the closed recovery state, never raw DB text. */
+  private preserveManualCompensation(instanceId: string): void {
+    try {
+      this.o.db.transaction(() => {
+        this.o.repo.updateNodeMigration(instanceId, 'manual_required', 'compensation');
+      })();
+    } catch {
+      // Outward callers still receive only BootstrapCompensationError below.
+    }
   }
 
   /** 启动期内部恢复：不递归获取公开 gate，直接复用同一严格补偿原语。 */
@@ -389,11 +425,15 @@ export class InstanceService {
     residuals: BootstrapResourceResidual[];
   }>> {
     const interrupted = this.o.repo.interruptedNodeMigrations()
-      .filter((journal) => journal.operationKind === 'bootstrap');
+      .filter((journal) => (
+        journal.operationKind === 'bootstrap'
+        && RECOVERABLE_BOOTSTRAP_PHASES.has(journal.phase)
+      ));
     const results: Array<{ instanceId: string; residuals: BootstrapResourceResidual[] }> = [];
     for (const journal of interrupted) {
       const residuals = await this.compensateBootstrap(
         journal.instanceId,
+        journal.txId,
         'system',
         journal.error === 'none' ? 'compensation' : journal.error,
       );

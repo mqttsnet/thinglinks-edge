@@ -99,6 +99,8 @@ export function assertValidSpec(spec: InstanceSpec, portRange: { min: number; ma
 }
 
 export const containerName = (id: string) => `tle-nr-${id}`;
+export const BOOTSTRAP_TX_LABEL = 'com.mqttsnet.thinglinks-edge.bootstrap-tx';
+const BOOTSTRAP_TX_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
 /**
  * 实例数据目录（宿主路径）。
@@ -121,8 +123,13 @@ export function buildCreateOptions(
      * 而现场常常只有企业代理这一条路。留空表示不配 —— 离线部署即此形态。
      */
     proxyEnv?: readonly string[];
+    /** 仅由全新实例 bootstrap 专用创建路径传入；普通重建不得携带。 */
+    bootstrapTxId?: string;
   },
 ): Record<string, unknown> {
+  if (opts.bootstrapTxId !== undefined && !BOOTSTRAP_TX_ID.test(opts.bootstrapTxId)) {
+    throw new SpecError('bootstrap tx id 非法');
+  }
   const exposed: Record<string, Record<string, never>> = {};
   const bindings: Record<string, Array<{ HostIp: string; HostPort: string }>> = {};
   for (const p of spec.ports) {
@@ -162,6 +169,7 @@ export function buildCreateOptions(
     Labels: {
       'com.mqttsnet.thinglinks-edge.managed': 'true',
       'com.mqttsnet.thinglinks-edge.instance': spec.id,
+      ...(opts.bootstrapTxId ? { [BOOTSTRAP_TX_LABEL]: opts.bootstrapTxId } : {}),
     },
     ExposedPorts: exposed,
     HostConfig: {
@@ -201,6 +209,13 @@ export function assertSafeCreateOptions(
   opts: { instanceDataRoot: string },
 ): void {
   const hc = (options['HostConfig'] ?? {}) as Record<string, unknown>;
+  const labels = (options['Labels'] ?? {}) as Record<string, unknown>;
+  const bootstrapTxId = labels[BOOTSTRAP_TX_LABEL];
+  if (bootstrapTxId !== undefined && (
+    typeof bootstrapTxId !== 'string' || !BOOTSTRAP_TX_ID.test(bootstrapTxId)
+  )) {
+    throw new SpecError('bootstrap tx label 非法');
+  }
 
   for (const key of FORBIDDEN_HOST_CONFIG) {
     if (hc[key] !== undefined) {
@@ -223,7 +238,6 @@ export function assertSafeCreateOptions(
     if (!Array.isArray(binds)) throw new SpecError('Binds 必须是数组');
     // 合法挂载只有一个，且完全由平台算出：数据根来自配置，实例 id 取自标签并过 ID_RE。
     // 用「精确等于」而不是模式匹配 —— 模式匹配留给 ../ 之类构造的余地，等号不留。
-    const labels = (options['Labels'] ?? {}) as Record<string, unknown>;
     const instanceId = labels['com.mqttsnet.thinglinks-edge.instance'];
     if (typeof instanceId !== 'string') {
       throw new SpecError('缺少实例标签，无法校验数据目录挂载');

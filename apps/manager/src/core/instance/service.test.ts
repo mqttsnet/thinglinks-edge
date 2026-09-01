@@ -432,13 +432,13 @@ async function bootstrapFixture(options: {
     imageRepo: 'nodered/node-red',
     imageRef: (tag: string) => `nodered/node-red:${tag}`,
     assertBootstrapResourcesAbsent: async () => { events.push('resources-absent'); },
-    ensureDataDir: async (id: string, mode: string) => {
-      events.push(`data:${mode}`);
+    prepareBootstrapDataDir: async (id: string, txId: string) => {
+      events.push(`data:${txId}`);
       if (options.failure === 'data') throw new Error('opaque-secret-value');
       writeInstalledFiles(instanceDataRoot, id, options.failure === 'on-disk');
     },
-    createInstance: async (_spec: unknown, _settings: string, mode: string) => {
-      events.push(`create:${mode}`);
+    createBootstrapInstance: async (_spec: unknown, _settings: string, txId: string) => {
+      events.push(`create:${txId}`);
       if (options.failure === 'create') throw new Error('opaque-secret-value');
       containerPresent = true;
     },
@@ -446,8 +446,8 @@ async function bootstrapFixture(options: {
       events.push('start');
       if (options.failure === 'start') throw new Error('opaque-secret-value');
     },
-    cleanupBootstrap: async () => {
-      events.push('cleanup');
+    cleanupBootstrap: async (_id: string, txId: string) => {
+      events.push(`cleanup:${txId}`);
       if ((options.residuals?.length ?? 0) === 0) containerPresent = false;
       return { residuals: options.residuals ?? [] };
     },
@@ -470,7 +470,7 @@ async function bootstrapFixture(options: {
   const barrier: PlatformNodeOperationBarrier = {
     reach: async (event) => {
       assert.ok(repo.nodeMigration(event.instanceId));
-      events.push(`barrier:${event.phase}:${event.boundary}`);
+      events.push(`barrier:${event.txId}:${event.phase}:${event.boundary}`);
     },
   };
   const platformPackages = {
@@ -534,13 +534,15 @@ test('new instance returns only after npm install Admin health and host files ar
       mode: 'npm', platformVersion: '0.0.1', migrationState: 'committed', migrationError: 'none',
     });
     assert.equal(f.repo.nodeMigration('line-new')?.phase, 'committed');
+    const txId = f.repo.nodeMigration('line-new')?.txId;
+    assert.ok(txId);
     assert.deepEqual(f.events, [
       'trust',
       'resources-absent',
-      'barrier:preparing:after-phase-persist',
-      'data:npm',
-      'create:npm',
-      'barrier:preparing:after-container-create',
+      `barrier:${txId}:preparing:after-phase-persist`,
+      `data:${txId}`,
+      `create:${txId}`,
+      `barrier:${txId}:preparing:after-container-create`,
       'start',
       'readiness',
       'install',
@@ -564,8 +566,14 @@ for (const failure of [
       await assert.rejects(() => f.service.create(newInstance));
       assert.equal(f.repo.get('line-new'), undefined);
       assert.equal(f.repo.ingestToken('line-new'), undefined);
-      if (failure === 'trust') assert.ok(!f.events.includes('cleanup'));
-      else assert.ok(f.events.includes('cleanup'));
+      if (failure === 'trust') assert.ok(!f.events.some((event) => event.startsWith('cleanup:')));
+      else {
+        const cleanup = f.events.find((event) => event.startsWith('cleanup:'));
+        const preparing = f.events.find((event) => event.startsWith('barrier:'));
+        const txId = preparing?.split(':')[1];
+        assert.ok(txId);
+        assert.equal(cleanup, `cleanup:${txId}`);
+      }
       const audit = f.db.prepare(
         "SELECT detail FROM audit WHERE action = 'create-instance' AND target = 'line-new' AND result = 'fail'",
       ).get() as { detail: string } | undefined;
@@ -669,7 +677,7 @@ test('startup recovery selects interrupted bootstrap journals and awaits verifie
     assert.deepEqual(recovered, [{ instanceId: 'line-recover', residuals: [] }]);
     assert.equal(f.repo.get('line-recover'), undefined);
     assert.equal(f.repo.ingestToken('line-recover'), undefined);
-    assert.ok(f.events.includes('cleanup'));
+    assert.ok(f.events.some((event) => event === 'cleanup:tx-recover-line-recover'));
   } finally {
     await f.close();
   }
@@ -686,6 +694,65 @@ test('startup recovery preserves manual_required when verified cleanup reports r
       migrationState: 'manual_required', migrationError: 'compensation',
     });
     assert.equal(f.repo.ingestToken('line-recover'), 'recovery-ingest-token');
+  } finally {
+    await f.close();
+  }
+});
+
+test('startup recovery leaves a projection-mismatch manual bootstrap untouched', async () => {
+  const f = await bootstrapFixture();
+  try {
+    seedInterruptedBootstrap(f, 'line-recover');
+    f.db.prepare(
+      "UPDATE instance SET node_migration_state = 'verifying', node_migration_error = 'verification' WHERE id = ?",
+    ).run('line-recover');
+    // Startup constructor reconciliation makes both authoritative rows manual_required.
+    new InstanceRepo(f.db, deriveKey('bootstrap-service-test', 'instance'));
+    const before = f.repo.nodeMigration('line-recover');
+    const cleanupBefore = f.events.filter((event) => event.startsWith('cleanup:')).length;
+
+    assert.deepEqual(await f.service.recoverInterruptedBootstraps(), []);
+    assert.deepEqual(f.repo.nodeMigration('line-recover'), before);
+    assert.ok(f.repo.get('line-recover'));
+    assert.equal(
+      f.events.filter((event) => event.startsWith('cleanup:')).length,
+      cleanupBefore,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test('startup recovery leaves rolled_back_dirty bootstrap evidence untouched', async () => {
+  const f = await bootstrapFixture();
+  try {
+    seedInterruptedBootstrap(f, 'line-recover');
+    f.repo.updateNodeMigration('line-recover', 'rolled_back_dirty', 'rollback');
+    const before = f.repo.nodeMigration('line-recover');
+    const cleanupBefore = f.events.filter((event) => event.startsWith('cleanup:')).length;
+
+    assert.deepEqual(await f.service.recoverInterruptedBootstraps(), []);
+    assert.deepEqual(f.repo.nodeMigration('line-recover'), before);
+    assert.ok(f.repo.get('line-recover'));
+    assert.equal(
+      f.events.filter((event) => event.startsWith('cleanup:')).length,
+      cleanupBefore,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test('startup recovery leaves pending_start_verification bootstrap evidence untouched', async () => {
+  const f = await bootstrapFixture();
+  try {
+    seedInterruptedBootstrap(f, 'line-recover');
+    f.repo.updateNodeMigration('line-recover', 'pending_start_verification');
+    const before = f.repo.nodeMigration('line-recover');
+
+    assert.deepEqual(await f.service.recoverInterruptedBootstraps(), []);
+    assert.deepEqual(f.repo.nodeMigration('line-recover'), before);
+    assert.ok(f.repo.get('line-recover'));
   } finally {
     await f.close();
   }
@@ -731,11 +798,24 @@ test('clean compensation keeps the row when its trace audit cannot commit', asyn
     f.db.exec(`CREATE TRIGGER reject_compensated_create_audit BEFORE INSERT ON audit
       WHEN NEW.action = 'create-instance' AND NEW.result = 'fail'
       BEGIN SELECT RAISE(ABORT, 'compensated create audit rejected'); END;`);
-    await assert.rejects(() => f.service.create(newInstance), /compensated create audit rejected/);
+    await assert.rejects(
+      () => f.service.create(newInstance),
+      (error: unknown) => {
+        assert.ok(error instanceof BootstrapCompensationError);
+        assert.deepEqual(error.residuals, []);
+        assert.doesNotMatch(error.message, /compensated create audit rejected|opaque-secret-value/);
+        return true;
+      },
+    );
     assert.ok(f.repo.get('line-new'));
     assert.deepEqual(f.repo.nodeRuntime('line-new'), {
-      mode: 'npm', platformVersion: '', migrationState: 'rolling_back', migrationError: 'install',
+      mode: 'npm', platformVersion: '',
+      migrationState: 'manual_required', migrationError: 'compensation',
     });
+    assert.equal(
+      (f.db.prepare("SELECT COUNT(*) AS n FROM audit WHERE action = 'create-instance' AND result = 'fail'").get() as { n: number }).n,
+      0,
+    );
   } finally {
     await f.close();
   }
@@ -747,11 +827,56 @@ test('residual compensation commits manual_required and its trace audit atomical
     f.db.exec(`CREATE TRIGGER reject_residual_audit BEFORE INSERT ON audit
       WHEN NEW.action = 'bootstrap-compensation'
       BEGIN SELECT RAISE(ABORT, 'residual audit rejected'); END;`);
-    await assert.rejects(() => f.service.create(newInstance), /residual audit rejected/);
+    await assert.rejects(
+      () => f.service.create(newInstance),
+      (error: unknown) => {
+        assert.ok(error instanceof BootstrapCompensationError);
+        assert.deepEqual(error.residuals, ['network']);
+        assert.doesNotMatch(error.message, /residual audit rejected|opaque-secret-value/);
+        return true;
+      },
+    );
     assert.deepEqual(f.repo.nodeRuntime('line-new'), {
-      mode: 'npm', platformVersion: '', migrationState: 'rolling_back', migrationError: 'install',
+      mode: 'npm', platformVersion: '',
+      migrationState: 'manual_required', migrationError: 'compensation',
+    });
+    assert.equal(
+      (f.db.prepare("SELECT COUNT(*) AS n FROM audit WHERE action = 'bootstrap-compensation'").get() as { n: number }).n,
+      0,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test('audit-finalization failure reaches HTTP only as a controlled redacted compensation error', async () => {
+  const f = await bootstrapFixture({ failure: 'data' });
+  const app = Fastify({ logger: false });
+  f.db.exec(`CREATE TRIGGER reject_http_compensation_audit BEFORE INSERT ON audit
+    WHEN NEW.action = 'create-instance' AND NEW.result = 'fail'
+    BEGIN SELECT RAISE(ABORT, 'opaque-db-finalization-secret'); END;`);
+  registerInstances(app, {
+    config: { basePath: '' },
+    service: f.service,
+    guard: () => ({ username: 'admin', role: 'admin' }),
+    users: { grantFor: () => undefined },
+    fail: (reply, error) => reply.code(400).send({ error: (error as Error).message }),
+  } as unknown as HttpContext);
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/instances',
+      payload: { ...newInstance, actor: undefined },
+    });
+    assert.equal(response.statusCode, 400);
+    assert.match(response.json().error, /补偿收尾未完成/);
+    assert.doesNotMatch(response.body, /opaque-db-finalization-secret|opaque-secret-value/);
+    assert.deepEqual(f.repo.nodeRuntime('line-new'), {
+      mode: 'npm', platformVersion: '',
+      migrationState: 'manual_required', migrationError: 'compensation',
     });
   } finally {
+    await app.close();
     await f.close();
   }
 });
