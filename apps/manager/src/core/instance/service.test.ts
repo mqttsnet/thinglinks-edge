@@ -2,10 +2,21 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { openDb } from '../db.ts';
 import { deriveKey } from '../auth/crypto.ts';
-import { InstanceRepo, type InstanceRecord } from './repo.ts';
-import { InstanceOperationGate, type InstanceOperationLease } from './operation-gate.ts';
+import {
+  InstanceRepo,
+  type InstanceRecord,
+  type NodeMigrationErrorCode,
+  type NodeMigrationState,
+} from './repo.ts';
+import {
+  InstanceOperationGate,
+  InstanceRepositoryOperationPolicy,
+  type InstanceOperationLease,
+  type RepositoryOperationPolicy,
+} from './operation-gate.ts';
 import { InstanceService, type CreateInstanceInput } from './service.ts';
 import type { DockerClient } from './docker-client.ts';
+import { PLATFORM_NODE_PACKAGE } from '../nodes/platform-contract.ts';
 
 const record = (id = 'line-a'): InstanceRecord => ({
   id,
@@ -18,7 +29,53 @@ const record = (id = 'line-a'): InstanceRecord => ({
   notes: '',
 });
 
-function fixture() {
+type PolicySetup = (
+  repo: InstanceRepo,
+  db: ReturnType<typeof openDb>,
+) => RepositoryOperationPolicy;
+
+function persistedPolicy(
+  state: NodeMigrationState,
+  error: NodeMigrationErrorCode = 'none',
+): PolicySetup {
+  return (repo, db) => {
+    if (state === 'idle') {
+      db.prepare(
+        'UPDATE instance SET node_migration_state = ?, node_migration_error = ? WHERE id = ?',
+      ).run(state, error, 'line-a');
+      return new InstanceRepositoryOperationPolicy(repo);
+    }
+    repo.beginNodeMigration({
+      instanceId: 'line-a',
+      txId: `tx-service-${state}`,
+      operationKind: 'bootstrap',
+      phase: 'preparing',
+      originalRunning: false,
+      stagedBefore: false,
+      modeBefore: 'legacy',
+      imageIdBefore: 'sha256:image-a',
+      targetIntegrity: PLATFORM_NODE_PACKAGE.integrity,
+      checkpointDir: '',
+      snapshot: { version: 1, kind: 'bootstrap' },
+      actor: 'admin',
+    });
+    if (state === 'committed') {
+      db.transaction(() => {
+        db.prepare(
+          'UPDATE instance_node_migration SET phase = ?, error = ? WHERE instance_id = ?',
+        ).run(state, error, 'line-a');
+        db.prepare(
+          'UPDATE instance SET node_migration_state = ?, node_migration_error = ? WHERE id = ?',
+        ).run(state, error, 'line-a');
+      })();
+    } else if (state !== 'preparing' || error !== 'none') {
+      repo.updateNodeMigration('line-a', state, error);
+    }
+    return new InstanceRepositoryOperationPolicy(repo);
+  };
+}
+
+function fixture(policySetup?: PolicySetup) {
   const db = openDb(':memory:');
   const repo = new InstanceRepo(db, deriveKey('service-gate-test', 'instance'));
   repo.create(record(), [], [{ username: 'admin', password: 'old-password', permissions: '*' }]);
@@ -38,7 +95,9 @@ function fixture() {
     imageRef: (tag: string) => `nodered/node-red:${tag}`,
     createInstance: async (input: { id: string }) => { calls.push(`create:${input.id}`); },
   } as unknown as DockerClient;
-  const gate = new InstanceOperationGate({ assertAllowed: () => undefined });
+  const gate = new InstanceOperationGate(
+    policySetup?.(repo, db) ?? { assertAllowed: () => undefined },
+  );
   const service = new InstanceService({
     db,
     repo,
@@ -123,4 +182,86 @@ test('under-lease primitives reject fabricated and wrong-instance leases before 
     );
   });
   assert.deepEqual(f.calls, []);
+});
+
+test('under-lease primitives reject wrong-operation and expired leases before Docker', async () => {
+  const f = fixture();
+  let expired: InstanceOperationLease | undefined;
+  await f.gate.run('line-a', 'start-instance', async (lease) => {
+    expired = lease;
+    await assert.rejects(
+      () => f.service.stopUnderLease('line-a', lease, 'admin'),
+      /cannot authorize/,
+    );
+  });
+  assert.deepEqual(f.calls, []);
+
+  assert.ok(expired);
+  await assert.rejects(
+    () => f.service.startUnderLease('line-a', expired, 'admin'),
+    /invalid|no longer active/,
+  );
+  assert.deepEqual(f.calls, []);
+});
+
+test('repository-backed manual_required blocks every public service mutator before side effects', async () => {
+  const actions = [
+    (f: ReturnType<typeof fixture>) => f.service.start('line-a', 'admin'),
+    (f: ReturnType<typeof fixture>) => f.service.stop('line-a', 'admin'),
+    (f: ReturnType<typeof fixture>) => f.service.remove('line-a', { removeData: false, actor: 'admin' }),
+    (f: ReturnType<typeof fixture>) => f.service.resetCredential('line-a', 'admin', 'admin'),
+    (f: ReturnType<typeof fixture>) => f.service.applyNodePolicy('line-a', 'admin'),
+    (f: ReturnType<typeof fixture>) => f.service.upgradeImage('line-a', '5.1.0-24-minimal', 'admin'),
+  ];
+
+  for (const run of actions) {
+    const f = fixture(persistedPolicy('manual_required', 'state-inconsistent'));
+    const beforeAudit = (f.db.prepare('SELECT COUNT(*) AS n FROM audit').get() as { n: number }).n;
+    const beforeCredential = f.repo.credentials('line-a')[0]?.password;
+    await assert.rejects(() => run(f), /manual_required\/state-inconsistent/);
+    assert.deepEqual(f.calls, []);
+    assert.ok(f.repo.get('line-a'));
+    assert.equal(f.repo.get('line-a')?.imageTag, '5.0.4-24-minimal');
+    assert.equal(f.repo.credentials('line-a')[0]?.password, beforeCredential);
+    assert.equal(
+      (f.db.prepare('SELECT COUNT(*) AS n FROM audit').get() as { n: number }).n,
+      beforeAudit,
+    );
+  }
+});
+
+for (const state of ['idle', 'committed', 'rolled_back'] as const) {
+  test(`public start remains usable in clean ${state}`, async () => {
+    const f = fixture(persistedPolicy(state));
+    await f.service.start('line-a', 'admin');
+    assert.deepEqual(f.calls, ['assertManaged:line-a', 'start:line-a']);
+    const audit = f.db.prepare(
+      "SELECT result FROM audit WHERE action = 'start-instance' AND target = 'line-a'",
+    ).get() as { result: string } | undefined;
+    assert.equal(audit?.result, 'ok');
+  });
+}
+
+test('clean pending_start_verification permits only the public start facade', async () => {
+  const start = fixture(persistedPolicy('pending_start_verification'));
+  await start.service.start('line-a', 'admin');
+  assert.deepEqual(start.calls, ['assertManaged:line-a', 'start:line-a']);
+
+  const blocked = [
+    (f: ReturnType<typeof fixture>) => f.service.stop('line-a', 'admin'),
+    (f: ReturnType<typeof fixture>) => f.service.remove('line-a', { removeData: false, actor: 'admin' }),
+    (f: ReturnType<typeof fixture>) => f.service.resetCredential('line-a', 'admin', 'admin'),
+    (f: ReturnType<typeof fixture>) => f.service.applyNodePolicy('line-a', 'admin'),
+    (f: ReturnType<typeof fixture>) => f.service.upgradeImage('line-a', '5.1.0-24-minimal', 'admin'),
+  ];
+  for (const run of blocked) {
+    const f = fixture(persistedPolicy('pending_start_verification'));
+    const beforeAudit = (f.db.prepare('SELECT COUNT(*) AS n FROM audit').get() as { n: number }).n;
+    await assert.rejects(() => run(f), /pending_start_verification\/none/);
+    assert.deepEqual(f.calls, []);
+    assert.equal(
+      (f.db.prepare('SELECT COUNT(*) AS n FROM audit').get() as { n: number }).n,
+      beforeAudit,
+    );
+  }
 });

@@ -125,6 +125,57 @@ test('fabricated and wrong-instance leases are rejected', async () => {
   });
 });
 
+test('an active lease cannot authorize the wrong operation and expires after release', async () => {
+  const gate = new InstanceOperationGate(ALLOW_ALL_POLICY);
+  let captured: InstanceOperationLease | undefined;
+  await gate.run('line-a', 'start-instance', async (lease) => {
+    captured = lease;
+    assert.throws(
+      () => gate.assertLease(lease, 'line-a', ['stop-instance']),
+      /cannot authorize/,
+    );
+    gate.assertLease(lease, 'line-a', ['start-instance']);
+  });
+
+  assert.ok(captured);
+  assert.throws(
+    () => gate.assertLease(captured, 'line-a', ['start-instance']),
+    /invalid|no longer active/,
+  );
+});
+
+for (const persisted of [
+  { state: 'idle', error: 'verification' },
+  { state: 'committed', error: 'verification' },
+  { state: 'rolled_back', error: 'rollback' },
+  { state: 'pending_start_verification', error: 'verification' },
+] as const) {
+  test(`${persisted.state} is not usable while its durable error is ${persisted.error}`, async () => {
+    const { db, repo } = repositoryFixture();
+    if (persisted.state === 'idle') {
+      db.prepare(
+        'UPDATE instance SET node_migration_state = ?, node_migration_error = ? WHERE id = ?',
+      ).run(persisted.state, persisted.error, 'line-a');
+    } else {
+      beginBootstrap(repo, `tx-dirty-${persisted.state}`);
+      db.transaction(() => {
+        db.prepare(
+          'UPDATE instance_node_migration SET phase = ?, error = ? WHERE instance_id = ?',
+        ).run(persisted.state, persisted.error, 'line-a');
+        db.prepare(
+          'UPDATE instance SET node_migration_state = ?, node_migration_error = ? WHERE id = ?',
+        ).run(persisted.state, persisted.error, 'line-a');
+      })();
+    }
+
+    const gate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repo));
+    await assert.rejects(
+      () => gate.run('line-a', 'start-instance', async () => undefined),
+      new RegExp(`${persisted.state}/${persisted.error}`),
+    );
+  });
+}
+
 test('manual_required survives gate recreation and blocks every runtime mutation', async () => {
   const { repo } = repositoryFixture();
   beginBootstrap(repo, 'tx-manual');

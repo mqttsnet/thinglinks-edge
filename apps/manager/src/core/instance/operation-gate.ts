@@ -99,9 +99,13 @@ export class InstanceRepositoryOperationPolicy implements RepositoryOperationPol
           + `，journal ${journal.phase}/${journal.error}`,
       );
     }
-    if (ORDINARY_SAFE_STATES.has(runtime.migrationState)) return;
     if (
-      runtime.migrationState === 'pending_start_verification'
+      runtime.migrationError === 'none'
+      && ORDINARY_SAFE_STATES.has(runtime.migrationState)
+    ) return;
+    if (
+      runtime.migrationError === 'none'
+      && runtime.migrationState === 'pending_start_verification'
       && operation === 'start-instance'
     ) return;
 

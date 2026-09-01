@@ -7,10 +7,15 @@ import { join } from 'node:path';
 import Fastify from 'fastify';
 import { openDb } from '../../core/db.ts';
 import { deriveKey } from '../../core/auth/crypto.ts';
-import { InstanceOperationGate, InstanceBusyError } from '../../core/instance/operation-gate.ts';
+import {
+  InstanceOperationGate,
+  InstanceBusyError,
+  InstanceRepositoryOperationPolicy,
+} from '../../core/instance/operation-gate.ts';
 import { InstanceRepo, type InstanceRecord } from '../../core/instance/repo.ts';
 import { NodeCatalog } from '../../core/nodes/catalog.ts';
 import { NodeStore } from '../../core/nodes/store.ts';
+import { PLATFORM_NODE_PACKAGE } from '../../core/nodes/platform-contract.ts';
 import type { HttpContext } from '../context.ts';
 import { registerNodeCatalog } from './catalog.ts';
 
@@ -25,7 +30,7 @@ const instance: InstanceRecord = {
   notes: '',
 };
 
-test('install-node POST uses the shared gate before Admin API and audit side effects', async () => {
+test('install-node POST honors live and repository-backed gates before side effects', async () => {
   let adminCalls = 0;
   const upstream = createServer((req, res) => {
     adminCalls += 1;
@@ -45,7 +50,7 @@ test('install-node POST uses the shared gate before Admin API and audit side eff
   const db = openDb(':memory:');
   const repo = new InstanceRepo(db, deriveKey('catalog-gate-test', 'instance'));
   repo.create(instance, [], [{ username: 'admin', password: 'secret', permissions: '*' }]);
-  const operationGate = new InstanceOperationGate({ assertAllowed: () => undefined });
+  const operationGate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repo));
   const app = Fastify({ logger: false });
   registerNodeCatalog(app, {
     config: { basePath: '' },
@@ -74,6 +79,28 @@ test('install-node POST uses the shared gate before Admin API and audit side eff
       assert.equal(response.statusCode, 409);
       assert.match(response.json().error, /platform-migration/);
     });
+    repo.beginNodeMigration({
+      instanceId: 'line-a',
+      txId: 'tx-install-manual',
+      operationKind: 'bootstrap',
+      phase: 'preparing',
+      originalRunning: false,
+      stagedBefore: false,
+      modeBefore: 'legacy',
+      imageIdBefore: 'sha256:image-a',
+      targetIntegrity: PLATFORM_NODE_PACKAGE.integrity,
+      checkpointDir: '',
+      snapshot: { version: 1, kind: 'bootstrap' },
+      actor: 'admin',
+    });
+    repo.updateNodeMigration('line-a', 'manual_required', 'state-inconsistent');
+    const persisted = await app.inject({
+      method: 'POST',
+      url: '/api/instances/line-a/nodes',
+      payload: { module: 'node-red-contrib-example', version: '1.0.0' },
+    });
+    assert.equal(persisted.statusCode, 409);
+    assert.match(persisted.json().error, /manual_required\/state-inconsistent/);
     assert.equal(adminCalls, 0);
     assert.equal(
       (db.prepare('SELECT COUNT(*) AS n FROM audit').get() as { n: number }).n,

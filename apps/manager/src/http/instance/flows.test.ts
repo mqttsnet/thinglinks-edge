@@ -4,8 +4,13 @@ import { createServer } from 'node:http';
 import Fastify from 'fastify';
 import { openDb } from '../../core/db.ts';
 import { deriveKey } from '../../core/auth/crypto.ts';
-import { InstanceOperationGate, InstanceBusyError } from '../../core/instance/operation-gate.ts';
+import {
+  InstanceOperationGate,
+  InstanceBusyError,
+  InstanceRepositoryOperationPolicy,
+} from '../../core/instance/operation-gate.ts';
 import { InstanceRepo, type InstanceRecord } from '../../core/instance/repo.ts';
+import { PLATFORM_NODE_PACKAGE } from '../../core/nodes/platform-contract.ts';
 import type { HttpContext } from '../context.ts';
 import { registerFlows } from './flows.ts';
 
@@ -20,7 +25,7 @@ const instance: InstanceRecord = {
   notes: '',
 };
 
-test('whole-flow POST uses the shared gate before any Admin API or audit side effect', async () => {
+test('whole-flow POST honors live and repository-backed gates before side effects', async () => {
   let adminCalls = 0;
   const upstream = createServer((req, res) => {
     adminCalls += 1;
@@ -43,7 +48,7 @@ test('whole-flow POST uses the shared gate before any Admin API or audit side ef
   const db = openDb(':memory:');
   const repo = new InstanceRepo(db, deriveKey('flows-gate-test', 'instance'));
   repo.create(instance, [], [{ username: 'admin', password: 'secret', permissions: '*' }]);
-  const operationGate = new InstanceOperationGate({ assertAllowed: () => undefined });
+  const operationGate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repo));
   const app = Fastify({ logger: false });
   registerFlows(app, {
     config: { basePath: '' },
@@ -68,6 +73,28 @@ test('whole-flow POST uses the shared gate before any Admin API or audit side ef
       assert.equal(response.statusCode, 409);
       assert.match(response.json().error, /platform-migration/);
     });
+    repo.beginNodeMigration({
+      instanceId: 'line-a',
+      txId: 'tx-flow-manual',
+      operationKind: 'bootstrap',
+      phase: 'preparing',
+      originalRunning: false,
+      stagedBefore: false,
+      modeBefore: 'legacy',
+      imageIdBefore: 'sha256:image-a',
+      targetIntegrity: PLATFORM_NODE_PACKAGE.integrity,
+      checkpointDir: '',
+      snapshot: { version: 1, kind: 'bootstrap' },
+      actor: 'admin',
+    });
+    repo.updateNodeMigration('line-a', 'manual_required', 'state-inconsistent');
+    const persisted = await app.inject({
+      method: 'POST',
+      url: '/api/instances/line-a/flows',
+      payload: { flows: [] },
+    });
+    assert.equal(persisted.statusCode, 409);
+    assert.match(persisted.json().error, /manual_required\/state-inconsistent/);
     assert.equal(adminCalls, 0);
     assert.equal(
       (db.prepare('SELECT COUNT(*) AS n FROM audit').get() as { n: number }).n,
