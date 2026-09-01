@@ -212,14 +212,21 @@ test('PlatformPackageService bootstrap invokes the hard-wired store verifier', (
   });
 });
 
-test('PlatformPackageService verifyForInstall re-runs the hard-wired verifier', () => {
+test('PlatformPackageService verifyForInstall succeeds then rejects bytes replaced after baseline', () => {
   withStore((store, root) => {
     const f = fixture();
     store.add(f.edge);
     store.add(f.common);
     const catalog = new NodeCatalog(openDb(':memory:'));
     ensurePlatformApproval(catalog, 'system');
-    const service = new PlatformPackageService({ store, catalog });
+    const service = new class extends PlatformPackageService {
+      protected verifyCurrentStore() {
+        return verifyPlatformPackageStore(store, f.contract);
+      }
+    }({ store, catalog });
+
+    const baseline = service.verifyForInstall();
+    assert.deepEqual(baseline.buffer, f.edge);
 
     writeFileSync(join(root, PLATFORM_NODE_PACKAGE.name,
       `${PLATFORM_NODE_PACKAGE.version}.tgz`), pack({

@@ -129,10 +129,18 @@ export class PlatformPackageService implements PlatformRegistryVerifier {
     this.#catalog = deps.catalog;
   }
 
+  /**
+   * 唯一的测试替换缝：生产构造器不接收 verifier、契约或配置，始终走固定常量。
+   * 测试子类只替换「怎样验证当前 store」，以便用内存 tar 做成功后篡改回归。
+   */
+  protected verifyCurrentStore(): VerifiedPlatformStore {
+    return verifyPlatformPackageStore(this.#store);
+  }
+
   /** 启动时先验包，再建立唯一的平台批准；任一失败都阻止继续启动。 */
   bootstrap(actor = 'system'): VerifiedPlatformStore {
     assertCommonIsNotApproved(this.#catalog);
-    const verified = verifyPlatformPackageStore(this.#store);
+    const verified = this.verifyCurrentStore();
     ensurePlatformApproval(this.#catalog, actor);
     return verified;
   }
@@ -140,7 +148,7 @@ export class PlatformPackageService implements PlatformRegistryVerifier {
   /** 每次平台安装紧邻运行期副作用前重验 tarball 与批准基线。 */
   verifyForInstall(): VerifiedPlatformPackage {
     assertCommonIsNotApproved(this.#catalog);
-    const verified = verifyPlatformPackageStore(this.#store);
+    const verified = this.verifyCurrentStore();
     const approved = this.#catalog.get(PLATFORM_NODE_PACKAGE.name);
     if (approved?.version !== PLATFORM_NODE_PACKAGE.version) {
       throw new NodePolicyError(
@@ -164,6 +172,6 @@ export class PlatformPackageService implements PlatformRegistryVerifier {
         ? 'common'
         : undefined;
     if (!selected) return undefined;
-    return verifyPlatformPackageStore(this.#store)[selected];
+    return this.verifyCurrentStore()[selected];
   }
 }
