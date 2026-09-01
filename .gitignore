@@ -29,12 +29,12 @@ thinglinks-edge-backup-*/
 thinglinks-edge-diag-*.tar
 preflight-report*.json
 
-# AI 协作与任务过程文档。
-# 需求与交接文档另有归口（仓库外的需求目录），不放代码仓 ——
-# 它们随会话高频变动，混进来会把真正的代码改动淹掉
+# 本地 AI 会话、草稿与个人偏好不提交。
+# 仓库级共享规则使用根 AGENTS.md / CLAUDE.md、.github/copilot-instructions.md
+# 与 docs/superpowers/。
 tasks/
-.claude
-CLAUDE.md
+.claude/
+CLAUDE.local.md
 *.scratch.*
 scratchpad/
 
