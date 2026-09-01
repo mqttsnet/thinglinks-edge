@@ -86,7 +86,8 @@ function isExactModuleQuery(value: string): boolean {
 
 function hitFromPackument(doc: UpstreamPackument, source: string): SearchHit | undefined {
   const version = doc['dist-tags']?.latest;
-  const manifest = version ? doc.versions[version] : undefined;
+  if (!version) return undefined;
+  const manifest = doc.versions[version];
   const nodeRed = manifest?.['node-red'];
   if (!manifest || !nodeRed || typeof nodeRed !== 'object' || !('nodes' in nodeRed)) return undefined;
 
