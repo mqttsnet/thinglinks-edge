@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -45,6 +46,8 @@ function fixture(over: Partial<DockerClientOptions> = {}) {
 
 const missing = () => Object.assign(new Error('not found'), { statusCode: 404 });
 const instanceLabel = 'com.mqttsnet.thinglinks-edge.instance';
+const quarantineFor = (root: string, id: string, txId: string) =>
+  join(root, `.thinglinks-bootstrap-quarantine-${id}-${txId}`);
 
 function rawOf(docker: DockerClient): Record<string, any> {
   return docker.raw as unknown as Record<string, any>;
@@ -52,6 +55,8 @@ function rawOf(docker: DockerClient): Record<string, any> {
 
 function installAbsentResourceApi(docker: DockerClient): void {
   const raw = rawOf(docker);
+  raw.listContainers = async () => [];
+  raw.listNetworks = async () => [];
   raw.getContainer = () => ({ inspect: async () => { throw missing(); } });
   raw.getNetwork = () => ({ inspect: async () => { throw missing(); } });
 }
@@ -137,6 +142,69 @@ test('bootstrap create writes the exact tx owner label to network and container 
   );
 });
 
+test('bootstrap Manager attach uses captured network ID and never a same-name replacement', async () => {
+  const f = fixture({ managerContainer: 'manager-ref' });
+  const raw = rawOf(f.docker);
+  let capturedConnects = 0;
+  let foreignConnects = 0;
+  const ownedNetwork = {
+    Id: 'owned-network-id', Labels: ownedLabels('line-a', 'bootstrap-tx-a'), Containers: {},
+  };
+  const foreignNetwork = {
+    Id: 'foreign-network-id', Labels: ownedLabels('line-a', 'foreign-tx'), Containers: {},
+  };
+  raw.getImage = () => ({ inspect: async () => ({}) });
+  raw.createNetwork = async () => ({ id: 'owned-network-id' });
+  raw.createContainer = async () => ({ putArchive: async () => undefined });
+  raw.getContainer = (ref: string) => ({
+    inspect: async () => ref === 'manager-ref' ? { Id: 'manager-immutable-id' } : { Id: ref },
+  });
+  raw.getNetwork = (ref: string) => {
+    if (ref === 'owned-network-id') {
+      return {
+        inspect: async () => ownedNetwork,
+        connect: async () => { capturedConnects += 1; },
+      };
+    }
+    return {
+      inspect: async () => foreignNetwork,
+      connect: async () => { foreignConnects += 1; },
+    };
+  };
+  await f.docker.prepareBootstrapDataDir('line-a', 'bootstrap-tx-a');
+
+  await f.docker.createBootstrapInstance({
+    id: 'line-a', imageTag: '5.0.4-24-minimal', memoryMb: 512, cpus: 0.5,
+    ports: [], adminRoot: '/red/line-a/',
+  }, 'module.exports = {};', 'bootstrap-tx-a');
+  assert.equal(capturedConnects, 1);
+  assert.equal(foreignConnects, 0);
+});
+
+test('bootstrap Manager attach rejects captured network ID with mismatched tx label', async () => {
+  const f = fixture({ managerContainer: 'manager-ref' });
+  const raw = rawOf(f.docker);
+  let connects = 0;
+  const mismatched = {
+    Id: 'owned-network-id', Labels: ownedLabels('line-a', 'foreign-tx'), Containers: {},
+  };
+  raw.getImage = () => ({ inspect: async () => ({}) });
+  raw.createNetwork = async () => ({ id: 'owned-network-id' });
+  raw.createContainer = async () => ({ putArchive: async () => undefined });
+  raw.getContainer = () => ({ inspect: async () => ({ Id: 'manager-immutable-id' }) });
+  raw.getNetwork = () => ({
+    inspect: async () => mismatched,
+    connect: async () => { connects += 1; },
+  });
+  await f.docker.prepareBootstrapDataDir('line-a', 'bootstrap-tx-a');
+
+  await assert.rejects(() => f.docker.createBootstrapInstance({
+    id: 'line-a', imageTag: '5.0.4-24-minimal', memoryMb: 512, cpus: 0.5,
+    ports: [], adminRoot: '/red/line-a/',
+  }, 'module.exports = {};', 'bootstrap-tx-a'), /bootstrap.*network.*owner|owner.*network/i);
+  assert.equal(connects, 0);
+});
+
 test('network created after preflight is rejected and preserved as a foreign race winner', async () => {
   const f = fixture();
   installAbsentResourceApi(f.docker);
@@ -195,9 +263,22 @@ function installCleanupApi(docker: DockerClient, options: {
     Labels: options.networkLabels ?? ownedLabels(id, txId),
     Containers: {},
   };
+  raw.listContainers = async () => (
+    state.containerRemoved || container.Config.Labels[BOOTSTRAP_TX_LABEL] !== txId
+      ? []
+      : [{ Id: container.Id, Labels: container.Config.Labels }]
+  );
+  raw.listNetworks = async () => (
+    state.networkRemoved || network.Labels[BOOTSTRAP_TX_LABEL] !== txId
+      ? []
+      : [{ Id: network.Id, Labels: network.Labels }]
+  );
   raw.getContainer = (ref: string) => ({
     inspect: async () => {
-      if (ref === 'container-id') return container;
+      if (ref === 'container-id') {
+        if (state.containerRemoved) throw missing();
+        return container;
+      }
       if (state.containerRemoved) {
         if (options.replaceContainer) {
           return { ...container, Id: 'foreign-container', Config: { Labels: ownedLabels(id, 'foreign-tx') } };
@@ -214,7 +295,10 @@ function installCleanupApi(docker: DockerClient, options: {
   });
   raw.getNetwork = (ref: string) => ({
     inspect: async () => {
-      if (ref === 'network-id') return network;
+      if (ref === 'network-id') {
+        if (state.networkRemoved) throw missing();
+        return network;
+      }
       if (state.networkRemoved) {
         if (options.replaceNetwork) {
           return { ...network, Id: 'foreign-network', Labels: ownedLabels(id, 'foreign-tx') };
@@ -298,7 +382,11 @@ test('cleanup reports data deletion failure after still cleaning owned container
   );
   assert.equal(state.containerRemoved, true);
   assert.equal(state.networkRemoved, true);
-  assert.equal(existsSync(join(dirname(f.legacyDir), 'line-a')), true);
+  assert.equal(existsSync(join(dirname(f.legacyDir), 'line-a')), false);
+  assert.equal(
+    existsSync(quarantineFor(dirname(f.legacyDir), 'line-a', 'bootstrap-tx-a')),
+    true,
+  );
 });
 
 test('cleanup preserves every foreign-labeled or marker-mismatched resource', async () => {
@@ -333,6 +421,103 @@ test('cleanup treats a missing owner marker as a data residual and preserves the
   assert.equal(readFileSync(join(instanceDir, 'foreign.txt'), 'utf8'), 'foreign-data');
 });
 
+test('data replacement created after quarantine rename is preserved and reported as residual', async () => {
+  let original = '';
+  const f = fixture({
+    removeDir: async (quarantine) => {
+      mkdirSync(original);
+      writeFileSync(join(original, 'replacement.txt'), 'foreign-replacement');
+      rmSync(quarantine, { recursive: true, force: false });
+    },
+  });
+  installAbsentResourceApi(f.docker);
+  original = join(dirname(f.legacyDir), 'line-a');
+  const quarantine = quarantineFor(dirname(f.legacyDir), 'line-a', 'bootstrap-tx-a');
+  await f.docker.prepareBootstrapDataDir('line-a', 'bootstrap-tx-a');
+
+  assert.deepEqual(
+    await f.docker.cleanupBootstrap('line-a', 'bootstrap-tx-a'),
+    { residuals: ['data'] },
+  );
+  assert.equal(readFileSync(join(original, 'replacement.txt'), 'utf8'), 'foreign-replacement');
+  assert.equal(existsSync(quarantine), false);
+});
+
+test('marker mismatch is quarantined then restored to the original path when it is safe', async () => {
+  const renames: Array<[string, string]> = [];
+  const f = fixture({
+    renameDir: async (source, destination) => {
+      renames.push([source, destination]);
+      renameSync(source, destination);
+    },
+  });
+  installAbsentResourceApi(f.docker);
+  const original = join(dirname(f.legacyDir), 'line-a');
+  const quarantine = quarantineFor(dirname(f.legacyDir), 'line-a', 'bootstrap-tx-a');
+  await f.docker.prepareBootstrapDataDir('line-a', 'foreign-tx');
+
+  assert.deepEqual(
+    await f.docker.cleanupBootstrap('line-a', 'bootstrap-tx-a'),
+    { residuals: ['data'] },
+  );
+  assert.deepEqual(renames, [[original, quarantine], [quarantine, original]]);
+  assert.equal(readFileSync(join(original, BOOTSTRAP_OWNER_FILE), 'utf8'), 'foreign-tx');
+  assert.equal(existsSync(quarantine), false);
+});
+
+test('occupied restore preserves both replacement original and mismatched quarantine', async () => {
+  let renameCalls = 0;
+  const f = fixture({
+    renameDir: async (source, destination) => {
+      renameCalls += 1;
+      renameSync(source, destination);
+      if (renameCalls === 1) {
+        mkdirSync(source);
+        writeFileSync(join(source, 'replacement.txt'), 'foreign-replacement');
+      }
+    },
+  });
+  installAbsentResourceApi(f.docker);
+  const original = join(dirname(f.legacyDir), 'line-a');
+  const quarantine = quarantineFor(dirname(f.legacyDir), 'line-a', 'bootstrap-tx-a');
+  await f.docker.prepareBootstrapDataDir('line-a', 'foreign-tx');
+
+  assert.deepEqual(
+    await f.docker.cleanupBootstrap('line-a', 'bootstrap-tx-a'),
+    { residuals: ['data'] },
+  );
+  assert.equal(readFileSync(join(original, 'replacement.txt'), 'utf8'), 'foreign-replacement');
+  assert.equal(readFileSync(join(quarantine, BOOTSTRAP_OWNER_FILE), 'utf8'), 'foreign-tx');
+});
+
+test('delete failure leaves owned quarantine for a later cleanup retry', async () => {
+  let removeCalls = 0;
+  const f = fixture({
+    removeDir: async (path) => {
+      removeCalls += 1;
+      if (removeCalls === 1) throw new Error('delete failed');
+      rmSync(path, { recursive: true, force: false });
+    },
+  });
+  installAbsentResourceApi(f.docker);
+  const original = join(dirname(f.legacyDir), 'line-a');
+  const quarantine = quarantineFor(dirname(f.legacyDir), 'line-a', 'bootstrap-tx-a');
+  await f.docker.prepareBootstrapDataDir('line-a', 'bootstrap-tx-a');
+
+  assert.deepEqual(
+    await f.docker.cleanupBootstrap('line-a', 'bootstrap-tx-a'),
+    { residuals: ['data'] },
+  );
+  assert.equal(existsSync(original), false);
+  assert.equal(existsSync(quarantine), true);
+
+  assert.deepEqual(
+    await f.docker.cleanupBootstrap('line-a', 'bootstrap-tx-a'),
+    { residuals: [] },
+  );
+  assert.equal(existsSync(quarantine), false);
+});
+
 test('post-delete same-name replacements are residuals and are never deleted twice', async () => {
   const f = fixture();
   const state = installCleanupApi(f.docker, { replaceContainer: true, replaceNetwork: true });
@@ -344,4 +529,71 @@ test('post-delete same-name replacements are residuals and are never deleted twi
   );
   assert.equal(state.containerRemoveCalls, 1);
   assert.equal(state.networkRemoveCalls, 1);
+});
+
+test('cleanup deletes exact-label task resources by immutable ID while preserving same-name foreign replacements', async () => {
+  const f = fixture();
+  const raw = rawOf(f.docker);
+  const ownedContainer = {
+    Id: 'owned-container-id', Config: { Labels: ownedLabels('line-a', 'bootstrap-tx-a') },
+  };
+  const foreignContainer = {
+    Id: 'foreign-container-id', Config: { Labels: ownedLabels('line-a', 'foreign-tx') },
+  };
+  const ownedNetwork = {
+    Id: 'owned-network-id', Labels: ownedLabels('line-a', 'bootstrap-tx-a'), Containers: {},
+  };
+  const foreignNetwork = {
+    Id: 'foreign-network-id', Labels: ownedLabels('line-a', 'foreign-tx'), Containers: {},
+  };
+  let ownedContainerDeletes = 0;
+  let foreignContainerDeletes = 0;
+  let ownedNetworkDeletes = 0;
+  let foreignNetworkDeletes = 0;
+  let ownedContainerGone = false;
+  let ownedNetworkGone = false;
+  raw.listContainers = async () => [{ Id: 'owned-container-id', Labels: ownedLabels('line-a', 'bootstrap-tx-a') }];
+  raw.listNetworks = async () => [{ Id: 'owned-network-id', Labels: ownedLabels('line-a', 'bootstrap-tx-a') }];
+  raw.getContainer = (ref: string) => ({
+    inspect: async () => {
+      if (ref === 'owned-container-id') {
+        if (ownedContainerGone) throw missing();
+        return ownedContainer;
+      }
+      return foreignContainer;
+    },
+    remove: async () => {
+      if (ref === 'owned-container-id') {
+        ownedContainerDeletes += 1;
+        ownedContainerGone = true;
+      }
+      else foreignContainerDeletes += 1;
+    },
+  });
+  raw.getNetwork = (ref: string) => ({
+    inspect: async () => {
+      if (ref === 'owned-network-id') {
+        if (ownedNetworkGone) throw missing();
+        return ownedNetwork;
+      }
+      return foreignNetwork;
+    },
+    remove: async () => {
+      if (ref === 'owned-network-id') {
+        ownedNetworkDeletes += 1;
+        ownedNetworkGone = true;
+      }
+      else foreignNetworkDeletes += 1;
+    },
+    disconnect: async () => undefined,
+  });
+
+  assert.deepEqual(
+    await f.docker.cleanupBootstrap('line-a', 'bootstrap-tx-a'),
+    { residuals: ['container', 'network'] },
+  );
+  assert.equal(ownedContainerDeletes, 1);
+  assert.equal(ownedNetworkDeletes, 1);
+  assert.equal(foreignContainerDeletes, 0);
+  assert.equal(foreignNetworkDeletes, 0);
 });

@@ -7,7 +7,7 @@
  *
  * 所有创建请求都必须经 assertSafeCreateOptions 二次校验后才下发。
  */
-import { mkdir, rm, cp, lstat, open, readFile } from 'node:fs/promises';
+import { mkdir, rm, cp, lstat, open, readFile, rename } from 'node:fs/promises';
 import Docker from 'dockerode';
 import {
   buildCreateOptions, assertSafeCreateOptions, assertValidSpec,
@@ -71,6 +71,8 @@ export interface DockerClientOptions {
   copyDir?: ((source: string, destination: string) => Promise<void>) | undefined;
   /** bootstrap 数据目录删除 seam；生产使用 fs.rm，测试注入确定性失败。 */
   removeDir?: ((path: string) => Promise<void>) | undefined;
+  /** bootstrap 原子隔离/恢复 seam；生产使用 fs.rename。 */
+  renameDir?: ((source: string, destination: string) => Promise<void>) | undefined;
 }
 
 export interface InstanceStatus {
@@ -165,6 +167,18 @@ export class DockerClient {
     return Object.keys(network.Containers ?? {}).some((id) => id === containerId);
   }
 
+  private assertBootstrapNetworkOwnership(
+    instanceId: string,
+    txId: string,
+    networkId: string,
+    network: Docker.NetworkInspectInfo,
+  ): void {
+    this.assertNetworkOwnership(instanceId, network);
+    if (network.Id !== networkId || network.Labels?.[BOOTSTRAP_TX_LABEL] !== txId) {
+      throw new Error(`bootstrap network owner mismatch for ${instanceId}`);
+    }
+  }
+
   /** 把 Manager 接入实例网络，使其可达实例；实例之间仍互不可达 */
   private async attachManager(instanceId: string, signal?: AbortSignal): Promise<void> {
     const mgr = this.opts.managerContainer;
@@ -191,6 +205,38 @@ export class DockerClient {
       const after = await networkRef.inspect().catch(() => undefined);
       if (after) this.assertNetworkOwnership(instanceId, after);
       if (after && after.Id === network.Id && DockerClient.hasContainer(after, manager.Id)) return;
+      throw error;
+    }
+  }
+
+  /** Bootstrap 专用：固定到 createNetwork 返回的 ID，绝不按同名网络重新解析。 */
+  private async attachManagerToBootstrapNetwork(
+    instanceId: string,
+    txId: string,
+    networkId: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const mgr = this.opts.managerContainer;
+    if (!mgr) return;
+    if (signal?.aborted) throw signal.reason;
+    const managerRef = this.docker.getContainer(mgr);
+    const manager = signal
+      ? await managerRef.inspect({ abortSignal: signal })
+      : await managerRef.inspect();
+    const networkRef = this.docker.getNetwork(networkId);
+    const network = await networkRef.inspect();
+    this.assertBootstrapNetworkOwnership(instanceId, txId, networkId, network);
+    if (signal?.aborted) throw signal.reason;
+    if (DockerClient.hasContainer(network, manager.Id)) return;
+    try {
+      await networkRef.connect({ Container: manager.Id, abortSignal: signal } as Docker.NetworkConnectOptions & {
+        abortSignal?: AbortSignal;
+      });
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      const after = await networkRef.inspect().catch(() => undefined);
+      if (after) this.assertBootstrapNetworkOwnership(instanceId, txId, networkId, after);
+      if (after && DockerClient.hasContainer(after, manager.Id)) return;
       throw error;
     }
   }
@@ -334,11 +380,10 @@ export class DockerClient {
     await this.syncDirectory(this.opts.instanceDataRoot);
   }
 
-  private async bootstrapDataOwnership(
-    instanceId: string,
+  private async bootstrapDataOwnershipAt(
+    dir: string,
     txId: string,
   ): Promise<'absent' | 'owned' | 'foreign'> {
-    const dir = instanceDataDir(this.opts.instanceDataRoot, instanceId);
     let dirStat;
     try {
       dirStat = await lstat(dir);
@@ -359,6 +404,159 @@ export class DockerClient {
       return await readFile(markerPath, 'utf8') === txId ? 'owned' : 'foreign';
     } catch {
       return 'foreign';
+    }
+  }
+
+  private async bootstrapDataOwnership(
+    instanceId: string,
+    txId: string,
+  ): Promise<'absent' | 'owned' | 'foreign'> {
+    return this.bootstrapDataOwnershipAt(
+      instanceDataDir(this.opts.instanceDataRoot, instanceId),
+      txId,
+    );
+  }
+
+  private bootstrapQuarantineDir(instanceId: string, txId: string): string {
+    return `${this.opts.instanceDataRoot}/.thinglinks-bootstrap-quarantine-${instanceId}-${txId}`;
+  }
+
+  private async renameBootstrapDir(source: string, destination: string): Promise<void> {
+    const renameDir = this.opts.renameDir ?? rename;
+    await renameDir(source, destination);
+    await this.syncDirectory(this.opts.instanceDataRoot);
+  }
+
+  private async pathExists(path: string): Promise<boolean> {
+    try {
+      await lstat(path);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw error;
+    }
+  }
+
+  /**
+   * 原子把当前路径隔离为 tx 专属 quarantine，之后只验证/删除 quarantine。
+   * 原路径在 rename 后出现的任何对象都视为外来替换并保持不动。
+   */
+  private async cleanupBootstrapData(
+    instanceId: string,
+    txId: string,
+  ): Promise<boolean> {
+    const original = instanceDataDir(this.opts.instanceDataRoot, instanceId);
+    const quarantine = this.bootstrapQuarantineDir(instanceId, txId);
+    let residual = false;
+
+    let quarantineExists = await this.pathExists(quarantine).catch(() => {
+      residual = true;
+      return false;
+    });
+    let originalExists = await this.pathExists(original).catch(() => {
+      residual = true;
+      return true;
+    });
+
+    if (!quarantineExists && originalExists) {
+      try {
+        await this.renameBootstrapDir(original, quarantine);
+      } catch {
+        residual = true;
+      }
+      quarantineExists = await this.pathExists(quarantine).catch(() => {
+        residual = true;
+        return false;
+      });
+      originalExists = await this.pathExists(original).catch(() => {
+        residual = true;
+        return true;
+      });
+    }
+
+    if (!quarantineExists) return residual || originalExists;
+
+    const ownership = await this.bootstrapDataOwnershipAt(quarantine, txId);
+    if (ownership !== 'owned') {
+      if (!originalExists) {
+        try {
+          await this.renameBootstrapDir(quarantine, original);
+        } catch {
+          // A concurrent replacement may now own the original path; preserve quarantine.
+        }
+      }
+      return true;
+    }
+
+    try {
+      const removeDir = this.opts.removeDir
+        ?? ((path: string) => rm(path, { recursive: true, force: false }));
+      await removeDir(quarantine);
+    } catch {
+      residual = true;
+    }
+    if (await this.pathExists(quarantine).catch(() => true)) residual = true;
+    // A same-name replacement created after quarantine is foreign and must never be deleted.
+    if (await this.pathExists(original).catch(() => true)) residual = true;
+    return residual;
+  }
+
+  private hasBootstrapLabels(
+    labels: Record<string, string> | undefined,
+    instanceId: string,
+    txId: string,
+  ): boolean {
+    return labels?.[MANAGED_LABEL] === 'true'
+      && labels[INSTANCE_LABEL] === instanceId
+      && labels[BOOTSTRAP_TX_LABEL] === txId;
+  }
+
+  private bootstrapLabelFilters(instanceId: string, txId: string): { label: string[] } {
+    return {
+      label: [
+        `${MANAGED_LABEL}=true`,
+        `${INSTANCE_LABEL}=${instanceId}`,
+        `${BOOTSTRAP_TX_LABEL}=${txId}`,
+      ],
+    };
+  }
+
+  private async discoverBootstrapContainerIds(
+    instanceId: string,
+    txId: string,
+  ): Promise<{ ok: boolean; ids: string[] }> {
+    try {
+      const items = await this.docker.listContainers({
+        all: true,
+        filters: this.bootstrapLabelFilters(instanceId, txId),
+      });
+      return {
+        ok: true,
+        ids: items
+          .filter((item) => this.hasBootstrapLabels(item.Labels, instanceId, txId))
+          .map((item) => item.Id),
+      };
+    } catch {
+      return { ok: false, ids: [] };
+    }
+  }
+
+  private async discoverBootstrapNetworkIds(
+    instanceId: string,
+    txId: string,
+  ): Promise<{ ok: boolean; ids: string[] }> {
+    try {
+      const items = await this.docker.listNetworks({
+        filters: this.bootstrapLabelFilters(instanceId, txId),
+      });
+      return {
+        ok: true,
+        ids: items
+          .filter((item) => this.hasBootstrapLabels(item.Labels, instanceId, txId))
+          .map((item) => item.Id),
+      };
+    } catch {
+      return { ok: false, ids: [] };
     }
   }
 
@@ -401,7 +599,7 @@ export class DockerClient {
     });
     assertSafeCreateOptions(options, { instanceDataRoot: this.opts.instanceDataRoot });
     const container = await this.docker.createContainer(options as Docker.ContainerCreateOptions);
-    await this.attachManager(spec.id);
+    await this.attachManagerToBootstrapNetwork(spec.id, txId, networkId);
     await container.putArchive(
       tarFile('settings.js', settingsJs, { uid: NODE_RED_UID, gid: NODE_RED_UID, mode: 0o644 }),
       { path: '/data' },
@@ -562,20 +760,37 @@ export class DockerClient {
     this.requireBootstrapTxId(txId);
     const residuals = new Set<BootstrapResourceResidual>();
 
+    const discoveredContainers = await this.discoverBootstrapContainerIds(instanceId, txId);
+    if (!discoveredContainers.ok) residuals.add('container');
+    const containerIds = new Set(discoveredContainers.ids);
     try {
-      const inspected = await this.docker.getContainer(containerName(instanceId)).inspect();
-      const labels = inspected.Config.Labels ?? {};
-      if (
-        labels[MANAGED_LABEL] !== 'true'
-        || labels[INSTANCE_LABEL] !== instanceId
-        || labels[BOOTSTRAP_TX_LABEL] !== txId
-      ) {
-        residuals.add('container');
+      const named = await this.docker.getContainer(containerName(instanceId)).inspect();
+      if (this.hasBootstrapLabels(named.Config.Labels, instanceId, txId)) {
+        containerIds.add(named.Id);
       } else {
-        await this.docker.getContainer(inspected.Id).remove({ force: true });
+        residuals.add('container');
       }
     } catch (error) {
       if ((error as { statusCode?: number }).statusCode !== 404) residuals.add('container');
+    }
+    for (const containerId of containerIds) {
+      const containerRef = this.docker.getContainer(containerId);
+      try {
+        const inspected = await containerRef.inspect();
+        if (!this.hasBootstrapLabels(inspected.Config.Labels, instanceId, txId)) {
+          residuals.add('container');
+          continue;
+        }
+        await containerRef.remove({ force: true });
+      } catch (error) {
+        if ((error as { statusCode?: number }).statusCode !== 404) residuals.add('container');
+      }
+      try {
+        await containerRef.inspect();
+        residuals.add('container');
+      } catch (error) {
+        if ((error as { statusCode?: number }).statusCode !== 404) residuals.add('container');
+      }
     }
     try {
       await this.docker.getContainer(containerName(instanceId)).inspect();
@@ -584,17 +799,38 @@ export class DockerClient {
       if ((error as { statusCode?: number }).statusCode !== 404) residuals.add('container');
     }
 
+    const discoveredNetworks = await this.discoverBootstrapNetworkIds(instanceId, txId);
+    if (!discoveredNetworks.ok) residuals.add('network');
+    const networkIds = new Set(discoveredNetworks.ids);
     try {
-      const network = await this.assertOwnedNetwork(instanceId);
-      if (network.Labels?.[BOOTSTRAP_TX_LABEL] !== txId) {
-        residuals.add('network');
+      const named = await this.docker.getNetwork(this.instanceNetwork(instanceId)).inspect();
+      if (this.hasBootstrapLabels(named.Labels, instanceId, txId)) {
+        networkIds.add(named.Id);
       } else {
-        const networkRef = this.docker.getNetwork(network.Id);
-        await this.detachManager(networkRef, instanceId);
-        await networkRef.remove();
+        residuals.add('network');
       }
     } catch (error) {
       if ((error as { statusCode?: number }).statusCode !== 404) residuals.add('network');
+    }
+    for (const networkId of networkIds) {
+      const networkRef = this.docker.getNetwork(networkId);
+      try {
+        const inspected = await networkRef.inspect();
+        if (!this.hasBootstrapLabels(inspected.Labels, instanceId, txId)) {
+          residuals.add('network');
+          continue;
+        }
+        await this.detachManager(networkRef, instanceId);
+        await networkRef.remove();
+      } catch (error) {
+        if ((error as { statusCode?: number }).statusCode !== 404) residuals.add('network');
+      }
+      try {
+        await networkRef.inspect();
+        residuals.add('network');
+      } catch (error) {
+        if ((error as { statusCode?: number }).statusCode !== 404) residuals.add('network');
+      }
     }
     try {
       await this.docker.getNetwork(this.instanceNetwork(instanceId)).inspect();
@@ -603,25 +839,7 @@ export class DockerClient {
       if ((error as { statusCode?: number }).statusCode !== 404) residuals.add('network');
     }
 
-    const dataDir = instanceDataDir(this.opts.instanceDataRoot, instanceId);
-    const dataOwnership = await this.bootstrapDataOwnership(instanceId, txId);
-    if (dataOwnership === 'foreign') {
-      residuals.add('data');
-    } else if (dataOwnership === 'owned') {
-      try {
-        const removeDir = this.opts.removeDir
-          ?? ((path: string) => rm(path, { recursive: true, force: false }));
-        await removeDir(dataDir);
-      } catch {
-        residuals.add('data');
-      }
-      try {
-        await lstat(dataDir);
-        residuals.add('data');
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') residuals.add('data');
-      }
-    }
+    if (await this.cleanupBootstrapData(instanceId, txId)) residuals.add('data');
 
     const ordered: BootstrapResourceResidual[] = ['container', 'network', 'data'];
     return { residuals: ordered.filter((kind) => residuals.has(kind)) };
