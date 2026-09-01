@@ -165,6 +165,12 @@ export class UpstreamRegistry {
             continue;
           }
           const doc = await res.json() as UpstreamPackument;
+          const latest = doc['dist-tags']?.latest;
+          const manifestName = latest ? doc.versions[latest]?.name : undefined;
+          if (doc.name !== q || (manifestName !== undefined && manifestName !== q)) {
+            errors.push(`${src.name}: 包名不匹配（请求 ${q}，返回 ${doc.name}）`);
+            continue;
+          }
           const hit = hitFromPackument(doc, src.name);
           return hit ? [hit] : [];
         } catch (e) {

@@ -216,6 +216,40 @@ test('an exact source failure does not mask a later exact node package', async (
   assert.deepEqual(hits.map((hit) => [hit.name, hit.source]), [[edgeDoc.name, 'npm']]);
 });
 
+test('a mismatched exact packument is skipped for a later matching source', async () => {
+  const mismatched = structuredClone(edgeDoc);
+  mismatched.name = '@mqttsnet/other-edge-nodes';
+  mismatched.versions['0.0.1']!.name = mismatched.name;
+  const up = new UpstreamRegistry({
+    sources: () => [
+      { name: 'wrong', url: 'https://wrong.example' },
+      { name: 'npm', url: 'https://up.example' },
+    ],
+    fetchImpl: (async (url: string | URL) => new Response(JSON.stringify(
+      String(url).startsWith('https://wrong.example') ? mismatched : edgeDoc,
+    ), { status: 200 })) as unknown as typeof fetch,
+  });
+  assert.deepEqual((await up.search(edgeDoc.name)).map((hit) => [hit.name, hit.source]), [
+    [edgeDoc.name, 'npm'],
+  ]);
+});
+
+test('a mismatched exact packument is reported instead of becoming fuzzy search', async () => {
+  let fuzzyCalls = 0;
+  const mismatched = structuredClone(edgeDoc);
+  mismatched.name = '@mqttsnet/other-edge-nodes';
+  mismatched.versions['0.0.1']!.name = mismatched.name;
+  const up = new UpstreamRegistry({
+    sources: () => [{ name: 'wrong', url: 'https://wrong.example' }],
+    fetchImpl: (async (url: string | URL) => {
+      if (String(url).includes('/-/v1/search')) fuzzyCalls++;
+      return new Response(JSON.stringify(mismatched), { status: 200 });
+    }) as unknown as typeof fetch,
+  });
+  await assert.rejects(() => up.search(edgeDoc.name), /所有节点源都取不到.*包名不匹配/);
+  assert.equal(fuzzyCalls, 0);
+});
+
 test('an exact non-node package stays empty without fuzzy fallback', async () => {
   let fuzzyCalls = 0;
   const up = new UpstreamRegistry({
