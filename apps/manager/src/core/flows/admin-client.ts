@@ -163,7 +163,10 @@ export interface InstalledNodeSet {
 /** 实例上装着的一个节点模块。 */
 export interface InstalledModule {
   module: string;
+  /** 唯一观察版本；多个版本时为空，完整证据见 observedVersions。 */
   version: string;
+  /** Admin API node set 中观察到的全部版本，按字典序稳定排序。 */
+  observedVersions: string[];
   /**
    * 是否**不是**镜像自带的。
    *
@@ -239,8 +242,9 @@ export function moduleFromNodeSets(module: string, nodeSets: InstalledNodeSet[])
   const observedFiles = [...new Set(orderedSets.flatMap((set) => set.file ? [set.file] : []))].sort();
   return {
     module,
-    // Admin API does not guarantee a single version record. Pick deterministically; nodeSets retain all evidence.
-    version: versions[0] ?? '',
+    // A disagreement is evidence, not a tie to break. Do not silently select one version.
+    version: versions.length === 1 ? versions[0]! : '',
+    observedVersions: versions,
     local: orderedSets.some((set) => set.local === true),
     types,
     enabled: orderedSets.every((set) => set.enabled),
@@ -248,7 +252,7 @@ export function moduleFromNodeSets(module: string, nodeSets: InstalledNodeSet[])
     nodeSets: orderedSets,
     observedFiles,
     source: sourceForNodeSets(module, types),
-    health: errors.length > 0 ? 'failed' : 'healthy',
+    health: errors.length > 0 || versions.length > 1 ? 'failed' : 'healthy',
   };
 }
 

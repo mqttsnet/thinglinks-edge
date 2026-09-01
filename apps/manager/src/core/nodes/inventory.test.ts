@@ -10,7 +10,8 @@ import type { InstalledModule, InstalledNodeSet } from '../flows/admin-client.ts
 
 const mod = (over: Partial<InstalledModule>): InstalledModule => ({
   module: 'x', version: '1.0.0', local: true, types: [], enabled: true,
-  errors: [], nodeSets: [], observedFiles: [], source: 'npm', health: 'healthy', ...over,
+  observedVersions: ['1.0.0'], errors: [], nodeSets: [], observedFiles: [],
+  source: 'npm', health: 'healthy', ...over,
 });
 
 const nodeSet = (over: Partial<InstalledNodeSet>): InstalledNodeSet => ({
@@ -26,7 +27,11 @@ test('only the exact published Edge package is platform owned', () => {
   assert.equal(
     classify(mod({
       module: '@mqttsnet/thinglinks-edge-nodes', version: '0.0.1',
-      types: ['tl-device', 'tl-tag', 'tl-uplink'],
+      observedVersions: ['0.0.1'], types: ['tl-device', 'tl-tag', 'tl-uplink'],
+      nodeSets: [nodeSet({
+        module: '@mqttsnet/thinglinks-edge-nodes', version: '0.0.1',
+        types: ['tl-device'],
+      })],
     }), new Set()),
     'platform',
   );
@@ -132,6 +137,29 @@ test('module load errors take precedence over conflicts for global health', () =
   assert.deepEqual(inventory.conflicts, [{
     type: 'tl-device', owners: ['@mqttsnet/thinglinks-edge-nodes', 'node-red'],
   }]);
+});
+
+test('mixed node-set versions remain visible, fail health, and cannot be platform owned', () => {
+  const installed = aggregateNodeSets([
+    nodeSet({
+      id: '@mqttsnet/thinglinks-edge-nodes/tl-device',
+      module: '@mqttsnet/thinglinks-edge-nodes', version: '0.0.1', types: ['tl-device'],
+    }),
+    nodeSet({
+      id: '@mqttsnet/thinglinks-edge-nodes/tl-tag',
+      module: '@mqttsnet/thinglinks-edge-nodes', version: '0.0.2', types: ['tl-tag'],
+    }),
+    nodeSet({
+      id: '@mqttsnet/thinglinks-edge-nodes/tl-uplink',
+      module: '@mqttsnet/thinglinks-edge-nodes', version: '0.0.1', types: ['tl-uplink'],
+    }),
+  ]).modules[0]!;
+
+  assert.deepEqual(installed.observedVersions, ['0.0.1', '0.0.2']);
+  assert.equal(installed.version, '');
+  assert.equal(installed.health, 'failed');
+  assert.equal(classify(installed, new Set()), 'unapproved');
+  assert.throws(() => assertHealthyPlatformModule(installed), /version|版本/i);
 });
 
 test('healthy published platform module has exactly the three enabled error-free types', () => {

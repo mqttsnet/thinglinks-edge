@@ -78,7 +78,7 @@ export function aggregateNodeSets(nodeSets: InstalledNodeSet[]): InstalledInvent
   const assessed = modules.map((module) => ({
     ...module,
     // A real node-set load error is more important than duplicate ownership evidence.
-    health: module.errors.length > 0 ? 'failed' as const
+    health: module.health === 'failed' || module.errors.length > 0 ? 'failed' as const
       : conflictedOwners.has(module.module) ? 'conflict' as const : 'healthy' as const,
   }));
   const health = assessed.some((module) => module.health === 'failed') ? 'failed'
@@ -97,7 +97,17 @@ export function classify(m: InstalledModule, approved: ReadonlySet<string>): Nod
     if (!hasPlatformType || hasBuiltinType) return 'builtin';
     return 'platform';
   }
-  if (m.module === PLATFORM_NODE_PACKAGE.name && m.version === PLATFORM_NODE_PACKAGE.version) {
+  if (
+    m.module === PLATFORM_NODE_PACKAGE.name
+    && m.version === PLATFORM_NODE_PACKAGE.version
+    && m.observedVersions.length === 1
+    && m.observedVersions[0] === PLATFORM_NODE_PACKAGE.version
+    && m.nodeSets.length > 0
+    && m.nodeSets.every((nodeSet) => (
+      nodeSet.module === PLATFORM_NODE_PACKAGE.name
+      && nodeSet.version === PLATFORM_NODE_PACKAGE.version
+    ))
+  ) {
     return 'platform';
   }
   return approved.has(m.module) ? 'approved' : 'unapproved';
@@ -107,6 +117,12 @@ export function classify(m: InstalledModule, approved: ReadonlySet<string>): Nod
 export function assertHealthyPlatformModule(installed: InstalledModule): void {
   if (installed.module !== PLATFORM_NODE_PACKAGE.name) {
     throw new Error(`平台节点模块不匹配：${installed.module}`);
+  }
+  if (
+    installed.observedVersions.length !== 1
+    || installed.observedVersions[0] !== PLATFORM_NODE_PACKAGE.version
+  ) {
+    throw new Error(`平台节点观察到不一致版本：${installed.observedVersions.join(', ')}`);
   }
   if (installed.version !== PLATFORM_NODE_PACKAGE.version) {
     throw new Error(`平台节点版本不匹配：${installed.version}`);
