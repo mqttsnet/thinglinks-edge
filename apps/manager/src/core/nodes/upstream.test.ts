@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { gzipSync } from 'node:zlib';
 import { tarArchive } from '../archive/tar.ts';
-import { UpstreamRegistry, assertIntegrity } from './upstream.ts';
+import { UpstreamRegistry, assertIntegrity, type UpstreamPackument } from './upstream.ts';
 import { NodePolicyError } from './policy.ts';
 
 const pack = (name: string, version: string) => gzipSync(tarArchive([{
@@ -132,17 +132,222 @@ function searchSource(name: string, names: string[]) {
   }) as unknown as typeof fetch;
 }
 
-test('搜索加 keywords:node-red 限定 —— 不加会返回一堆无关的普通库', async () => {
-  let seen = '';
-  const impl = (async (url: string | URL) => {
-    seen = String(url);
-    return new Response(JSON.stringify({ objects: [] }), { status: 200 });
-  }) as unknown as typeof fetch;
-  const up = new UpstreamRegistry({
-    sources: () => [{ name: 'x', url: 'https://up.example' }], fetchImpl: impl,
+const edgeDoc: UpstreamPackument = {
+  name: '@mqttsnet/thinglinks-edge-nodes',
+  'dist-tags': { latest: '0.0.1' },
+  versions: {
+    '0.0.1': {
+      name: '@mqttsnet/thinglinks-edge-nodes',
+      version: '0.0.1',
+      description: 'ThingLinks Edge nodes',
+      keywords: ['thinglinks', 'node-red'],
+      'node-red': { nodes: { 'tl-device': 'tl-device.js' } },
+      dist: { tarball: 'https://up.example/edge.tgz' },
+    },
+  },
+};
+
+function registryReturning(doc: UpstreamPackument): UpstreamRegistry {
+  return new UpstreamRegistry({
+    sources: () => [{ name: 'npm', url: 'https://up.example' }],
+    fetchImpl: (async (url: string | URL) => String(url).includes('/-/v1/search')
+      ? new Response(JSON.stringify({ objects: [] }), { status: 200 })
+      : new Response(JSON.stringify(doc), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })) as unknown as typeof fetch,
   });
-  await up.search('modbus');
-  assert.match(decodeURIComponent(seen), /keywords:node-red modbus/);
+}
+
+test('exact scoped node package bypasses npm search index', async () => {
+  const up = registryReturning(edgeDoc);
+  const hits = await up.search('@mqttsnet/thinglinks-edge-nodes');
+  assert.deepEqual(hits.map((hit) => [hit.name, hit.version]), [
+    ['@mqttsnet/thinglinks-edge-nodes', '0.0.1'],
+  ]);
+});
+
+test('exact common package is not a Node-RED search hit', async () => {
+  const up = registryReturning({
+    name: '@mqttsnet/thinglinks-node-red-common',
+    'dist-tags': { latest: '0.0.1' },
+    versions: {
+      '0.0.1': {
+        name: '@mqttsnet/thinglinks-node-red-common',
+        version: '0.0.1',
+        keywords: [],
+      },
+    },
+  });
+  assert.deepEqual(await up.search('@mqttsnet/thinglinks-node-red-common'), []);
+});
+
+test('all-source exact 404 falls through to fuzzy search', async () => {
+  let fuzzyCalls = 0;
+  const up = new UpstreamRegistry({
+    sources: () => [{ name: 'npm', url: 'https://up.example' }],
+    fetchImpl: (async (url: string | URL) => {
+      if (String(url).includes('/-/v1/search')) {
+        fuzzyCalls++;
+        return new Response(JSON.stringify({ objects: [{ package: {
+          name: edgeDoc.name, version: '0.0.1', description: 'ThingLinks Edge nodes',
+          keywords: ['thinglinks', 'node-red'],
+        } }] }), { status: 200 });
+      }
+      return new Response('not found', { status: 404 });
+    }) as unknown as typeof fetch,
+  });
+  assert.deepEqual((await up.search('thinglinks')).map((hit) => hit.name), [edgeDoc.name]);
+  assert.equal(fuzzyCalls, 1);
+});
+
+test('an exact source failure does not mask a later exact node package', async () => {
+  const up = new UpstreamRegistry({
+    sources: () => [
+      { name: 'timeout', url: 'https://timeout.example' },
+      { name: 'npm', url: 'https://up.example' },
+    ],
+    fetchImpl: (async (url: string | URL) => {
+      if (String(url).startsWith('https://timeout.example')) throw new Error('ETIMEDOUT');
+      return new Response(JSON.stringify(edgeDoc), { status: 200 });
+    }) as unknown as typeof fetch,
+  });
+  const hits = await up.search('@mqttsnet/thinglinks-edge-nodes');
+  assert.deepEqual(hits.map((hit) => [hit.name, hit.source]), [[edgeDoc.name, 'npm']]);
+});
+
+test('an exact non-node package stays empty without fuzzy fallback', async () => {
+  let fuzzyCalls = 0;
+  const up = new UpstreamRegistry({
+    sources: () => [{ name: 'npm', url: 'https://up.example' }],
+    fetchImpl: (async (url: string | URL) => {
+      if (String(url).includes('/-/v1/search')) {
+        fuzzyCalls++;
+        return new Response(JSON.stringify({ objects: [{ package: {
+          name: edgeDoc.name, version: '0.0.1', keywords: ['node-red'],
+        } }] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({
+        name: 'ordinary-thinglinks-lib',
+        'dist-tags': { latest: '1.0.0' },
+        versions: { '1.0.0': { name: 'ordinary-thinglinks-lib', version: '1.0.0' } },
+      }), { status: 200 });
+    }) as unknown as typeof fetch,
+  });
+  assert.deepEqual(await up.search('ordinary-thinglinks-lib'), []);
+  assert.equal(fuzzyCalls, 0);
+});
+
+test('the first exact source is authoritative even when a later source has a node package', async () => {
+  const up = new UpstreamRegistry({
+    sources: () => [
+      { name: 'common', url: 'https://common.example' },
+      { name: 'npm', url: 'https://up.example' },
+    ],
+    fetchImpl: (async (url: string | URL) => String(url).startsWith('https://common.example')
+      ? new Response(JSON.stringify({
+        name: edgeDoc.name,
+        'dist-tags': { latest: '0.0.1' },
+        versions: { '0.0.1': { name: edgeDoc.name, version: '0.0.1' } },
+      }), { status: 200 })
+      : new Response(JSON.stringify(edgeDoc), { status: 200 })) as unknown as typeof fetch,
+  });
+  assert.deepEqual(await up.search(edgeDoc.name), []);
+});
+
+test('a source failure plus remaining exact 404s is reported instead of becoming fuzzy search', async () => {
+  let fuzzyCalls = 0;
+  const up = new UpstreamRegistry({
+    sources: () => [
+      { name: 'timeout', url: 'https://timeout.example' },
+      { name: 'npm', url: 'https://up.example' },
+    ],
+    fetchImpl: (async (url: string | URL) => {
+      if (String(url).includes('/-/v1/search')) fuzzyCalls++;
+      if (String(url).startsWith('https://timeout.example')) throw new Error('ETIMEDOUT');
+      return new Response('not found', { status: 404 });
+    }) as unknown as typeof fetch,
+  });
+  await assert.rejects(() => up.search('thinglinks'), /所有节点源都取不到 thinglinks.*ETIMEDOUT/);
+  assert.equal(fuzzyCalls, 0);
+});
+
+test('duplicate exact node packages honor configured source priority', async () => {
+  const firstDoc = structuredClone(edgeDoc);
+  firstDoc['dist-tags'] = { latest: '0.0.1' };
+  const secondDoc = structuredClone(edgeDoc);
+  secondDoc['dist-tags'] = { latest: '0.0.2' };
+  secondDoc.versions['0.0.2'] = {
+    ...edgeDoc.versions['0.0.1'], version: '0.0.2',
+  };
+  const up = new UpstreamRegistry({
+    sources: () => [
+      { name: 'first', url: 'https://first.example' },
+      { name: 'second', url: 'https://second.example' },
+    ],
+    fetchImpl: (async (url: string | URL) => new Response(JSON.stringify(
+      String(url).startsWith('https://first.example') ? firstDoc : secondDoc,
+    ), { status: 200 })) as unknown as typeof fetch,
+  });
+  assert.deepEqual((await up.search(edgeDoc.name)).map((hit) => [hit.version, hit.source]), [['0.0.1', 'first']]);
+});
+
+test('fuzzy search sends plain text and filters non-node packages locally', async () => {
+  let requested = '';
+  const up = new UpstreamRegistry({
+    sources: () => [{ name: 'npm', url: 'https://up.example' }],
+    fetchImpl: (async (url: string | URL) => {
+      requested = decodeURIComponent(String(url));
+      return new Response(JSON.stringify({ objects: [
+        { package: {
+          name: '@mqttsnet/thinglinks-edge-nodes',
+          version: '0.0.1',
+          description: 'ThingLinks Edge nodes',
+          keywords: ['thinglinks', 'node-red'],
+        } },
+        { package: {
+          name: 'ordinary-thinglinks-lib',
+          version: '1.0.0',
+          description: 'ordinary library',
+          keywords: ['thinglinks'],
+        } },
+      ] }), { status: 200 });
+    }) as unknown as typeof fetch,
+  });
+  const hits = await up.search('thinglinks edge');
+  assert.match(requested, /text=thinglinks edge/);
+  assert.doesNotMatch(requested, /keywords:node-red/);
+  assert.deepEqual(hits.map((hit) => hit.name), ['@mqttsnet/thinglinks-edge-nodes']);
+});
+
+test('fuzzy search keeps mixed-case node-red keywords', async () => {
+  const impl = (async () => new Response(JSON.stringify({ objects: [{ package: {
+    name: 'node-red-contrib-thinglinks', version: '1.0.0',
+    description: 'ThingLinks extra node', keywords: ['thinglinks', 'Node-RED'],
+  } }] }), { status: 200 })) as unknown as typeof fetch;
+  const mixed = new UpstreamRegistry({
+    sources: () => [{ name: 'npm', url: 'https://up.example' }], fetchImpl: impl,
+  });
+  assert.deepEqual((await mixed.search('thinglinks extra')).map((hit) => hit.name), ['node-red-contrib-thinglinks']);
+});
+
+test('fuzzy search continues after a failed source and preserves successful source attribution', async () => {
+  const up = new UpstreamRegistry({
+    sources: () => [
+      { name: 'failed', url: 'https://failed.example' },
+      { name: 'second', url: 'https://second.example' },
+    ],
+    fetchImpl: (async (url: string | URL) => {
+      if (String(url).startsWith('https://failed.example')) throw new Error('ECONNREFUSED');
+      return new Response(JSON.stringify({ objects: [{ package: {
+        name: 'node-red-contrib-thinglinks', version: '1.0.0',
+        description: 'ThingLinks extra node', keywords: ['thinglinks', 'node-red'],
+      } }] }), { status: 200 });
+    }) as unknown as typeof fetch,
+  });
+  assert.deepEqual((await up.search('thinglinks extra')).map((hit) => [hit.name, hit.source]), [
+    ['node-red-contrib-thinglinks', 'second'],
+  ]);
 });
 
 test('空关键字不发请求', async () => {
@@ -168,7 +373,7 @@ test('多源结果合并，同名包按源的顺序取先到的那个', async ()
       return searchSource(which, names)(url);
     }) as unknown as typeof fetch,
   });
-  const hits = await up.search('x');
+  const hits = await up.search('node');
   assert.deepEqual(hits.map((h) => h.name).sort(), ['dup-node', 'only-a', 'only-b']);
   assert.equal(hits.find((h) => h.name === 'dup-node')?.source, '内网');
 });
@@ -184,7 +389,7 @@ test('**一个源挂了不拖垮整次搜索** —— 现场常有内网源临�
       return searchSource('好源', ['a-node'])(url);
     }) as unknown as typeof fetch,
   });
-  assert.deepEqual((await up.search('a')).map((h) => h.name), ['a-node']);
+  assert.deepEqual((await up.search('a node')).map((h) => h.name), ['a-node']);
 });
 
 test('源清单是现读的 —— 页面上加了源立刻生效，不必重启', async () => {
