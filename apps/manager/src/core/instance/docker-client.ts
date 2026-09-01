@@ -73,6 +73,12 @@ export interface DockerClientOptions {
   removeDir?: ((path: string) => Promise<void>) | undefined;
   /** bootstrap 原子隔离/恢复 seam；生产使用 fs.rename。 */
   renameDir?: ((source: string, destination: string) => Promise<void>) | undefined;
+  /** 仅供确定性竞态测试；生产不注入。 */
+  afterBootstrapDataOwnershipCheck?: ((event: {
+    original: string;
+    quarantine: string;
+    ownership: 'owned' | 'foreign';
+  }) => Promise<void>) | undefined;
 }
 
 export interface InstanceStatus {
@@ -477,14 +483,15 @@ export class DockerClient {
     if (!quarantineExists) return residual || originalExists;
 
     const ownership = await this.bootstrapDataOwnershipAt(quarantine, txId);
+    if (ownership !== 'absent') {
+      await this.opts.afterBootstrapDataOwnershipCheck?.({
+        original,
+        quarantine,
+        ownership,
+      });
+    }
     if (ownership !== 'owned') {
-      if (!originalExists) {
-        try {
-          await this.renameBootstrapDir(quarantine, original);
-        } catch {
-          // A concurrent replacement may now own the original path; preserve quarantine.
-        }
-      }
+      // Foreign evidence is never auto-restored: even rename onto an empty directory may replace it.
       return true;
     }
 
@@ -798,6 +805,9 @@ export class DockerClient {
     } catch (error) {
       if ((error as { statusCode?: number }).statusCode !== 404) residuals.add('container');
     }
+    // Detection-only second pass: late/renamed exact-label resources wait for the next recovery pass.
+    const lateContainers = await this.discoverBootstrapContainerIds(instanceId, txId);
+    if (!lateContainers.ok || lateContainers.ids.length > 0) residuals.add('container');
 
     const discoveredNetworks = await this.discoverBootstrapNetworkIds(instanceId, txId);
     if (!discoveredNetworks.ok) residuals.add('network');
@@ -838,6 +848,9 @@ export class DockerClient {
     } catch (error) {
       if ((error as { statusCode?: number }).statusCode !== 404) residuals.add('network');
     }
+    // Never widen this pass into a retry/prune; newly discovered IDs are residual evidence only.
+    const lateNetworks = await this.discoverBootstrapNetworkIds(instanceId, txId);
+    if (!lateNetworks.ok || lateNetworks.ids.length > 0) residuals.add('network');
 
     if (await this.cleanupBootstrapData(instanceId, txId)) residuals.add('data');
 

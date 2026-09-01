@@ -642,6 +642,30 @@ for (const residual of ['container', 'network', 'data'] as const) {
   });
 }
 
+test('late exact-label Docker residuals retain the bootstrap row as manual_required', async () => {
+  const f = await bootstrapFixture({
+    failure: 'start',
+    residuals: ['container', 'network'],
+  });
+  try {
+    await assert.rejects(
+      () => f.service.create(newInstance),
+      (error: unknown) => {
+        assert.ok(error instanceof BootstrapCompensationError);
+        assert.deepEqual(error.residuals, ['container', 'network']);
+        return true;
+      },
+    );
+    assert.ok(f.repo.get('line-new'));
+    assert.deepEqual(f.repo.nodeRuntime('line-new'), {
+      mode: 'npm', platformVersion: '',
+      migrationState: 'manual_required', migrationError: 'compensation',
+    });
+  } finally {
+    await f.close();
+  }
+});
+
 function seedInterruptedBootstrap(f: Awaited<ReturnType<typeof bootstrapFixture>>, id: string): void {
   f.repo.createWithNodeMigration(
     {

@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   renameSync,
   rmSync,
   writeFileSync,
@@ -397,6 +398,7 @@ test('cleanup preserves every foreign-labeled or marker-mismatched resource', as
   });
   await f.docker.prepareBootstrapDataDir('line-a', 'foreign-tx');
   const instanceDir = join(dirname(f.legacyDir), 'line-a');
+  const quarantine = quarantineFor(dirname(f.legacyDir), 'line-a', 'bootstrap-tx-a');
 
   assert.deepEqual(
     await f.docker.cleanupBootstrap('line-a', 'bootstrap-tx-a'),
@@ -404,13 +406,15 @@ test('cleanup preserves every foreign-labeled or marker-mismatched resource', as
   );
   assert.equal(state.containerRemoveCalls, 0);
   assert.equal(state.networkRemoveCalls, 0);
-  assert.equal(existsSync(instanceDir), true);
+  assert.equal(existsSync(instanceDir), false);
+  assert.equal(readFileSync(join(quarantine, BOOTSTRAP_OWNER_FILE), 'utf8'), 'foreign-tx');
 });
 
 test('cleanup treats a missing owner marker as a data residual and preserves the directory', async () => {
   const f = fixture();
   installAbsentResourceApi(f.docker);
   const instanceDir = join(dirname(f.legacyDir), 'line-a');
+  const quarantine = quarantineFor(dirname(f.legacyDir), 'line-a', 'bootstrap-tx-a');
   mkdirSync(instanceDir);
   writeFileSync(join(instanceDir, 'foreign.txt'), 'foreign-data');
 
@@ -418,7 +422,8 @@ test('cleanup treats a missing owner marker as a data residual and preserves the
     await f.docker.cleanupBootstrap('line-a', 'bootstrap-tx-a'),
     { residuals: ['data'] },
   );
-  assert.equal(readFileSync(join(instanceDir, 'foreign.txt'), 'utf8'), 'foreign-data');
+  assert.equal(existsSync(instanceDir), false);
+  assert.equal(readFileSync(join(quarantine, 'foreign.txt'), 'utf8'), 'foreign-data');
 });
 
 test('data replacement created after quarantine rename is preserved and reported as residual', async () => {
@@ -443,7 +448,7 @@ test('data replacement created after quarantine rename is preserved and reported
   assert.equal(existsSync(quarantine), false);
 });
 
-test('marker mismatch is quarantined then restored to the original path when it is safe', async () => {
+test('marker mismatch is quarantined and never auto-restored even when original is absent', async () => {
   const renames: Array<[string, string]> = [];
   const f = fixture({
     renameDir: async (source, destination) => {
@@ -460,12 +465,35 @@ test('marker mismatch is quarantined then restored to the original path when it 
     await f.docker.cleanupBootstrap('line-a', 'bootstrap-tx-a'),
     { residuals: ['data'] },
   );
-  assert.deepEqual(renames, [[original, quarantine], [quarantine, original]]);
-  assert.equal(readFileSync(join(original, BOOTSTRAP_OWNER_FILE), 'utf8'), 'foreign-tx');
-  assert.equal(existsSync(quarantine), false);
+  assert.deepEqual(renames, [[original, quarantine]]);
+  assert.equal(existsSync(original), false);
+  assert.equal(readFileSync(join(quarantine, BOOTSTRAP_OWNER_FILE), 'utf8'), 'foreign-tx');
 });
 
-test('occupied restore preserves both replacement original and mismatched quarantine', async () => {
+test('mismatched quarantine never overwrites a concurrently created empty original directory', async () => {
+  let interleavings = 0;
+  const f = fixture({
+    afterBootstrapDataOwnershipCheck: async ({ original, ownership }) => {
+      assert.equal(ownership, 'foreign');
+      interleavings += 1;
+      mkdirSync(original);
+    },
+  });
+  installAbsentResourceApi(f.docker);
+  const original = join(dirname(f.legacyDir), 'line-a');
+  const quarantine = quarantineFor(dirname(f.legacyDir), 'line-a', 'bootstrap-tx-a');
+  await f.docker.prepareBootstrapDataDir('line-a', 'foreign-tx');
+
+  assert.deepEqual(
+    await f.docker.cleanupBootstrap('line-a', 'bootstrap-tx-a'),
+    { residuals: ['data'] },
+  );
+  assert.equal(interleavings, 1);
+  assert.deepEqual(readdirSync(original), []);
+  assert.equal(readFileSync(join(quarantine, BOOTSTRAP_OWNER_FILE), 'utf8'), 'foreign-tx');
+});
+
+test('occupied original preserves both replacement and mismatched quarantine', async () => {
   let renameCalls = 0;
   const f = fixture({
     renameDir: async (source, destination) => {
@@ -552,8 +580,12 @@ test('cleanup deletes exact-label task resources by immutable ID while preservin
   let foreignNetworkDeletes = 0;
   let ownedContainerGone = false;
   let ownedNetworkGone = false;
-  raw.listContainers = async () => [{ Id: 'owned-container-id', Labels: ownedLabels('line-a', 'bootstrap-tx-a') }];
-  raw.listNetworks = async () => [{ Id: 'owned-network-id', Labels: ownedLabels('line-a', 'bootstrap-tx-a') }];
+  raw.listContainers = async () => ownedContainerGone
+    ? []
+    : [{ Id: 'owned-container-id', Labels: ownedLabels('line-a', 'bootstrap-tx-a') }];
+  raw.listNetworks = async () => ownedNetworkGone
+    ? []
+    : [{ Id: 'owned-network-id', Labels: ownedLabels('line-a', 'bootstrap-tx-a') }];
   raw.getContainer = (ref: string) => ({
     inspect: async () => {
       if (ref === 'owned-container-id') {
@@ -596,4 +628,56 @@ test('cleanup deletes exact-label task resources by immutable ID while preservin
   assert.equal(ownedNetworkDeletes, 1);
   assert.equal(foreignContainerDeletes, 0);
   assert.equal(foreignNetworkDeletes, 0);
+});
+
+test('late exact-label container is detection-only residual and is not deleted in this pass', async () => {
+  const f = fixture();
+  const raw = rawOf(f.docker);
+  let discoveries = 0;
+  let lateDeletes = 0;
+  raw.listContainers = async () => {
+    discoveries += 1;
+    return discoveries === 1
+      ? []
+      : [{ Id: 'late-container-id', Labels: ownedLabels('line-a', 'bootstrap-tx-a') }];
+  };
+  raw.listNetworks = async () => [];
+  raw.getContainer = () => ({
+    inspect: async () => { throw missing(); },
+    remove: async () => { lateDeletes += 1; },
+  });
+  raw.getNetwork = () => ({ inspect: async () => { throw missing(); } });
+
+  assert.deepEqual(
+    await f.docker.cleanupBootstrap('line-a', 'bootstrap-tx-a'),
+    { residuals: ['container'] },
+  );
+  assert.equal(discoveries, 2);
+  assert.equal(lateDeletes, 0);
+});
+
+test('late exact-label network is detection-only residual and is not deleted in this pass', async () => {
+  const f = fixture();
+  const raw = rawOf(f.docker);
+  let discoveries = 0;
+  let lateDeletes = 0;
+  raw.listContainers = async () => [];
+  raw.listNetworks = async () => {
+    discoveries += 1;
+    return discoveries === 1
+      ? []
+      : [{ Id: 'late-network-id', Labels: ownedLabels('line-a', 'bootstrap-tx-a') }];
+  };
+  raw.getContainer = () => ({ inspect: async () => { throw missing(); } });
+  raw.getNetwork = () => ({
+    inspect: async () => { throw missing(); },
+    remove: async () => { lateDeletes += 1; },
+  });
+
+  assert.deepEqual(
+    await f.docker.cleanupBootstrap('line-a', 'bootstrap-tx-a'),
+    { residuals: ['network'] },
+  );
+  assert.equal(discoveries, 2);
+  assert.equal(lateDeletes, 0);
 });
