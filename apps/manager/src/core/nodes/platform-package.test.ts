@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -212,8 +213,8 @@ test('PlatformPackageService bootstrap invokes the hard-wired store verifier', (
   });
 });
 
-test('PlatformPackageService verifyForInstall succeeds then rejects bytes replaced after baseline', () => {
-  withStore((store, root) => {
+test('production PlatformPackageService cannot replace fixed verification through subclassing', () => {
+  withStore((store) => {
     const f = fixture();
     store.add(f.edge);
     store.add(f.common);
@@ -225,14 +226,90 @@ test('PlatformPackageService verifyForInstall succeeds then rejects bytes replac
       }
     }({ store, catalog });
 
-    const baseline = service.verifyForInstall();
-    assert.deepEqual(baseline.buffer, f.edge);
-
-    writeFileSync(join(root, PLATFORM_NODE_PACKAGE.name,
-      `${PLATFORM_NODE_PACKAGE.version}.tgz`), pack({
-      name: PLATFORM_NODE_PACKAGE.name,
-      version: PLATFORM_NODE_PACKAGE.version,
-    }, 'replaced-before-install'));
     assert.throws(() => service.verifyForInstall(), /integrity|完整性/i);
   });
+});
+
+test('production wrapper re-reads after a successful baseline before install', () => {
+  const moduleUrls = {
+    archive: new URL('../archive/tar.ts', import.meta.url).href,
+    catalog: new URL('./catalog.ts', import.meta.url).href,
+    contract: new URL('./platform-contract.ts', import.meta.url).href,
+    db: new URL('../db.ts', import.meta.url).href,
+    platform: new URL('./platform-package.ts', import.meta.url).href,
+    store: new URL('./store.ts', import.meta.url).href,
+  };
+  const script = `
+    import assert from 'node:assert/strict';
+    import { mock } from 'node:test';
+    import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+    import { tmpdir } from 'node:os';
+    import { join } from 'node:path';
+    import { gzipSync } from 'node:zlib';
+
+    const urls = ${JSON.stringify(moduleUrls)};
+    const { tarArchive } = await import(urls.archive);
+    const { NodeCatalog } = await import(urls.catalog);
+    const { PLATFORM_COMMON_PACKAGE, PLATFORM_NODE_PACKAGE } = await import(urls.contract);
+    const { openDb } = await import(urls.db);
+    const actualStore = await import(urls.store);
+    const pack = (pkg, marker = '') => gzipSync(tarArchive([
+      { name: 'package/package.json', content: JSON.stringify(pkg) },
+      { name: 'package/marker.txt', content: marker },
+    ]));
+    const common = pack({
+      name: PLATFORM_COMMON_PACKAGE.name,
+      version: PLATFORM_COMMON_PACKAGE.version,
+    });
+    const edge = pack({
+      name: PLATFORM_NODE_PACKAGE.name,
+      version: PLATFORM_NODE_PACKAGE.version,
+      dependencies: { [PLATFORM_COMMON_PACKAGE.name]: PLATFORM_COMMON_PACKAGE.version },
+      'node-red': { nodes: {
+        'tl-device': 'tl-device.js', 'tl-tag': 'tl-tag.js', 'tl-uplink': 'tl-uplink.js',
+      } },
+    });
+    const baseline = new Map([
+      [actualStore.readPackage(edge).integrity, PLATFORM_NODE_PACKAGE.integrity],
+      [actualStore.readPackage(common).integrity, PLATFORM_COMMON_PACKAGE.integrity],
+    ]);
+
+    mock.module(urls.store, { namedExports: {
+      ...actualStore,
+      readPackage(buffer) {
+        const parsed = actualStore.readPackage(buffer);
+        const pinned = baseline.get(parsed.integrity);
+        return pinned ? { ...parsed, integrity: pinned } : parsed;
+      },
+    } });
+    const { ensurePlatformApproval, PlatformPackageService } =
+      await import(urls.platform + '?fixed-wrapper-test');
+    const root = mkdtempSync(join(tmpdir(), 'tle-platform-wrapper-'));
+    try {
+      const store = new actualStore.NodeStore(root);
+      store.add(edge);
+      store.add(common);
+      const catalog = new NodeCatalog(openDb(':memory:'));
+      ensurePlatformApproval(catalog, 'system');
+      const service = new PlatformPackageService({ store, catalog });
+      assert.deepEqual(service.verifyForInstall().buffer, edge);
+
+      writeFileSync(join(root, PLATFORM_NODE_PACKAGE.name,
+        PLATFORM_NODE_PACKAGE.version + '.tgz'), pack({
+        name: PLATFORM_NODE_PACKAGE.name,
+        version: PLATFORM_NODE_PACKAGE.version,
+      }, 'tampered-after-baseline'));
+      assert.throws(() => service.verifyForInstall(), /integrity|完整性/i);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  `;
+  const child = spawnSync(process.execPath, [
+    '--experimental-strip-types',
+    '--experimental-test-module-mocks',
+    '--input-type=module',
+    '--eval',
+    script,
+  ], { encoding: 'utf8' });
+  assert.equal(child.status, 0, child.stderr || child.stdout);
 });
