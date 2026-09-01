@@ -5,6 +5,8 @@ import { NodeCatalog } from './catalog.ts';
 import { NodePolicyError } from './policy.ts';
 import { PLATFORM_NODE_PACKAGE } from './platform-contract.ts';
 import { ensurePlatformApproval } from './platform-package.ts';
+import { PLATFORM_COMMON_PACKAGE } from './platform-contract.ts';
+import { buildPolicy } from './policy.ts';
 
 const fresh = () => new NodeCatalog(openDb(':memory:'));
 
@@ -71,6 +73,32 @@ test('非平台目录条目仍可更新和撤销', () => {
   c.approve({ module: 'ordinary-node', version: '2.0.0', actor: 'b' });
   assert.equal(c.get('ordinary-node')?.version, '2.0.0');
   assert.equal(c.revoke('ordinary-node'), true);
+});
+
+test('common 公共包不能通过通用目录接口批准', () => {
+  const c = fresh();
+  assert.throws(() => c.approve({
+    module: PLATFORM_COMMON_PACKAGE.name,
+    version: PLATFORM_COMMON_PACKAGE.version,
+    actor: 'operator',
+  }), NodePolicyError);
+  assert.equal(c.get(PLATFORM_COMMON_PACKAGE.name), undefined);
+});
+
+test('历史 common 批准行不能进入 policy allowList 或 catalogue names', () => {
+  const db = openDb(':memory:');
+  const c = new NodeCatalog(db);
+  db.prepare(
+    `INSERT INTO node_catalog (module, version, note, approved_by, approved_at)
+     VALUES (?, ?, ?, ?, datetime('now'))`,
+  ).run(PLATFORM_COMMON_PACKAGE.name, PLATFORM_COMMON_PACKAGE.version,
+    'legacy', 'legacy');
+  c.approve({ module: 'ordinary-node', version: '1.0.0', actor: 'operator' });
+
+  const policy = buildPolicy(c.approved(), { allowInstall: true });
+  assert.deepEqual(policy.allowList, ['ordinary-node@1.0.0']);
+  assert.deepEqual([...c.names()], ['ordinary-node']);
+  assert.ok(c.get(PLATFORM_COMMON_PACKAGE.name));
 });
 
 test('备注超长截断，不让一条记录撑爆列表', () => {

@@ -19,6 +19,7 @@ import { assertModuleName, assertVersionRange, NodePolicyError, type ApprovedMod
   from './policy.ts';
 import {
   PLATFORM_APPROVAL_NOTE,
+  PLATFORM_COMMON_PACKAGE,
   PLATFORM_NODE_PACKAGE,
 } from './platform-contract.ts';
 
@@ -73,6 +74,11 @@ export class NodeCatalog {
     const version = input.version?.trim() ?? '';
     if (version !== '') assertVersionRange(version);
     if (!input.actor) throw new NodePolicyError('缺少审批人');
+    if (input.module === PLATFORM_COMMON_PACKAGE.name) {
+      throw new NodePolicyError(
+        `common 公共包禁止批准：${PLATFORM_COMMON_PACKAGE.name}`,
+      );
+    }
 
     const current = this.get(input.module);
     if (
@@ -117,10 +123,14 @@ export class NodeCatalog {
 
   /** 生成 policy 用的形状 */
   approved(): ApprovedModule[] {
-    return this.list().map((e) => ({ module: e.module, version: e.version }));
+    return this.list()
+      .filter((e) => e.module !== PLATFORM_COMMON_PACKAGE.name)
+      .map((e) => ({ module: e.module, version: e.version }));
   }
 
   names(): Set<string> {
-    return new Set(this.list().map((e) => e.module));
+    return new Set(this.list()
+      .filter((e) => e.module !== PLATFORM_COMMON_PACKAGE.name)
+      .map((e) => e.module));
   }
 }

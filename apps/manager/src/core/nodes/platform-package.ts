@@ -112,6 +112,14 @@ export function ensurePlatformApproval(
   });
 }
 
+function assertCommonIsNotApproved(catalog: NodeCatalog): void {
+  if (catalog.get(PLATFORM_COMMON_PACKAGE.name)) {
+    throw new NodePolicyError(
+      `common 公共包禁止批准：${PLATFORM_COMMON_PACKAGE.name}`,
+    );
+  }
+}
+
 export class PlatformPackageService implements PlatformRegistryVerifier {
   #store: NodeStore;
   #catalog: NodeCatalog;
@@ -123,6 +131,7 @@ export class PlatformPackageService implements PlatformRegistryVerifier {
 
   /** 启动时先验包，再建立唯一的平台批准；任一失败都阻止继续启动。 */
   bootstrap(actor = 'system'): VerifiedPlatformStore {
+    assertCommonIsNotApproved(this.#catalog);
     const verified = verifyPlatformPackageStore(this.#store);
     ensurePlatformApproval(this.#catalog, actor);
     return verified;
@@ -130,6 +139,7 @@ export class PlatformPackageService implements PlatformRegistryVerifier {
 
   /** 每次平台安装紧邻运行期副作用前重验 tarball 与批准基线。 */
   verifyForInstall(): VerifiedPlatformPackage {
+    assertCommonIsNotApproved(this.#catalog);
     const verified = verifyPlatformPackageStore(this.#store);
     const approved = this.#catalog.get(PLATFORM_NODE_PACKAGE.name);
     if (approved?.version !== PLATFORM_NODE_PACKAGE.version) {

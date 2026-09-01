@@ -15,6 +15,7 @@ import {
   PLATFORM_NODE_TYPES,
 } from '../../core/nodes/platform-contract.ts';
 import {
+  ensurePlatformApproval,
   verifyPlatformPackageStore,
   type PlatformPackageTrustContract,
   type PlatformRegistryVerifier,
@@ -76,15 +77,18 @@ async function registryResponse(opts: {
   store: NodeStore;
   path: string;
   verifier?: PlatformRegistryVerifier;
+  setupCatalog?: (db: ReturnType<typeof openDb>, catalog: NodeCatalog) => void;
 }) {
   const app = Fastify({ logger: false });
   const db = openDb(':memory:');
+  const catalog = new NodeCatalog(db);
+  opts.setupCatalog?.(db, catalog);
   registerNpmRegistry(app, {
     config: { basePath: '' },
     db,
   } as HttpContext, {
     store: opts.store,
-    catalog: new NodeCatalog(db),
+    catalog,
     internalBase: 'http://manager:19100/npm/',
     platformPackages: opts.verifier,
   });
@@ -234,5 +238,158 @@ test('非平台包 packument 与 tarball 保持原行为', async () => {
     });
     assert.equal(tarball.statusCode, 200);
     assert.deepEqual(tarball.rawPayload, body);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('common 的固定 packument 与 tarball 都来自校验快照', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tle-registry-'));
+  try {
+    const store = new NodeStore(root);
+    const f = platformFixture();
+    store.add(f.edge);
+    store.add(f.common);
+    const verifier = fixtureVerifier(store, f.contract);
+    const packument = await registryResponse({
+      store,
+      path: '/npm/@mqttsnet/thinglinks-node-red-common',
+      verifier,
+    });
+    assert.equal(packument.statusCode, 200);
+    assert.equal(packument.json()['dist-tags'].latest, PLATFORM_COMMON_PACKAGE.version);
+    assert.equal(packument.json().versions['0.0.1'].dist.integrity,
+      f.contract.common.integrity);
+    const tarball = await registryResponse({
+      store,
+      path: '/npm/@mqttsnet/thinglinks-node-red-common/-/thinglinks-node-red-common-0.0.1.tgz',
+      verifier,
+    });
+    assert.equal(tarball.statusCode, 200);
+    assert.deepEqual(tarball.rawPayload, f.common);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('固定包名的非钉死版本即使在 store 中存在也不暴露', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tle-registry-'));
+  try {
+    const store = new NodeStore(root);
+    const f = platformFixture();
+    store.add(f.edge);
+    store.add(f.common);
+    store.add(pack({
+      name: PLATFORM_NODE_PACKAGE.name,
+      version: '9.0.0',
+      'node-red': { nodes: { malicious: 'malicious.js' } },
+    }));
+    store.add(pack({
+      name: PLATFORM_COMMON_PACKAGE.name,
+      version: '9.0.0',
+      'node-red': { nodes: { hidden: 'hidden.js' } },
+    }));
+    const verifier = fixtureVerifier(store, f.contract);
+
+    for (const path of [
+      '/npm/@mqttsnet/thinglinks-edge-nodes/-/thinglinks-edge-nodes-9.0.0.tgz',
+      '/npm/@mqttsnet/thinglinks-node-red-common/-/thinglinks-node-red-common-9.0.0.tgz',
+    ]) {
+      const response = await registryResponse({ store, path, verifier });
+      assert.equal(response.statusCode, 404, path);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('catalogue 排除同名高版本并只追加校验过的 Edge，绝不追加 common', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tle-registry-'));
+  try {
+    const store = new NodeStore(root);
+    const f = platformFixture();
+    store.add(f.edge);
+    store.add(f.common);
+    store.add(pack({
+      name: PLATFORM_NODE_PACKAGE.name,
+      version: '9.0.0',
+      'node-red': { nodes: { malicious: 'malicious.js' } },
+    }));
+    store.add(pack({
+      name: PLATFORM_COMMON_PACKAGE.name,
+      version: '9.0.0',
+      'node-red': { nodes: { hidden: 'hidden.js' } },
+    }));
+    const response = await registryResponse({
+      store,
+      path: '/npm/-/catalogue.json',
+      verifier: fixtureVerifier(store, f.contract),
+      setupCatalog(db, catalog) {
+        ensurePlatformApproval(catalog, 'system');
+        db.prepare(
+          `INSERT INTO node_catalog (module, version, note, approved_by, approved_at)
+           VALUES (?, ?, ?, ?, datetime('now'))`,
+        ).run(PLATFORM_COMMON_PACKAGE.name, PLATFORM_COMMON_PACKAGE.version,
+          'legacy', 'legacy');
+      },
+    });
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(response.json().modules.map((entry: { id: string; version: string }) =>
+      ({ id: entry.id, version: entry.version })), [{
+      id: PLATFORM_NODE_PACKAGE.name,
+      version: PLATFORM_NODE_PACKAGE.version,
+    }]);
+    assert.deepEqual(response.json().modules[0].types, PLATFORM_NODE_TYPES);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('catalogue 缺 verifier 时省略 Edge 但保留普通条目', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tle-registry-'));
+  try {
+    const store = new NodeStore(root);
+    const f = platformFixture();
+    store.add(f.edge);
+    store.add(f.common);
+    store.add(pack({
+      name: 'ordinary-node', version: '1.0.0',
+      'node-red': { nodes: { ordinary: 'ordinary.js' } },
+    }));
+    const response = await registryResponse({
+      store,
+      path: '/npm/-/catalogue.json',
+      setupCatalog(_db, catalog) {
+        ensurePlatformApproval(catalog, 'system');
+        catalog.approve({ module: 'ordinary-node', version: '1.0.0', actor: 'operator' });
+      },
+    });
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(response.json().modules.map((entry: { id: string }) => entry.id),
+      ['ordinary-node']);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('catalogue 检测到固定字节漂移时省略 Edge 但保留普通条目', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tle-registry-'));
+  try {
+    const store = new NodeStore(root);
+    const f = platformFixture();
+    store.add(f.edge);
+    store.add(f.common);
+    store.add(pack({
+      name: 'ordinary-node', version: '1.0.0',
+      'node-red': { nodes: { ordinary: 'ordinary.js' } },
+    }));
+    writeFileSync(join(root, PLATFORM_NODE_PACKAGE.name,
+      `${PLATFORM_NODE_PACKAGE.version}.tgz`), pack({
+      name: PLATFORM_NODE_PACKAGE.name,
+      version: PLATFORM_NODE_PACKAGE.version,
+      'node-red': { nodes: { tampered: 'tampered.js' } },
+    }));
+    const response = await registryResponse({
+      store,
+      path: '/npm/-/catalogue.json',
+      verifier: fixtureVerifier(store, f.contract),
+      setupCatalog(_db, catalog) {
+        ensurePlatformApproval(catalog, 'system');
+        catalog.approve({ module: 'ordinary-node', version: '1.0.0', actor: 'operator' });
+      },
+    });
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(response.json().modules.map((entry: { id: string }) => entry.id),
+      ['ordinary-node']);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

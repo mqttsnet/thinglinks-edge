@@ -15,6 +15,7 @@ import {
 } from './platform-contract.ts';
 import {
   ensurePlatformApproval,
+  PlatformPackageService,
   verifyPlatformPackageStore,
   type PlatformPackageTrustContract,
 } from './platform-package.ts';
@@ -163,5 +164,68 @@ test('replacing fixed bytes behind the store API is detected before install', ()
 
     assert.throws(() => verifyPlatformPackageStore(store, f.contract),
       /integrity|完整性/i);
+  });
+});
+
+function insertLegacyCommonApproval(db: ReturnType<typeof openDb>): void {
+  db.prepare(
+    `INSERT INTO node_catalog (module, version, note, approved_by, approved_at)
+     VALUES (?, ?, ?, ?, datetime('now'))`,
+  ).run(PLATFORM_COMMON_PACKAGE.name, PLATFORM_COMMON_PACKAGE.version,
+    'legacy', 'legacy');
+}
+
+test('PlatformPackageService bootstrap fails before approving Edge when legacy common is approved', () => {
+  withStore((store) => {
+    const db = openDb(':memory:');
+    const catalog = new NodeCatalog(db);
+    insertLegacyCommonApproval(db);
+    const service = new PlatformPackageService({ store, catalog });
+
+    assert.throws(() => service.bootstrap('system'), /common.*批准|批准.*common/i);
+    assert.equal(catalog.get(PLATFORM_NODE_PACKAGE.name), undefined);
+  });
+});
+
+test('PlatformPackageService verifyForInstall fails closed on legacy common approval', () => {
+  withStore((store) => {
+    const db = openDb(':memory:');
+    const catalog = new NodeCatalog(db);
+    ensurePlatformApproval(catalog, 'system');
+    insertLegacyCommonApproval(db);
+    const service = new PlatformPackageService({ store, catalog });
+
+    assert.throws(() => service.verifyForInstall(), /common.*批准|批准.*common/i);
+  });
+});
+
+test('PlatformPackageService bootstrap invokes the hard-wired store verifier', () => {
+  withStore((store) => {
+    const f = fixture();
+    store.add(f.edge);
+    store.add(f.common);
+    const catalog = new NodeCatalog(openDb(':memory:'));
+    const service = new PlatformPackageService({ store, catalog });
+
+    assert.throws(() => service.bootstrap('system'), /integrity|完整性/i);
+    assert.equal(catalog.get(PLATFORM_NODE_PACKAGE.name), undefined);
+  });
+});
+
+test('PlatformPackageService verifyForInstall re-runs the hard-wired verifier', () => {
+  withStore((store, root) => {
+    const f = fixture();
+    store.add(f.edge);
+    store.add(f.common);
+    const catalog = new NodeCatalog(openDb(':memory:'));
+    ensurePlatformApproval(catalog, 'system');
+    const service = new PlatformPackageService({ store, catalog });
+
+    writeFileSync(join(root, PLATFORM_NODE_PACKAGE.name,
+      `${PLATFORM_NODE_PACKAGE.version}.tgz`), pack({
+      name: PLATFORM_NODE_PACKAGE.name,
+      version: PLATFORM_NODE_PACKAGE.version,
+    }, 'replaced-before-install'));
+    assert.throws(() => service.verifyForInstall(), /integrity|完整性/i);
   });
 });

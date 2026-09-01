@@ -147,14 +147,54 @@ export function registerNpmRegistry(
    * 路径放在 `/-/` 下：npm 的包名不允许以 `-` 开头，所以这个前缀
    * 永远不会和某个真实包撞上。
    */
-  api.get(`${config.basePath}/npm/-/catalogue.json`, async (_req, reply) =>
-    reply
+  api.get(`${config.basePath}/npm/-/catalogue.json`, async (req, reply) => {
+    const approved = catalog.names();
+    const genericApproved = new Set(
+      [...approved].filter((name) => !isPlatformPackageName(name)),
+    );
+    const doc = buildCatalogue(store, {
+      name: 'ThingLinks Edge Community catalogue',
+      approved: genericApproved,
+    });
+
+    /*
+     * 两个固定包名永不进入 buildCatalogue 的「取最新版本」路径。Edge 只有在
+     * 精确基线已批准且本次快照校验通过时才追加；common 永不出现在 palette。
+     * 校验能力尚未由 Task 3 注入或磁盘漂移时，只省略 Edge，普通目录仍可用。
+     */
+    const edgeApproval = catalog.get(PLATFORM_NODE_PACKAGE.name);
+    if (
+      edgeApproval?.version === PLATFORM_NODE_PACKAGE.version
+      && platformPackages
+    ) {
+      try {
+        const snapshot = platformPackages.snapshotForRegistry(
+          PLATFORM_NODE_PACKAGE.name,
+          PLATFORM_NODE_PACKAGE.version,
+        );
+        if (snapshot) {
+          doc.modules.push({
+            id: snapshot.meta.name,
+            version: snapshot.meta.version,
+            description: snapshot.meta.description,
+            keywords: snapshot.meta.keywords,
+            types: snapshot.meta.types,
+            updated_at: snapshot.meta.updatedAt,
+          });
+          doc.modules.sort((a, b) => a.id.localeCompare(b.id));
+        }
+      } catch (e) {
+        req.log.warn(
+          `[npm] catalogue 省略平台包：${(e as Error).message}`,
+        );
+      }
+    }
+
+    return reply
       // 编辑器每次打开面板都会带缓存破坏参数重取，明确禁缓存免得中间层自作主张
       .header('cache-control', 'no-store')
-      .send(buildCatalogue(store, {
-        name: 'ThingLinks Edge Community catalogue',
-        approved: catalog.names(),
-      })));
+      .send(doc);
+  });
 
   /**
    * packument 与包体。
