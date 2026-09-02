@@ -271,6 +271,32 @@ async function withReadCompletionHook<T>(
   }
 }
 
+async function withOpenCompletionHook<T>(
+  onOpen: (absolute: string, flags: unknown) => void,
+  action: () => Promise<T>,
+): Promise<T> {
+  const originalOpen = fs.promises.open;
+  fs.promises.open = (async (path: unknown, flags: unknown, ...args: unknown[]) => {
+    const handle = await Reflect.apply(originalOpen, fs.promises, [path, flags, ...args]);
+    const absolute = typeof path === 'string'
+      ? resolve(path)
+      : path instanceof URL
+        ? fileURLToPath(path)
+        : Buffer.isBuffer(path)
+          ? resolve(path.toString())
+          : '';
+    if (absolute) onOpen(absolute, flags);
+    return handle;
+  }) as typeof originalOpen;
+  syncBuiltinESMExports();
+  try {
+    return await action();
+  } finally {
+    fs.promises.open = originalOpen;
+    syncBuiltinESMExports();
+  }
+}
+
 function writeTestManifest(path: string, fact: TestArtifactFact): void {
   writeFileSync(path, `${JSON.stringify(fact)}\n`, { mode: 0o600 });
 }
@@ -1975,8 +2001,8 @@ test('C60 delayed Node-RED state write settles before restart convergence and pr
 
   assert.equal(pending.phase, 'pending_start_verification');
   assert.equal(restarts, 2);
-  assert.equal(firstRestartPolls, 9);
-  assert.equal(f.probeSettle.sleeps.length, 14);
+  assert.equal(firstRestartPolls, 14);
+  assert.equal(f.probeSettle.sleeps.length, 24);
   assert.ok(f.probeSettle.sleeps.every((ms) => ms === 500));
   assert.deepEqual(JSON.parse(readFileSync(join(f.instanceRoot, '.config.nodes.json'), 'utf8')), {
     generation: 'C',
@@ -2015,8 +2041,8 @@ test('C60 artifact change just before the quiet threshold resets the full counte
 
   assert.equal(result.phase, 'pending_start_verification');
   assert.equal(restarts, 2);
-  assert.equal(firstRestartPolls, 10);
-  assert.equal(f.probeSettle.sleeps.length, 15);
+  assert.equal(firstRestartPolls, 15);
+  assert.equal(f.probeSettle.sleeps.length, 25);
   assert.ok(f.probeSettle.sleeps.every((ms) => ms === 500));
 });
 
@@ -2070,28 +2096,140 @@ test('C60 post-quiet full revalidation rejects package drift before authority', 
   assert.deepEqual(txSidecars(f.instanceRoot, 'tx-01'), []);
 });
 
-test('C60 final export must still equal the quiet artifact sample', async () => {
+test('C61 final Admin verification delayed write settles again and authority keeps C/A', async () => {
   const f = migrationFixture({ originalRunning: false });
+  const order: string[] = [];
+  let restarts = 0;
+  let finalSettlePolls = 0;
+  let finalWriteScheduled = false;
+  f.docker.afterProbeRestart = (probeRoot) => {
+    restarts += 1;
+    if (restarts === 1) {
+      writeJson(join(probeRoot, '.config.nodes.json'), { generation: 'A' });
+      writeJson(join(probeRoot, '.config.nodes.json.backup'), { generation: 'B' });
+    }
+  };
+  f.probeSettle.onSleep = () => {
+    if (!finalWriteScheduled || restarts !== 1 || !f.state.probeRoot) return;
+    finalSettlePolls += 1;
+    if (finalSettlePolls === 4) {
+      writeJson(join(f.state.probeRoot, '.config.nodes.json'), { generation: 'C' });
+      writeJson(join(f.state.probeRoot, '.config.nodes.json.backup'), { generation: 'A' });
+    }
+  };
+  const installedModulesAt = f.admin.installedModulesAt.bind(f.admin);
+  f.admin.installedModulesAt = async (target) => {
+    order.push('admin-installed');
+    return installedModulesAt(target);
+  };
   const currentFlowsAt = f.admin.currentFlowsAt.bind(f.admin);
   f.admin.currentFlowsAt = async (target) => {
     const observed = await currentFlowsAt(target);
+    order.push('admin-flows');
     if (f.admin.probeCurrentFlowsCalls === 2) {
-      assert.ok(f.state.probeRoot);
-      writeJson(join(f.state.probeRoot, '.config.modules.json'), {
-        changedDuringFinalValidation: true,
-      });
+      finalWriteScheduled = true;
     }
     return observed;
+  };
+
+  const pending = await withOpenCompletionHook((absolute, flags) => {
+    if (
+      absolute === resolve(stoppedAuthorityPath(f), 'manifest.json')
+      && typeof flags === 'number'
+      && (flags & fs.constants.O_CREAT) !== 0
+    ) order.push('authority');
+  }, () => withReadCompletionHook((absolute) => {
+    if (
+      f.state.probeRoot
+      && absolute === resolve(f.state.probeRoot, '.config.modules.json')
+    ) order.push('sample');
+  }, () => f.service.migrate('line-a', 'admin')));
+
+  assert.equal(pending.phase, 'pending_start_verification');
+  assert.equal(restarts, 2);
+  assert.equal(finalSettlePolls, 9);
+  assert.equal(f.probeSettle.sleeps.length, 24);
+  assert.equal(f.admin.probeInstalledModulesCalls, 4);
+  assert.equal(f.admin.probeCurrentFlowsCalls, 4);
+  assert.deepEqual(JSON.parse(readFileSync(join(f.instanceRoot, '.config.nodes.json'), 'utf8')), {
+    generation: 'C',
+  });
+  assert.deepEqual(
+    JSON.parse(readFileSync(join(f.instanceRoot, '.config.nodes.json.backup'), 'utf8')),
+    { generation: 'A' },
+  );
+  const authorityIndex = order.indexOf('authority');
+  const lastAdminIndex = Math.max(
+    order.lastIndexOf('admin-installed'),
+    order.lastIndexOf('admin-flows'),
+  );
+  assert.equal(existsSync(stoppedAuthorityPath(f)), true);
+  assert.ok(authorityIndex > lastAdminIndex);
+  assert.deepEqual(order.slice(lastAdminIndex + 1, authorityIndex), Array(6).fill('sample'));
+
+  const committed = await f.gate.run('line-a', 'start-instance', (lease) => (
+    f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+  assert.equal(committed.phase, 'committed');
+  assert.equal(f.docker.runtimeCalls.filter((call) => call === 'start').length, 1);
+});
+
+test('C61 second settle churn times out before authority or live apply', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  const currentFlowsAt = f.admin.currentFlowsAt.bind(f.admin);
+  let secondSettleActive = false;
+  let churn = 0;
+  f.admin.currentFlowsAt = async (target) => {
+    const observed = await currentFlowsAt(target);
+    if (f.admin.probeCurrentFlowsCalls === 2) secondSettleActive = true;
+    return observed;
+  };
+  f.probeSettle.onSleep = () => {
+    if (!secondSettleActive || !f.state.probeRoot) return;
+    churn += 1;
+    writeJson(join(f.state.probeRoot, '.config.nodes.json'), { churn });
   };
 
   const result = await f.service.migrate('line-a', 'admin');
 
   assert.equal(result.phase, 'rolled_back');
-  assert.equal(f.probeSettle.sleeps.length, 5);
-  assert.equal(f.admin.probeInstalledModulesCalls, 2);
-  assert.equal(f.admin.probeCurrentFlowsCalls, 2);
+  assert.equal(churn, 20);
+  assert.equal(f.probeSettle.sleeps.length, 25);
+  assert.equal(f.docker.runtimeCalls.filter((call) => call === 'probe-restart').length, 1);
   assert.equal(existsSync(stoppedAuthorityPath(f)), false);
   assert.deepEqual(txSidecars(f.instanceRoot, 'tx-01'), []);
+  assert.equal(f.barrierEvents.some((event) => (
+    event.boundary === 'after-live-backup' || event.boundary === 'after-live-rename'
+  )), false);
+});
+
+test('C61 ownership loss on the second settle final export is fenced before authority', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  let exportedConfigReads = 0;
+  let replaced = false;
+
+  const result = await withReadCompletionHook((absolute) => {
+    if (
+      !replaced
+      && f.state.probeRoot
+      && absolute === resolve(f.state.probeRoot, '.config.modules.json')
+    ) {
+      exportedConfigReads += 1;
+      if (exportedConfigReads === 12) {
+        replaced = true;
+        claimReplacementExecution(f, 'owner-second-settle-final-0001', 'staged');
+      }
+    }
+  }, () => f.service.migrate('line-a', 'admin'));
+
+  assert.equal(replaced, true);
+  assert.equal(result.phase, 'staged');
+  assert.equal(f.probeSettle.sleeps.length, 10);
+  assert.equal(existsSync(stoppedAuthorityPath(f)), false);
+  assert.deepEqual(txSidecars(f.instanceRoot, 'tx-01'), []);
+  assert.equal(f.barrierEvents.some((event) => (
+    event.boundary === 'after-live-backup' || event.boundary === 'after-live-rename'
+  )), false);
 });
 
 test('C60 ownership loss during quiescence polling writes no authority or sidecars', async () => {

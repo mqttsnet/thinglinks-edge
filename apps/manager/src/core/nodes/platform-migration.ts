@@ -1473,20 +1473,16 @@ export class PlatformMigrationService {
     }
   }
 
-  private async settleAndVerifyStoppedProbe(
+  private async settleStoppedProbeArtifacts(
     execution: MigrationExecutionSession,
-    handle: MigrationProbeHandle,
-    target: AdminTarget,
+    root: string,
   ): Promise<StoppedArtifactFact[]> {
-    await this.o.admin.waitReadyAt(target);
-    execution.renew(['staged']);
-    await this.verifyStoppedProbeRuntime(handle, target);
-    let settled = await this.exportStoppedProbe(handle.dataRoot);
+    let settled = await this.exportStoppedProbe(root);
     execution.renew(['staged']);
     let quiet = 0;
     for (let sample = 0; sample < this.probeSettleRuntime.maxSamples; sample += 1) {
       await this.probeSettleRuntime.sleep(this.probeSettleRuntime.pollIntervalMs);
-      const current = await this.exportStoppedProbe(handle.dataRoot);
+      const current = await this.exportStoppedProbe(root);
       execution.renew(['staged']);
       if (sameArtifactFacts(settled, current)) {
         quiet += 1;
@@ -1499,13 +1495,20 @@ export class PlatformMigrationService {
     if (quiet < this.probeSettleRuntime.quietSamples) {
       throw controlled('verification', 'probe runtime artifacts did not become quiet');
     }
-    await this.verifyStoppedProbeRuntime(handle, target);
-    const final = await this.exportStoppedProbe(handle.dataRoot);
+    return settled;
+  }
+
+  private async settleAndVerifyStoppedProbe(
+    execution: MigrationExecutionSession,
+    handle: MigrationProbeHandle,
+    target: AdminTarget,
+  ): Promise<StoppedArtifactFact[]> {
+    await this.o.admin.waitReadyAt(target);
     execution.renew(['staged']);
-    if (!sameArtifactFacts(settled, final)) {
-      throw controlled('verification', 'probe runtime artifacts changed after quiet verification');
-    }
-    return final;
+    await this.verifyStoppedProbeRuntime(handle, target);
+    await this.settleStoppedProbeArtifacts(execution, handle.dataRoot);
+    await this.verifyStoppedProbeRuntime(handle, target);
+    return this.settleStoppedProbeArtifacts(execution, handle.dataRoot);
   }
 
   private async persistStoppedAuthority(
