@@ -603,6 +603,9 @@ class FakeAdminRuntime implements InstanceAdminRuntime {
 class FakeAdminActions implements PlatformMigrationAdminActions {
   installedModulesCalls = 0;
   currentFlowsCalls = 0;
+  waitReadyAtCalls = 0;
+  probeInstalledModulesCalls = 0;
+  probeCurrentFlowsCalls = 0;
   installCalls = 0;
   liveInstallCalls = 0;
   probeInstallCalls = 0;
@@ -674,9 +677,12 @@ class FakeAdminActions implements PlatformMigrationAdminActions {
     return this.flowValue;
   }
 
-  async waitReadyAt(): Promise<void> {}
+  async waitReadyAt(): Promise<void> {
+    this.waitReadyAtCalls += 1;
+  }
 
   async installedModulesAt(_target: AdminTarget): Promise<InstalledModule[]> {
+    this.probeInstalledModulesCalls += 1;
     if (!this.state.probeRoot) throw new Error('probe root missing');
     return this.state.staged ? [builtinInventory(), healthyPlatformInventory()] : [builtinInventory()];
   }
@@ -691,6 +697,7 @@ class FakeAdminActions implements PlatformMigrationAdminActions {
   }
 
   async currentFlowsAt(_target: AdminTarget): Promise<unknown> {
+    this.probeCurrentFlowsCalls += 1;
     if (!this.state.probeRoot) throw new Error('probe root missing');
     const path = join(this.state.probeRoot, 'flows.json');
     return existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : [];
@@ -1594,12 +1601,100 @@ test('stopped migration verifies an isolated probe, applies allowlisted state, a
   assert.equal(f.docker.inspection.running, false);
   assert.equal(sha256(readFileSync(join(f.instanceRoot, 'flows.json'))), flowBefore);
   assert.deepEqual(f.docker.runtimeCalls, [
-    'probe-create', 'probe-write-settings', 'probe-restart', 'probe-cleanup',
+    'probe-create', 'probe-write-settings', 'probe-restart', 'probe-restart', 'probe-cleanup',
   ]);
   assert.equal(existsSync(join(f.instanceRoot, 'node_modules', '@mqttsnet', 'thinglinks-edge-nodes')), true);
   assert.equal(existsSync(join(f.root, '.thinglinks-probes', 'line-a', 'tx-01')), false);
   assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), true);
   assert.equal(existsSync(stoppedAuthorityPath(f)), true);
+});
+
+test('C58 stopped probe exports only after one-generation node config rotation converges', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  const generations = [
+    [{ generation: 'A' }, { generation: 'B' }],
+    [{ generation: 'C' }, { generation: 'A' }],
+    [{ generation: 'C' }, { generation: 'A' }],
+  ] as const;
+  let restart = 0;
+  f.docker.afterProbeRestart = (probeRoot) => {
+    const generation = generations[Math.min(restart, generations.length - 1)]!;
+    restart += 1;
+    writeJson(join(probeRoot, '.config.nodes.json'), generation[0]);
+    writeJson(join(probeRoot, '.config.nodes.json.backup'), generation[1]);
+  };
+
+  const pending = await f.service.migrate('line-a', 'admin');
+
+  assert.equal(pending.phase, 'pending_start_verification');
+  assert.equal(restart, 3);
+  assert.equal(f.docker.runtimeCalls.filter((call) => call === 'probe-restart').length, 3);
+  assert.equal(f.admin.waitReadyAtCalls, 4);
+  assert.equal(f.admin.probeInstalledModulesCalls, 3);
+  assert.equal(f.admin.probeCurrentFlowsCalls, 3);
+  assert.deepEqual(JSON.parse(readFileSync(join(f.instanceRoot, '.config.nodes.json'), 'utf8')), {
+    generation: 'C',
+  });
+  assert.deepEqual(
+    JSON.parse(readFileSync(join(f.instanceRoot, '.config.nodes.json.backup'), 'utf8')),
+    { generation: 'A' },
+  );
+  const authority = JSON.parse(
+    readFileSync(join(stoppedAuthorityPath(f), 'manifest.json'), 'utf8'),
+  ) as { artifacts: Array<{ key: string; desired: TestArtifactFact }> };
+  const desired = new Map(authority.artifacts.map((artifact) => [artifact.key, artifact.desired]));
+  for (const key of ['.config.nodes.json', '.config.nodes.json.backup']) {
+    assert.deepEqual(desired.get(key), testArtifactFact(f.instanceRoot, key), key);
+  }
+
+  const committed = await f.gate.run('line-a', 'start-instance', (lease) => (
+    f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+  assert.equal(committed.phase, 'committed');
+  assert.equal(f.docker.runtimeCalls.filter((call) => call === 'start').length, 1);
+});
+
+test('C58 stable stopped probe needs exactly one confirmation restart', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  f.docker.afterProbeRestart = (probeRoot) => {
+    writeJson(join(probeRoot, '.config.nodes.json'), { generation: 'stable' });
+    writeJson(join(probeRoot, '.config.nodes.json.backup'), { generation: 'prior' });
+  };
+
+  const result = await f.service.migrate('line-a', 'admin');
+
+  assert.equal(result.phase, 'pending_start_verification');
+  assert.equal(f.docker.runtimeCalls.filter((call) => call === 'probe-restart').length, 2);
+  assert.equal(f.admin.waitReadyAtCalls, 3);
+  assert.equal(f.admin.probeInstalledModulesCalls, 2);
+  assert.equal(f.admin.probeCurrentFlowsCalls, 2);
+});
+
+test('C58 oscillating stopped probe rolls back before applying any live artifact', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  const before = migrationEvidence(f.instanceRoot);
+  let restart = 0;
+  f.docker.afterProbeRestart = (probeRoot) => {
+    restart += 1;
+    writeJson(join(probeRoot, '.config.nodes.json'), { generation: restart });
+    writeJson(join(probeRoot, '.config.nodes.json.backup'), { generation: restart - 1 });
+  };
+
+  const result = await f.service.migrate('line-a', 'admin');
+
+  assert.equal(result.phase, 'rolled_back');
+  assert.equal(result.error, 'none');
+  assert.equal(restart, 3);
+  assert.equal(f.admin.waitReadyAtCalls, 4);
+  assert.equal(f.admin.probeInstalledModulesCalls, 3);
+  assert.equal(f.admin.probeCurrentFlowsCalls, 3);
+  assert.equal(f.docker.runtimeCalls.includes('start'), false);
+  assert.equal(f.docker.runtimeCalls.includes('write-settings'), false);
+  assert.equal(f.barrierEvents.some((event) => (
+    event.boundary === 'after-live-backup' || event.boundary === 'after-live-rename'
+  )), false);
+  assert.equal(existsSync(join(f.root, '.thinglinks-probes', 'line-a', 'tx-01')), false);
+  assert.deepEqual(migrationEvidenceDiff(f.instanceRoot, before), []);
 });
 
 test('C49 stopped probe accepts exact and canonical tilde root selectors', async () => {
@@ -2118,7 +2213,7 @@ test('stopped live apply covers all four file/directory states without overwriti
   const f = migrationFixture({ originalRunning: false, preexisting: true });
   writeFileSync(join(f.instanceRoot, '.config.modules.json.backup'), 'delete-on-cutover', { mode: 0o640 });
   f.docker.afterProbeRestart = (probeRoot) => {
-    rmSync(join(probeRoot, '.config.modules.json.backup'));
+    rmSync(join(probeRoot, '.config.modules.json.backup'), { force: true });
     writeFileSync(join(probeRoot, '.config.nodes.json.backup'), 'create-on-cutover', { mode: 0o600 });
     writeFileSync(join(
       probeRoot, 'node_modules', '@mqttsnet', 'thinglinks-edge-nodes', 'probe-only.txt',
@@ -2191,7 +2286,7 @@ for (const fault of ['missing', 'tampered'] as const) {
         { mode: 0o640 },
       );
       f.docker.afterProbeRestart = (probeRoot) => {
-        rmSync(join(probeRoot, '.config.modules.json.backup'));
+        rmSync(join(probeRoot, '.config.modules.json.backup'), { force: true });
         writeFileSync(
           join(probeRoot, '.config.nodes.json.backup'),
           'create-on-cutover',

@@ -848,6 +848,14 @@ function sameArtifact(left: StoppedArtifactFact, right: StoppedArtifactFact): bo
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+function sameArtifactFacts(
+  left: readonly StoppedArtifactFact[],
+  right: readonly StoppedArtifactFact[],
+): boolean {
+  return left.length === right.length
+    && left.every((fact, index) => sameArtifact(fact, right[index]!));
+}
+
 function stoppedSidecar(
   path: string,
   txId: string,
@@ -1402,6 +1410,23 @@ export class PlatformMigrationService {
     const facts: StoppedArtifactFact[] = [];
     for (const key of STOPPED_EXPORT_PATHS) facts.push(await artifactFact(root, key));
     return facts;
+  }
+
+  private async verifyAndExportStoppedProbe(
+    execution: MigrationExecutionSession,
+    handle: MigrationProbeHandle,
+    target: AdminTarget,
+  ): Promise<StoppedArtifactFact[]> {
+    await this.o.admin.waitReadyAt(target);
+    execution.renew(['staged']);
+    assertNpmOwners(await this.o.admin.installedModulesAt(target));
+    await this.verifyProbePackageFiles(handle.dataRoot);
+    const expectedFlows = await this.probeFlowIds(handle.dataRoot);
+    const observedFlows = flowIds(await this.o.admin.currentFlowsAt(target));
+    if (!observedFlows || JSON.stringify(observedFlows) !== JSON.stringify(expectedFlows)) {
+      throw controlled('verification', 'probe Admin flow identity mismatch');
+    }
+    return this.exportStoppedProbe(handle.dataRoot);
   }
 
   private async persistStoppedAuthority(
@@ -2139,15 +2164,21 @@ export class PlatformMigrationService {
         boundary: 'after-settings-write',
       });
       await this.o.docker.restartMigrationProbe(handle);
-      await this.o.admin.waitReadyAt(target);
-      assertNpmOwners(await this.o.admin.installedModulesAt(target));
-      await this.verifyProbePackageFiles(handle.dataRoot);
-      const expectedFlows = await this.probeFlowIds(handle.dataRoot);
-      const observedFlows = flowIds(await this.o.admin.currentFlowsAt(target));
-      if (!observedFlows || JSON.stringify(observedFlows) !== JSON.stringify(expectedFlows)) {
-        throw controlled('verification', 'probe Admin flow identity mismatch');
+      let previous = await this.verifyAndExportStoppedProbe(execution, handle, target);
+      let exported: StoppedArtifactFact[] | undefined;
+      for (let confirmation = 0; confirmation < 2; confirmation += 1) {
+        execution.renew(['staged']);
+        await this.o.docker.restartMigrationProbe(handle);
+        const current = await this.verifyAndExportStoppedProbe(execution, handle, target);
+        if (sameArtifactFacts(previous, current)) {
+          exported = current;
+          break;
+        }
+        previous = current;
       }
-      const exported = await this.exportStoppedProbe(handle.dataRoot);
+      if (!exported) {
+        throw controlled('verification', 'probe runtime artifact facts did not converge');
+      }
       const authority = await this.persistStoppedAuthority(journal, exported);
       await this.prepareStoppedPartials(instanceId, txId, handle.dataRoot, exported);
       const cleanup = await this.o.docker.cleanupMigrationProbe(handle);
