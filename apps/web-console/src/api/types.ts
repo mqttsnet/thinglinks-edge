@@ -791,6 +791,9 @@ export interface InventoryItem {
   types: string[];
   enabled: boolean;
   compliance: NodeCompliance;
+  /** Node-RED Admin API 的加载证据；旧 Manager 可不提供，前端必须如实降级。 */
+  health?: 'healthy' | 'conflict' | 'failed';
+  errors?: string[];
 }
 
 export interface InstanceInventory {
@@ -800,6 +803,41 @@ export interface InstanceInventory {
   reason: string;
   modules: InventoryItem[];
   unapproved: number;
+}
+
+/** 平台节点包迁移的持久化事务阶段；与 Manager 的 NodeMigrationState 一一对应。 */
+export type PlatformMigrationPhase =
+  | 'idle'
+  | 'preparing'
+  | 'checkpointed'
+  | 'staged'
+  | 'cutover'
+  | 'verifying'
+  | 'pending_start_verification'
+  | 'rolling_back'
+  | 'committed'
+  | 'rolled_back'
+  | 'rolled_back_dirty'
+  | 'manual_required';
+
+/** 只有此受控枚举能进入迁移状态响应，绝不回显底层异常或检查点路径。 */
+export type PlatformMigrationErrorCode =
+  | 'none'
+  | 'preflight'
+  | 'checkpoint'
+  | 'install'
+  | 'cutover'
+  | 'verification'
+  | 'rollback'
+  | 'compensation'
+  | 'state-inconsistent';
+
+export interface PlatformNodeMigration {
+  instanceId: string;
+  phase: PlatformMigrationPhase;
+  runtimeMode: 'legacy' | 'npm';
+  platformVersion: string;
+  error: PlatformMigrationErrorCode;
 }
 
 /** 下发策略到某台实例的结果。逐台给，一台失败不影响其余 */

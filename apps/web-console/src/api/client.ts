@@ -17,6 +17,7 @@ import type {
   DiagProbeResponse,
   FlowTemplate, ApplyPreview, ApplyResult,
   CatalogEntry, StoreListResult, ImportResult, InstanceInventory, ApplyPolicyResult,
+  PlatformNodeMigration,
 } from './types';
 import { filenameFrom } from './filename';
 
@@ -507,6 +508,18 @@ export const api = {
 
   nodeInventory: () =>
     request<{ instances: InstanceInventory[] }>('/api/nodes/inventory'),
+
+  /** 只读平台节点迁移状态；没有启动、搜索或刷新副作用。 */
+  platformNodeMigration: (instanceId: string) =>
+    request<PlatformNodeMigration>(
+      `/api/instances/${encodeURIComponent(instanceId)}/nodes/thinglinks-migration`),
+
+  /** 唯一能请求平台节点迁移的显式操作；Manager 内部负责幂等与同实例互斥。 */
+  migratePlatformNodes: (instanceId: string) =>
+    request<PlatformNodeMigration>(
+      `/api/instances/${encodeURIComponent(instanceId)}/nodes/thinglinks-migration`,
+      { method: 'POST' },
+    ),
 
   previewApply: (instanceId: string, templateId: string) =>
     request<ApplyPreview>(`/api/instances/${instanceId}/flows`, {

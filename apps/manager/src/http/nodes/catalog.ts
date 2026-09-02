@@ -18,6 +18,12 @@ import { NodePolicyError } from '../../core/nodes/policy.ts';
 import { closureReport, type NodeStore } from '../../core/nodes/store.ts';
 import { inventoryOf } from '../../core/nodes/inventory.ts';
 import { installModule, AdminApiError } from '../../core/flows/admin-client.ts';
+import { assertValidId } from '../../core/instance/container-spec.ts';
+import {
+  PlatformMigrationError,
+  type PlatformMigrationService,
+} from '../../core/nodes/platform-migration.ts';
+import type { NodeMigrationErrorCode } from '../../core/instance/repo.ts';
 import type { NodeCatalog } from '../../core/nodes/catalog.ts';
 import type { NpmSourceRepo } from '../../core/nodes/sources.ts';
 import type { UpstreamRegistry } from '../../core/nodes/upstream.ts';
@@ -30,6 +36,8 @@ const MAX_TGZ_BYTES = 64 * 1024 * 1024;
 export interface CatalogDeps {
   store: NodeStore;
   catalog: NodeCatalog;
+  /** Task9 构造的唯一迁移服务；HTTP 层只转发显式请求，绝不自行重建。 */
+  migrationService: PlatformMigrationService;
   /** 节点源清单。留空则不挂源管理与在线搜索（纯离线部署） */
   sources?: NpmSourceRepo | undefined;
   upstream?: UpstreamRegistry | undefined;
@@ -39,7 +47,34 @@ export function registerNodeCatalog(
   api: FastifyInstance, ctx: HttpContext, deps: CatalogDeps,
 ): void {
   const { config, db, guard, operationGate } = ctx;
-  const { store, catalog, sources, upstream } = deps;
+  const { store, catalog, migrationService, sources, upstream } = deps;
+
+  /*
+   * 迁移失败信息不能直接回显：底层预检会接触实例环境、检查点和运行期凭据。
+   * 状态中的 error 是持久化的受控枚举，下面的摘要同样只基于该枚举生成。
+   */
+  const migrationErrorSummary: Record<NodeMigrationErrorCode, string> = {
+    none: '没有迁移错误',
+    preflight: '迁移预检未通过，请检查实例状态后重试',
+    checkpoint: '迁移检查点不可用，未继续执行',
+    install: '平台节点包安装未完成，请刷新迁移状态',
+    cutover: '节点运行模式切换未完成，请刷新迁移状态',
+    verification: '迁移校验未通过，已保留受控状态',
+    rollback: '迁移回滚未完全完成，需要按状态处理',
+    compensation: '迁移补偿未完成，需要按状态处理',
+    'state-inconsistent': '迁移状态不一致，需要人工确认',
+  };
+
+  const migrationInstanceId = (req: any, reply: any): string | undefined => {
+    const id = String((req.params as { id?: unknown }).id ?? '');
+    try {
+      assertValidId(id);
+      return id;
+    } catch {
+      reply.code(400).send({ error: '实例 ID 非法' });
+      return undefined;
+    }
+  };
 
   /*
    * 节点包是二进制。只在本插件作用域内加这一个解析器 ——
@@ -446,5 +481,43 @@ export function registerNodeCatalog(
     const t = targetFor(ctx, id);
     if ('error' in t) return reply.code(t.code).send({ error: t.error });
     return reply.send(await inventoryOf(id, t, catalog.names()));
+  });
+
+  // ── 平台节点包迁移 ──────────────────────────────────
+  //
+  // 迁移是唯一会从 legacy raw nodes 切到受信任 npm 平台包的动作。搜索、批准、
+  // 缓存与台账刷新都不能触发它；同一服务内部持有 operation gate 与事务幂等性。
+
+  api.get(`${config.basePath}/api/instances/:id/nodes/thinglinks-migration`, async (req, reply) => {
+    const id = migrationInstanceId(req, reply);
+    if (!id) return;
+    if (!guard(req, reply, { csrf: false, need: 'instance:view', instance: id })) return;
+    try {
+      return reply.send(migrationService.status(id));
+    } catch (error) {
+      // 不存在是受控的 preflight；其余底层故障不能伪装成 404，也不能回显文本。
+      if (error instanceof PlatformMigrationError) {
+        return reply.code(404).send({ error: '实例不存在' });
+      }
+      return reply.code(500).send({ error: '迁移状态读取失败，请稍后重试' });
+    }
+  });
+
+  api.post(`${config.basePath}/api/instances/:id/nodes/thinglinks-migration`, async (req, reply) => {
+    const id = migrationInstanceId(req, reply);
+    if (!id) return;
+    const user = guard(req, reply, { csrf: true, need: 'instance:operate', instance: id });
+    if (!user) return;
+    try {
+      // migrate() 已在 active/existing transaction 时返回当前状态，不能再套一层 gate。
+      return reply.send(await migrationService.migrate(id, user.username));
+    } catch (error) {
+      if (error instanceof PlatformMigrationError) {
+        return reply.code(409).send({
+          error: migrationErrorSummary[error.code], code: error.code,
+        });
+      }
+      return reply.code(500).send({ error: '迁移请求未完成，请刷新状态后重试' });
+    }
   });
 }

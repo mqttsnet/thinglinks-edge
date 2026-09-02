@@ -16,6 +16,7 @@ import { InstanceRepo, type InstanceRecord } from '../../core/instance/repo.ts';
 import { NodeCatalog } from '../../core/nodes/catalog.ts';
 import { NodeStore } from '../../core/nodes/store.ts';
 import { PLATFORM_NODE_PACKAGE } from '../../core/nodes/platform-contract.ts';
+import { PlatformMigrationError, type PlatformMigrationResult, type PlatformMigrationService } from '../../core/nodes/platform-migration.ts';
 import type { HttpContext } from '../context.ts';
 import { registerNodeCatalog } from './catalog.ts';
 
@@ -109,6 +110,116 @@ test('install-node POST honors live and repository-backed gates before side effe
   } finally {
     await app.close();
     await new Promise<void>((resolve, reject) => upstream.close((error) => error ? reject(error) : resolve()));
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('platform migration endpoints declare instance permissions, CSRF, and expose only safe status fields', async () => {
+  const db = openDb(':memory:');
+  const root = mkdtempSync(join(tmpdir(), 'tle-node-migration-http-'));
+  const app = Fastify({ logger: false });
+  const guarded: Array<{ csrf: boolean; need: string; instance?: string }> = [];
+  const calls: Array<{ method: 'status' | 'migrate'; id: string; actor?: string }> = [];
+  const status: PlatformMigrationResult = {
+    instanceId: 'line-a', phase: 'manual_required', runtimeMode: 'legacy',
+    platformVersion: '', error: 'state-inconsistent',
+  };
+  const migrationService = {
+    status(id: string) {
+      calls.push({ method: 'status', id });
+      return status;
+    },
+    async migrate(id: string, actor: string) {
+      calls.push({ method: 'migrate', id, actor });
+      return {
+        ...status,
+        phase: 'rolled_back_dirty' as const,
+        error: 'rollback' as const,
+      };
+    },
+  } as unknown as PlatformMigrationService;
+  registerNodeCatalog(app, {
+    config: { basePath: '' }, db,
+    guard: (_req, _reply, opts) => {
+      guarded.push(opts);
+      return { username: 'operator', role: 'admin' };
+    },
+    fail: (reply, error) => reply.code(400).send({ error: (error as Error).message }),
+  } as unknown as HttpContext, {
+    store: new NodeStore(root), catalog: new NodeCatalog(db), migrationService,
+  });
+
+  try {
+    const read = await app.inject({
+      method: 'GET', url: '/api/instances/line-a/nodes/thinglinks-migration',
+    });
+    assert.equal(read.statusCode, 200);
+    assert.deepEqual(read.json(), status);
+    assert.deepEqual(guarded.pop(), { csrf: false, need: 'instance:view', instance: 'line-a' });
+
+    const write = await app.inject({
+      method: 'POST', url: '/api/instances/line-a/nodes/thinglinks-migration',
+    });
+    assert.equal(write.statusCode, 200);
+    assert.deepEqual(write.json(), {
+      ...status, phase: 'rolled_back_dirty', error: 'rollback',
+    });
+    assert.deepEqual(guarded.pop(), { csrf: true, need: 'instance:operate', instance: 'line-a' });
+    assert.deepEqual(calls, [
+      { method: 'status', id: 'line-a' },
+      { method: 'migrate', id: 'line-a', actor: 'operator' },
+    ]);
+
+    const catalogRead = await app.inject({ method: 'GET', url: '/api/nodes/catalog' });
+    assert.equal(catalogRead.statusCode, 200);
+    assert.deepEqual(calls, [
+      { method: 'status', id: 'line-a' },
+      { method: 'migrate', id: 'line-a', actor: 'operator' },
+    ], 'catalogue reads never start or inspect migration');
+
+    const invalid = await app.inject({
+      method: 'POST', url: '/api/instances/INVALID/nodes/thinglinks-migration',
+    });
+    assert.equal(invalid.statusCode, 400);
+    assert.deepEqual(invalid.json(), { error: '实例 ID 非法' });
+    assert.deepEqual(calls, [
+      { method: 'status', id: 'line-a' },
+      { method: 'migrate', id: 'line-a', actor: 'operator' },
+    ]);
+  } finally {
+    await app.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('platform migration POST maps controlled failures without leaking the underlying error', async () => {
+  const db = openDb(':memory:');
+  const root = mkdtempSync(join(tmpdir(), 'tle-node-migration-safe-error-'));
+  const app = Fastify({ logger: false });
+  const migrationService = {
+    status: () => ({
+      instanceId: 'line-a', phase: 'idle', runtimeMode: 'legacy', platformVersion: '', error: 'none',
+    }),
+    migrate: async () => {
+      throw new PlatformMigrationError('preflight', 'sensitive-value /private/checkpoint');
+    },
+  } as unknown as PlatformMigrationService;
+  registerNodeCatalog(app, {
+    config: { basePath: '' }, db,
+    guard: () => ({ username: 'operator', role: 'admin' }),
+    fail: (reply, error) => reply.code(400).send({ error: (error as Error).message }),
+  } as unknown as HttpContext, {
+    store: new NodeStore(root), catalog: new NodeCatalog(db), migrationService,
+  });
+
+  try {
+    const response = await app.inject({
+      method: 'POST', url: '/api/instances/line-a/nodes/thinglinks-migration',
+    });
+    assert.equal(response.statusCode, 409);
+    assert.deepEqual(response.json(), { error: '迁移预检未通过，请检查实例状态后重试', code: 'preflight' });
+  } finally {
+    await app.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

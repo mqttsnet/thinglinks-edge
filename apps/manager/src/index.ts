@@ -788,7 +788,7 @@ export async function main(overrides: InternalManagerOverrides = {}): Promise<vo
       const app = buildServer({
         ...platformNodeServices.serverDeps,
         ...instanceAdmin.serverDeps,
-        config, db, auth, repo, service, operationGate, proxySessions,
+        config, db, auth, repo, service, operationGate, migrationService, proxySessions,
         upstreamFor: instanceUpstreamFor,
         spool, metrics, drainer, outages,
         cloud, cloudConfig,

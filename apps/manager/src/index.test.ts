@@ -15,6 +15,11 @@ import {
 import { NOOP_PLATFORM_NODE_BARRIER } from './core/nodes/platform-operation-barrier.ts';
 import { InstanceRepo } from './core/instance/repo.ts';
 import { deriveKey } from './core/auth/crypto.ts';
+import { AuthService } from './core/auth/service.ts';
+import { createContext, type ServerDeps } from './http/context.ts';
+import type { CatalogDeps } from './http/nodes/catalog.ts';
+import type { PlatformMigrationService } from './core/nodes/platform-migration.ts';
+import type { InstanceOperationGate } from './core/instance/operation-gate.ts';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -61,6 +66,35 @@ test('Admin runtime composition shares one object with InstanceService and HttpC
   });
   assert.strictEqual(assembled.instanceServiceDeps.adminRuntime, assembled.adminRuntime);
   assert.strictEqual(assembled.serverDeps.adminRuntime, assembled.adminRuntime);
+});
+
+test('migration HTTP composition preserves the one service and operation-gate identity', () => {
+  const db = openDb(':memory:');
+  const repo = new InstanceRepo(db, deriveKey('index-migration-http', 'instance'));
+  const migrationService = {} as PlatformMigrationService;
+  const operationGate = {} as InstanceOperationGate;
+  const serverDeps = {
+    config: { basePath: '' },
+    db,
+    auth: new AuthService(db, deriveKey('index-migration-http', 'auth')),
+    repo,
+    service: {},
+    adminRuntime: {},
+    operationGate,
+    migrationService,
+    proxySessions: {},
+    platformPackages: {},
+  } as ServerDeps;
+  const context = createContext(serverDeps);
+  const catalogDeps: Pick<CatalogDeps, 'migrationService'> = {
+    migrationService: context.migrationService,
+  };
+
+  assert.strictEqual(serverDeps.migrationService, migrationService);
+  assert.strictEqual(context.migrationService, migrationService);
+  assert.strictEqual(catalogDeps.migrationService, migrationService);
+  assert.strictEqual(serverDeps.operationGate, operationGate);
+  assert.strictEqual(context.operationGate, operationGate);
 });
 
 test('manager startup orders data, trust, singleton construction, network, unified recovery, backgrounds, and serving', async () => {

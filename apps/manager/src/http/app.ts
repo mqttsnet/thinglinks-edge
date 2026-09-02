@@ -90,6 +90,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       });
       registerNodeCatalog(api, ctx, {
         store: deps.nodeStore, catalog: deps.nodeCatalog,
+        migrationService: ctx.migrationService,
         sources: deps.nodeSources, upstream: deps.nodeUpstream,
       });
     }
