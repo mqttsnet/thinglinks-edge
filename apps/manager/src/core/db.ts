@@ -384,10 +384,23 @@ const MIGRATIONS: string[] = [
     actor TEXT NOT NULL,
     started_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    execution_owner TEXT NOT NULL DEFAULT '',
+    execution_lease_expires_at INTEGER NOT NULL DEFAULT 0,
     error TEXT NOT NULL DEFAULT 'none' CHECK (error IN (
       'none','preflight','checkpoint','install','cutover','verification',
       'rollback','compensation','state-inconsistent'
-    ))
+    )),
+    CHECK (
+      (execution_owner = '' AND execution_lease_expires_at = 0)
+      OR (
+        operation_kind = 'migration'
+        AND length(execution_owner) BETWEEN 16 AND 128
+        AND substr(execution_owner, 1, 1) GLOB '[A-Za-z0-9]'
+        AND execution_owner NOT GLOB '*[^A-Za-z0-9._-]*'
+        AND typeof(execution_lease_expires_at) = 'integer'
+        AND execution_lease_expires_at > 0
+      )
+    )
   );
   `,
 ];

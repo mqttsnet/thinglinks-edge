@@ -59,6 +59,45 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+class ManualMigrationTime {
+  nowMs = 1_000;
+  readonly sleeps: number[] = [];
+  private readonly heartbeatTasks = new Set<() => void>();
+  private readonly sleepers: Array<{ wakeAt: number; resolve: () => void }> = [];
+
+  now = (): number => this.nowMs;
+
+  sleep = (ms: number): Promise<void> => {
+    this.sleeps.push(ms);
+    return new Promise((resolve) => {
+      this.sleepers.push({ wakeAt: this.nowMs + ms, resolve });
+    });
+  };
+
+  startHeartbeat = (_intervalMs: number, task: () => void): (() => void) => {
+    this.heartbeatTasks.add(task);
+    return () => this.heartbeatTasks.delete(task);
+  };
+
+  get pendingSleeps(): number {
+    return this.sleepers.length;
+  }
+
+  pulse(): void {
+    for (const task of [...this.heartbeatTasks]) task();
+  }
+
+  advance(ms: number): void {
+    this.nowMs += ms;
+    for (let index = this.sleepers.length - 1; index >= 0; index -= 1) {
+      const sleeper = this.sleepers[index]!;
+      if (sleeper.wakeAt > this.nowMs) continue;
+      this.sleepers.splice(index, 1);
+      sleeper.resolve();
+    }
+  }
+}
+
 after(() => {
   for (const root of roots) rmSync(root, { recursive: true, force: true });
 });
@@ -492,6 +531,7 @@ function migrationFixture(options: FixtureOptions = {}) {
     admin.beforeModules = [rawPlatformInventory(), stagedPlatformInventory()];
   }
   const packages = new FakePackageVerifier();
+  const time = new ManualMigrationTime();
   const proxySessions = new ProxySessionRegistry();
   const events: string[] = [];
   const controls: {
@@ -515,10 +555,16 @@ function migrationFixture(options: FixtureOptions = {}) {
       events.push(`checkpoint:create:${repo.nodeMigration(instanceId)?.phase ?? 'none'}`);
       return realCheckpoint.create(instanceId, txId);
     },
-    cleanupPartial: (...args) => realCheckpoint.cleanupPartial(...args),
+    cleanupPartial: (...args) => {
+      events.push('checkpoint:cleanup-partial');
+      return realCheckpoint.cleanupPartial(...args);
+    },
     readyExists: (...args) => realCheckpoint.readyExists(...args),
     verify: (...args) => realCheckpoint.verify(...args),
-    restore: (...args) => realCheckpoint.restore(...args),
+    restore: (...args) => {
+      events.push('checkpoint:restore');
+      return realCheckpoint.restore(...args);
+    },
     verifyLive: (...args) => realCheckpoint.verifyLive(...args),
     cleanupTerminal: (...args) => {
       if (controls.cleanupFailure) throw new Error('password=cleanup-secret');
@@ -540,6 +586,7 @@ function migrationFixture(options: FixtureOptions = {}) {
     selectedRepo: InstanceRepo,
     selectedGate: InstanceOperationGate,
     txId: string,
+    executionOwner = `owner-${txId}-0000000000000000`,
   ) => new PlatformMigrationService({
     repo: selectedRepo,
     gate: selectedGate,
@@ -553,6 +600,13 @@ function migrationFixture(options: FixtureOptions = {}) {
     barrier,
     instanceDataRoot: root,
     txId: () => txId,
+    executionRuntime: {
+      now: time.now,
+      sleep: time.sleep,
+      startHeartbeat: time.startHeartbeat,
+      executionOwner: () => executionOwner,
+      leaseDurationMs: 1_000,
+    },
   });
   const service = createService(repo, gate, 'tx-01');
   return {
@@ -566,6 +620,7 @@ function migrationFixture(options: FixtureOptions = {}) {
     adminRuntime,
     admin,
     packages,
+    time,
     checkpoint: realCheckpoint,
     proxySessions,
     events,
@@ -580,6 +635,7 @@ async function interruptedMigration(
   f: ReturnType<typeof migrationFixture>,
   txId: string,
   phase: Exclude<NodeMigrationState, 'idle' | 'committed' | 'rolled_back' | 'rolled_back_dirty' | 'manual_required'>,
+  execution?: { owner: string; expiresAt: number },
 ): Promise<void> {
   f.repo.beginNodeMigration({
     instanceId: 'line-a',
@@ -604,11 +660,29 @@ async function interruptedMigration(
       nodeInventorySha256: 'b'.repeat(64),
     },
     actor: 'admin',
+    ...(execution ? {
+      executionOwner: execution.owner,
+      executionLeaseExpiresAt: execution.expiresAt,
+    } : {}),
   });
   if (phase !== 'preparing') {
     await f.checkpoint.create('line-a', txId);
     f.repo.updateNodeMigration('line-a', phase);
   }
+}
+
+function claimReplacementExecution(
+  f: ReturnType<typeof migrationFixture>,
+  owner: string,
+  phase: 'preparing' | 'checkpointed' | 'staged' | 'cutover' | 'verifying' | 'rolling_back',
+): void {
+  const journal = f.repo.nodeMigration('line-a');
+  assert.ok(journal);
+  f.time.advance(1_000);
+  const claimed = f.repo.claimNodeMigrationExecution(
+    'line-a', journal.txId, owner, [phase], f.time.now(), 1_000,
+  );
+  assert.equal(claimed?.executionOwner, owner);
 }
 
 test('preflight rejects modified, missing, and extra legacy files with no Docker runtime side effects', async () => {
@@ -818,6 +892,7 @@ test('running migration checkpoints, stages once, cuts over, verifies, and commi
   assert.equal(result.phase, 'committed');
   assert.equal(result.runtimeMode, 'npm');
   assert.equal(result.platformVersion, PLATFORM_NODE_PACKAGE.version);
+  assert.doesNotMatch(JSON.stringify(result), /execution|owner-tx-01/i);
   assert.equal(f.repo.nodeRuntime('line-a')?.mode, 'npm');
   assert.equal(f.repo.nodeRuntime('line-a')?.platformVersion, PLATFORM_NODE_PACKAGE.version);
   assert.equal(f.admin.installCalls, 1);
@@ -835,6 +910,10 @@ test('running migration checkpoints, stages once, cuts over, verifies, and commi
       "SELECT COUNT(*) AS n FROM audit WHERE action = 'commit-node-migration' AND target = ? AND result = 'ok'",
     ).get('line-a') as { n: number }).n,
     1,
+  );
+  assert.doesNotMatch(
+    JSON.stringify(f.db.prepare('SELECT detail FROM audit WHERE target = ?').all('line-a')),
+    /owner-tx-01/i,
   );
   assert.deepEqual(
     f.events
@@ -1312,6 +1391,273 @@ test('public rollback is busy during active migration and preparing without read
   assert.equal(result.error, 'none');
   assert.deepEqual(preparing.docker.runtimeCalls, []);
   assert.equal(await preparing.checkpoint.readyExists('line-a', 'tx-preparing-no-ready'), false);
+});
+
+test('separate Manager recovery cannot steal an unexpired staged migration owner', async () => {
+  const staged = deferred<void>();
+  const resume = deferred<void>();
+  const f = migrationFixture({
+    onBarrier: async (event) => {
+      if (event.phase === 'staged' && event.boundary === 'after-phase-persist') {
+        staged.resolve();
+        await resume.promise;
+      }
+    },
+  });
+  const active = f.service.migrate('line-a', 'admin-a');
+  await staged.promise;
+  const peerDb = openDb(join(f.root, 'manager.db'));
+  const peerRepo = new InstanceRepo(peerDb, deriveKey('migration-test-master-key', 'instance'));
+  const peerGate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(peerRepo));
+  const peer = f.createService(peerRepo, peerGate, 'tx-peer', 'owner-peer-b-0000000001');
+
+  try {
+    const result = await peer.rollback('line-a', new Error('operator requested'));
+    assert.equal(result.phase, 'staged');
+    assert.equal(f.admin.installCalls, 0);
+    assert.equal(f.admin.uninstallCalls, 0);
+    assert.deepEqual(f.docker.runtimeCalls, []);
+  } finally {
+    resume.resolve();
+  }
+  assert.equal((await active).phase, 'committed');
+  assert.equal(f.admin.installCalls, 1);
+  assert.deepEqual(f.docker.runtimeCalls, ['write-settings', 'restart']);
+  peerDb.close();
+});
+
+test('expired staged migration is recovered once and the former owner stops before POST', async () => {
+  const staged = deferred<void>();
+  const resume = deferred<void>();
+  const f = migrationFixture({
+    onBarrier: async (event) => {
+      if (event.phase === 'staged' && event.boundary === 'after-phase-persist') {
+        staged.resolve();
+        await resume.promise;
+      }
+    },
+  });
+  const active = f.service.migrate('line-a', 'admin-a');
+  await staged.promise;
+  f.time.advance(1_000);
+  const peerDb = openDb(join(f.root, 'manager.db'));
+  const peerRepo = new InstanceRepo(peerDb, deriveKey('migration-test-master-key', 'instance'));
+  const peerGate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(peerRepo));
+  const peer = f.createService(peerRepo, peerGate, 'tx-peer', 'owner-peer-b-0000000002');
+
+  assert.equal(
+    (await peer.rollback('line-a', new Error('operator requested'))).phase,
+    'rolled_back',
+  );
+  resume.resolve();
+  assert.equal((await active).phase, 'rolled_back');
+  assert.equal(f.admin.installCalls, 0);
+  assert.equal(f.admin.uninstallCalls, 0);
+  assert.deepEqual(f.docker.runtimeCalls, ['stop', 'start']);
+  peerDb.close();
+});
+
+test('active migration heartbeat renews ownership while paused and still fences peer recovery', async () => {
+  const staged = deferred<void>();
+  const resume = deferred<void>();
+  const f = migrationFixture({
+    onBarrier: async (event) => {
+      if (event.phase === 'staged' && event.boundary === 'after-phase-persist') {
+        staged.resolve();
+        await resume.promise;
+      }
+    },
+  });
+  const active = f.service.migrate('line-a', 'admin-a');
+  await staged.promise;
+  const before = f.repo.nodeMigration('line-a')?.executionLeaseExpiresAt;
+  f.time.advance(500);
+  f.time.pulse();
+  assert.ok((f.repo.nodeMigration('line-a')?.executionLeaseExpiresAt ?? 0) > (before ?? 0));
+  f.time.advance(500);
+
+  const peerDb = openDb(join(f.root, 'manager.db'));
+  const peerRepo = new InstanceRepo(peerDb, deriveKey('migration-test-master-key', 'instance'));
+  const peerGate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(peerRepo));
+  const peer = f.createService(peerRepo, peerGate, 'tx-peer', 'owner-peer-heartbeat-0001');
+  assert.equal((await peer.rollback('line-a', new Error('operator requested'))).phase, 'staged');
+  assert.deepEqual(f.docker.runtimeCalls, []);
+  assert.equal(f.admin.installCalls, 0);
+
+  resume.resolve();
+  assert.equal((await active).phase, 'committed');
+  assert.equal(f.admin.installCalls, 1);
+  peerDb.close();
+});
+
+test('two recovery workers waiting on one expired owner produce exactly one rollback effect set', async () => {
+  const f = migrationFixture();
+  await interruptedMigration(
+    f,
+    'tx-recovery-race',
+    'staged',
+    { owner: 'owner-crashed-worker-0001', expiresAt: 2_000 },
+  );
+  writeInstalledPackage(f.instanceRoot);
+  f.state.staged = true;
+  f.admin.beforeModules = [rawPlatformInventory(), stagedPlatformInventory()];
+
+  const dbB = openDb(join(f.root, 'manager.db'));
+  const repoB = new InstanceRepo(dbB, deriveKey('migration-test-master-key', 'instance'));
+  const gateB = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repoB));
+  const workerB = f.createService(repoB, gateB, 'tx-worker-b', 'owner-recovery-worker-b-0001');
+  const dbC = openDb(join(f.root, 'manager.db'));
+  const repoC = new InstanceRepo(dbC, deriveKey('migration-test-master-key', 'instance'));
+  const gateC = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repoC));
+  const workerC = f.createService(repoC, gateC, 'tx-worker-c', 'owner-recovery-worker-c-0001');
+
+  const recoveryB = workerB.recoverInterrupted();
+  const recoveryC = workerC.recoverInterrupted();
+  assert.equal(f.time.pendingSleeps, 2);
+  f.time.advance(1_000);
+  await Promise.all([recoveryB, recoveryC]);
+
+  assert.deepEqual(f.time.sleeps, [1_000, 1_000]);
+  assert.ok(f.time.sleeps.every((ms) => ms < 60_000));
+  assert.equal(f.repo.nodeMigration('line-a')?.phase, 'rolled_back');
+  assert.equal(f.admin.uninstallCalls, 1);
+  assert.equal(f.docker.runtimeCalls.filter((call) => call === 'stop').length, 1);
+  assert.equal(f.events.filter((event) => event === 'checkpoint:restore').length, 1);
+  assert.equal(f.docker.runtimeCalls.filter((call) => call === 'start').length, 1);
+  dbB.close();
+  dbC.close();
+});
+
+test('ownership loss after cutover phase barrier prevents settings write', async () => {
+  const f = migrationFixture({
+    onBarrier: (event) => {
+      if (event.phase === 'cutover' && event.boundary === 'after-phase-persist') {
+        claimReplacementExecution(f, 'owner-before-settings-0001', 'cutover');
+      }
+    },
+  });
+
+  const result = await f.service.migrate('line-a', 'admin');
+
+  assert.equal(result.phase, 'cutover');
+  assert.deepEqual(f.docker.runtimeCalls, []);
+  assert.equal(f.admin.installCalls, 1);
+});
+
+test('ownership loss after settings barrier prevents restart', async () => {
+  const f = migrationFixture({
+    onBarrier: (event) => {
+      if (event.phase === 'cutover' && event.boundary === 'after-settings-write') {
+        claimReplacementExecution(f, 'owner-before-restart-0001', 'cutover');
+      }
+    },
+  });
+
+  const result = await f.service.migrate('line-a', 'admin');
+
+  assert.equal(result.phase, 'cutover');
+  assert.deepEqual(f.docker.runtimeCalls, ['write-settings']);
+});
+
+test('ownership loss before uninstall prevents uninstall and later rollback effects', async () => {
+  const f = migrationFixture();
+  const unhealthy = healthyPlatformInventory();
+  unhealthy.nodeSets[0] = { ...unhealthy.nodeSets[0]!, enabled: false, err: 'load_failed' };
+  unhealthy.enabled = false;
+  unhealthy.errors = ['load_failed'];
+  unhealthy.health = 'failed';
+  f.admin.afterRestart = unhealthy;
+  const installedModules = f.admin.installedModules.bind(f.admin);
+  let replaced = false;
+  f.admin.installedModules = async () => {
+    const modules = await installedModules();
+    if (!replaced && f.repo.nodeMigration('line-a')?.phase === 'rolling_back') {
+      replaced = true;
+      claimReplacementExecution(f, 'owner-before-uninstall-001', 'rolling_back');
+    }
+    return modules;
+  };
+
+  const result = await f.service.migrate('line-a', 'admin');
+
+  assert.equal(result.phase, 'rolling_back');
+  assert.equal(f.admin.uninstallCalls, 0);
+  assert.equal(f.docker.runtimeCalls.filter((call) => call === 'stop').length, 0);
+});
+
+test('ownership loss after uninstall prevents stop', async () => {
+  const f = migrationFixture();
+  const unhealthy = healthyPlatformInventory();
+  unhealthy.nodeSets[0] = { ...unhealthy.nodeSets[0]!, enabled: false, err: 'load_failed' };
+  unhealthy.enabled = false;
+  unhealthy.errors = ['load_failed'];
+  unhealthy.health = 'failed';
+  f.admin.afterRestart = unhealthy;
+  const uninstall = f.admin.uninstallPlatformModule.bind(f.admin);
+  f.admin.uninstallPlatformModule = async () => {
+    await uninstall();
+    claimReplacementExecution(f, 'owner-before-stop-0000001', 'rolling_back');
+  };
+
+  const result = await f.service.migrate('line-a', 'admin');
+
+  assert.equal(result.phase, 'rolling_back');
+  assert.equal(f.admin.uninstallCalls, 1);
+  assert.equal(f.docker.runtimeCalls.filter((call) => call === 'stop').length, 0);
+});
+
+test('ownership loss after stop prevents checkpoint restore', async () => {
+  const f = migrationFixture({
+    barrierFailure: { phase: 'checkpointed', boundary: 'after-phase-persist' },
+  });
+  const stop = f.docker.stop.bind(f.docker);
+  f.docker.stop = async () => {
+    await stop();
+    claimReplacementExecution(f, 'owner-before-restore-0001', 'rolling_back');
+  };
+
+  const result = await f.service.migrate('line-a', 'admin');
+
+  assert.equal(result.phase, 'rolling_back');
+  assert.equal(f.docker.runtimeCalls.filter((call) => call === 'stop').length, 1);
+  assert.equal(f.events.filter((event) => event === 'checkpoint:restore').length, 0);
+});
+
+test('ownership loss after restore prevents start', async () => {
+  const f = migrationFixture({
+    barrierFailure: { phase: 'checkpointed', boundary: 'after-phase-persist' },
+  });
+  const restore = f.checkpointPort.restore.bind(f.checkpointPort);
+  f.checkpointPort.restore = async (...args) => {
+    await restore(...args);
+    claimReplacementExecution(f, 'owner-before-start-000001', 'rolling_back');
+  };
+
+  const result = await f.service.migrate('line-a', 'admin');
+
+  assert.equal(result.phase, 'rolling_back');
+  assert.equal(f.events.filter((event) => event === 'checkpoint:restore').length, 1);
+  assert.equal(f.docker.runtimeCalls.filter((call) => call === 'start').length, 0);
+});
+
+test('ownership loss before partial checkpoint cleanup prevents cleanup', async () => {
+  const f = migrationFixture();
+  await interruptedMigration(f, 'tx-cleanup-owner-loss', 'preparing');
+  const readyExists = f.checkpointPort.readyExists.bind(f.checkpointPort);
+  let replaced = false;
+  f.checkpointPort.readyExists = async (...args) => {
+    const ready = await readyExists(...args);
+    if (!replaced) {
+      replaced = true;
+      claimReplacementExecution(f, 'owner-before-cleanup-0001', 'preparing');
+    }
+    return ready;
+  };
+
+  const result = await f.service.rollback('line-a', new Error('operator requested'));
+
+  assert.equal(result.phase, 'preparing');
+  assert.equal(f.events.filter((event) => event === 'checkpoint:cleanup-partial').length, 0);
 });
 
 test('stale recovery scan cannot claim or finalize a replacement tx before runtime effects', async () => {

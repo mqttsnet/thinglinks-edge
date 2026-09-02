@@ -87,6 +87,9 @@ export interface InstanceNodeMigrationJournal {
   startedAt: string;
   updatedAt: string;
   error: NodeMigrationErrorCode;
+  /** Internal execution fencing only; never include in status, UI, or audit payloads. */
+  executionOwner: string;
+  executionLeaseExpiresAt: number;
 }
 
 export interface BeginNodeMigrationInput {
@@ -102,6 +105,8 @@ export interface BeginNodeMigrationInput {
   checkpointDir: string;
   snapshot: NodeMigrationSnapshot;
   actor: string;
+  executionOwner?: string;
+  executionLeaseExpiresAt?: number;
   /** 仅允许显式替换该实例一个已 clean rolled_back 的旧事务 */
   replaceRolledBackTxId?: string;
 }
@@ -118,6 +123,8 @@ const NODE_MIGRATION_ERROR_CODES = [
   'verification', 'rollback', 'compensation', 'state-inconsistent',
 ] as const;
 const TX_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const EXECUTION_OWNER = /^[A-Za-z0-9][A-Za-z0-9._-]{15,127}$/;
+const MAX_EXECUTION_LEASE_MS = 59_000;
 const PATH_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const SHA512_INTEGRITY = /^sha512-[A-Za-z0-9+/]+={0,2}$/;
 const SHA256_HEX = /^[a-f0-9]{64}$/;
@@ -137,6 +144,34 @@ function requireSafeText(value: string, label: string, maxLength: number): void 
     throw new RepoError(`${label} 无效`);
   }
   if (redact(value) !== value) throw new RepoError(`${label} 不得包含凭据`);
+}
+
+function requireExecutionOwner(owner: string): void {
+  if (!EXECUTION_OWNER.test(owner)) throw new RepoError('迁移执行 owner 无效');
+}
+
+function requireExecutionNow(nowMs: number): void {
+  if (!Number.isSafeInteger(nowMs) || nowMs < 0) throw new RepoError('迁移执行时钟无效');
+}
+
+function executionLeaseExpiry(nowMs: number, durationMs: number): number {
+  requireExecutionNow(nowMs);
+  if (!Number.isSafeInteger(durationMs) || durationMs <= 0 || durationMs > MAX_EXECUTION_LEASE_MS) {
+    throw new RepoError('迁移执行租期无效');
+  }
+  const expiresAt = nowMs + durationMs;
+  if (!Number.isSafeInteger(expiresAt) || expiresAt <= nowMs) throw new RepoError('迁移执行租期溢出');
+  return expiresAt;
+}
+
+function executionBegin(input: BeginNodeMigrationInput): { owner: string; expiresAt: number } {
+  const owner = input.executionOwner ?? '';
+  const expiresAt = input.executionLeaseExpiresAt ?? 0;
+  if (owner === '' && expiresAt === 0) return { owner, expiresAt };
+  if (input.operationKind !== 'migration') throw new RepoError('bootstrap 不得持有迁移执行租约');
+  requireExecutionOwner(owner);
+  if (!Number.isSafeInteger(expiresAt) || expiresAt <= 0) throw new RepoError('迁移执行到期时间无效');
+  return { owner, expiresAt };
 }
 
 function requireExactKeys(value: Record<string, unknown>, keys: readonly string[], label: string): void {
@@ -487,6 +522,7 @@ export class InstanceRepo {
     requireSafeText(input.imageIdBefore, '迁移前镜像 id', 256);
     if (!SHA512_INTEGRITY.test(input.targetIntegrity)) throw new RepoError('目标包完整性无效');
     requireSafeText(input.actor, '操作人', 128);
+    const execution = executionBegin(input);
     const snapshot = safeSnapshot(input.snapshot, input.operationKind);
     const snapshotJson = JSON.stringify(snapshot);
     validateCheckpointDir(input);
@@ -527,6 +563,8 @@ export class InstanceRepo {
           && existing['snapshot_json'] === snapshotJson
           && existing['actor'] === input.actor
           && existing['error'] === 'none'
+          && existing['execution_owner'] === execution.owner
+          && existing['execution_lease_expires_at'] === execution.expiresAt
           && instance.node_migration_state === 'preparing'
           && instance.node_migration_error === 'none';
         if (identical) return;
@@ -561,13 +599,13 @@ export class InstanceRepo {
         `INSERT INTO instance_node_migration
           (instance_id, tx_id, operation_kind, phase, original_running, staged_before,
            mode_before, image_id_before, target_integrity, checkpoint_dir,
-           snapshot_json, actor, error)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'none')`,
+           snapshot_json, actor, execution_owner, execution_lease_expires_at, error)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'none')`,
       ).run(
         input.instanceId, input.txId, input.operationKind, input.phase,
         input.originalRunning ? 1 : 0, input.stagedBefore ? 1 : 0,
         input.modeBefore, input.imageIdBefore, input.targetIntegrity,
-        input.checkpointDir, snapshotJson, input.actor,
+        input.checkpointDir, snapshotJson, input.actor, execution.owner, execution.expiresAt,
       );
       this.db.prepare(
         `UPDATE instance
@@ -601,28 +639,105 @@ export class InstanceRepo {
     })();
   }
 
+  /** Atomically claim an ownerless/expired Task-8 tx, or renew the same owner idempotently. */
+  claimNodeMigrationExecution(
+    instanceId: string,
+    txId: string,
+    owner: string,
+    expected: readonly NodeMigrationPhase[],
+    nowMs: number,
+    leaseDurationMs: number,
+  ): InstanceNodeMigrationJournal | undefined {
+    if (!TX_ID.test(txId) || expected.length === 0) throw new RepoError('迁移执行 claim 参数无效');
+    requireExecutionOwner(owner);
+    const expiresAt = executionLeaseExpiry(nowMs, leaseDurationMs);
+    for (const phase of expected) requireEnum(phase, NODE_MIGRATION_PHASES, '预期迁移阶段');
+    const marks = expected.map(() => '?').join(', ');
+    const updated = this.db.prepare(
+      `UPDATE instance_node_migration
+       SET execution_owner = ?, execution_lease_expires_at = ?, updated_at = datetime('now')
+       WHERE instance_id = ? AND tx_id = ? AND operation_kind = 'migration'
+         AND phase IN (${marks})
+         AND (execution_owner = '' OR execution_owner = ? OR execution_lease_expires_at <= ?)
+         AND EXISTS (
+           SELECT 1 FROM instance i
+           WHERE i.id = instance_node_migration.instance_id
+             AND i.node_migration_state = instance_node_migration.phase
+             AND i.node_migration_error = instance_node_migration.error
+         )`,
+    ).run(owner, expiresAt, instanceId, txId, ...expected, owner, nowMs);
+    if (updated.changes !== 1) return undefined;
+    return this.nodeMigration(instanceId);
+  }
+
+  /** Renew only a still-live exact owner; an expired active worker cannot resurrect itself. */
+  renewNodeMigrationExecution(
+    instanceId: string,
+    txId: string,
+    owner: string,
+    expected: readonly NodeMigrationPhase[],
+    nowMs: number,
+    leaseDurationMs: number,
+  ): InstanceNodeMigrationJournal {
+    if (!TX_ID.test(txId) || expected.length === 0) throw new RepoError('迁移执行 renew 参数无效');
+    requireExecutionOwner(owner);
+    const expiresAt = executionLeaseExpiry(nowMs, leaseDurationMs);
+    for (const phase of expected) requireEnum(phase, NODE_MIGRATION_PHASES, '预期迁移阶段');
+    const marks = expected.map(() => '?').join(', ');
+    const updated = this.db.prepare(
+      `UPDATE instance_node_migration
+       SET execution_lease_expires_at = ?, updated_at = datetime('now')
+       WHERE instance_id = ? AND tx_id = ? AND operation_kind = 'migration'
+         AND execution_owner = ? AND execution_lease_expires_at > ?
+         AND phase IN (${marks})
+         AND EXISTS (
+           SELECT 1 FROM instance i
+           WHERE i.id = instance_node_migration.instance_id
+             AND i.node_migration_state = instance_node_migration.phase
+             AND i.node_migration_error = instance_node_migration.error
+         )`,
+    ).run(expiresAt, instanceId, txId, owner, nowMs, ...expected);
+    if (updated.changes !== 1) throw new RepoError('迁移执行租约所有权已变化');
+    return this.nodeMigration(instanceId)!;
+  }
+
   /** Task-8 CAS transition: stale recovery/worker rows must never advance a replacement tx. */
   transitionNodeMigrationExact(
     instanceId: string,
     txId: string,
+    owner: string,
+    nowMs: number,
     expected: readonly NodeMigrationPhase[],
     phase: NodeMigrationPhase,
     error: NodeMigrationErrorCode = 'none',
   ): void {
     if (!TX_ID.test(txId) || expected.length === 0) throw new RepoError('迁移事务 CAS 参数无效');
+    requireExecutionOwner(owner);
+    requireExecutionNow(nowMs);
     requireEnum(phase, NODE_MIGRATION_PHASES, '迁移阶段');
     requireEnum(error, NODE_MIGRATION_ERROR_CODES, '迁移错误码');
     for (const item of expected) requireEnum(item, NODE_MIGRATION_PHASES, '预期迁移阶段');
     const marks = expected.map(() => '?').join(', ');
     this.db.transaction(() => {
       const current = this.db.prepare(
-        `SELECT phase, error FROM instance_node_migration WHERE instance_id = ? AND tx_id = ?`,
-      ).get(instanceId, txId) as { phase: NodeMigrationPhase; error: NodeMigrationErrorCode } | undefined;
-      if (!current || !expected.includes(current.phase)) throw new RepoError('迁移事务所有权已变化');
+        `SELECT phase, error, execution_lease_expires_at
+         FROM instance_node_migration
+         WHERE instance_id = ? AND tx_id = ? AND operation_kind = 'migration'
+           AND execution_owner = ? AND execution_lease_expires_at > ?`,
+      ).get(instanceId, txId, owner, nowMs) as {
+        phase: NodeMigrationPhase;
+        error: NodeMigrationErrorCode;
+        execution_lease_expires_at: number;
+      } | undefined;
+      if (!current || !expected.includes(current.phase)) throw new RepoError('迁移事务执行所有权已变化');
       const journal = this.db.prepare(
         `UPDATE instance_node_migration SET phase = ?, error = ?, updated_at = datetime('now')
-         WHERE instance_id = ? AND tx_id = ? AND phase IN (${marks})`,
-      ).run(phase, error, instanceId, txId, ...expected);
+         WHERE instance_id = ? AND tx_id = ? AND operation_kind = 'migration'
+           AND execution_owner = ? AND execution_lease_expires_at = ?
+           AND phase IN (${marks})`,
+      ).run(
+        phase, error, instanceId, txId, owner, current.execution_lease_expires_at, ...expected,
+      );
       if (journal.changes !== 1) throw new RepoError('迁移事务 CAS 未命中');
       const projection = this.db.prepare(
         `UPDATE instance SET node_migration_state = ?, node_migration_error = ?
@@ -675,31 +790,42 @@ export class InstanceRepo {
   commitNodeMigrationExact(
     instanceId: string,
     txId: string,
+    owner: string,
+    nowMs: number,
     expectedPhase: 'verifying',
     platformVersion: string,
     actor: string,
   ): void {
     if (!TX_ID.test(txId)) throw new RepoError('迁移事务 CAS 参数无效');
+    requireExecutionOwner(owner);
+    requireExecutionNow(nowMs);
     requireSafeText(platformVersion, '平台节点版本', 128);
     requireSafeText(actor, '操作人', 128);
     this.db.transaction(() => {
       const ready = this.db.prepare(
-        `SELECT m.mode_before
+        `SELECT m.mode_before, m.execution_lease_expires_at
          FROM instance_node_migration m
          JOIN instance i ON i.id = m.instance_id
          WHERE m.instance_id = ? AND m.tx_id = ? AND m.operation_kind = 'migration'
            AND m.phase = ? AND m.error = 'none'
+           AND m.execution_owner = ? AND m.execution_lease_expires_at > ?
            AND i.node_migration_state = m.phase AND i.node_migration_error = m.error
            AND i.node_runtime_mode = m.mode_before`,
-      ).get(instanceId, txId, expectedPhase) as { mode_before: NodeRuntimeMode } | undefined;
+      ).get(instanceId, txId, expectedPhase, owner, nowMs) as {
+        mode_before: NodeRuntimeMode;
+        execution_lease_expires_at: number;
+      } | undefined;
       if (!ready) throw new RepoError('迁移事务所有权或提交阶段已变化');
 
       const journal = this.db.prepare(
         `UPDATE instance_node_migration
-         SET phase = 'committed', error = 'none', updated_at = datetime('now')
+         SET phase = 'committed', error = 'none',
+             execution_owner = '', execution_lease_expires_at = 0,
+             updated_at = datetime('now')
          WHERE instance_id = ? AND tx_id = ? AND operation_kind = 'migration'
-           AND phase = ? AND error = 'none'`,
-      ).run(instanceId, txId, expectedPhase);
+           AND phase = ? AND error = 'none'
+           AND execution_owner = ? AND execution_lease_expires_at = ?`,
+      ).run(instanceId, txId, expectedPhase, owner, ready.execution_lease_expires_at);
       if (journal.changes !== 1) throw new RepoError('迁移事务提交 CAS 未命中');
       const projection = this.db.prepare(
         `UPDATE instance
@@ -752,29 +878,42 @@ export class InstanceRepo {
   finishNodeMigrationRollbackExact(
     instanceId: string,
     txId: string,
+    owner: string,
+    nowMs: number,
     expectedPhase: 'rolling_back',
     phase: 'rolled_back' | 'rolled_back_dirty',
     actor: string,
   ): void {
     if (!TX_ID.test(txId)) throw new RepoError('迁移事务 CAS 参数无效');
+    requireExecutionOwner(owner);
+    requireExecutionNow(nowMs);
     requireSafeText(actor, '操作人', 128);
     const error: NodeMigrationErrorCode = phase === 'rolled_back' ? 'none' : 'rollback';
     this.db.transaction(() => {
       const current = this.db.prepare(
-        `SELECT m.error
+        `SELECT m.error, m.execution_lease_expires_at
          FROM instance_node_migration m
          JOIN instance i ON i.id = m.instance_id
          WHERE m.instance_id = ? AND m.tx_id = ? AND m.operation_kind = 'migration'
            AND m.phase = ? AND i.node_runtime_mode = 'legacy'
+           AND m.execution_owner = ? AND m.execution_lease_expires_at > ?
            AND i.node_migration_state = m.phase AND i.node_migration_error = m.error`,
-      ).get(instanceId, txId, expectedPhase) as { error: NodeMigrationErrorCode } | undefined;
+      ).get(instanceId, txId, expectedPhase, owner, nowMs) as {
+        error: NodeMigrationErrorCode;
+        execution_lease_expires_at: number;
+      } | undefined;
       if (!current) throw new RepoError('迁移事务所有权或回滚阶段已变化');
       const journal = this.db.prepare(
         `UPDATE instance_node_migration
-         SET phase = ?, error = ?, updated_at = datetime('now')
+         SET phase = ?, error = ?, execution_owner = '', execution_lease_expires_at = 0,
+             updated_at = datetime('now')
          WHERE instance_id = ? AND tx_id = ? AND operation_kind = 'migration'
-           AND phase = ? AND error = ?`,
-      ).run(phase, error, instanceId, txId, expectedPhase, current.error);
+           AND phase = ? AND error = ?
+           AND execution_owner = ? AND execution_lease_expires_at = ?`,
+      ).run(
+        phase, error, instanceId, txId, expectedPhase, current.error,
+        owner, current.execution_lease_expires_at,
+      );
       if (journal.changes !== 1) throw new RepoError('迁移事务回滚 CAS 未命中');
       const projection = this.db.prepare(
         `UPDATE instance
@@ -817,6 +956,8 @@ export class InstanceRepo {
   finishNodeMigrationManualExact(
     instanceId: string,
     txId: string,
+    owner: string,
+    nowMs: number,
     expectedPhases: readonly NodeMigrationState[],
     error: Exclude<NodeMigrationErrorCode, 'none'>,
     actor: string,
@@ -824,29 +965,39 @@ export class InstanceRepo {
     if (!TX_ID.test(txId) || expectedPhases.length === 0) {
       throw new RepoError('迁移事务 CAS 参数无效');
     }
+    requireExecutionOwner(owner);
+    requireExecutionNow(nowMs);
     for (const phase of expectedPhases) requireEnum(phase, NODE_MIGRATION_PHASES, '预期迁移阶段');
     requireEnum(error, NODE_MIGRATION_ERROR_CODES.filter((code) => code !== 'none'), '迁移错误码');
     requireSafeText(actor, '操作人', 128);
     const marks = expectedPhases.map(() => '?').join(', ');
     this.db.transaction(() => {
       const current = this.db.prepare(
-        `SELECT m.phase, m.error
+        `SELECT m.phase, m.error, m.execution_lease_expires_at
          FROM instance_node_migration m
          JOIN instance i ON i.id = m.instance_id
          WHERE m.instance_id = ? AND m.tx_id = ? AND m.operation_kind = 'migration'
            AND m.phase IN (${marks})
+           AND m.execution_owner = ? AND m.execution_lease_expires_at > ?
            AND i.node_migration_state = m.phase AND i.node_migration_error = m.error`,
-      ).get(instanceId, txId, ...expectedPhases) as {
+      ).get(instanceId, txId, ...expectedPhases, owner, nowMs) as {
         phase: NodeMigrationPhase;
         error: NodeMigrationErrorCode;
+        execution_lease_expires_at: number;
       } | undefined;
       if (!current) throw new RepoError('迁移事务所有权或人工处理阶段已变化');
       const journal = this.db.prepare(
         `UPDATE instance_node_migration
-         SET phase = 'manual_required', error = ?, updated_at = datetime('now')
+         SET phase = 'manual_required', error = ?,
+             execution_owner = '', execution_lease_expires_at = 0,
+             updated_at = datetime('now')
          WHERE instance_id = ? AND tx_id = ? AND operation_kind = 'migration'
-           AND phase = ? AND error = ?`,
-      ).run(error, instanceId, txId, current.phase, current.error);
+           AND phase = ? AND error = ?
+           AND execution_owner = ? AND execution_lease_expires_at = ?`,
+      ).run(
+        error, instanceId, txId, current.phase, current.error,
+        owner, current.execution_lease_expires_at,
+      );
       if (journal.changes !== 1) throw new RepoError('迁移事务人工处理 CAS 未命中');
       const projection = this.db.prepare(
         `UPDATE instance
@@ -935,6 +1086,8 @@ export class InstanceRepo {
       startedAt: row['started_at'] as string,
       updatedAt: row['updated_at'] as string,
       error: row['error'] as NodeMigrationErrorCode,
+      executionOwner: row['execution_owner'] as string,
+      executionLeaseExpiresAt: row['execution_lease_expires_at'] as number,
     };
   }
 

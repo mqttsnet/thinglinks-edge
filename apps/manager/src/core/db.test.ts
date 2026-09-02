@@ -27,6 +27,16 @@ test('v12 database upgrades existing instance and journal to v13 idempotently', 
     'SELECT COUNT(*) AS n FROM instance_node_migration',
   ).get() as { n: number };
   assert.equal(journalCount.n, 0);
+  const executionColumns = db.prepare(
+    `SELECT name, dflt_value, "notnull" AS required
+     FROM pragma_table_info('instance_node_migration')
+     WHERE name IN ('execution_owner', 'execution_lease_expires_at')
+     ORDER BY name`,
+  ).all();
+  assert.deepEqual(executionColumns, [
+    { name: 'execution_lease_expires_at', dflt_value: '0', required: 1 },
+    { name: 'execution_owner', dflt_value: "''", required: 1 },
+  ]);
   assert.equal(migrate(db), 13);
   const preserved = db.prepare(
     'SELECT name, notes FROM instance WHERE id = ?',
@@ -60,6 +70,66 @@ test('v13 journal has an enforced instance foreign key', () => {
     'missing', 'tx-01', 'migration', 'preparing', 0, 0, 'legacy',
     'sha256:image-a', 'sha512:a', '.thinglinks-migration/missing/tx-01', '{}', 'admin',
   ), /FOREIGN KEY/);
+});
+
+test('revised v13 execution ownership defaults and constraints are enforced', () => {
+  const db = new Database(':memory:');
+  db.pragma('foreign_keys = ON');
+  migrate(db);
+  db.prepare(
+    `INSERT INTO instance
+      (id, name, image_tag, mem_limit, cpu_limit, admin_root, cred_secret, notes)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run('line-a', 'Line A', '5.0.4-24-minimal', 512, 0.5, '/red/line-a/', 'secret', '');
+  const insert = db.prepare(
+    `INSERT INTO instance_node_migration
+      (instance_id, tx_id, operation_kind, phase, original_running, staged_before,
+       mode_before, image_id_before, target_integrity, checkpoint_dir,
+       snapshot_json, actor)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  insert.run(
+    'line-a', 'tx-bootstrap', 'bootstrap', 'preparing', 0, 0, 'legacy',
+    'sha256:image-a', 'sha512:a', '', '{"version":1,"kind":"bootstrap"}', 'admin',
+  );
+  assert.deepEqual(
+    db.prepare(
+      `SELECT execution_owner, execution_lease_expires_at
+       FROM instance_node_migration WHERE instance_id = 'line-a'`,
+    ).get(),
+    { execution_owner: '', execution_lease_expires_at: 0 },
+  );
+
+  db.prepare("DELETE FROM instance_node_migration WHERE instance_id = 'line-a'").run();
+  const insertOwned = db.prepare(
+    `INSERT INTO instance_node_migration
+      (instance_id, tx_id, operation_kind, phase, original_running, staged_before,
+       mode_before, image_id_before, target_integrity, checkpoint_dir,
+       snapshot_json, actor, execution_owner, execution_lease_expires_at)
+     VALUES (?, ?, 'migration', 'preparing', 1, 0, 'legacy', ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  insertOwned.run(
+    'line-a', 'tx-owned', 'sha256:image-a', 'sha512:a',
+    '.thinglinks-migration/line-a/tx-owned',
+    '{"version":1,"kind":"migration"}', 'admin', 'owner-valid-0001', 10_000,
+  );
+  db.prepare("DELETE FROM instance_node_migration WHERE instance_id = 'line-a'").run();
+
+  for (const [owner, expiresAt] of [
+    ['bad owner', 10_000],
+    ['owner-valid-0001', 0],
+    ['owner-valid-0001', 1.5],
+    ['', 10_000],
+  ] as const) {
+    assert.throws(
+      () => insertOwned.run(
+        'line-a', `tx-invalid-${expiresAt}-${owner.length}`, 'sha256:image-a', 'sha512:a',
+        '.thinglinks-migration/line-a/tx-invalid',
+        '{"version":1,"kind":"migration"}', 'admin', owner, expiresAt,
+      ),
+      /CHECK constraint failed/,
+    );
+  }
 });
 
 test('v13 rejects arbitrary migration error text in journal and projection', () => {

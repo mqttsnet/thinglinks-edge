@@ -151,6 +151,16 @@ export interface PlatformMigrationServiceOptions {
   barrier: PlatformNodeOperationBarrier;
   instanceDataRoot: string;
   txId?: (() => string) | undefined;
+  /** Internal deterministic time/heartbeat port; production uses the bounded defaults below. */
+  executionRuntime?: PlatformMigrationExecutionRuntime | undefined;
+}
+
+export interface PlatformMigrationExecutionRuntime {
+  now(): number;
+  sleep(ms: number): Promise<void>;
+  startHeartbeat(intervalMs: number, task: () => void): () => void;
+  executionOwner(): string;
+  leaseDurationMs: number;
 }
 
 interface PreflightFacts {
@@ -162,6 +172,31 @@ interface PreflightFacts {
 
 const TARGET_TYPES = new Set<string>(PLATFORM_NODE_TYPES);
 const IMAGE_ID = /^sha256:[a-fA-F0-9]{64}$/;
+const RECOVERABLE_PHASES = [
+  'preparing', 'checkpointed', 'staged', 'cutover', 'verifying', 'rolling_back',
+] as const;
+const DEFAULT_EXECUTION_LEASE_MS = 15_000;
+const MAX_EXECUTION_LEASE_MS = 59_000;
+
+const DEFAULT_EXECUTION_RUNTIME: PlatformMigrationExecutionRuntime = {
+  now: () => Date.now(),
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  startHeartbeat: (intervalMs, task) => {
+    const timer = setInterval(task, intervalMs);
+    timer.unref();
+    return () => clearInterval(timer);
+  },
+  executionOwner: () => `owner-${randomUUID()}`,
+  leaseDurationMs: DEFAULT_EXECUTION_LEASE_MS,
+};
+
+interface MigrationExecutionSession {
+  readonly instanceId: string;
+  readonly txId: string;
+  readonly owner: string;
+  renew(expected: readonly (typeof RECOVERABLE_PHASES)[number][]): InstanceNodeMigrationJournal;
+  stop(): void;
+}
 
 function hash(value: Buffer | string): string {
   return createHash('sha256').update(value).digest('hex');
@@ -383,9 +418,16 @@ function assertCheckpointMatchesPreflight(
 
 export class PlatformMigrationService {
   private readonly o: PlatformMigrationServiceOptions;
+  private readonly executionRuntime: PlatformMigrationExecutionRuntime;
 
   constructor(options: PlatformMigrationServiceOptions) {
     this.o = options;
+    this.executionRuntime = options.executionRuntime ?? DEFAULT_EXECUTION_RUNTIME;
+    if (
+      !Number.isSafeInteger(this.executionRuntime.leaseDurationMs)
+      || this.executionRuntime.leaseDurationMs <= 0
+      || this.executionRuntime.leaseDurationMs > MAX_EXECUTION_LEASE_MS
+    ) throw new Error('platform migration execution lease must be 1..59000 ms');
   }
 
   status(instanceId: string): PlatformMigrationResult {
@@ -399,6 +441,98 @@ export class PlatformMigrationService {
       platformVersion: runtime.platformVersion,
       error: journal?.error ?? runtime.migrationError,
     };
+  }
+
+  private startExecutionSession(
+    instanceId: string,
+    txId: string,
+    owner: string,
+  ): MigrationExecutionSession {
+    let lost = false;
+    const renew = (
+      expected: readonly (typeof RECOVERABLE_PHASES)[number][],
+    ): InstanceNodeMigrationJournal => {
+      if (lost) throw new RepoError('迁移执行租约所有权已变化');
+      try {
+        return this.o.repo.renewNodeMigrationExecution(
+          instanceId,
+          txId,
+          owner,
+          expected,
+          this.executionRuntime.now(),
+          this.executionRuntime.leaseDurationMs,
+        );
+      } catch (error) {
+        lost = true;
+        throw error;
+      }
+    };
+    const stopHeartbeat = this.executionRuntime.startHeartbeat(
+      Math.max(1, Math.floor(this.executionRuntime.leaseDurationMs / 3)),
+      () => {
+        if (lost) return;
+        try {
+          renew(RECOVERABLE_PHASES);
+        } catch {
+          lost = true;
+        }
+      },
+    );
+    return { instanceId, txId, owner, renew, stop: stopHeartbeat };
+  }
+
+  private async claimExecution(
+    scanned: InstanceNodeMigrationJournal,
+    owner: string,
+    waitForScannedLease: boolean,
+  ): Promise<InstanceNodeMigrationJournal | undefined> {
+    let current = this.o.repo.nodeMigration(scanned.instanceId);
+    if (!current || current.txId !== scanned.txId || current.phase !== scanned.phase) return undefined;
+    const now = this.executionRuntime.now();
+    if (
+      waitForScannedLease
+      && current.executionOwner !== ''
+      && current.executionOwner !== owner
+      && current.executionLeaseExpiresAt > now
+    ) {
+      const waitMs = Math.min(
+        current.executionLeaseExpiresAt - now,
+        this.executionRuntime.leaseDurationMs,
+      );
+      await this.executionRuntime.sleep(waitMs);
+      current = this.o.repo.nodeMigration(scanned.instanceId);
+      if (!current || current.txId !== scanned.txId || current.phase !== scanned.phase) return undefined;
+    }
+    if (!RECOVERABLE_PHASES.includes(current.phase as (typeof RECOVERABLE_PHASES)[number])) {
+      return undefined;
+    }
+    return this.o.repo.claimNodeMigrationExecution(
+      current.instanceId,
+      current.txId,
+      owner,
+      [current.phase as (typeof RECOVERABLE_PHASES)[number]],
+      this.executionRuntime.now(),
+      this.executionRuntime.leaseDurationMs,
+    );
+  }
+
+  private async reachOwned(
+    execution: MigrationExecutionSession,
+    phase: (typeof RECOVERABLE_PHASES)[number],
+    sequence: number,
+  ): Promise<void> {
+    await this.reach(execution.instanceId, execution.txId, phase, sequence);
+    execution.renew([phase]);
+  }
+
+  private async barrierOwned(
+    execution: MigrationExecutionSession,
+    event: Parameters<PlatformNodeOperationBarrier['reach']>[0] & {
+      phase: (typeof RECOVERABLE_PHASES)[number];
+    },
+  ): Promise<void> {
+    await this.o.barrier.reach(event);
+    execution.renew([event.phase]);
   }
 
   async migrate(instanceId: string, actor: string): Promise<PlatformMigrationResult> {
@@ -450,10 +584,14 @@ export class PlatformMigrationService {
       throw controlled('preflight', 'migration facts changed while editor sessions drained');
     }
     const txId = this.o.txId?.() ?? `migration-${randomUUID()}`;
+    const executionOwner = this.executionRuntime.executionOwner();
+    const executionLeaseExpiresAt = this.executionRuntime.now()
+      + this.executionRuntime.leaseDurationMs;
     const checkpointDir = `.thinglinks-migration/${instanceId}/${txId}`;
     let journalOwned = false;
     let installedByTx = false;
     let failureCode: NodeMigrationErrorCode = 'checkpoint';
+    let execution: MigrationExecutionSession | undefined;
     try {
       try {
         this.o.repo.beginNodeMigration({
@@ -469,32 +607,44 @@ export class PlatformMigrationService {
           checkpointDir,
           snapshot: facts.snapshot,
           actor,
+          executionOwner,
+          executionLeaseExpiresAt,
           ...(replaceRolledBackTxId ? { replaceRolledBackTxId } : {}),
         });
-        journalOwned = this.o.repo.nodeMigration(instanceId)?.txId === txId;
+        const owned = this.o.repo.nodeMigration(instanceId);
+        journalOwned = owned?.txId === txId && owned.executionOwner === executionOwner;
       } catch (error) {
         const current = this.o.repo.nodeMigration(instanceId);
         if (current && current.txId !== txId) return this.status(instanceId);
         if (error instanceof RepoError) throw controlled('preflight', 'migration journal precondition changed');
         throw error;
       }
-      await this.reach(instanceId, txId, 'preparing', 1);
+      execution = this.startExecutionSession(instanceId, txId, executionOwner);
+      await this.reachOwned(execution, 'preparing', 1);
+      execution.renew(['preparing']);
       await this.o.checkpoint.create(instanceId, txId);
       assertCheckpointMatchesPreflight(
         await this.o.checkpoint.verify(instanceId, txId),
         facts.snapshot,
       );
 
-      this.o.repo.transitionNodeMigrationExact(instanceId, txId, ['preparing'], 'checkpointed');
-      await this.reach(instanceId, txId, 'checkpointed', 2);
+      this.o.repo.transitionNodeMigrationExact(
+        instanceId, txId, executionOwner, this.executionRuntime.now(),
+        ['preparing'], 'checkpointed',
+      );
+      await this.reachOwned(execution, 'checkpointed', 2);
 
       failureCode = 'install';
       if (!facts.stagedBefore) {
         // A POST can mutate and then fail/lose its response. Persist ownership before it.
-        this.o.repo.transitionNodeMigrationExact(instanceId, txId, ['checkpointed'], 'staged');
-        await this.reach(instanceId, txId, 'staged', 3);
+        this.o.repo.transitionNodeMigrationExact(
+          instanceId, txId, executionOwner, this.executionRuntime.now(),
+          ['checkpointed'], 'staged',
+        );
+        await this.reachOwned(execution, 'staged', 3);
         installedByTx = true;
         this.o.platformPackages.verifyForInstall();
+        execution.renew(['staged']);
         const staged = await this.o.admin.stagePlatformModule(instanceId);
         try {
           assertStagedEvidence(staged);
@@ -510,16 +660,23 @@ export class PlatformMigrationService {
         throw controlled('install', 'installed platform package filesystem evidence is invalid');
       });
       if (facts.stagedBefore) {
-        this.o.repo.transitionNodeMigrationExact(instanceId, txId, ['checkpointed'], 'staged');
-        await this.reach(instanceId, txId, 'staged', 3);
+        this.o.repo.transitionNodeMigrationExact(
+          instanceId, txId, executionOwner, this.executionRuntime.now(),
+          ['checkpointed'], 'staged',
+        );
+        await this.reachOwned(execution, 'staged', 3);
       }
 
       failureCode = 'cutover';
-      this.o.repo.transitionNodeMigrationExact(instanceId, txId, ['staged'], 'cutover');
-      await this.reach(instanceId, txId, 'cutover', 4);
+      this.o.repo.transitionNodeMigrationExact(
+        instanceId, txId, executionOwner, this.executionRuntime.now(),
+        ['staged'], 'cutover',
+      );
+      await this.reachOwned(execution, 'cutover', 4);
       const settings = this.o.settings.renderNodeSettingsUnderLease(instanceId, lease, 'npm');
+      execution.renew(['cutover']);
       await this.o.docker.writeSettings(instanceId, settings);
-      await this.o.barrier.reach({
+      await this.barrierOwned(execution, {
         instanceId,
         txId,
         phase: 'cutover',
@@ -527,16 +684,23 @@ export class PlatformMigrationService {
         artifact: 'settings',
         boundary: 'after-settings-write',
       });
+      execution.renew(['cutover']);
       await this.o.docker.restart(instanceId);
       await this.o.adminRuntime.waitReady(instanceId, { timeoutMs: 30_000, intervalMs: 250 });
 
       failureCode = 'verification';
-      this.o.repo.transitionNodeMigrationExact(instanceId, txId, ['cutover'], 'verifying');
-      await this.reach(instanceId, txId, 'verifying', 6);
+      this.o.repo.transitionNodeMigrationExact(
+        instanceId, txId, executionOwner, this.executionRuntime.now(),
+        ['cutover'], 'verifying',
+      );
+      await this.reachOwned(execution, 'verifying', 6);
       await this.verifyCutover(instanceId, this.o.repo.nodeMigration(instanceId)!);
+      execution.renew(['verifying']);
       this.o.repo.commitNodeMigrationExact(
         instanceId,
         txId,
+        executionOwner,
+        this.executionRuntime.now(),
         'verifying',
         PLATFORM_NODE_PACKAGE.version,
         actor,
@@ -557,7 +721,10 @@ export class PlatformMigrationService {
       const cause = error instanceof PlatformMigrationError
         ? error
         : controlled(failureCode, `${failureCode} external operation failed`);
-      return this.rollbackUnderLease(instanceId, txId, cause, lease, installedByTx);
+      if (!execution) return this.status(instanceId);
+      return this.rollbackUnderLease(instanceId, txId, cause, lease, installedByTx, execution);
+    } finally {
+      execution?.stop();
     }
   }
 
@@ -572,6 +739,7 @@ export class PlatformMigrationService {
     if (!scanned || ![
       'preparing', 'checkpointed', 'staged', 'cutover', 'verifying', 'rolling_back',
     ].includes(scanned.phase)) return this.status(instanceId);
+    const recoveryOwner = this.executionRuntime.executionOwner();
     return this.o.gate.run(instanceId, 'platform-recovery', async (lease) => {
       this.o.gate.assertLease(lease, instanceId, ['platform-recovery']);
       const current = this.o.repo.nodeMigration(instanceId);
@@ -583,7 +751,14 @@ export class PlatformMigrationService {
       ) {
         return this.status(instanceId);
       }
-      return this.recoverExactJournal(current, controlledCause);
+      const claimed = await this.claimExecution(current, recoveryOwner, false);
+      if (!claimed) return this.status(instanceId);
+      const execution = this.startExecutionSession(instanceId, claimed.txId, recoveryOwner);
+      try {
+        return await this.recoverExactJournal(claimed, controlledCause, execution);
+      } finally {
+        execution.stop();
+      }
     });
   }
 
@@ -593,11 +768,22 @@ export class PlatformMigrationService {
     cause: PlatformMigrationError,
     lease: InstanceOperationLease,
     installedByTx: boolean,
+    execution: MigrationExecutionSession,
   ): Promise<PlatformMigrationResult> {
     this.o.gate.assertLease(lease, instanceId, ['platform-migration']);
     const journal = this.o.repo.nodeMigration(instanceId);
-    if (!journal || journal.txId !== txId) return this.status(instanceId);
-    return this.rollbackExactJournal(journal, cause, installedByTx);
+    if (
+      !journal
+      || journal.txId !== txId
+      || journal.executionOwner !== execution.owner
+      || !RECOVERABLE_PHASES.includes(journal.phase as (typeof RECOVERABLE_PHASES)[number])
+    ) return this.status(instanceId);
+    try {
+      execution.renew([journal.phase as (typeof RECOVERABLE_PHASES)[number]]);
+    } catch {
+      return this.status(instanceId);
+    }
+    return this.rollbackExactJournal(journal, cause, installedByTx, execution);
   }
 
   /** Recovery path: claim and operate only on the caller-observed exact durable journal. */
@@ -605,6 +791,7 @@ export class PlatformMigrationService {
     journal: InstanceNodeMigrationJournal,
     cause: PlatformMigrationError,
     installedByTx: boolean,
+    execution: MigrationExecutionSession,
   ): Promise<PlatformMigrationResult> {
     const { instanceId } = journal;
     let cleanupDirty = false;
@@ -613,16 +800,22 @@ export class PlatformMigrationService {
       this.o.repo.transitionNodeMigrationExact(
         instanceId,
         journal.txId,
+        execution.owner,
+        this.executionRuntime.now(),
         [journal.phase],
         'rolling_back',
         cause.code,
       );
       claimed = true;
-      await this.reach(instanceId, journal.txId, 'rolling_back', 100);
+      await this.reachOwned(execution, 'rolling_back', 100);
       if (installedByTx && !journal.stagedBefore) {
-        cleanupDirty = await this.cleanupAttemptedInstall(instanceId);
+        cleanupDirty = await this.cleanupAttemptedInstall(instanceId, execution);
       }
-      if (journal.originalRunning) await this.o.docker.stop(instanceId);
+      if (journal.originalRunning) {
+        execution.renew(['rolling_back']);
+        await this.o.docker.stop(instanceId);
+      }
+      execution.renew(['rolling_back']);
       await this.o.checkpoint.restore(instanceId, journal.txId);
       await this.o.checkpoint.verifyLive(instanceId, journal.txId);
       const afterRestore = await this.o.docker.inspectMigrationRuntime(instanceId);
@@ -630,6 +823,7 @@ export class PlatformMigrationService {
         throw controlled('rollback', 'rollback immutable image identity changed');
       }
       if (journal.originalRunning) {
+        execution.renew(['rolling_back']);
         await this.o.docker.start(instanceId);
         await this.o.adminRuntime.waitReady(instanceId, { timeoutMs: 30_000, intervalMs: 250 });
         // Node-RED can rewrite /data while starting; the post-start bytes are authoritative.
@@ -657,9 +851,12 @@ export class PlatformMigrationService {
         );
       }
       if (cleanupDirty) {
+        execution.renew(['rolling_back']);
         this.o.repo.finishNodeMigrationRollbackExact(
           instanceId,
           journal.txId,
+          execution.owner,
+          this.executionRuntime.now(),
           'rolling_back',
           'rolled_back_dirty',
           journal.actor,
@@ -668,9 +865,12 @@ export class PlatformMigrationService {
           .catch(() => undefined);
         return this.status(instanceId);
       }
+      execution.renew(['rolling_back']);
       this.o.repo.finishNodeMigrationRollbackExact(
         instanceId,
         journal.txId,
+        execution.owner,
+        this.executionRuntime.now(),
         'rolling_back',
         'rolled_back',
         journal.actor,
@@ -685,9 +885,12 @@ export class PlatformMigrationService {
     } catch {
       if (!claimed) return this.status(instanceId);
       try {
+        execution.renew(['rolling_back']);
         this.o.repo.finishNodeMigrationManualExact(
           instanceId,
           journal.txId,
+          execution.owner,
+          this.executionRuntime.now(),
           ['rolling_back'],
           'rollback',
           journal.actor,
@@ -722,10 +925,23 @@ export class PlatformMigrationService {
           if (!current || current.txId !== journal.txId || current.phase !== journal.phase) {
             return this.status(journal.instanceId);
           }
-          return this.recoverExactJournal(
-            current,
-            controlled('rollback', 'interrupted migration recovery requested'),
+          const recoveryOwner = this.executionRuntime.executionOwner();
+          const claimed = await this.claimExecution(current, recoveryOwner, true);
+          if (!claimed) return this.status(journal.instanceId);
+          const execution = this.startExecutionSession(
+            journal.instanceId,
+            journal.txId,
+            recoveryOwner,
           );
+          try {
+            return await this.recoverExactJournal(
+              claimed,
+              controlled('rollback', 'interrupted migration recovery requested'),
+              execution,
+            );
+          } finally {
+            execution.stop();
+          }
         }));
       } catch {
         results.push(this.status(journal.instanceId));
@@ -737,6 +953,7 @@ export class PlatformMigrationService {
   private async recoverExactJournal(
     journal: InstanceNodeMigrationJournal,
     cause: PlatformMigrationError,
+    execution: MigrationExecutionSession,
   ): Promise<PlatformMigrationResult> {
     if (journal.phase === 'preparing') {
       let ready: boolean;
@@ -744,9 +961,12 @@ export class PlatformMigrationService {
         ready = await this.o.checkpoint.readyExists(journal.instanceId, journal.txId);
       } catch {
         try {
+          execution.renew(['preparing']);
           this.o.repo.finishNodeMigrationManualExact(
             journal.instanceId,
             journal.txId,
+            execution.owner,
+            this.executionRuntime.now(),
             ['preparing'],
             'checkpoint',
             journal.actor,
@@ -758,18 +978,24 @@ export class PlatformMigrationService {
       }
       if (!ready) {
         try {
+          execution.renew(['preparing']);
           await this.o.checkpoint.cleanupPartial(journal.instanceId, journal.txId);
           this.o.repo.transitionNodeMigrationExact(
             journal.instanceId,
             journal.txId,
+            execution.owner,
+            this.executionRuntime.now(),
             ['preparing'],
             'rolling_back',
             'checkpoint',
           );
-          await this.reach(journal.instanceId, journal.txId, 'rolling_back', 100);
+          await this.reachOwned(execution, 'rolling_back', 100);
+          execution.renew(['rolling_back']);
           this.o.repo.finishNodeMigrationRollbackExact(
             journal.instanceId,
             journal.txId,
+            execution.owner,
+            this.executionRuntime.now(),
             'rolling_back',
             'rolled_back',
             journal.actor,
@@ -777,9 +1003,12 @@ export class PlatformMigrationService {
           await this.cleanupTerminal(journal.instanceId, journal.txId, 'rolled_back', journal.actor);
         } catch {
           try {
+            execution.renew(['preparing', 'rolling_back']);
             this.o.repo.finishNodeMigrationManualExact(
               journal.instanceId,
               journal.txId,
+              execution.owner,
+              this.executionRuntime.now(),
               ['preparing', 'rolling_back'],
               'rollback',
               journal.actor,
@@ -795,6 +1024,7 @@ export class PlatformMigrationService {
       journal,
       cause,
       !journal.stagedBefore && !['preparing', 'checkpointed'].includes(journal.phase),
+      execution,
     );
   }
 
@@ -1029,7 +1259,10 @@ export class PlatformMigrationService {
   }
 
   /** A POST may have changed disk or Admin state even when it rejects; clean both facts first. */
-  private async cleanupAttemptedInstall(instanceId: string): Promise<boolean> {
+  private async cleanupAttemptedInstall(
+    instanceId: string,
+    execution: MigrationExecutionSession,
+  ): Promise<boolean> {
     let modules: InstalledModule[];
     let footprint: boolean;
     try {
@@ -1043,6 +1276,7 @@ export class PlatformMigrationService {
     const adminFootprint = modules.some((module) => module.module === PLATFORM_NODE_PACKAGE.name);
     if (!adminFootprint && !footprint) return false;
     try {
+      execution.renew(['rolling_back']);
       await this.o.admin.uninstallPlatformModule(instanceId);
     } catch {
       return true;

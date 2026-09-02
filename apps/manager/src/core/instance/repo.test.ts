@@ -6,6 +6,8 @@ import { InstanceRepo, RepoError, type InstanceRecord, type PortRecord } from '.
 import { PLATFORM_NODE_PACKAGE } from '../nodes/platform-contract.ts';
 
 const KEY = deriveKey('test-master', 'salt');
+const TEST_EXECUTION_OWNER = 'owner-migration-tests-0001';
+const TEST_EXECUTION_NOW = 1_000;
 const fresh = () => new InstanceRepo(openDb(':memory:'), KEY);
 
 const rec = (over: Partial<InstanceRecord> = {}): InstanceRecord => ({
@@ -54,6 +56,8 @@ const migrationBegin = (
   checkpointDir: `.thinglinks-migration/${instanceId}/${txId}`,
   snapshot: migrationSnapshot(),
   actor: 'admin',
+  executionOwner: TEST_EXECUTION_OWNER,
+  executionLeaseExpiresAt: 10_000,
   ...over,
 });
 
@@ -551,11 +555,17 @@ test('exact tx phase CAS refuses a stale replacement and leaves the new journal 
   repo.beginNodeMigration(migrationBegin('line-a', 'tx-new', { replaceRolledBackTxId: 'tx-old' }));
 
   assert.throws(
-    () => repo.transitionNodeMigrationExact('line-a', 'tx-old', ['preparing'], 'checkpointed'),
+    () => repo.transitionNodeMigrationExact(
+      'line-a', 'tx-old', TEST_EXECUTION_OWNER, TEST_EXECUTION_NOW,
+      ['preparing'], 'checkpointed',
+    ),
     /所有权|CAS|变化/i,
   );
   assert.equal(repo.nodeMigration('line-a')?.txId, 'tx-new');
-  repo.transitionNodeMigrationExact('line-a', 'tx-new', ['preparing'], 'checkpointed');
+  repo.transitionNodeMigrationExact(
+    'line-a', 'tx-new', TEST_EXECUTION_OWNER, TEST_EXECUTION_NOW,
+    ['preparing'], 'checkpointed',
+  );
   assert.equal(repo.nodeMigration('line-a')?.phase, 'checkpointed');
 });
 
@@ -564,20 +574,24 @@ test('exact Task 8 finalizers reject stale tx ownership and preserve the replace
     {
       name: 'commit',
       prepare: (repo: InstanceRepo) => repo.transitionNodeMigrationExact(
-        'line-a', 'tx-old', ['preparing'], 'verifying',
+        'line-a', 'tx-old', TEST_EXECUTION_OWNER, TEST_EXECUTION_NOW,
+        ['preparing'], 'verifying',
       ),
       finalize: (repo: InstanceRepo) => repo.commitNodeMigrationExact(
-        'line-a', 'tx-old', 'verifying', PLATFORM_NODE_PACKAGE.version, 'admin',
+        'line-a', 'tx-old', TEST_EXECUTION_OWNER, TEST_EXECUTION_NOW,
+        'verifying', PLATFORM_NODE_PACKAGE.version, 'admin',
       ),
       phase: 'verifying',
     },
     {
       name: 'rollback',
       prepare: (repo: InstanceRepo) => repo.transitionNodeMigrationExact(
-        'line-a', 'tx-old', ['preparing'], 'rolling_back', 'rollback',
+        'line-a', 'tx-old', TEST_EXECUTION_OWNER, TEST_EXECUTION_NOW,
+        ['preparing'], 'rolling_back', 'rollback',
       ),
       finalize: (repo: InstanceRepo) => repo.finishNodeMigrationRollbackExact(
-        'line-a', 'tx-old', 'rolling_back', 'rolled_back', 'admin',
+        'line-a', 'tx-old', TEST_EXECUTION_OWNER, TEST_EXECUTION_NOW,
+        'rolling_back', 'rolled_back', 'admin',
       ),
       phase: 'rolling_back',
     },
@@ -585,7 +599,8 @@ test('exact Task 8 finalizers reject stale tx ownership and preserve the replace
       name: 'manual',
       prepare: () => undefined,
       finalize: (repo: InstanceRepo) => repo.finishNodeMigrationManualExact(
-        'line-a', 'tx-old', ['preparing'], 'rollback', 'admin',
+        'line-a', 'tx-old', TEST_EXECUTION_OWNER, TEST_EXECUTION_NOW,
+        ['preparing'], 'rollback', 'admin',
       ),
       phase: 'preparing',
     },
@@ -605,5 +620,92 @@ test('exact Task 8 finalizers reject stale tx ownership and preserve the replace
     assert.equal(repo.nodeMigration('line-a')?.txId, 'tx-replacement', scenario.name);
     assert.equal(repo.nodeMigration('line-a')?.phase, scenario.phase, scenario.name);
     assert.equal(repo.nodeRuntime('line-a')?.migrationState, scenario.phase, scenario.name);
+  }
+});
+
+test('Task 8 execution ownership claims, renews, fences peers, and clears on terminals', () => {
+  const repo = fresh();
+  repo.create(rec(), [], cred());
+  const ownerA = 'owner-repository-a-0001';
+  const ownerB = 'owner-repository-b-0001';
+  repo.beginNodeMigration(migrationBegin('line-a', 'tx-owned', {
+    executionOwner: ownerA,
+    executionLeaseExpiresAt: 2_000,
+  }));
+  assert.equal(repo.nodeMigration('line-a')?.executionOwner, ownerA);
+  assert.equal(repo.nodeMigration('line-a')?.executionLeaseExpiresAt, 2_000);
+
+  assert.equal(
+    repo.claimNodeMigrationExecution(
+      'line-a', 'tx-owned', ownerB, ['preparing'], 1_999, 1_000,
+    ),
+    undefined,
+  );
+  assert.equal(
+    repo.claimNodeMigrationExecution(
+      'line-a', 'tx-owned', ownerA, ['preparing'], 1_000, 2_000,
+    )?.executionLeaseExpiresAt,
+    3_000,
+  );
+  assert.equal(
+    repo.renewNodeMigrationExecution(
+      'line-a', 'tx-owned', ownerA, ['preparing'], 1_500, 2_000,
+    ).executionLeaseExpiresAt,
+    3_500,
+  );
+  assert.throws(
+    () => repo.renewNodeMigrationExecution(
+      'line-a', 'tx-owned', ownerB, ['preparing'], 1_500, 2_000,
+    ),
+    /所有权|租约|owner/i,
+  );
+  assert.equal(
+    repo.claimNodeMigrationExecution(
+      'line-a', 'tx-owned', ownerB, ['preparing'], 3_500, 1_000,
+    )?.executionOwner,
+    ownerB,
+  );
+  assert.throws(
+    () => repo.transitionNodeMigrationExact(
+      'line-a', 'tx-owned', ownerA, 3_500, ['preparing'], 'verifying',
+    ),
+    /所有权|租约|CAS|变化/i,
+  );
+  repo.transitionNodeMigrationExact(
+    'line-a', 'tx-owned', ownerB, 3_500, ['preparing'], 'verifying',
+  );
+  repo.commitNodeMigrationExact(
+    'line-a', 'tx-owned', ownerB, 3_500,
+    'verifying', PLATFORM_NODE_PACKAGE.version, 'admin',
+  );
+  assert.equal(repo.nodeMigration('line-a')?.executionOwner, '');
+  assert.equal(repo.nodeMigration('line-a')?.executionLeaseExpiresAt, 0);
+  assert.doesNotMatch(JSON.stringify(repo.nodeRuntime('line-a')), /owner-repository/);
+});
+
+test('exact Task 8 rollback and manual terminals clear execution ownership', () => {
+  for (const terminal of ['rolled_back', 'manual_required'] as const) {
+    const repo = fresh();
+    repo.create(rec(), [], cred());
+    const txId = `tx-clear-${terminal}`;
+    const owner = `owner-clear-${terminal}`;
+    repo.beginNodeMigration(migrationBegin('line-a', txId, {
+      executionOwner: owner,
+      executionLeaseExpiresAt: 10_000,
+    }));
+    repo.transitionNodeMigrationExact(
+      'line-a', txId, owner, 1_000, ['preparing'], 'rolling_back', 'rollback',
+    );
+    if (terminal === 'rolled_back') {
+      repo.finishNodeMigrationRollbackExact(
+        'line-a', txId, owner, 1_000, 'rolling_back', 'rolled_back', 'admin',
+      );
+    } else {
+      repo.finishNodeMigrationManualExact(
+        'line-a', txId, owner, 1_000, ['rolling_back'], 'rollback', 'admin',
+      );
+    }
+    assert.equal(repo.nodeMigration('line-a')?.executionOwner, '', terminal);
+    assert.equal(repo.nodeMigration('line-a')?.executionLeaseExpiresAt, 0, terminal);
   }
 });
