@@ -25,7 +25,8 @@
 import Docker from 'dockerode';
 import { gzipSync } from 'node:zlib';
 import { createServer } from 'node:http';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { createServer as createTcpServer } from 'node:net';
 
 import { openDb } from '../dist/core/db.js';
 import { deriveKey } from '../dist/core/auth/crypto.js';
@@ -33,26 +34,60 @@ import { AuthService } from '../dist/core/auth/service.js';
 import { InstanceRepo } from '../dist/core/instance/repo.js';
 import { InstanceService } from '../dist/core/instance/service.js';
 import { DockerClient } from '../dist/core/instance/docker-client.js';
+import {
+  InstanceOperationGate,
+  InstanceRepositoryOperationPolicy,
+} from '../dist/core/instance/operation-gate.js';
+import { ProxySessionRegistry } from '../dist/core/instance/proxy-session-registry.js';
 import { buildServer } from '../dist/http/app.js';
 import { containerName } from '../dist/core/instance/container-spec.js';
 import { NodeStore } from '../dist/core/nodes/store.js';
 import { NodeCatalog } from '../dist/core/nodes/catalog.js';
 import { buildPolicy } from '../dist/core/nodes/policy.js';
 import { UpstreamRegistry } from '../dist/core/nodes/upstream.js';
+import { MigrationCheckpointStore } from '../dist/core/nodes/migration-checkpoint.js';
+import {
+  NodeRedPlatformMigrationAdminActions,
+  PlatformMigrationService,
+} from '../dist/core/nodes/platform-migration.js';
+import {
+  PLATFORM_APPROVAL_NOTE,
+  PLATFORM_COMMON_PACKAGE,
+  PLATFORM_NODE_PACKAGE,
+} from '../dist/core/nodes/platform-contract.js';
+import {
+  assembleInstanceAdminRuntime,
+  assemblePlatformNodeServices,
+  assemblePlatformOperationBarrier,
+} from '../dist/index.js';
 import { tarArchive } from '../dist/core/archive/tar.js';
-import { TEST_DATA_ROOT, TEST_EDGE_ROOT, ensureRoot, resetDataDir } from './_data-root.mjs';
+import {
+  TEST_DATA_ROOT,
+  TEST_EDGE_ROOT,
+  dataDirExists,
+  ensureRoot,
+  resetDataDir,
+} from './_data-root.mjs';
 import { adminSession } from './_session.mjs';
 
-const NET = 'tle-nodes-net';
-const BRIDGE_IN = 'tle-nodes-bridge-in';     // 宿主 → 实例
-const BRIDGE_OUT = 'tle-nodes-bridge-out';   // 实例 → 宿主（私有源）
-const PORT = 13287;
-const NR_PORT = 30940;
+const RUN_ID = randomUUID().replaceAll('-', '').slice(0, 12);
+const NET = `tle-nodes-net-${RUN_ID}`;
+const BRIDGE_IN = `tle-nodes-bridge-in-${RUN_ID}`;  // 宿主 → 实例
+const BRIDGE_OUT = `tle-nodes-bridge-out-${RUN_ID}`; // 实例 → 宿主（私有源）
 const REG_PORT = 19100;
 const ADMIN_PW = 'initial-password-123';
-const ID = 'nodes-a';
+const ID = `nodes-${RUN_ID}`;
 const TAG = '5.0.4-24-minimal';
 const PUBLIC_CATALOGUE_URL = 'https://catalogue.nodered.org/catalogue.json';
+const MANAGED_LABEL = 'com.mqttsnet.thinglinks-edge.managed';
+const INSTANCE_LABEL = 'com.mqttsnet.thinglinks-edge.instance';
+const VERIFY_RUN_LABEL = 'com.mqttsnet.thinglinks-edge.verify-run';
+const VERIFY_ROLE_LABEL = 'com.mqttsnet.thinglinks-edge.verify-role';
+const NETWORK_NAME = `${NET}-${ID}`;
+
+let PORT;
+let NR_PORT;
+let UPSTREAM_PORT;
 
 /** 批准的夹具 —— 公网上不存在这个名字 */
 const OK_PKG = 'node-red-contrib-tle-fixture-ok';
@@ -60,7 +95,6 @@ const OK_PKG = 'node-red-contrib-tle-fixture-ok';
 const DENIED_PKG = 'node-red-contrib-tle-fixture-denied';
 /** 批准了、但**不放进库**的夹具 —— 用来验回源下载 */
 const UPSTREAM_PKG = 'node-red-contrib-tle-fixture-upstream';
-const UPSTREAM_PORT = 13291;
 /**
  * 依赖被写成 **tarball URL** 的夹具（对着 node-red-contrib-modbus 5.60.2 实测后加的）。
  *
@@ -72,6 +106,13 @@ const UPSTREAM_PORT = 13291;
  */
 const URLDEP_PKG = 'node-red-contrib-tle-fixture-urldep';
 const URLDEP_LIB = 'tle-fixture-urldep-lib';
+const GENERIC_FIXTURE_PACKAGES = Object.freeze([
+  OK_PKG,
+  DENIED_PKG,
+  UPSTREAM_PKG,
+  URLDEP_PKG,
+  URLDEP_LIB,
+]);
 /** 容器里解析不了的主机名：npm 一旦去连它就必然失败 —— 这正是我们要的 */
 const UNREACHABLE = `https://tle-nodes-verify.invalid/${URLDEP_LIB}-1.0.0.tgz`;
 
@@ -81,6 +122,10 @@ const check = (name, ok, detail = '') => {
   results.push({ name, ok });
   console.log(`  ${ok ? '✓' : '✗'} ${name}${detail ? '  — ' + detail : ''}`);
 };
+const requireCheck = (name, ok, detail = '') => {
+  check(name, ok, detail);
+  if (!ok) throw new Error(`前置条件失败：${name}${detail ? `（${detail}）` : ''}`);
+};
 const cataloguesFromSettings = (settings) => {
   const match = /^\s*catalogues:\s*(\[[^\r\n]*\])/m.exec(settings);
   if (!match) return undefined;
@@ -89,6 +134,121 @@ const cataloguesFromSettings = (settings) => {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const containerState = async (id) =>
   raw.getContainer(containerName(id)).inspect().then((i) => i.State.Status).catch(() => 'missing');
+
+const allocatePort = () => new Promise((resolvePort, reject) => {
+  const listener = createTcpServer();
+  listener.once('error', reject);
+  listener.listen(0, '127.0.0.1', () => {
+    const address = listener.address();
+    if (!address || typeof address === 'string') {
+      listener.close();
+      reject(new Error('无法分配验证端口'));
+      return;
+    }
+    listener.close((error) => error ? reject(error) : resolvePort(address.port));
+  });
+});
+
+const sidecarLabels = (role) => ({
+  [VERIFY_RUN_LABEL]: RUN_ID,
+  [VERIFY_ROLE_LABEL]: role,
+});
+
+const containerOwnership = (name) => name === containerName(ID)
+  ? { [MANAGED_LABEL]: 'true', [INSTANCE_LABEL]: ID }
+  : name === BRIDGE_IN ? sidecarLabels('bridge-in') : sidecarLabels('bridge-out');
+
+const exactContainer = async (name) => {
+  const info = await raw.getContainer(name).inspect().catch((error) => {
+    if (error?.statusCode === 404) return undefined;
+    throw error;
+  });
+  if (!info) return undefined;
+  const expected = containerOwnership(name);
+  const labels = info.Config?.Labels ?? {};
+  if (Object.entries(expected).some(([key, value]) => labels[key] !== value)) {
+    throw new Error(`拒绝操作归属不匹配的容器 ${name}`);
+  }
+  return { id: info.Id, name };
+};
+
+const exactNetwork = async () => {
+  const info = await raw.getNetwork(NETWORK_NAME).inspect().catch((error) => {
+    if (error?.statusCode === 404) return undefined;
+    throw error;
+  });
+  if (!info) return undefined;
+  if (
+    info.Name !== NETWORK_NAME
+    || info.Labels?.[MANAGED_LABEL] !== 'true'
+    || info.Labels?.[INSTANCE_LABEL] !== ID
+  ) throw new Error(`拒绝操作归属不匹配的网络 ${NETWORK_NAME}`);
+  return { id: info.Id, name: info.Name };
+};
+
+async function createOwnedSidecar(options, role) {
+  const container = await raw.createContainer({
+    ...options,
+    Labels: sidecarLabels(role),
+  });
+  const info = await container.inspect();
+  const expectedName = role === 'bridge-in' ? BRIDGE_IN : BRIDGE_OUT;
+  if (info.Name !== `/${expectedName}` || info.Id !== container.id) {
+    throw new Error(`边车身份不一致：${expectedName}`);
+  }
+  const labels = info.Config?.Labels ?? {};
+  if (Object.entries(sidecarLabels(role)).some(([key, value]) => labels[key] !== value)) {
+    throw new Error(`边车归属标签不一致：${expectedName}`);
+  }
+  await raw.getContainer(info.Id).start();
+}
+
+async function createBootstrapBridges(docker) {
+  const network = await exactNetwork();
+  const instance = await exactContainer(containerName(ID));
+  if (!network || !instance) throw new Error('bootstrap 容器或实例网络尚未形成');
+
+  await createOwnedSidecar({
+    name: BRIDGE_IN,
+    Image: 'alpine/socat',
+    Cmd: [`TCP-LISTEN:${NR_PORT},fork,reuseaddr`, `TCP:${containerName(ID)}:1880`],
+    ExposedPorts: { [`${NR_PORT}/tcp`]: {} },
+    HostConfig: {
+      NetworkMode: docker.instanceNetwork(ID),
+      PortBindings: { [`${NR_PORT}/tcp`]: [{ HostIp: '127.0.0.1', HostPort: String(NR_PORT) }] },
+    },
+  }, 'bridge-in');
+  await createOwnedSidecar({
+    name: BRIDGE_OUT,
+    Image: 'alpine/socat',
+    Cmd: [`TCP-LISTEN:${REG_PORT},fork,reuseaddr`, `TCP:host.docker.internal:${PORT}`],
+    HostConfig: {
+      NetworkMode: docker.instanceNetwork(ID),
+      ExtraHosts: ['host.docker.internal:host-gateway'],
+    },
+  }, 'bridge-out');
+}
+
+function cleanupGenericFixtures(store) {
+  for (const name of GENERIC_FIXTURE_PACKAGES) {
+    for (const version of store.versions(name)) store.remove(name, version);
+  }
+}
+
+async function assertTargetsAbsent() {
+  for (const name of [BRIDGE_IN, BRIDGE_OUT, containerName(ID)]) {
+    const existing = await raw.getContainer(name).inspect().catch((error) => {
+      if (error?.statusCode === 404) return undefined;
+      throw error;
+    });
+    if (existing) throw new Error(`随机验证容器名已存在，拒绝启动：${name}`);
+  }
+  const network = await raw.getNetwork(NETWORK_NAME).inspect().catch((error) => {
+    if (error?.statusCode === 404) return undefined;
+    throw error;
+  });
+  if (network) throw new Error(`随机验证网络名已存在，拒绝启动：${NETWORK_NAME}`);
+}
 
 /** 造一个能被 Node-RED 真正加载起来的最小节点包 */
 function fixture(name, version = '1.0.0', deps = undefined) {
@@ -161,11 +321,31 @@ async function execInContainer(id, cmd) {
 const catInContainer = (id, file) => execInContainer(id, ['cat', file]);
 
 async function cleanup() {
-  for (const n of [`${BRIDGE_IN}-${ID}`, BRIDGE_OUT, containerName(ID)]) {
-    await raw.getContainer(n).remove({ force: true }).catch(() => {});
+  const failures = [];
+  for (const name of [BRIDGE_IN, BRIDGE_OUT, containerName(ID)]) {
+    try {
+      const owned = await exactContainer(name);
+      if (owned) await raw.getContainer(owned.id).remove({ force: true });
+    } catch (error) {
+      failures.push(error.message);
+    }
   }
-  await raw.getNetwork(`${NET}-${ID}`).remove().catch(() => {});
+  try {
+    const owned = await exactNetwork();
+    if (owned) await raw.getNetwork(owned.id).remove();
+  } catch (error) {
+    failures.push(error.message);
+  }
   await resetDataDir(ID);
+  for (const name of [BRIDGE_IN, BRIDGE_OUT, containerName(ID)]) {
+    const residual = await raw.getContainer(name).inspect().then(() => true).catch(() => false);
+    if (residual) failures.push(`容器残留 ${name}`);
+  }
+  const networkResidual = await raw.getNetwork(NETWORK_NAME).inspect()
+    .then(() => true).catch(() => false);
+  if (networkResidual) failures.push(`网络残留 ${NETWORK_NAME}`);
+  if (await dataDirExists(ID)) failures.push(`实例数据残留 ${ID}`);
+  return failures;
 }
 
 /**
@@ -207,8 +387,14 @@ function startFakeUpstream(body) {
 
 let server;
 let upstreamServer;
+let nodeStore;
+let protectedDigests;
 async function main() {
-  await cleanup();
+  [PORT, NR_PORT, UPSTREAM_PORT] = await Promise.all([
+    allocatePort(), allocatePort(), allocatePort(),
+  ]);
+  await assertTargetsAbsent();
+  await resetDataDir(ID);
   await ensureRoot();
 
   const dataDir = `${TEST_EDGE_ROOT}/manager`;
@@ -218,12 +404,36 @@ async function main() {
   const auth = new AuthService(db);
   auth.ensureInitialUser('admin', ADMIN_PW);
 
-  // 私有源库放在临时目录，与生产的 <dataDir>/npm 同构
-  const store = new NodeStore(`${dataDir}/npm-verify`);
-  for (const m of store.modules()) {
-    for (const v of store.versions(m)) store.remove(m, v);
-  }
+  // 复用真实 <dataDir>/npm；只清本脚本的普通夹具，固定 Edge/common 根绝不删改。
+  const store = new NodeStore(`${dataDir}/npm`);
+  nodeStore = store;
+  cleanupGenericFixtures(store);
   const catalog = new NodeCatalog(db);
+  const platformNodeServices = assemblePlatformNodeServices({ store, catalog });
+  const trusted = platformNodeServices.platformPackages.verifyForInstall();
+  const trustedCommon = platformNodeServices.platformPackages.snapshotForRegistry(
+    PLATFORM_COMMON_PACKAGE.name,
+    PLATFORM_COMMON_PACKAGE.version,
+  );
+  if (!trustedCommon) throw new Error('固定 common 信任根不可用');
+  protectedDigests = new Map([
+    [PLATFORM_NODE_PACKAGE.name, createHash('sha256').update(trusted.buffer).digest('hex')],
+    [PLATFORM_COMMON_PACKAGE.name, createHash('sha256').update(trustedCommon.buffer).digest('hex')],
+  ]);
+  requireCheck('固定 Edge/common 信任根存在且完整性匹配',
+    trusted.meta.name === PLATFORM_NODE_PACKAGE.name
+      && trusted.meta.version === PLATFORM_NODE_PACKAGE.version
+      && trusted.meta.integrity === PLATFORM_NODE_PACKAGE.integrity
+      && trustedCommon.meta.name === PLATFORM_COMMON_PACKAGE.name
+      && trustedCommon.meta.version === PLATFORM_COMMON_PACKAGE.version
+      && trustedCommon.meta.integrity === PLATFORM_COMMON_PACKAGE.integrity);
+  requireCheck('固定 Edge 被精确批准且 common 从不单独批准',
+    catalog.get(PLATFORM_NODE_PACKAGE.name)?.version === PLATFORM_NODE_PACKAGE.version
+      && catalog.get(PLATFORM_NODE_PACKAGE.name)?.note === PLATFORM_APPROVAL_NOTE
+      && catalog.get(PLATFORM_COMMON_PACKAGE.name) === undefined);
+  requireCheck('Edge 精确依赖 common，common 不是 Node-RED 节点包',
+    trusted.meta.dependencies[PLATFORM_COMMON_PACKAGE.name] === PLATFORM_COMMON_PACKAGE.version
+      && trustedCommon.meta.hasNodeRedMetadata === false);
   let paletteMode = 'allowlist';
 
   const docker = new DockerClient({
@@ -232,15 +442,79 @@ async function main() {
     instanceDataRoot: TEST_DATA_ROOT, timezone: 'Asia/Shanghai',
     // 实例里的 npm 通过出向边车访问宿主上的 Manager
     npmRegistry: `http://${BRIDGE_OUT}:${REG_PORT}/npm/`,
+    managerUrl: `http://${BRIDGE_OUT}:${REG_PORT}`,
   });
+  let bootstrapBridgesReady = false;
+  const platformOperation = assemblePlatformOperationBarrier({
+    barrier: {
+      async reach(event) {
+        if (
+          event.instanceId === ID
+          && event.phase === 'preparing'
+          && event.boundary === 'after-container-create'
+        ) {
+          await createBootstrapBridges(docker);
+          bootstrapBridgesReady = true;
+        }
+      },
+    },
+  });
+  const operationGate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repo));
+  const proxySessions = new ProxySessionRegistry();
+  const instanceAdmin = assembleInstanceAdminRuntime({
+    repo,
+    upstreamFor: () => `http://127.0.0.1:${NR_PORT}`,
+  });
+  let migrationService;
+  const pendingStartCompletion = {
+    completePendingStartUnderLease(instanceId, lease, actor) {
+      if (!migrationService) throw new Error('迁移服务尚未装配');
+      return migrationService.completePendingStartUnderLease(instanceId, lease, actor);
+    },
+  };
   const service = new InstanceService({
-    db, repo, docker, basePath: '', portRange: { min: 30000, max: 30999 },
+    ...instanceAdmin.instanceServiceDeps,
+    ...platformOperation.instanceServiceDeps,
+    db, repo, docker, gate: operationGate,
+    instanceDataRoot: TEST_DATA_ROOT,
+    platformPackages: platformNodeServices.platformPackages,
+    pendingStartCompletion,
+    basePath: '', portRange: { min: 30000, max: 30999 },
     allowedImageTags: [TAG],
+    probeHostPorts: false,
+    // macOS 沙箱可能拒绝 uv_uptime；这里只隔离宿主读数，不替代 Docker/npm/Admin 行为。
+    readHostStats: async () => ({
+      cpuCount: 4,
+      loadPercent: 1,
+      memTotalMb: 4096,
+      memUsedMb: 512,
+      memPercent: 12.5,
+      memReliable: true,
+      diskTotalGb: 100,
+      diskUsedGb: 10,
+      diskPercent: 10,
+      uptimeSec: 100,
+    }),
     palettePolicy: () => buildPolicy(catalog.approved(), {
       allowInstall: true, catalogueUrl: '/npm/-/catalogue.json',
       publicCatalogueUrl: PUBLIC_CATALOGUE_URL,
       mode: paletteMode,
     }),
+  });
+  migrationService = new PlatformMigrationService({
+    repo,
+    gate: operationGate,
+    proxySessions,
+    docker,
+    adminRuntime: instanceAdmin.adminRuntime,
+    admin: new NodeRedPlatformMigrationAdminActions(instanceAdmin.adminRuntime),
+    platformPackages: platformNodeServices.platformPackages,
+    checkpoint: new MigrationCheckpointStore(TEST_DATA_ROOT),
+    settings: service,
+    repair: service,
+    bootstrapRecovery: service,
+    ...platformOperation.migrationServiceDeps,
+    instanceDataRoot: TEST_DATA_ROOT,
   });
   const config = {
     externalUrl: `http://127.0.0.1:${PORT}`, basePath: '', cookieSecure: false,
@@ -251,7 +525,12 @@ async function main() {
 
   upstreamServer = await startFakeUpstream(fixture(UPSTREAM_PKG));
   const app = buildServer({
+    ...instanceAdmin.serverDeps,
+    ...platformNodeServices.serverDeps,
     config, db, auth, repo, service,
+    operationGate,
+    migrationService,
+    proxySessions,
     upstreamFor: () => `http://127.0.0.1:${NR_PORT}`,
     nodeStore: store, nodeCatalog: catalog,
     npmRegistryUrl: `http://${BRIDGE_OUT}:${REG_PORT}/npm/`,
@@ -269,7 +548,7 @@ async function main() {
   const H = (s) => ({ cookie: s.cookie, 'content-type': 'application/json', 'x-csrf-token': s.csrf });
 
   const admin = await adminSession(B, ADMIN_PW);
-  check('管理员登录成功', Boolean(admin.csrf));
+  requireCheck('管理员登录成功', Boolean(admin.csrf));
 
   // ── 1. 往私有源导入两个夹具包 ─────────────────────
   for (const name of [OK_PKG, DENIED_PKG]) {
@@ -279,14 +558,21 @@ async function main() {
       body: fixture(name),
     });
     const body = await res.json().catch(() => ({}));
-    check(`导入节点包 ${name}`, res.status === 200 && body.package?.name === name,
+    requireCheck(`导入节点包 ${name}`, res.status === 200 && body.package?.name === name,
       res.status === 200 ? '' : `HTTP ${res.status} ${JSON.stringify(body).slice(0, 140)}`);
   }
 
   const listed = await fetch(`${B}/api/nodes/store`, { headers: { cookie: admin.cookie } })
     .then((r) => r.json());
-  check('包库列出两个包且无依赖缺口', listed.packages?.length === 2
-    && listed.packages.every((p) => p.missingDeps.length === 0 && p.isNodeRedNode));
+  const listedGeneric = (listed.packages ?? [])
+    .filter((item) => [OK_PKG, DENIED_PKG].includes(item.module));
+  requireCheck('包库精确列出两个当前夹具且无依赖缺口', listedGeneric.length === 2
+    && listedGeneric.every((p) => p.missingDeps.length === 0 && p.isNodeRedNode));
+  check('包库保留固定 Edge/common 根且版本精确',
+    listed.packages?.some((item) => item.module === PLATFORM_NODE_PACKAGE.name
+      && item.versions?.includes(PLATFORM_NODE_PACKAGE.version))
+    && listed.packages?.some((item) => item.module === PLATFORM_COMMON_PACKAGE.name
+      && item.versions?.includes(PLATFORM_COMMON_PACKAGE.version)));
 
   // ── 1b. URL 依赖夹具：先只导节点包，故意不导它的依赖 ──
   const importRaw = async (bytes) => {
@@ -335,8 +621,12 @@ async function main() {
   check('Community catalogue 使用统一英文命名',
     cat.name === 'ThingLinks Edge Community catalogue',
     `实际 ${JSON.stringify(cat.name)}`);
-  check('私有 catalogue 只列已批准的节点包',
-    catIds.length === 2 && catIds.includes(OK_PKG) && catIds.includes(URLDEP_PKG),
+  check('私有 catalogue 只列普通批准包与固定 Edge，永不列 common',
+    catIds.length === 3
+      && catIds.includes(OK_PKG)
+      && catIds.includes(URLDEP_PKG)
+      && catIds.includes(PLATFORM_NODE_PACKAGE.name)
+      && !catIds.includes(PLATFORM_COMMON_PACKAGE.name),
     `实际 ${JSON.stringify(catIds)}`);
 
   // ── 3. 起实例（settings 由当前批准清单生成）─────────
@@ -344,20 +634,30 @@ async function main() {
     method: 'POST', headers: H(admin),
     body: JSON.stringify({ id: ID, name: ID, imageTag: TAG, memoryMb: 512, cpus: 0.5, ports: [] }),
   });
-  check('创建实例', created.status === 201,
-    created.status === 201 ? '' : `HTTP ${created.status} ${JSON.stringify(await created.json()).slice(0, 200)}`);
+  const createdBody = await created.json().catch(() => ({}));
+  requireCheck('创建实例完成真实 npm bootstrap', created.status === 201,
+    created.status === 201 ? '' : `HTTP ${created.status} ${JSON.stringify(createdBody).slice(0, 200)}`);
+  requireCheck('bootstrap 在启动前建立双向桥接', bootstrapBridgesReady);
+  requireCheck('新实例容器与网络归属精确且可按不可变 ID 解析',
+    Boolean(await exactContainer(containerName(ID))) && Boolean(await exactNetwork()));
 
   let state = 'missing';
   for (let i = 0; i < 40 && state !== 'running'; i++) { await sleep(1000); state = await containerState(ID); }
-  check('实例容器在运行', state === 'running', `state=${state}`);
+  requireCheck('实例容器在运行', state === 'running', `state=${state}`);
 
   // 容器里的实际配置 —— 不看生成函数的输出，看落到盘上的那一份
   const settings = await catInContainer(ID, '/data/settings.js');
   check('实例 settings.js 里 denyList 为 ["*"]（为空会让白名单校验整段跳过）',
     /denyList:\s*\["\*"\]/.test(settings));
-  // 两个已批准的包都要在，别的都不能在。catalog 按 module 排序，所以顺序是确定的
-  check('实例 settings.js 里 allowList 只含已批准的包',
-    settings.includes(`allowList: ${JSON.stringify([OK_PKG, URLDEP_PKG].sort())}`),
+  // 固定 Edge 与两个普通批准包都要在；common 只是依赖，绝不进 allowList。
+  const expectedAllowList = [
+    `${PLATFORM_NODE_PACKAGE.name}@${PLATFORM_NODE_PACKAGE.version}`,
+    OK_PKG,
+    URLDEP_PKG,
+  ].sort();
+  check('实例 settings.js 里 allowList 精确含固定 Edge 与普通批准包，不含 common',
+    settings.includes(`allowList: ${JSON.stringify(expectedAllowList)}`)
+      && !settings.includes(PLATFORM_COMMON_PACKAGE.name),
     /allowList:.*/.exec(settings)?.[0]?.slice(0, 120) ?? '没找到 allowList');
   check('实例 settings.js 里 allowUpload:false（老写法 editorTheme.palette.upload 已拦不住）',
     /allowUpload:\s*false/.test(settings));
@@ -369,27 +669,8 @@ async function main() {
     env.some((e) => e === `NPM_CONFIG_REGISTRY=http://${BRIDGE_OUT}:${REG_PORT}/npm/`),
     env.filter((e) => e.startsWith('NPM_CONFIG')).join(' ') || '一个都没有');
 
-  // ── 4. 两个方向的边车 ─────────────────────────────
-  await raw.createContainer({
-    name: `${BRIDGE_IN}-${ID}`, Image: 'alpine/socat',
-    Cmd: [`TCP-LISTEN:${NR_PORT},fork,reuseaddr`, `TCP:${containerName(ID)}:1880`],
-    ExposedPorts: { [`${NR_PORT}/tcp`]: {} },
-    HostConfig: {
-      NetworkMode: docker.instanceNetwork(ID),
-      PortBindings: { [`${NR_PORT}/tcp`]: [{ HostIp: '127.0.0.1', HostPort: String(NR_PORT) }] },
-    },
-  }).then((c) => c.start());
-
-  await raw.createContainer({
-    name: BRIDGE_OUT, Image: 'alpine/socat',
-    Cmd: [`TCP-LISTEN:${REG_PORT},fork,reuseaddr`, `TCP:host.docker.internal:${PORT}`],
-    HostConfig: {
-      NetworkMode: docker.instanceNetwork(ID),
-      // Linux 上 host.docker.internal 要显式给；Docker Desktop 本来就有
-      ExtraHosts: ['host.docker.internal:host-gateway'],
-    },
-  }).then((c) => c.start());
-  await sleep(2000);
+  // ── 4. 双向边车已在 bootstrap 的 after-container-create 边界启动 ──
+  await sleep(1000);
 
   const ready = async () => {
     for (let i = 0; i < 60; i++) {
@@ -555,8 +836,16 @@ async function main() {
   const inv = await fetch(`${B}/api/nodes/inventory/${ID}`, { headers: { cookie: admin.cookie } })
     .then((r) => r.json());
   const okItem = inv.modules?.find((m) => m.module === OK_PKG);
+  const platformItem = inv.modules?.find((m) => m.module === PLATFORM_NODE_PACKAGE.name);
   check('台账看得到刚装上的节点，且判为合规', okItem?.compliance === 'approved',
     `实际 ${JSON.stringify(okItem ?? null)}`);
+  check('固定 Edge 在真实 bootstrap 后精确加载且判为 platform',
+    platformItem?.compliance === 'platform'
+      && platformItem.version === PLATFORM_NODE_PACKAGE.version
+      && platformItem.health === 'healthy',
+    `实际 ${JSON.stringify(platformItem ?? null).slice(0, 180)}`);
+  check('common 只作为 Edge 依赖存在，不进入 Node-RED 台账',
+    !inv.modules?.some((m) => m.module === PLATFORM_COMMON_PACKAGE.name));
   check('台账把镜像自带的节点判为 builtin',
     inv.modules?.find((m) => m.module === 'node-red')?.compliance === 'builtin');
   check('台账此刻没有未批准项', inv.unapproved === 0, `unapproved=${inv.unapproved}`);
@@ -572,7 +861,7 @@ async function main() {
     && inv2.modules.find((m) => m.module === OK_PKG)?.compliance === 'unapproved',
     `unapproved=${inv2.unapproved}`);
 
-  // 另一个也撤掉，好让下面那条「白名单已清空」是个确定的断言
+  // 另一个也撤掉；UPSTREAM_PKG 仍获批准，固定 Edge 也不可撤销。
   await fetch(`${B}/api/nodes/catalog/${encodeURIComponent(URLDEP_PKG)}`, {
     method: 'DELETE', headers: H(admin),
   });
@@ -586,8 +875,15 @@ async function main() {
 
   await sleep(3000);
   const settings2 = await catInContainer(ID, '/data/settings.js');
-  check('下发后实例白名单已清空（撤销真的传导到了实例）',
-    settings2.includes('allowList: []') && /denyList:\s*\["\*"\]/.test(settings2));
+  check('撤销两个普通批准后白名单精确保留固定 Edge 与仍批准的回源包',
+    settings2.includes(`allowList: ${JSON.stringify([
+      `${PLATFORM_NODE_PACKAGE.name}@${PLATFORM_NODE_PACKAGE.version}`,
+      UPSTREAM_PKG,
+    ].sort())}`)
+      && !settings2.includes(OK_PKG)
+      && !settings2.includes(URLDEP_PKG)
+      && !settings2.includes(PLATFORM_COMMON_PACKAGE.name)
+      && /denyList:\s*\["\*"\]/.test(settings2));
 
   // ── 8. open：公共目录只在显式放开时出现，下载仍由私有 registry 完成 ──
   paletteMode = 'open';
@@ -652,7 +948,24 @@ main()
   .finally(async () => {
     await server?.close().catch(() => {});
     upstreamServer?.close();
-    await cleanup();
+    if (nodeStore) {
+      try {
+        cleanupGenericFixtures(nodeStore);
+        check('只清理五个精确命名的普通夹具包',
+          GENERIC_FIXTURE_PACKAGES.every((name) => nodeStore.versions(name).length === 0));
+        check('固定 Edge/common 信任根字节在验证前后保持不变',
+          [PLATFORM_NODE_PACKAGE, PLATFORM_COMMON_PACKAGE].every((pin) => {
+            const bytes = nodeStore.tarball(pin.name, pin.version);
+            return bytes
+              && createHash('sha256').update(bytes).digest('hex') === protectedDigests?.get(pin.name);
+          }));
+      } catch (error) {
+        check('普通夹具清理与固定信任根复核', false, error.message);
+      }
+    }
+    const cleanupFailures = await cleanup();
+    check('随机资源按不可变 ID 与归属标签清理干净', cleanupFailures.length === 0,
+      cleanupFailures.join(' | '));
     const bad = results.filter((r) => !r.ok);
     console.log(`\n节点管理验证：${results.length - bad.length}/${results.length} 通过`);
     if (bad.length > 0) {

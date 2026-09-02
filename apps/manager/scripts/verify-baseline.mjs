@@ -192,8 +192,13 @@ async function main() {
   check(G3, '匿名的私有源只有 GET，没有任何写入路径',
         registryVerbs.length > 0 && registryVerbs.every((v) => v === 'get'),
         registryVerbs.join(' '));
-  check(G3, '私有源的节点目录只列已批准的包（配置被改坏时源里也没别的可给）',
-        /approved:\s*catalog\.names\(\)/.test(registrySrc));
+  check(G3, '私有源目录只列普通批准包与经固定信任重验的 Edge，永不列 common',
+        /const approved = catalog\.names\(\)/.test(registrySrc)
+        && /filter\(\(name\) => !isPlatformPackageName\(name\)\)/.test(registrySrc)
+        && /approved:\s*genericApproved/.test(registrySrc)
+        && /edgeApproval\?\.version === PLATFORM_NODE_PACKAGE\.version/.test(registrySrc)
+        && /platformPackages\.snapshotForRegistry\(/.test(registrySrc)
+        && /common 永不出现在 palette/.test(registrySrc));
 
   check(G3, '角色表未知角色按最小权限处理，不按 admin 兜底',
         can('nobody', 'instance:list') === false && can('', 'user:manage') === false);
