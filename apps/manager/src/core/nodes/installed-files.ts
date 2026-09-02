@@ -73,6 +73,15 @@ function expectExact(value: unknown, expected: string, label: string): void {
   }
 }
 
+function expectRootSelector(value: unknown, expected: string, label: string): void {
+  // Node-RED 5.0.4 persists `~<version>` at the project root. The protected
+  // Manager registry exposes no other version for this fixed package name;
+  // exact lock package entries and SRI checks below still prove installed bytes.
+  if (value !== expected && value !== `~${expected}`) {
+    throw new InstalledPlatformFilesError(`${label} selector is not accepted`);
+  }
+}
+
 export async function verifyInstalledPlatformFiles(
   options: VerifyInstalledPlatformFilesOptions,
 ): Promise<void> {
@@ -104,7 +113,7 @@ export async function verifyInstalledPlatformFiles(
     instance, join(instance, commonRelative, 'package.json'), 'common manifest', options.readFile,
   );
 
-  expectExact(
+  expectRootSelector(
     dependencies(rootPackage, 'root package')[PLATFORM_NODE_PACKAGE.name],
     PLATFORM_NODE_PACKAGE.version,
     'root package Edge',
@@ -112,7 +121,7 @@ export async function verifyInstalledPlatformFiles(
 
   const packages = record(lock['packages'], 'root lock packages');
   const lockRoot = record(packages[''], 'root lock project');
-  expectExact(
+  expectRootSelector(
     dependencies(lockRoot, 'root lock project')[PLATFORM_NODE_PACKAGE.name],
     PLATFORM_NODE_PACKAGE.version,
     'root lock Edge',

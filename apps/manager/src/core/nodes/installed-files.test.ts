@@ -85,7 +85,18 @@ test('valid host package manifests and lock evidence pass without Docker exec', 
   await assert.doesNotReject(() => verify(fixture.instanceDataRoot));
 });
 
-test('root package and lock must both pin the exact Edge version', async () => {
+test('Node-RED canonical tilde selectors pass with exact installed artifact evidence', async () => {
+  const fixture = validFixture();
+  fixture.rootPackage.dependencies[PLATFORM_NODE_PACKAGE.name] = '~0.0.1';
+  const packages = fixture.lock.packages as Record<string, any>;
+  packages[''].dependencies[PLATFORM_NODE_PACKAGE.name] = '~0.0.1';
+  writeJson(fixture.paths.root, fixture.rootPackage);
+  writeJson(fixture.paths.lock, fixture.lock);
+
+  await assert.doesNotReject(() => verify(fixture.instanceDataRoot));
+});
+
+test('root package and lock must both declare an accepted Edge selector', async () => {
   const missing = validFixture();
   writeJson(missing.paths.root, { ...missing.rootPackage, dependencies: {} });
   await assert.rejects(() => verify(missing.instanceDataRoot), /root package.*Edge|Edge.*root package/i);
@@ -95,6 +106,45 @@ test('root package and lock must both pin the exact Edge version', async () => {
   packages[''].dependencies[PLATFORM_NODE_PACKAGE.name] = '9.9.9';
   writeJson(wrong.paths.lock, wrong.lock);
   await assert.rejects(() => verify(wrong.instanceDataRoot), /lock.*Edge|Edge.*lock/i);
+});
+
+test('root package and lock-project reject non-canonical Edge selectors', async () => {
+  const rejectedSelectors = [
+    '^0.0.1',
+    '>=0.0.1',
+    'latest',
+    '*',
+    'workspace:*',
+    'file:../edge-nodes',
+    'https://registry.example/thinglinks-edge-nodes-0.0.1.tgz',
+    '~0.0.2',
+    '0.0.2',
+    ' 0.0.1',
+    '0.0.1 ',
+    '\t~0.0.1',
+    '~0.0.1\n',
+  ];
+
+  for (const selector of rejectedSelectors) {
+    const rootPackage = validFixture();
+    rootPackage.rootPackage.dependencies[PLATFORM_NODE_PACKAGE.name] = selector;
+    writeJson(rootPackage.paths.root, rootPackage.rootPackage);
+    await assert.rejects(
+      () => verify(rootPackage.instanceDataRoot),
+      /root package.*Edge|Edge.*root package/i,
+      `root package accepted ${JSON.stringify(selector)}`,
+    );
+
+    const lockProject = validFixture();
+    const packages = lockProject.lock.packages as Record<string, any>;
+    packages[''].dependencies[PLATFORM_NODE_PACKAGE.name] = selector;
+    writeJson(lockProject.paths.lock, lockProject.lock);
+    await assert.rejects(
+      () => verify(lockProject.instanceDataRoot),
+      /lock.*Edge|Edge.*lock/i,
+      `root lock project accepted ${JSON.stringify(selector)}`,
+    );
+  }
 });
 
 test('Edge manifest requires exact common dependency and exactly three registrations', async () => {
