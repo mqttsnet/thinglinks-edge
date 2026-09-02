@@ -15,8 +15,9 @@ import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { networkInterfaces } from 'node:os';
 import { execFile } from 'node:child_process';
-import { access, chmod, lstat, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { existsSync, realpathSync } from 'node:fs';
+import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { basename, dirname, join } from 'node:path';
 import Docker from 'dockerode';
 import bcrypt from 'bcryptjs';
 
@@ -46,7 +47,6 @@ import {
 } from '../dist/index.js';
 import { runPreflight } from '../dist/core/preflight/run.js';
 import { proxyEnvFor } from '../dist/core/proxy.js';
-import { TEST_DATA_ROOT, ensureRoot } from './_data-root.mjs';
 
 const RUN_LABEL = 'com.mqttsnet.thinglinks-edge.verifier-run';
 const ROLE_LABEL = 'com.mqttsnet.thinglinks-edge.verifier-role';
@@ -59,9 +59,13 @@ const INSTANCE_NET = `${NET}-${ID}`;
 const PROXY_NET = `${RUN_ID}-proxy-net`;
 const PROXY_BOX = `${RUN_ID}-proxy`;
 const OUTBOUND_BOX = `${RUN_ID}-outbound`;
-const RUN_DATA_ROOT = `${TEST_DATA_ROOT}/${RUN_ID}`;
-const DATA_OWNER = `${RUN_DATA_ROOT}/.verifier-owner`;
+const CANONICAL_TMP_PARENT = realpathSync(existsSync('/private/tmp') ? '/private/tmp' : '/tmp');
+assert.ok(CANONICAL_TMP_PARENT === '/private/tmp' || CANONICAL_TMP_PARENT === '/tmp');
+let RUN_DATA_ROOT;
+let DATA_OWNER;
 const TAG = '5.0.4-24-minimal';
+const INSTANCE_PASSWORD = `Aa1!${randomBytes(20).toString('base64url')}`;
+const INSTANCE_CREDENTIAL_SECRET = randomBytes(24).toString('base64url');
 /*
  * 假代理源码。**必须实现 CONNECT** ——
  * Node 的内置代理（undici ProxyAgent）即使目标是 http:// 也走 CONNECT 隧道，
@@ -93,6 +97,10 @@ const results = [];
 const check = (name, ok, detail = '') => {
   results.push({ name, ok });
   console.log(`  ${ok ? '✓' : '✗'} ${name}${detail ? '  — ' + detail : ''}`);
+};
+const notApplicable = (name, detail) => {
+  results.push({ name, ok: true, notApplicable: true });
+  console.log(`  − N/A ${name}  — ${detail}`);
 };
 
 const raw = new Docker();
@@ -131,13 +139,29 @@ async function protectedSnapshot() {
   return snapshots;
 }
 
-async function removeExactContainer(name, verifyOwnership) {
-  const expectedId = ownedContainerIds.get(name);
-  const named = await raw.getContainer(expectedId ?? name).inspect().catch((error) => {
+async function inspectOrAbsent(resource) {
+  try {
+    return await resource.inspect();
+  } catch (error) {
     if (error?.statusCode === 404) return undefined;
     throw error;
-  });
+  }
+}
+
+async function requireDockerAbsent(resource, label) {
+  const existing = await inspectOrAbsent(resource);
+  assert.equal(existing, undefined, `${label} still exists`);
+}
+
+async function removeExactContainer(name, verifyOwnership) {
+  const expectedId = ownedContainerIds.get(name);
+  const named = await inspectOrAbsent(raw.getContainer(expectedId ?? name));
   if (!named) {
+    if (expectedId) {
+      const replacement = await inspectOrAbsent(raw.getContainer(name));
+      assert.equal(replacement, undefined,
+        `recorded container ${expectedId} disappeared but ${name} was replaced`);
+    }
     ownedContainerIds.delete(name);
     return;
   }
@@ -149,17 +173,20 @@ async function removeExactContainer(name, verifyOwnership) {
   assert.equal(exact.Id, id);
   verifyOwnership(exact);
   await raw.getContainer(id).remove({ force: true });
-  assert.equal(await raw.getContainer(id).inspect().then(() => true).catch(() => false), false);
+  await requireDockerAbsent(raw.getContainer(id), `container ${id}`);
+  await requireDockerAbsent(raw.getContainer(name), `container name ${name}`);
   ownedContainerIds.delete(name);
 }
 
 async function removeExactNetwork(name, verifyOwnership) {
   const expectedId = ownedNetworkIds.get(name);
-  const named = await raw.getNetwork(expectedId ?? name).inspect().catch((error) => {
-    if (error?.statusCode === 404) return undefined;
-    throw error;
-  });
+  const named = await inspectOrAbsent(raw.getNetwork(expectedId ?? name));
   if (!named) {
+    if (expectedId) {
+      const replacement = await inspectOrAbsent(raw.getNetwork(name));
+      assert.equal(replacement, undefined,
+        `recorded network ${expectedId} disappeared but ${name} was replaced`);
+    }
     ownedNetworkIds.delete(name);
     return;
   }
@@ -171,36 +198,119 @@ async function removeExactNetwork(name, verifyOwnership) {
   assert.equal(exact.Id, id);
   verifyOwnership(exact);
   await raw.getNetwork(id).remove();
-  assert.equal(await raw.getNetwork(id).inspect().then(() => true).catch(() => false), false);
+  await requireDockerAbsent(raw.getNetwork(id), `network ${id}`);
+  await requireDockerAbsent(raw.getNetwork(name), `network name ${name}`);
   ownedNetworkIds.delete(name);
 }
 
-function assertRunDataRoot() {
-  const base = resolve(TEST_DATA_ROOT);
-  assert.ok(base.startsWith('/private/tmp/') || base.startsWith('/tmp/'),
-    `refuse non-temporary verifier data root: ${base}`);
-  assert.equal(resolve(RUN_DATA_ROOT), join(base, RUN_ID));
+async function requirePathAbsent(path, label) {
+  try {
+    await lstat(path);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return;
+    throw error;
+  }
+  throw new Error(`${label} still exists`);
+}
+
+async function assertRunDataRoot() {
+  assert.ok(RUN_DATA_ROOT && DATA_OWNER, 'verifier data root is not reserved');
+  const canonical = await realpath(RUN_DATA_ROOT);
+  assert.equal(dirname(canonical), CANONICAL_TMP_PARENT);
+  assert.ok(basename(canonical).startsWith(`${RUN_ID}-`));
+  assert.equal(canonical, RUN_DATA_ROOT);
 }
 
 async function reserveRunDataRoot() {
-  assertRunDataRoot();
-  await mkdir(RUN_DATA_ROOT, { mode: 0o700 });
+  RUN_DATA_ROOT = await mkdtemp(join(CANONICAL_TMP_PARENT, `${RUN_ID}-`));
+  RUN_DATA_ROOT = await realpath(RUN_DATA_ROOT);
+  DATA_OWNER = join(RUN_DATA_ROOT, '.verifier-owner');
+  await assertRunDataRoot();
   await writeFile(DATA_OWNER, RUN_ID, { flag: 'wx', mode: 0o600 });
   // The official Node-RED image runs as uid 1000; this is an isolated verifier root.
   await chmod(RUN_DATA_ROOT, 0o777);
 }
 
 async function removeRunDataRoot() {
-  assertRunDataRoot();
+  if (!RUN_DATA_ROOT) return;
   const stat = await lstat(RUN_DATA_ROOT).catch((error) => {
     if (error?.code === 'ENOENT') return undefined;
     throw error;
   });
-  if (!stat) return;
+  if (!stat) {
+    RUN_DATA_ROOT = undefined;
+    DATA_OWNER = undefined;
+    return;
+  }
+  await assertRunDataRoot();
   assert.ok(stat.isDirectory() && !stat.isSymbolicLink(), 'refuse untrusted verifier data root');
+  const ownerStat = await lstat(DATA_OWNER);
+  assert.ok(ownerStat.isFile() && !ownerStat.isSymbolicLink(), 'refuse untrusted data owner');
   assert.equal(await readFile(DATA_OWNER, 'utf8'), RUN_ID, 'refuse foreign verifier data root');
   await rm(RUN_DATA_ROOT, { recursive: true, force: false });
-  assert.equal(await access(RUN_DATA_ROOT).then(() => true).catch(() => false), false);
+  await requirePathAbsent(RUN_DATA_ROOT, 'verifier data root');
+  RUN_DATA_ROOT = undefined;
+  DATA_OWNER = undefined;
+}
+
+async function scopedContainers() {
+  return raw.listContainers({
+    all: true,
+    filters: { label: [`${RUN_LABEL}=${RUN_ID}`, `${INSTANCE_LABEL}=${ID}`] },
+  });
+}
+
+async function cleanupScopedContainers() {
+  const allowedRoles = new Set(['proxy', 'outbound']);
+  const errors = [];
+  for (const item of await scopedContainers()) {
+    try {
+      const info = await inspectOrAbsent(raw.getContainer(item.Id));
+      if (!info) continue;
+      const labels = info.Config?.Labels ?? {};
+      assert.equal(labels[RUN_LABEL], RUN_ID);
+      assert.equal(labels[INSTANCE_LABEL], ID);
+      assert.ok(allowedRoles.has(labels[ROLE_LABEL]), 'unexpected scoped container role');
+      const name = info.Name.replace(/^\//, '');
+      await raw.getContainer(info.Id).remove({ force: true });
+      await requireDockerAbsent(raw.getContainer(info.Id), `scoped container ${info.Id}`);
+      ownedContainerIds.delete(name);
+    } catch (error) {
+      errors.push(`${item.Id}: ${error.message}`);
+    }
+  }
+  const remaining = await scopedContainers();
+  if (remaining.length > 0) errors.push(`remaining ids: ${remaining.map((item) => item.Id).join(',')}`);
+  if (errors.length > 0) throw new Error(`scoped container cleanup failed: ${errors.join('; ')}`);
+}
+
+async function scopedNetworks() {
+  return raw.listNetworks({
+    filters: { label: [`${RUN_LABEL}=${RUN_ID}`, `${INSTANCE_LABEL}=${ID}`] },
+  });
+}
+
+async function cleanupScopedNetworks() {
+  const allowedRoles = new Set(['proxy-network', 'instance-network']);
+  const errors = [];
+  for (const item of await scopedNetworks()) {
+    try {
+      const info = await inspectOrAbsent(raw.getNetwork(item.Id));
+      if (!info) continue;
+      const labels = info.Labels ?? {};
+      assert.equal(labels[RUN_LABEL], RUN_ID);
+      assert.equal(labels[INSTANCE_LABEL], ID);
+      assert.ok(allowedRoles.has(labels[ROLE_LABEL]), 'unexpected scoped network role');
+      await raw.getNetwork(info.Id).remove();
+      await requireDockerAbsent(raw.getNetwork(info.Id), `scoped network ${info.Id}`);
+      ownedNetworkIds.delete(info.Name);
+    } catch (error) {
+      errors.push(`${item.Id}: ${error.message}`);
+    }
+  }
+  const remaining = await scopedNetworks();
+  if (remaining.length > 0) errors.push(`remaining ids: ${remaining.map((item) => item.Id).join(',')}`);
+  if (errors.length > 0) throw new Error(`scoped network cleanup failed: ${errors.join('; ')}`);
 }
 
 function assembleRuntime({ db, repo, docker, dataRoot, upstreamFor }) {
@@ -266,6 +376,7 @@ async function cleanup() {
   for (const [name, role] of [[OUTBOUND_BOX, 'outbound'], [PROXY_BOX, 'proxy']]) {
     await attempt(`${role} cleanup`, () => removeExactContainer(name, (info) => {
       assert.equal(info.Config?.Labels?.[RUN_LABEL], RUN_ID);
+      assert.equal(info.Config?.Labels?.[INSTANCE_LABEL], ID);
       assert.equal(info.Config?.Labels?.[ROLE_LABEL], role);
     }));
   }
@@ -273,6 +384,7 @@ async function cleanup() {
     assert.equal(info.Config?.Labels?.[MANAGED_LABEL], 'true');
     assert.equal(info.Config?.Labels?.[INSTANCE_LABEL], ID);
   }));
+  await attempt('scoped container cleanup', cleanupScopedContainers);
   await attempt('instance network cleanup', () => removeExactNetwork(INSTANCE_NET, (info) => {
     assert.equal(info.Labels?.[MANAGED_LABEL], 'true');
     assert.equal(info.Labels?.[INSTANCE_LABEL], ID);
@@ -281,8 +393,10 @@ async function cleanup() {
   }));
   await attempt('proxy network cleanup', () => removeExactNetwork(PROXY_NET, (info) => {
     assert.equal(info.Labels?.[RUN_LABEL], RUN_ID);
+    assert.equal(info.Labels?.[INSTANCE_LABEL], ID);
     assert.equal(info.Labels?.[ROLE_LABEL], 'proxy-network');
   }));
+  await attempt('scoped network cleanup', cleanupScopedNetworks);
   await attempt('data cleanup', removeRunDataRoot);
   await attempt('resource ledger', async () => {
     assert.equal(ownedContainerIds.size, 0, 'owned container ids remain');
@@ -327,7 +441,6 @@ const internal = {
 async function main() {
   console.log('\n──── 企业 HTTP 代理出网 · 验证 ────\n');
   protectedBefore = await protectedSnapshot();
-  await ensureRoot();
   await reserveRunDataRoot();
 
   const { srv } = fakeProxy();
@@ -370,10 +483,13 @@ async function main() {
   // 所以验 pass 要用非回环地址 —— 假代理已监听全部网卡
   const lanIp = Object.values(networkInterfaces()).flat()
     .find((i) => i && i.family === 'IPv4' && !i.internal)?.address;
-  const good = await preflightWith(
-    { httpProxy: `http://${lanIp ?? '127.0.0.1'}:${proxyPort}`, httpsProxy: '', noProxy: full });
-  check('代理可达且 NO_PROXY 齐全时通过', lanIp ? good?.status === 'pass' : true,
-        lanIp ? good?.detail?.slice(0, 60) : '本机无非回环地址，跳过');
+  if (lanIp) {
+    const good = await preflightWith(
+      { httpProxy: `http://${lanIp}:${proxyPort}`, httpsProxy: '', noProxy: full });
+    check('代理可达且 NO_PROXY 齐全时通过', good?.status === 'pass', good?.detail?.slice(0, 60));
+  } else {
+    notApplicable('代理可达且 NO_PROXY 齐全时通过', '本机没有可用于该边界的非回环 IPv4 地址');
+  }
 
   const loop = await preflightWith({ httpProxy: proxyUrl, httpsProxy: '', noProxy: full });
   check('回环地址的代理会被点出来（容器里的 127.0.0.1 是容器自己）',
@@ -397,9 +513,9 @@ async function main() {
    *
    * 断言取巧但严密：目标域名 `update.invalid` **不可能解析**，
    * 所以只要响应体里出现假代理返回的版本号，就只能是经代理拿到的。
-   */
+  */
   const image = process.env.MANAGER_IMAGE ?? 'mqttsnet/thinglinks-edge:1.0.1';
-  const hasImage = await raw.getImage(image).inspect().then((i) => i, () => undefined);
+  const hasImage = await inspectOrAbsent(raw.getImage(image));
   if (!hasImage) {
     check(`本机没有 ${image}，镜像内验证无法进行`, false,
           '先 docker compose -f docker-compose.yml -f docker-compose.build.yml build');
@@ -414,25 +530,30 @@ async function main() {
 
     const proxyNetwork = await raw.createNetwork({
       Name: PROXY_NET, Internal: true,
-      Labels: { [RUN_LABEL]: RUN_ID, [ROLE_LABEL]: 'proxy-network' },
+      Labels: {
+        [RUN_LABEL]: RUN_ID, [INSTANCE_LABEL]: ID, [ROLE_LABEL]: 'proxy-network',
+      },
     });
     const proxyNetworkInfo = await proxyNetwork.inspect();
     assert.equal(proxyNetworkInfo.Labels?.[RUN_LABEL], RUN_ID);
+    assert.equal(proxyNetworkInfo.Labels?.[INSTANCE_LABEL], ID);
     ownedNetworkIds.set(PROXY_NET, proxyNetworkInfo.Id);
     await sh('docker', [
       'run', '-d', '--name', PROXY_BOX, '--network', PROXY_NET,
-      '--label', `${RUN_LABEL}=${RUN_ID}`, '--label', `${ROLE_LABEL}=proxy`,
+      '--label', `${RUN_LABEL}=${RUN_ID}`, '--label', `${INSTANCE_LABEL}=${ID}`,
+      '--label', `${ROLE_LABEL}=proxy`,
       '--user', '1000:1000', '--read-only', '--cap-drop', 'ALL',
       '--security-opt', 'no-new-privileges:true', '--tmpfs', '/tmp:rw,noexec,nosuid,size=8m',
       '--entrypoint', 'node', 'node:24.19.0-alpine', '-e', FAKE_PROXY_SRC,
     ]);
     const proxyInfo = await raw.getContainer(PROXY_BOX).inspect();
     assert.equal(proxyInfo.Config?.Labels?.[RUN_LABEL], RUN_ID);
+    assert.equal(proxyInfo.Config?.Labels?.[INSTANCE_LABEL], ID);
     ownedContainerIds.set(PROXY_BOX, proxyInfo.Id);
     // 等它把端口听起来，否则第一次请求会连接被拒
     let proxyReady = false;
     for (let i = 0; i < 40; i += 1) {
-      const logs = await sh('docker', ['logs', PROXY_BOX]).catch(() => '');
+      const logs = await sh('docker', ['logs', PROXY_BOX]);
       if (logs.includes('READY')) { proxyReady = true; break; }
       await new Promise((r) => setTimeout(r, 200));
     }
@@ -440,7 +561,8 @@ async function main() {
 
     const out = await sh('docker', [
       'run', '--name', OUTBOUND_BOX, '--network', PROXY_NET,
-      '--label', `${RUN_LABEL}=${RUN_ID}`, '--label', `${ROLE_LABEL}=outbound`,
+      '--label', `${RUN_LABEL}=${RUN_ID}`, '--label', `${INSTANCE_LABEL}=${ID}`,
+      '--label', `${ROLE_LABEL}=outbound`,
       '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true',
       '--tmpfs', '/tmp:rw,noexec,nosuid,size=8m',
       '-e', `HTTP_PROXY=http://${PROXY_BOX}:8080`,
@@ -454,9 +576,10 @@ async function main() {
     ]);
     const outboundInfo = await raw.getContainer(OUTBOUND_BOX).inspect();
     assert.equal(outboundInfo.Config?.Labels?.[RUN_LABEL], RUN_ID);
+    assert.equal(outboundInfo.Config?.Labels?.[INSTANCE_LABEL], ID);
     ownedContainerIds.set(OUTBOUND_BOX, outboundInfo.Id);
 
-    const proxyLog = await sh('docker', ['logs', PROXY_BOX]).catch(() => '');
+    const proxyLog = await sh('docker', ['logs', PROXY_BOX]);
     check('镜像里的对外请求确实打到了代理，而不是绕过去直连',
           proxyLog.includes('HIT'), `代理日志：${proxyLog.trim().split('\n').pop() ?? '(空)'}`);
     check('经代理拿回来的响应体完好（域名不可解析，能拿到就只能来自代理）',
@@ -471,7 +594,7 @@ async function main() {
   await mkdir(runtimeRoot, { mode: 0o700 });
   const db = openDb(join(runtimeRoot, 'edge.db'));
   runtimeDb = db;
-  const repo = new InstanceRepo(db, deriveKey('proxy', 'salt'));
+  const repo = new InstanceRepo(db, deriveKey(randomBytes(32).toString('base64url'), 'salt'));
   const proxyEnv = proxyEnvFor({ httpProxy: proxyUrl, httpsProxy: '', noProxy: '10.0.0.0/8' }, internal);
   const instanceNetwork = await raw.createNetwork({
     Name: INSTANCE_NET, Driver: 'bridge', Internal: true,
@@ -497,20 +620,20 @@ async function main() {
   repo.create(
     {
       id: ID, name: '代理验证', imageTag: TAG, memLimit: 256, cpuLimit: 0.5,
-      adminRoot: `/red/${ID}/`, credSecret: 'proxy-credential-secret', notes: '',
+      adminRoot: `/red/${ID}/`, credSecret: INSTANCE_CREDENTIAL_SECRET, notes: '',
       nodeRuntimeMode: 'legacy',
     },
     [],
-    [{ username: 'admin', password: 'proxy-node-red-password', permissions: '*' }],
+    [{ username: 'admin', password: INSTANCE_PASSWORD, permissions: '*' }],
   );
   await docker.createInstance({
     id: ID, imageTag: TAG, memoryMb: 256, cpus: 0.5, ports: [],
     adminRoot: `/red/${ID}/`,
   }, renderSettings({
     instanceId: ID, nodeRuntimeMode: 'legacy', adminRoot: `/red/${ID}/`,
-    credentialSecret: 'proxy-credential-secret',
+    credentialSecret: INSTANCE_CREDENTIAL_SECRET,
     credentials: [{
-      username: 'admin', passwordHash: bcrypt.hashSync('proxy-node-red-password', 8), permissions: '*',
+      username: 'admin', passwordHash: bcrypt.hashSync(INSTANCE_PASSWORD, 8), permissions: '*',
     }],
   }), 'legacy');
   const instanceInfo = await raw.getContainer(containerName(ID)).inspect();
