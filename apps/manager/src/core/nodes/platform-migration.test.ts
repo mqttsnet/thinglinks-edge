@@ -322,6 +322,27 @@ function stoppedAuthorityPath(
   return join(f.root, '.thinglinks-stopped-evidence', 'line-a', txId);
 }
 
+function downgradeStoppedAuthorityToV1(f: ReturnType<typeof migrationFixture>): void {
+  const manifest = join(stoppedAuthorityPath(f), 'manifest.json');
+  const v2 = JSON.parse(readFileSync(manifest, 'utf8')) as {
+    instanceId: string;
+    txId: string;
+    targetIntegrity: string;
+    artifacts: Array<{
+      key: string;
+      desired: TestArtifactFact;
+      prior: TestArtifactFact;
+    }>;
+  };
+  writeFileSync(manifest, `${JSON.stringify({
+    version: 1,
+    instanceId: v2.instanceId,
+    txId: v2.txId,
+    targetIntegrity: v2.targetIntegrity,
+    artifacts: v2.artifacts.map(({ key, desired, prior }) => ({ key, desired, prior })),
+  })}\n`, { mode: 0o600 });
+}
+
 function writeForgedDesiredSidecar(
   instanceRoot: string,
   txId: string,
@@ -2409,7 +2430,9 @@ test('C62 node-config semantic authority rejects every non-serialization drift',
   }
 });
 
-test('C62 probe semantic authority rejects BOM and lone-surrogate parser differentials', async () => {
+test('C62 probe semantic parser rejects duplicate keys numeric collisions and hard boundaries', async () => {
+  const overDepth = `{"deep":${'['.repeat(64)}0${']'.repeat(64)}}`;
+  const overValues = `{"values":[${'0,'.repeat(99_998)}0]}`;
   const cases = [
     {
       name: 'BOM',
@@ -2418,7 +2441,22 @@ test('C62 probe semantic authority rejects BOM and lone-surrogate parser differe
         Buffer.from(`${JSON.stringify(platformNodeConfig())}\n`),
       ]),
     },
-    { name: 'lone surrogate', bytes: Buffer.from('{"bad":"\\ud800"}\n') },
+    { name: 'invalid UTF-8', bytes: Buffer.from([0xff]) },
+    { name: 'lone surrogate value', bytes: Buffer.from('{"bad":"\\ud800"}\n') },
+    { name: 'lone surrogate key', bytes: Buffer.from('{"\\ud800":true}\n') },
+    { name: 'duplicate decoded root key', bytes: Buffer.from('{"a":1,"\\u0061":1}\n') },
+    {
+      name: 'duplicate decoded nested key',
+      bytes: Buffer.from('{"outer":{"a":1,"\\u0061":1}}\n'),
+    },
+    { name: 'unsafe integer 9007199254740992', bytes: Buffer.from('{"n":9007199254740992}\n') },
+    { name: 'unsafe integer 9007199254740993', bytes: Buffer.from('{"n":9007199254740993}\n') },
+    { name: 'negative zero', bytes: Buffer.from('{"n":-0}\n') },
+    { name: 'fraction', bytes: Buffer.from('{"n":1.0}\n') },
+    { name: 'exponent', bytes: Buffer.from('{"n":1e0}\n') },
+    { name: 'underflow', bytes: Buffer.from('{"n":1e-400}\n') },
+    { name: 'depth over 64', bytes: Buffer.from(overDepth) },
+    { name: 'values over 100000', bytes: Buffer.from(overValues) },
   ];
 
   for (const item of cases) {
@@ -2433,6 +2471,96 @@ test('C62 probe semantic authority rejects BOM and lone-surrogate parser differe
     assert.equal(result.phase, 'rolled_back', item.name);
     assert.equal(existsSync(stoppedAuthorityPath(f)), false, item.name);
     assert.deepEqual(txSidecars(f.instanceRoot, 'tx-01'), [], item.name);
+  }
+});
+
+test('C62 canonical numeric depth and value limits accept their exact boundaries', async () => {
+  const exactDepth = `{"deep":${'['.repeat(63)}0${']'.repeat(63)}}`;
+  const exactValues = `{"values":[${'0,'.repeat(99_997)}0]}`;
+  const cases = [
+    {
+      name: 'safe integer limits and zero',
+      bytes: Buffer.from('{"max":9007199254740991,"min":-9007199254740991,"zero":0}\n'),
+    },
+    { name: 'depth exactly 64', bytes: Buffer.from(exactDepth) },
+    { name: 'values exactly 100000', bytes: Buffer.from(exactValues) },
+  ];
+
+  for (const item of cases) {
+    const f = migrationFixture({ originalRunning: false });
+    f.docker.afterProbeRestart = (probeRoot) => {
+      writeFileSync(join(probeRoot, '.config.nodes.json'), item.bytes, { mode: 0o600 });
+      writeJson(join(probeRoot, '.config.nodes.json.backup'), { previous: 'probe-main' });
+    };
+
+    assert.equal(
+      (await f.service.migrate('line-a', 'admin')).phase,
+      'pending_start_verification',
+      item.name,
+    );
+    const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+      f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+    ));
+
+    assert.equal(result.phase, 'committed', item.name);
+  }
+});
+
+test('C62 live parser rejects duplicate and numeric lexemes that lossy JSON parsing would collide', async () => {
+  const modules = JSON.stringify(platformNodeConfig()['modules']);
+  const exactDepth = `{"deep":${'['.repeat(63)}0${']'.repeat(63)}}`;
+  const overDepth = `{"deep":${'['.repeat(64)}0${']'.repeat(64)}}`;
+  const exactValues = `{"values":[${'0,'.repeat(99_997)}0]}`;
+  const overValues = `{"values":[${'0,'.repeat(99_998)}0]}`;
+  const cases = [
+    {
+      name: 'escape-equivalent root duplicate',
+      probe: `{"modules":${modules}}`,
+      live: `{"modules":${modules},"\\u006dodules":${modules}}`,
+    },
+    {
+      name: 'escape-equivalent nested duplicate',
+      probe: '{"outer":{"a":1}}',
+      live: '{"outer":{"a":1,"\\u0061":1}}',
+    },
+    { name: 'zero versus negative zero', probe: '{"n":0}', live: '{"n":-0}' },
+    { name: 'integer versus fraction', probe: '{"n":1}', live: '{"n":1.0}' },
+    { name: 'integer versus exponent', probe: '{"n":1}', live: '{"n":1e0}' },
+    { name: 'zero versus underflow', probe: '{"n":0}', live: '{"n":1e-400}' },
+    { name: 'invalid UTF-8 live', probe: '{}', live: Buffer.from([0xff]) },
+    { name: 'lone surrogate live value', probe: '{"bad":"valid"}', live: '{"bad":"\\ud800"}' },
+    { name: 'live depth over 64', probe: exactDepth, live: overDepth },
+    { name: 'live values over 100000', probe: exactValues, live: overValues },
+  ];
+
+  for (const item of cases) {
+    const f = migrationFixture({ originalRunning: false });
+    const probeBytes = Buffer.isBuffer(item.probe)
+      ? item.probe
+      : Buffer.from(`${item.probe}\n`);
+    const liveBytes = Buffer.isBuffer(item.live)
+      ? item.live
+      : Buffer.from(`${item.live}\n`);
+    f.docker.afterProbeRestart = (probeRoot) => {
+      writeFileSync(join(probeRoot, '.config.nodes.json'), probeBytes, { mode: 0o600 });
+      writeJson(join(probeRoot, '.config.nodes.json.backup'), { previous: 'probe-main' });
+    };
+    assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+    f.docker.afterStart = () => {
+      writeFileSync(join(f.instanceRoot, '.config.nodes.json'), liveBytes, { mode: 0o600 });
+      writeFileSync(
+        join(f.instanceRoot, '.config.nodes.json.backup'),
+        probeBytes,
+        { mode: 0o600 },
+      );
+    };
+
+    const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+      f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+    ));
+
+    assert.equal(result.phase, 'manual_required', item.name);
+    assert.equal(f.docker.inspection.running, false, item.name);
   }
 });
 
@@ -2538,28 +2666,43 @@ test('C62 equal raw prior and desired are restored byte-exact after semantic pos
   assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), false);
 });
 
-test('C62 legacy v1 authority remains exact-only and can complete recovery', async () => {
+for (const boundary of ['after-live-backup', 'after-live-rename'] as const) {
+  test(`C62 semantic equal artifact survives verifying ${boundary} failure for exact rollback`, async () => {
+    const f = migrationFixture({ originalRunning: false });
+    const before = migrationEvidence(f.instanceRoot);
+    assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+    f.controls.barrierFailure = {
+      phase: 'verifying',
+      boundary,
+      artifact: 'module-config',
+    };
+    f.docker.afterStart = () => {
+      writeFileSync(join(f.instanceRoot, '.config.nodes.json'), '{ }\n', { mode: 0o600 });
+      writeFileSync(join(f.instanceRoot, '.config.nodes.json.backup'), '{\n}\n', { mode: 0o600 });
+    };
+
+    const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+      f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+    ));
+
+    assert.equal(result.phase, 'rolled_back', boundary);
+    assert.equal(f.docker.inspection.running, false, boundary);
+    assert.deepEqual(migrationEvidenceDiff(f.instanceRoot, before), [], boundary);
+    assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), false, boundary);
+    assert.equal(f.barrierEvents.some((event) => (
+      event.phase === 'verifying'
+      && event.artifact === 'node-config'
+      && (event.boundary === 'after-live-backup' || event.boundary === 'after-live-rename')
+    )), false, boundary);
+  });
+}
+
+test('C62 legacy v1 authority rejects whitespace-only post-start rewrites', async () => {
   const f = migrationFixture({ originalRunning: false });
   assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
-  const manifest = join(stoppedAuthorityPath(f), 'manifest.json');
-  const v2 = JSON.parse(readFileSync(manifest, 'utf8')) as {
-    instanceId: string;
-    txId: string;
-    targetIntegrity: string;
-    artifacts: Array<{
-      key: string;
-      desired: TestArtifactFact;
-      prior: TestArtifactFact;
-    }>;
-  };
-  writeFileSync(manifest, `${JSON.stringify({
-    version: 1,
-    instanceId: v2.instanceId,
-    txId: v2.txId,
-    targetIntegrity: v2.targetIntegrity,
-    artifacts: v2.artifacts.map(({ key, desired, prior }) => ({ key, desired, prior })),
-  })}\n`, { mode: 0o600 });
+  downgradeStoppedAuthorityToV1(f);
   f.docker.afterStart = () => {
+    writeFileSync(join(f.instanceRoot, '.config.nodes.json'), '{ }\n', { mode: 0o600 });
     rmSync(join(f.instanceRoot, '.config.nodes.json.backup'), { force: true });
   };
 
@@ -2567,8 +2710,31 @@ test('C62 legacy v1 authority remains exact-only and can complete recovery', asy
     f.service.completePendingStartUnderLease('line-a', lease, 'admin')
   ));
 
+  assert.equal(result.phase, 'manual_required');
+  assert.equal(f.docker.inspection.running, false);
+  assert.equal(existsSync(stoppedAuthorityPath(f)), true);
+});
+
+test('C62 reopened recovery preserves exact v1 authority and explicit start succeeds', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  downgradeStoppedAuthorityToV1(f);
+  f.docker.afterStart = () => {
+    rmSync(join(f.instanceRoot, '.config.nodes.json.backup'), { force: true });
+  };
+
+  const reopened = reopenMigrationFixture(f);
+  assert.deepEqual(
+    (await reopened.service.recoverInterrupted()).map((result) => result.phase),
+    ['pending_start_verification'],
+  );
+  const result = await reopened.gate.run('line-a', 'start-instance', (lease) => (
+    reopened.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+
   assert.equal(result.phase, 'committed');
-  assert.equal(f.repo.nodeRuntime('line-a')?.mode, 'npm');
+  assert.equal(reopened.repo.nodeRuntime('line-a')?.mode, 'npm');
+  reopened.db.close();
 });
 
 test('C60 ownership loss during quiescence polling writes no authority or sidecars', async () => {

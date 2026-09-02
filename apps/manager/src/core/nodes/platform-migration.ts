@@ -960,44 +960,192 @@ async function artifactFact(root: string, key: string): Promise<StoppedArtifactF
   return { key, exists: true, kind: 'directory', mode, sha256: hash(JSON.stringify(entries)) };
 }
 
-function canonicalJson(value: unknown, depth = 0, state = { values: 0 }): string {
-  state.values += 1;
-  if (state.values > MAX_CANONICAL_JSON_VALUES || depth > MAX_CANONICAL_JSON_DEPTH) {
-    throw new Error('node config JSON structure exceeds limits');
-  }
-  if (value === null) return 'null';
-  if (typeof value === 'string') {
-    assertNoLoneSurrogate(value);
-    return JSON.stringify(value);
-  }
-  if (typeof value === 'boolean') return JSON.stringify(value);
-  if (typeof value === 'number' && Number.isFinite(value)) return JSON.stringify(value);
-  if (Array.isArray(value)) {
-    return `[${value.map((entry) => canonicalJson(entry, depth + 1, state)).join(',')}]`;
-  }
-  if (typeof value !== 'object' || Object.getPrototypeOf(value) !== Object.prototype) {
-    throw new Error('node config JSON contains an unsupported value');
-  }
-  const record = value as Record<string, unknown>;
-  return `{${Object.keys(record).sort().map((key) => {
-    assertNoLoneSurrogate(key);
-    return `${JSON.stringify(key)}:${canonicalJson(record[key], depth + 1, state)}`;
-  }).join(',')}}`;
-}
+function canonicalJsonObject(source: string): string {
+  let index = 0;
+  let values = 0;
 
-function assertNoLoneSurrogate(value: string): void {
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index);
-    if (code >= 0xd800 && code <= 0xdbff) {
-      const next = value.charCodeAt(index + 1);
-      if (index + 1 >= value.length || next < 0xdc00 || next > 0xdfff) {
-        throw new Error('node config JSON contains a lone surrogate');
+  const skipWhitespace = (): void => {
+    while (
+      source[index] === ' '
+      || source[index] === '\t'
+      || source[index] === '\n'
+      || source[index] === '\r'
+    ) index += 1;
+  };
+
+  const parseHexCodeUnit = (): number => {
+    const hex = source.slice(index, index + 4);
+    if (!/^[a-fA-F0-9]{4}$/.test(hex)) throw new Error('invalid JSON unicode escape');
+    index += 4;
+    return Number.parseInt(hex, 16);
+  };
+
+  const parseString = (): string => {
+    if (source[index] !== '"') throw new Error('JSON string expected');
+    index += 1;
+    let decoded = '';
+    while (index < source.length) {
+      const code = source.charCodeAt(index);
+      if (code === 0x22) {
+        index += 1;
+        return decoded;
       }
-      index += 1;
-    } else if (code >= 0xdc00 && code <= 0xdfff) {
-      throw new Error('node config JSON contains a lone surrogate');
+      if (code < 0x20) throw new Error('unescaped JSON control character');
+      if (code === 0x5c) {
+        index += 1;
+        const escape = source[index];
+        index += 1;
+        const simple: Record<string, string> = {
+          '"': '"', '\\': '\\', '/': '/', b: '\b', f: '\f', n: '\n', r: '\r', t: '\t',
+        };
+        if (escape && Object.prototype.hasOwnProperty.call(simple, escape)) {
+          decoded += simple[escape];
+          continue;
+        }
+        if (escape !== 'u') throw new Error('invalid JSON string escape');
+        const unit = parseHexCodeUnit();
+        if (unit >= 0xd800 && unit <= 0xdbff) {
+          if (source.slice(index, index + 2) !== '\\u') {
+            throw new Error('lone high surrogate in JSON string');
+          }
+          index += 2;
+          const low = parseHexCodeUnit();
+          if (low < 0xdc00 || low > 0xdfff) {
+            throw new Error('lone high surrogate in JSON string');
+          }
+          decoded += String.fromCharCode(unit, low);
+        } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+          throw new Error('lone low surrogate in JSON string');
+        } else {
+          decoded += String.fromCharCode(unit);
+        }
+        continue;
+      }
+      if (code >= 0xd800 && code <= 0xdbff) {
+        const low = source.charCodeAt(index + 1);
+        if (index + 1 >= source.length || low < 0xdc00 || low > 0xdfff) {
+          throw new Error('lone high surrogate in JSON string');
+        }
+        decoded += source[index]! + source[index + 1]!;
+        index += 2;
+      } else if (code >= 0xdc00 && code <= 0xdfff) {
+        throw new Error('lone low surrogate in JSON string');
+      } else {
+        decoded += source[index]!;
+        index += 1;
+      }
     }
+    throw new Error('unterminated JSON string');
+  };
+
+  type ParsedValue = { canonical: string; kind: 'object' | 'array' | 'primitive' };
+  const parseValue = (depth: number): ParsedValue => {
+    values += 1;
+    if (values > MAX_CANONICAL_JSON_VALUES || depth > MAX_CANONICAL_JSON_DEPTH) {
+      throw new Error('node config JSON structure exceeds limits');
+    }
+    skipWhitespace();
+    const token = source[index];
+    if (token === '{') {
+      index += 1;
+      skipWhitespace();
+      const entries: Array<[string, string]> = [];
+      const keys = new Set<string>();
+      if (source[index] === '}') {
+        index += 1;
+        return { canonical: '{}', kind: 'object' };
+      }
+      let closed = false;
+      while (index < source.length) {
+        const key = parseString();
+        if (keys.has(key)) throw new Error('duplicate decoded JSON object key');
+        keys.add(key);
+        skipWhitespace();
+        if (source[index] !== ':') throw new Error('JSON object colon expected');
+        index += 1;
+        const value = parseValue(depth + 1);
+        entries.push([key, value.canonical]);
+        skipWhitespace();
+        if (source[index] === '}') {
+          index += 1;
+          closed = true;
+          break;
+        }
+        if (source[index] !== ',') throw new Error('JSON object comma expected');
+        index += 1;
+        skipWhitespace();
+      }
+      if (!closed) throw new Error('unterminated JSON object');
+      entries.sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+      return {
+        canonical: `{${entries.map(([key, value]) => (
+          `${JSON.stringify(key)}:${value}`
+        )).join(',')}}`,
+        kind: 'object',
+      };
+    }
+    if (token === '[') {
+      index += 1;
+      skipWhitespace();
+      const entries: string[] = [];
+      if (source[index] === ']') {
+        index += 1;
+        return { canonical: '[]', kind: 'array' };
+      }
+      let closed = false;
+      while (index < source.length) {
+        entries.push(parseValue(depth + 1).canonical);
+        skipWhitespace();
+        if (source[index] === ']') {
+          index += 1;
+          closed = true;
+          break;
+        }
+        if (source[index] !== ',') throw new Error('JSON array comma expected');
+        index += 1;
+      }
+      if (!closed) throw new Error('unterminated JSON array');
+      return { canonical: `[${entries.join(',')}]`, kind: 'array' };
+    }
+    if (token === '"') {
+      return { canonical: JSON.stringify(parseString()), kind: 'primitive' };
+    }
+    for (const literal of ['true', 'false', 'null'] as const) {
+      if (source.startsWith(literal, index)) {
+        index += literal.length;
+        return { canonical: literal, kind: 'primitive' };
+      }
+    }
+    const start = index;
+    if (source[index] === '-') index += 1;
+    if (source[index] === '0') {
+      index += 1;
+      if (source[index] && /[0-9]/.test(source[index]!)) {
+        throw new Error('non-canonical JSON integer');
+      }
+    } else if (source[index] && /[1-9]/.test(source[index]!)) {
+      while (source[index] && /[0-9]/.test(source[index]!)) index += 1;
+    } else {
+      throw new Error('JSON value expected');
+    }
+    if (source[index] === '.' || source[index] === 'e' || source[index] === 'E') {
+      throw new Error('non-integer JSON number');
+    }
+    const integer = source.slice(start, index);
+    const number = Number(integer);
+    if (integer === '-0' || !Number.isSafeInteger(number)) {
+      throw new Error('unsafe or non-canonical JSON integer');
+    }
+    return { canonical: integer, kind: 'primitive' };
+  };
+
+  skipWhitespace();
+  const parsed = parseValue(0);
+  skipWhitespace();
+  if (parsed.kind !== 'object' || index !== source.length) {
+    throw new Error('node config JSON root must be one plain object');
   }
+  return parsed.canonical;
 }
 
 async function canonicalNodeConfigExpectation(
@@ -1032,19 +1180,12 @@ async function canonicalNodeConfigExpectation(
       )
     ) throw new Error('node config JSON differs from raw authority');
     const decoded = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
-    const parsed = JSON.parse(decoded) as unknown;
-    if (
-      !parsed
-      || typeof parsed !== 'object'
-      || Array.isArray(parsed)
-      || Object.getPrototypeOf(parsed) !== Object.prototype
-    ) throw new Error('node config JSON root must be a plain object');
     return {
       comparison: 'canonical-json',
       exists: true,
       kind: 'file',
       mode: before.mode & 0o777,
-      canonicalSha256: hash(canonicalJson(parsed)),
+      canonicalSha256: hash(canonicalJsonObject(decoded)),
     };
   } finally {
     await handle.close();
@@ -2235,13 +2376,15 @@ export class PlatformMigrationService {
 
   private async cleanupEqualStoppedEvidenceBeforeCommit(
     execution: MigrationExecutionSession,
-    desiredFacts: readonly StoppedArtifactFact[],
+    artifacts: readonly StoppedEvidenceAuthority['artifacts'][number][],
     startSequence: number,
   ): Promise<{ sequence: number; cleanedKeys: Set<string> }> {
     const liveRoot = join(this.o.instanceDataRoot, execution.instanceId);
     let sequence = startSequence;
     const cleanedKeys = new Set<string>();
-    for (const desired of desiredFacts) {
+    for (const artifact of artifacts) {
+      const { desired, prior, postStart } = artifact;
+      if (postStart.comparison !== 'exact' || !sameArtifact(prior, desired)) continue;
       const target = join(liveRoot, desired.key);
       const partial = stoppedSidecar(target, execution.txId, 'partial');
       const partialFact = await artifactFact(dirname(partial), basename(partial));
@@ -2574,9 +2717,8 @@ export class PlatformMigrationService {
       await this.verifyCutover(instanceId, this.o.repo.nodeMigration(instanceId)!);
       execution.renew(['verifying']);
       const artifacts = await this.verifyStoppedEvidenceOwned(instanceId, scanned.txId);
-      const desiredFacts = artifacts.map((artifact) => artifact.desired);
       const equalCleanup = await this.cleanupEqualStoppedEvidenceBeforeCommit(
-        execution, desiredFacts, 201,
+        execution, artifacts, 201,
       );
       const liveRoot = join(this.o.instanceDataRoot, instanceId);
       for (const artifact of artifacts) {
