@@ -146,3 +146,17 @@ test('归档含目录穿越路径时拒绝写入', async () => {
                        BackupError);
   await rm(target, { recursive: true, force: true });
 });
+
+test('PAX path 还原出的目录穿越同样被恢复边界拒绝', async () => {
+  const { tarArchive } = await import('./tar.ts');
+  const evil = tarArchive([
+    { name: 'manifest.json', content: JSON.stringify({
+        product: 'thinglinks-edge', format: 1, masterKeyFingerprint: keyFingerprint(KEY),
+        instances: [], schemaVersion: 2, createdAt: '' }) },
+    { name: `instances/../../${'x'.repeat(124)}`, content: 'pwned' },
+  ]);
+  const target = await mkdtemp(join(tmpdir(), 'tle-rs-pax-'));
+  await assert.rejects(() => restoreBackup({ archive: evil, dataRoot: target, key: KEY }),
+    BackupError);
+  await rm(target, { recursive: true, force: true });
+});

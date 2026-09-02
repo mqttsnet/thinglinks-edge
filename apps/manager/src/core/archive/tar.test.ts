@@ -35,16 +35,16 @@ test('归档整体为 512 的整数倍', () => {
   assert.equal(tarFile('a.txt', 'hi').length % 512, 0);
 });
 
-test('过长文件名被拒绝而不是静默截断', () => {
-  assert.throws(() => tarFile('a'.repeat(120), 'x'), /过长/);
+test('含 NUL 的文件名被拒绝而不是静默截断', () => {
+  assert.throws(() => tarFile('safe\0hidden', 'x'), /非法/);
 });
 
 const npmCachePath = [
   'instances', 'a'.repeat(32), '.npm', '_cacache', 'content-v2', 'sha512',
-  '34', 'ab', 'c'.repeat(86),
+  '34', 'ab', 'c'.repeat(124),
 ].join('/');
 
-test('真实 npm cacache 长路径使用 ustar prefix 且系统 tar 与自身都能还原', () => {
+test('真实 npm cacache 2/2/124 长路径使用 PAX 且系统 tar 与自身都能还原', () => {
   assert.ok(Buffer.byteLength(npmCachePath) > 100);
   assert.ok(Buffer.byteLength(npmCachePath) <= 255);
   const content = 'cached-package-bytes';
@@ -54,16 +54,19 @@ test('真实 npm cacache 长路径使用 ustar prefix 且系统 tar 与自身都
   assert.equal(own[0]?.content.toString(), content);
 });
 
-test('ustar name 字段按 UTF-8 字节支持 99、100 并拒绝无斜杠 101', () => {
+test('ustar name 字段支持 99、100，无法分割的 101 字节自动走 PAX', () => {
   for (const length of [99, 100]) {
     const name = 'n'.repeat(length);
     assert.equal(roundTrip(name, `n${length}`), `n${length}`);
     assert.equal(untar(tarFile(name, 'x'))[0]?.name, name);
   }
-  assert.throws(() => tarFile('n'.repeat(101), 'x'), /过长/);
+  const pax101 = 'n'.repeat(101);
+  assert.equal(roundTrip(pax101, 'pax-101'), 'pax-101');
+  assert.equal(untar(tarFile(pax101, 'x'))[0]?.name, pax101);
+  assert.equal(String.fromCharCode(tarFile(pax101, 'x')[156]!), 'x');
 });
 
-test('ustar prefix/name 精确支持 255 字节并拒绝 256 字节', () => {
+test('ustar prefix/name 精确支持 255 字节，256 字节自动走 PAX', () => {
   const exact255 = `${'p'.repeat(154)}/${'n'.repeat(100)}`;
   assert.equal(Buffer.byteLength(exact255), 255);
   assert.equal(roundTrip(exact255, 'max'), 'max');
@@ -76,15 +79,16 @@ test('ustar prefix/name 精确支持 255 字节并拒绝 256 字节', () => {
 
   const over256 = `${'p'.repeat(155)}/${'n'.repeat(100)}`;
   assert.equal(Buffer.byteLength(over256), 256);
-  assert.throws(() => tarFile(over256, 'x'), /过长/);
+  assert.equal(roundTrip(over256, 'pax-256'), 'pax-256');
+  assert.equal(untar(tarFile(over256, 'x'))[0]?.name, over256);
 });
 
-test('ustar 只在斜杠处分割，prefix 或最终分量超字段时拒绝', () => {
+test('ustar 无安全分割点时改用 PAX，不截断 prefix 或最终分量', () => {
   const prefixTooLong = `${'p'.repeat(156)}/${'n'.repeat(98)}`;
   const finalComponentTooLong = `prefix/${'n'.repeat(101)}`;
   assert.equal(Buffer.byteLength(prefixTooLong), 255);
-  assert.throws(() => tarFile(prefixTooLong, 'x'), /过长/);
-  assert.throws(() => tarFile(finalComponentTooLong, 'x'), /过长/);
+  assert.equal(untar(tarFile(prefixTooLong, 'x'))[0]?.name, prefixTooLong);
+  assert.equal(untar(tarFile(finalComponentTooLong, 'x'))[0]?.name, finalComponentTooLong);
 });
 
 test('ustar 多字节路径按字节分割，不截断 UTF-8 字符', () => {
@@ -94,6 +98,19 @@ test('ustar 多字节路径按字节分割，不截断 UTF-8 字符', () => {
   assert.equal(Buffer.byteLength(name), 250);
   assert.equal(roundTrip(name, '中文路径'), '中文路径');
   assert.equal(untar(tarFile(name, '中文路径'))[0]?.name, name);
+});
+
+test('PAX 多字节最终分量按 UTF-8 字节完整往返', () => {
+  const name = `prefix/${'文件'.repeat(40)}`; // final component 240 bytes
+  assert.ok(Buffer.byteLength(name.slice(name.indexOf('/') + 1)) > 100);
+  assert.equal(roundTrip(name, 'pax 中文'), 'pax 中文');
+  assert.equal(untar(tarFile(name, 'pax 中文'))[0]?.name, name);
+});
+
+test('PAX 路径上限 4096 字节，超过一字节即拒绝', () => {
+  const max = 'm'.repeat(4096);
+  assert.equal(untar(tarFile(max, 'max'))[0]?.name, max);
+  assert.throws(() => tarFile('m'.repeat(4097), 'x'), /过长/);
 });
 
 test('可指定属主 —— 容器内以 node-red(1000) 身份读取', () => {
@@ -188,28 +205,70 @@ function member(name: string, body: string, typeflag = '0'): Buffer {
   return Buffer.concat([header(name, data.length, typeflag), data, pad]);
 }
 
-test('npm 对超长路径写的 pax 扩展头被跳过，其后的条目不错位', () => {
+function paxRecord(key: string, value: string): string {
+  const suffix = ` ${key}=${value}\n`;
+  let length = Buffer.byteLength(suffix) + 1;
+  while (true) {
+    const record = `${length}${suffix}`;
+    const actual = Buffer.byteLength(record);
+    if (actual === length) return record;
+    length = actual;
+  }
+}
+
+test('外部 npm PAX path 精确应用到下一普通文件，未知安全 key 被忽略且随后条目不错位', () => {
   /*
    * 路径超过 100 字节时 npm（node-tar）会先写一个 typeflag `x` 的 PaxHeader 条目，
    * 里面是真实路径，紧跟着才是被截断名字的数据条目。实测 `npm pack` 一个
    * 288 字节路径的包，产出的正是这个形状。
    *
-   * 我们不解析 pax（只需要 package/package.json，它永远是短名），
-   * 但**必须按 size 正确跳过**它 —— 跳错一个字节，后面所有条目连同
-   * package.json 一起读不出来。
+   * 备份恢复现在也会产出 PAX，所以必须严格解析本地 path；其它安全 key
+   * 有界忽略，同时仍按 size 对齐，不能影响紧随其后的普通条目。
    */
-  const pax = 'path=package/' + 'x'.repeat(200) + '.txt\n';
+  const longName = `package/${'x'.repeat(200)}.txt`;
+  const pax = paxRecord('comment', 'npm-generated') + paxRecord('path', longName);
   const archive = Buffer.concat([
     member('package/package.json', '{"name":"a","version":"1.0.0"}'),
-    member('PaxHeader/long.txt', `${pax.length + 6} ${pax}`, 'x'),
+    member('PaxHeader/long.txt', pax, 'x'),
     member('xxxx/truncated-name.txt', 'deep'),
+    member('package/after.txt', 'after'),
     Buffer.alloc(1024, 0),
   ]);
   const files = untar(archive);
   assert.deepEqual(files.map((f) => f.name),
-    ['package/package.json', 'xxxx/truncated-name.txt']);
+    ['package/package.json', longName, 'package/after.txt']);
   assert.equal(files[0]!.content.toString(), '{"name":"a","version":"1.0.0"}');
   assert.equal(files[1]!.content.toString(), 'deep');
+  assert.equal(files[2]!.content.toString(), 'after');
+});
+
+test('PAX record 对非十进制、零长度、截断、重复 path、NUL 与超限严格拒绝', () => {
+  const archiveFor = (pax: string) => Buffer.concat([
+    member('PaxHeader/invalid', pax, 'x'),
+    member('placeholder', 'x'),
+    Buffer.alloc(1024, 0),
+  ]);
+  for (const pax of [
+    'x path=a\n',
+    '0 path=a\n',
+    '30 path=short\n',
+    paxRecord('path', 'first') + paxRecord('path', 'second'),
+    paxRecord('path', 'bad\0name'),
+    '9000 path=a\n',
+  ]) assert.throws(() => untar(archiveFor(pax)), /PAX/);
+});
+
+test('PAX header 必须恰好绑定下一普通文件，悬空或插入其它类型均拒绝', () => {
+  const pax = paxRecord('path', `deep/${'x'.repeat(120)}`);
+  assert.throws(() => untar(Buffer.concat([
+    member('PaxHeader/dangling', pax, 'x'), Buffer.alloc(1024, 0),
+  ])), /PAX/);
+  assert.throws(() => untar(Buffer.concat([
+    member('PaxHeader/not-regular', pax, 'x'),
+    member('directory/', '', '5'),
+    member('placeholder', 'x'),
+    Buffer.alloc(1024, 0),
+  ])), /PAX/);
 });
 
 test('目录条目被跳过，不会混进文件列表', () => {
