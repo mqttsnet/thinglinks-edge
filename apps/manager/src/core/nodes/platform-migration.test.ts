@@ -9,12 +9,14 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  lstatSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDb } from '../db.ts';
 import { deriveKey } from '../auth/crypto.ts';
@@ -119,6 +121,70 @@ const record = (id = 'line-a'): InstanceRecord => ({
 
 function sha256(value: Buffer | string): string {
   return createHash('sha256').update(value).digest('hex');
+}
+
+type TestArtifactFact =
+  | { key: string; exists: false }
+  | { key: string; exists: true; kind: 'file' | 'directory'; mode: number; sha256: string };
+
+function testArtifactFact(root: string, key: string): TestArtifactFact {
+  const absolute = join(root, key);
+  if (!existsSync(absolute)) return { key, exists: false };
+  const stat = lstatSync(absolute);
+  assert.equal(stat.isSymbolicLink(), false, key);
+  const mode = stat.mode & 0o777;
+  if (stat.isFile()) {
+    return { key, exists: true, kind: 'file', mode, sha256: sha256(readFileSync(absolute)) };
+  }
+  assert.equal(stat.isDirectory(), true, key);
+  const entries: Array<{
+    path: string;
+    kind: 'file' | 'directory';
+    mode: number;
+    sha256?: string;
+  }> = [];
+  const walk = (directory: string, prefix: string) => {
+    const children = readdirSync(directory, { withFileTypes: true })
+      .sort((a, b) => a.name.localeCompare(b.name));
+    for (const child of children) {
+      const path = prefix ? join(prefix, child.name) : child.name;
+      const childAbsolute = join(directory, child.name);
+      const childStat = lstatSync(childAbsolute);
+      assert.equal(childStat.isSymbolicLink(), false, path);
+      if (childStat.isDirectory()) {
+        entries.push({ path, kind: 'directory', mode: childStat.mode & 0o777 });
+        walk(childAbsolute, path);
+      } else {
+        assert.equal(childStat.isFile(), true, path);
+        entries.push({
+          path,
+          kind: 'file',
+          mode: childStat.mode & 0o777,
+          sha256: sha256(readFileSync(childAbsolute)),
+        });
+      }
+    }
+  };
+  walk(absolute, '');
+  return { key, exists: true, kind: 'directory', mode, sha256: sha256(JSON.stringify(entries)) };
+}
+
+function writeTestManifest(path: string, fact: TestArtifactFact): void {
+  writeFileSync(path, `${JSON.stringify(fact)}\n`, { mode: 0o600 });
+}
+
+function txSidecars(root: string, txId: string): string[] {
+  const found: string[] = [];
+  const walk = (directory: string) => {
+    if (!existsSync(directory)) return;
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      if (entry.name.includes(`.tle-${txId}.`)) found.push(path);
+      if (entry.isDirectory()) walk(path);
+    }
+  };
+  walk(root);
+  return found.sort();
 }
 
 function nodeSet(
@@ -862,22 +928,55 @@ function installPhaseRealisticStoppedEffects(
   phase: NodeMigrationState,
 ): void {
   if (!['cutover', 'verifying', 'rolling_back'].includes(phase)) return;
-  const target = join(f.instanceRoot, 'settings.js');
-  const original = readFileSync(target);
-  const backup = join(f.instanceRoot, `.settings.js.tle-${txId}.backup`);
-  const backupManifest = join(f.instanceRoot, `.settings.js.tle-${txId}.backup-manifest`);
-  const manifest = join(f.instanceRoot, `.settings.js.tle-${txId}.manifest`);
-  const desired = Buffer.from(
-    `module.exports={nodesExcludes:${JSON.stringify(LEGACY_RUNTIME_EXCLUDES)}};\n`,
+  const sidecar = (target: string, suffix: string) => (
+    join(dirname(target), `.${basename(target)}.tle-${txId}.${suffix}`)
   );
-  writeFileSync(backup, original, { mode: 0o600 });
-  writeFileSync(backupManifest, `${JSON.stringify({
-    key: 'settings.js', exists: true, kind: 'file', mode: 0o600, sha256: sha256(original),
-  })}\n`, { mode: 0o600 });
-  writeFileSync(target, desired, { mode: 0o600 });
-  writeFileSync(manifest, `${JSON.stringify({
-    key: 'settings.js', exists: true, kind: 'file', mode: 0o600, sha256: sha256(desired),
-  })}\n`, { mode: 0o600 });
+  const replaceFile = (key: string, desired: string, mode: number) => {
+    const target = join(f.instanceRoot, key);
+    const prior = testArtifactFact(f.instanceRoot, key);
+    assert.equal(prior.exists, true, key);
+    renameSync(target, sidecar(target, 'backup'));
+    writeTestManifest(sidecar(target, 'backup-manifest'), prior);
+    writeFileSync(target, desired, { mode });
+    writeTestManifest(sidecar(target, 'manifest'), testArtifactFact(f.instanceRoot, key));
+  };
+  replaceFile(
+    'settings.js',
+    `module.exports={nodesExcludes:${JSON.stringify(LEGACY_RUNTIME_EXCLUDES)}};\n`,
+    0o640,
+  );
+  replaceFile('package.json', '{"name":"line-a-runtime","dependencies":{"probe":"1.0.0"}}\n', 0o640);
+  replaceFile('package-lock.json', '{"packages":{"":{"dependencies":{"probe":"1.0.0"}}}}\n', 0o600);
+
+  const edgeKey = join('node_modules', ...PLATFORM_NODE_PACKAGE.name.split('/'));
+  const edgeTarget = join(f.instanceRoot, edgeKey);
+  assert.equal(existsSync(edgeTarget), false);
+  mkdirSync(join(edgeTarget, 'lib'), { recursive: true, mode: 0o750 });
+  chmodSync(edgeTarget, 0o750);
+  writeFileSync(join(edgeTarget, 'package.json'), '{"name":"created-edge"}\n', { mode: 0o640 });
+  writeFileSync(join(edgeTarget, 'lib', 'created.js'), 'module.exports = 1;\n', { mode: 0o600 });
+  writeTestManifest(sidecar(edgeTarget, 'manifest'), testArtifactFact(f.instanceRoot, edgeKey));
+
+  const commonKey = join('node_modules', ...PLATFORM_COMMON_PACKAGE.name.split('/'));
+  const commonTarget = join(f.instanceRoot, commonKey);
+  const commonPrior = testArtifactFact(f.instanceRoot, commonKey);
+  assert.equal(commonPrior.exists, true);
+  renameSync(commonTarget, sidecar(commonTarget, 'backup'));
+  writeTestManifest(sidecar(commonTarget, 'backup-manifest'), commonPrior);
+  mkdirSync(commonTarget, { recursive: true, mode: 0o700 });
+  chmodSync(commonTarget, 0o700);
+  writeFileSync(join(commonTarget, 'package.json'), '{"name":"replacement-common"}\n', { mode: 0o600 });
+  writeTestManifest(sidecar(commonTarget, 'manifest'), testArtifactFact(f.instanceRoot, commonKey));
+
+  for (const key of [
+    '.config.nodes.json', '.config.nodes.json.backup',
+    '.config.modules.json', '.config.modules.json.backup',
+  ]) {
+    const target = join(f.instanceRoot, key);
+    const desired = testArtifactFact(f.instanceRoot, key);
+    writeTestManifest(sidecar(target, 'manifest'), desired);
+    if (desired.exists) cpSync(target, sidecar(target, 'partial'));
+  }
 }
 
 function claimReplacementExecution(
@@ -1405,24 +1504,152 @@ for (const artifact of ['edge-module', 'common-module'] as const) {
       const f = migrationFixture({
         originalRunning: false,
         preexisting: true,
-        barrierFailure: { phase: 'cutover', boundary, artifact },
+        barrierFailure: { phase: 'verifying', boundary, artifact },
       });
       const relative = artifact === 'edge-module'
         ? join('node_modules', ...PLATFORM_NODE_PACKAGE.name.split('/'))
         : join('node_modules', ...PLATFORM_COMMON_PACKAGE.name.split('/'));
       const before = sha256(readFileSync(join(f.instanceRoot, relative, 'package.json')));
 
-      const result = await f.service.migrate('line-a', 'admin');
+      assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+      const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+        f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+      ));
 
       assert.equal(result.phase, 'rolled_back');
       assert.equal(sha256(readFileSync(join(f.instanceRoot, relative, 'package.json'))), before);
       assert.equal(f.docker.inspection.running, false);
       assert.ok(f.barrierEvents.some((event) => (
-        event.phase === 'cutover' && event.boundary === boundary && event.artifact === artifact
+        event.phase === 'verifying' && event.boundary === boundary && event.artifact === artifact
       )));
     });
   }
 }
+
+test('C41 equal Edge and common desired manifests and partials survive until explicit start', async () => {
+  const f = migrationFixture({ originalRunning: false, preexisting: true });
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  for (const packageName of [PLATFORM_NODE_PACKAGE.name, PLATFORM_COMMON_PACKAGE.name]) {
+    const packageDir = join(f.instanceRoot, 'node_modules', ...packageName.split('/'));
+    const parent = dirname(packageDir);
+    const base = basename(packageDir);
+    assert.equal(existsSync(join(parent, `.${base}.tle-tx-01.manifest`)), true, packageName);
+    assert.equal(existsSync(join(parent, `.${base}.tle-tx-01.partial`)), true, packageName);
+  }
+});
+
+for (const fault of ['missing', 'tampered'] as const) {
+  for (const matrix of ['settings', 'creation', 'deletion', 'replacement', 'equal-common'] as const) {
+    test(`C41 ${fault} desired manifest rejects ${matrix} before commit`, async () => {
+      const f = migrationFixture({ originalRunning: false, preexisting: true });
+      writeFileSync(
+        join(f.instanceRoot, '.config.modules.json.backup'),
+        'delete-on-cutover',
+        { mode: 0o640 },
+      );
+      f.docker.afterProbeRestart = (probeRoot) => {
+        rmSync(join(probeRoot, '.config.modules.json.backup'));
+        writeFileSync(
+          join(probeRoot, '.config.nodes.json.backup'),
+          'create-on-cutover',
+          { mode: 0o600 },
+        );
+        writeFileSync(join(
+          probeRoot, 'node_modules', '@mqttsnet', 'thinglinks-edge-nodes', 'replacement.txt',
+        ), 'replacement', { mode: 0o600 });
+      };
+      assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+      const manifests = {
+        settings: join(f.instanceRoot, '.settings.js.tle-tx-01.manifest'),
+        creation: join(f.instanceRoot, '..config.nodes.json.backup.tle-tx-01.manifest'),
+        deletion: join(f.instanceRoot, '..config.modules.json.backup.tle-tx-01.manifest'),
+        replacement: join(
+          f.instanceRoot, 'node_modules', '@mqttsnet',
+          '.thinglinks-edge-nodes.tle-tx-01.manifest',
+        ),
+        'equal-common': join(
+          f.instanceRoot, 'node_modules', '@mqttsnet',
+          '.thinglinks-node-red-common.tle-tx-01.manifest',
+        ),
+      } as const;
+      const selected = manifests[matrix];
+      if (fault === 'missing') rmSync(selected, { force: true });
+      else writeFileSync(selected, `${JSON.stringify({
+        key: matrix === 'settings' ? 'settings.js' : `tampered-${matrix}`,
+        exists: true,
+        kind: 'file',
+        mode: 0o600,
+        sha256: 'f'.repeat(64),
+      })}\n`, { mode: 0o600 });
+
+      const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+        f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+      ));
+
+      assert.notEqual(result.phase, 'committed', `${fault}/${matrix}`);
+      assert.equal(f.docker.inspection.running, false, `${fault}/${matrix}`);
+      assert.equal(
+        (f.db.prepare(
+          "SELECT COUNT(*) AS n FROM audit WHERE action = 'commit-node-migration' AND target = 'line-a'",
+        ).get() as { n: number }).n,
+        0,
+        `${fault}/${matrix}`,
+      );
+    });
+  }
+}
+
+test('C41 post-start settings and node-config drift is rejected before backup deletion', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  const settingsBefore = sha256(readFileSync(join(f.instanceRoot, 'settings.js')));
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  const backup = join(f.instanceRoot, '.settings.js.tle-tx-01.backup');
+  f.docker.afterStart = () => {
+    writeFileSync(join(f.instanceRoot, 'settings.js'), 'flow-mutated-settings', { mode: 0o600 });
+    writeFileSync(join(f.instanceRoot, '.config.nodes.json'), '{"flow":"mutated"}\n', { mode: 0o600 });
+  };
+
+  const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+    f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+
+  assert.equal(result.phase, 'manual_required');
+  assert.equal(f.docker.inspection.running, false);
+  assert.equal(sha256(readFileSync(backup)), settingsBefore);
+  assert.equal(existsSync(join(f.instanceRoot, '.settings.js.tle-tx-01.backup-manifest')), true);
+});
+
+test('C41 first post-commit cleanup never uses permissive retry rules for a missing desired manifest', async () => {
+  const f = migrationFixture({
+    originalRunning: false,
+    onBarrier: (event) => {
+      if (event.phase === 'committed' && event.boundary === 'after-phase-persist') {
+        rmSync(join(f.instanceRoot, '.settings.js.tle-tx-01.manifest'));
+      }
+    },
+  });
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+
+  const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+    f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+
+  assert.equal(result.phase, 'committed');
+  assert.equal(existsSync(join(f.instanceRoot, '.settings.js.tle-tx-01.backup')), true);
+  assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), true);
+  assert.equal(
+    (f.db.prepare(
+      "SELECT COUNT(*) AS n FROM audit WHERE action = 'stopped_evidence_cleanup_pending'",
+    ).get() as { n: number }).n,
+    1,
+  );
+
+  const reopened = reopenMigrationFixture(f);
+  await reopened.service.recoverInterrupted();
+  assert.equal(existsSync(join(f.instanceRoot, '.settings.js.tle-tx-01.backup')), true);
+  assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), true);
+  reopened.db.close();
+});
 
 test('stopped export ignores settings/package/lock backup variants exactly', async () => {
   const f = migrationFixture({ originalRunning: false });
@@ -2030,12 +2257,25 @@ test('C40 fresh file-backed service recovers every running and stopped phase wit
     ] as const) {
       const f = migrationFixture({ originalRunning });
       const txId = `tx-c40-${originalRunning ? 'running' : 'stopped'}-${phase}`;
+      const edgeKey = join('node_modules', ...PLATFORM_NODE_PACKAGE.name.split('/'));
+      const commonKey = join('node_modules', ...PLATFORM_COMMON_PACKAGE.name.split('/'));
+      if (!originalRunning && ['cutover', 'verifying', 'rolling_back'].includes(phase)) {
+        const common = join(f.instanceRoot, commonKey);
+        mkdirSync(join(common, 'lib'), { recursive: true, mode: 0o750 });
+        chmodSync(common, 0o750);
+        writeFileSync(join(common, 'package.json'), '{"name":"prior-common"}\n', { mode: 0o640 });
+        writeFileSync(join(common, 'lib', 'prior.js'), 'module.exports = 0;\n', { mode: 0o600 });
+      }
       const before = {
         settings: sha256(readFileSync(join(f.instanceRoot, 'settings.js'))),
         flows: sha256(readFileSync(join(f.instanceRoot, 'flows.json'))),
         credentials: sha256(readFileSync(join(f.instanceRoot, 'flows_cred.json'))),
         package: sha256(readFileSync(join(f.instanceRoot, 'package.json'))),
         lock: sha256(readFileSync(join(f.instanceRoot, 'package-lock.json'))),
+        packageMode: lstatSync(join(f.instanceRoot, 'package.json')).mode & 0o777,
+        lockMode: lstatSync(join(f.instanceRoot, 'package-lock.json')).mode & 0o777,
+        edge: testArtifactFact(f.instanceRoot, edgeKey),
+        common: testArtifactFact(f.instanceRoot, commonKey),
       };
       await interruptedMigration(f, txId, phase, undefined, originalRunning);
       if (originalRunning) installPhaseRealisticRunningEffects(f, phase);
@@ -2084,7 +2324,12 @@ test('C40 fresh file-backed service recovers every running and stopped phase wit
         credentials: sha256(readFileSync(join(f.instanceRoot, 'flows_cred.json'))),
         package: sha256(readFileSync(join(f.instanceRoot, 'package.json'))),
         lock: sha256(readFileSync(join(f.instanceRoot, 'package-lock.json'))),
+        packageMode: lstatSync(join(f.instanceRoot, 'package.json')).mode & 0o777,
+        lockMode: lstatSync(join(f.instanceRoot, 'package-lock.json')).mode & 0o777,
+        edge: testArtifactFact(f.instanceRoot, edgeKey),
+        common: testArtifactFact(f.instanceRoot, commonKey),
       }, before, `${originalRunning}/${phase}`);
+      assert.deepEqual(txSidecars(f.instanceRoot, txId), [], `${originalRunning}/${phase}`);
       reopened.db.close();
     }
   }

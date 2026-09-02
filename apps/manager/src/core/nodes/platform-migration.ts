@@ -36,6 +36,7 @@ import { verifyInstalledPlatformFiles } from './installed-files.ts';
 import { assertHealthyPlatformModule } from './inventory.ts';
 import type {
   MigrationCheckpointManifest,
+  MigrationCheckpointFilePath,
 } from './migration-checkpoint.ts';
 import type { PlatformNodeOperationBarrier } from './platform-operation-barrier.ts';
 import {
@@ -1103,17 +1104,19 @@ export class PlatformMigrationService {
   ): Promise<void> {
     const liveRoot = join(this.o.instanceDataRoot, instanceId);
     for (const fact of facts) {
-      if (!fact.exists) continue;
       const target = join(liveRoot, fact.key);
       const partial = stoppedSidecar(target, txId, 'partial');
       const manifest = stoppedSidecar(target, txId, 'manifest');
       await trustedArtifactParent(liveRoot, fact.key, true);
       try {
         const existing = await artifactFact(dirname(partial), basename(partial));
-        if (existing.exists) {
+        if (!fact.exists && existing.exists) {
+          throw new Error('absent stopped artifact has a stale partial');
+        }
+        if (fact.exists && existing.exists) {
           const normalized = { ...existing, key: fact.key } as StoppedArtifactFact;
           if (!sameArtifact(normalized, fact)) throw new Error('stale stopped partial differs');
-        } else {
+        } else if (fact.exists) {
           await copyArtifact(join(probeRoot, fact.key), partial, fact);
         }
         await writeArtifactManifest(manifest, fact);
@@ -1145,13 +1148,16 @@ export class PlatformMigrationService {
       const manifest = stoppedSidecar(target, execution.txId, 'manifest');
       const observed = await artifactFact(dirname(partial), basename(partial));
       const marker = await readArtifactManifest(manifest, fact.key);
+      if (!marker || !sameArtifact(marker, fact)) {
+        throw controlled('cutover', `prepared stopped desired manifest is incomplete ${fact.key}`);
+      }
       if (!fact.exists) {
-        if (observed.exists || marker) {
+        if (observed.exists) {
           throw controlled('cutover', `unexpected absent-artifact partial ${fact.key}`);
         }
         continue;
       }
-      if (!observed.exists || !marker || !sameArtifact(marker, fact)) {
+      if (!observed.exists) {
         throw controlled('cutover', `prepared stopped artifact is incomplete ${fact.key}`);
       }
       await syncArtifactTree(partial).catch(() => {
@@ -1169,7 +1175,6 @@ export class PlatformMigrationService {
       await trustedArtifactParent(liveRoot, fact.key, false);
       const partial = stoppedSidecar(target, execution.txId, 'partial');
       const backup = stoppedSidecar(target, execution.txId, 'backup');
-      const manifest = stoppedSidecar(target, execution.txId, 'manifest');
       const backupManifest = stoppedSidecar(target, execution.txId, 'backup-manifest');
       const live = await artifactFact(liveRoot, fact.key);
       const backupFact = await artifactFact(dirname(backup), basename(backup));
@@ -1190,22 +1195,7 @@ export class PlatformMigrationService {
       }
 
       if (live.exists && sameArtifact(live, fact)) {
-        // C32: make recovery forget the desired artifact before consuming the
-        // unused partial. A crash in either deletion window can only preserve live.
-        await rm(manifest, { force: true });
-        await syncDirectory(dirname(target));
-        await this.barrierOwned(execution, {
-          instanceId: execution.instanceId, txId: execution.txId, phase: 'cutover',
-          sequence: sequence++, artifact: this.artifactBarrierKey(fact.key),
-          boundary: 'after-live-backup',
-        });
-        await rm(partial, { recursive: true, force: true });
-        await syncDirectory(dirname(target));
-        await this.barrierOwned(execution, {
-          instanceId: execution.instanceId, txId: execution.txId, phase: 'cutover',
-          sequence: sequence++, artifact: this.artifactBarrierKey(fact.key),
-          boundary: 'after-live-rename',
-        });
+        // C41 retains equal desired+partial evidence through explicit-start verification.
         continue;
       }
       if (live.exists) {
@@ -1305,8 +1295,17 @@ export class PlatformMigrationService {
     instanceId: string,
     txId: string,
     allowCommittedCleanupResidue = false,
-  ): Promise<void> {
+  ): Promise<StoppedArtifactFact[]> {
     const liveRoot = join(this.o.instanceDataRoot, instanceId);
+    const desiredFacts: StoppedArtifactFact[] = [];
+    const journal = this.o.repo.nodeMigration(instanceId);
+    if (!allowCommittedCleanupResidue && (!journal || journal.txId !== txId)) {
+      throw new Error('strict stopped evidence journal identity mismatch');
+    }
+    const checkpoint = !allowCommittedCleanupResidue
+      ? await this.o.checkpoint.verify(instanceId, txId)
+      : undefined;
+    const checkpointFacts = new Map(checkpoint?.files.map((fact) => [fact.path, fact]) ?? []);
     for (const key of STOPPED_EXPORT_PATHS) {
       const target = join(liveRoot, key);
       await trustedArtifactParent(liveRoot, key, false);
@@ -1319,6 +1318,61 @@ export class PlatformMigrationService {
       const live = await artifactFact(liveRoot, key);
       const desired = await readArtifactManifest(manifest, key);
       const prior = await readArtifactManifest(backupManifest, key);
+      if (!allowCommittedCleanupResidue && !desired) {
+        throw new Error(`stopped desired manifest missing ${key}`);
+      }
+      if (desired) {
+        desiredFacts.push(desired);
+        if (!sameArtifact(live, desired)) {
+          throw new Error(`stopped live desired owner mismatch ${key}`);
+        }
+      }
+      if (!allowCommittedCleanupResidue) {
+        const requiredDesired = desired!;
+        let expectedPrior: StoppedArtifactFact;
+        if (key.startsWith(`node_modules${sep}`)) {
+          if (!journal!.stagedBefore) {
+            expectedPrior = { key, exists: false };
+          } else if (backupFact.exists) {
+            if (!prior) throw new Error(`stopped prior manifest missing ${key}`);
+            expectedPrior = prior;
+          } else {
+            // A preexisting module without backup is unambiguous only while the
+            // retained equal/no-op partial proves prior === desired.
+            if (!partialFact.exists || !requiredDesired.exists || prior) {
+              throw new Error(`stopped preexisting module matrix is ambiguous ${key}`);
+            }
+            expectedPrior = requiredDesired;
+          }
+        } else {
+          const fact = checkpointFacts.get(key as MigrationCheckpointFilePath);
+          if (!fact) throw new Error(`checkpoint prior fact missing ${key}`);
+          expectedPrior = fact.exists
+            ? { key, exists: true, kind: 'file', mode: fact.mode, sha256: fact.sha256 }
+            : { key, exists: false };
+        }
+        const changed = !sameArtifact(expectedPrior, requiredDesired);
+        if (changed && expectedPrior.exists) {
+          if (
+            !backupFact.exists || !prior
+            || !sameArtifact({ ...backupFact, key } as StoppedArtifactFact, expectedPrior)
+            || !sameArtifact(prior, expectedPrior)
+          ) throw new Error(`stopped changed prior evidence missing ${key}`);
+        } else if (backupFact.exists || prior) {
+          throw new Error(`stopped unchanged/created artifact has prior evidence ${key}`);
+        }
+        if (changed) {
+          if (partialFact.exists) throw new Error(`stopped changed partial was not consumed ${key}`);
+        } else if (requiredDesired.exists) {
+          if (!partialFact.exists || !sameArtifact(
+            { ...partialFact, key } as StoppedArtifactFact,
+            requiredDesired,
+          )) throw new Error(`stopped equal partial evidence missing ${key}`);
+        } else if (partialFact.exists) {
+          throw new Error(`stopped absent no-op has unexpected partial ${key}`);
+        }
+        continue;
+      }
       if (partialFact.exists) {
         if (!desired || !sameArtifact(
           { ...partialFact, key } as StoppedArtifactFact,
@@ -1326,11 +1380,11 @@ export class PlatformMigrationService {
         )) {
           throw new Error(`stopped partial owner mismatch ${key}`);
         }
-      } else if (desired && (!live.exists || !sameArtifact(live, desired))) {
+      } else if (desired && !sameArtifact(live, desired)) {
         throw new Error(`stopped live desired owner mismatch ${key}`);
       }
       if (backupFact.exists) {
-        if (!prior || !sameArtifact(
+        if (!desired || !prior || !sameArtifact(
           { ...backupFact, key } as StoppedArtifactFact,
           prior,
         )) {
@@ -1338,6 +1392,67 @@ export class PlatformMigrationService {
         }
       } else if (prior && !allowCommittedCleanupResidue) {
         throw new Error(`orphan stopped backup manifest ${key}`);
+      }
+    }
+    return desiredFacts;
+  }
+
+  private async cleanupEqualStoppedEvidenceBeforeCommit(
+    execution: MigrationExecutionSession,
+    desiredFacts: readonly StoppedArtifactFact[],
+    startSequence: number,
+  ): Promise<{ sequence: number; cleanedKeys: Set<string> }> {
+    const liveRoot = join(this.o.instanceDataRoot, execution.instanceId);
+    let sequence = startSequence;
+    const cleanedKeys = new Set<string>();
+    for (const desired of desiredFacts) {
+      const target = join(liveRoot, desired.key);
+      const partial = stoppedSidecar(target, execution.txId, 'partial');
+      const partialFact = await artifactFact(dirname(partial), basename(partial));
+      if (!partialFact.exists) continue;
+      // Strict verification proved a retained partial is an equal/no-op artifact.
+      const manifest = stoppedSidecar(target, execution.txId, 'manifest');
+      await rm(manifest, { force: false });
+      await syncDirectory(dirname(target));
+      await this.barrierOwned(execution, {
+        instanceId: execution.instanceId, txId: execution.txId, phase: 'verifying',
+        sequence: sequence++, artifact: this.artifactBarrierKey(desired.key),
+        boundary: 'after-live-backup',
+      });
+      await rm(partial, { recursive: true, force: false });
+      await syncDirectory(dirname(target));
+      await this.barrierOwned(execution, {
+        instanceId: execution.instanceId, txId: execution.txId, phase: 'verifying',
+        sequence: sequence++, artifact: this.artifactBarrierKey(desired.key),
+        boundary: 'after-live-rename',
+      });
+      cleanedKeys.add(desired.key);
+    }
+    return { sequence, cleanedKeys };
+  }
+
+  private async verifyInitialCommittedCleanup(
+    instanceId: string,
+    txId: string,
+    desiredFacts: readonly StoppedArtifactFact[],
+    precleanedKeys: ReadonlySet<string>,
+  ): Promise<void> {
+    const liveRoot = join(this.o.instanceDataRoot, instanceId);
+    for (const desired of desiredFacts) {
+      if (!sameArtifact(await artifactFact(liveRoot, desired.key), desired)) {
+        throw new Error(`committed live desired drift ${desired.key}`);
+      }
+      const target = join(liveRoot, desired.key);
+      const manifest = stoppedSidecar(target, txId, 'manifest');
+      const partial = stoppedSidecar(target, txId, 'partial');
+      const marker = await readArtifactManifest(manifest, desired.key);
+      const partialFact = await artifactFact(dirname(partial), basename(partial));
+      if (precleanedKeys.has(desired.key)) {
+        if (marker || partialFact.exists) {
+          throw new Error(`equal evidence cleanup was incomplete ${desired.key}`);
+        }
+      } else if (!marker || !sameArtifact(marker, desired)) {
+        throw new Error(`initial committed desired manifest missing ${desired.key}`);
       }
     }
   }
@@ -1368,8 +1483,17 @@ export class PlatformMigrationService {
     instanceId: string,
     txId: string,
     actor: string,
+    initial?: {
+      desiredFacts: readonly StoppedArtifactFact[];
+      precleanedKeys: ReadonlySet<string>;
+    },
   ): Promise<boolean> {
     try {
+      if (initial) {
+        await this.verifyInitialCommittedCleanup(
+          instanceId, txId, initial.desiredFacts, initial.precleanedKeys,
+        );
+      }
       await this.cleanupStoppedEvidence(instanceId, txId);
       return true;
     } catch {
@@ -1499,13 +1623,26 @@ export class PlatformMigrationService {
       await this.o.adminRuntime.waitReady(instanceId, { timeoutMs: 30_000, intervalMs: 250 });
       await this.verifyCutover(instanceId, this.o.repo.nodeMigration(instanceId)!);
       execution.renew(['verifying']);
-      await this.verifyStoppedEvidenceOwned(instanceId, scanned.txId);
+      const desiredFacts = await this.verifyStoppedEvidenceOwned(instanceId, scanned.txId);
+      const equalCleanup = await this.cleanupEqualStoppedEvidenceBeforeCommit(
+        execution, desiredFacts, 201,
+      );
+      for (const desired of desiredFacts) {
+        if (!sameArtifact(
+          await artifactFact(join(this.o.instanceDataRoot, instanceId), desired.key),
+          desired,
+        )) throw controlled('verification', `stopped live artifact drifted before commit ${desired.key}`);
+      }
+      execution.renew(['verifying']);
       this.o.repo.commitNodeMigrationExact(
         instanceId, scanned.txId, owner, this.executionRuntime.now(),
         'verifying', PLATFORM_NODE_PACKAGE.version, actor,
       );
-      await this.reach(instanceId, scanned.txId, 'committed', 201);
-      if (!await this.cleanupCommittedStoppedEvidence(instanceId, scanned.txId, actor)) {
+      await this.reach(instanceId, scanned.txId, 'committed', equalCleanup.sequence);
+      if (!await this.cleanupCommittedStoppedEvidence(instanceId, scanned.txId, actor, {
+        desiredFacts,
+        precleanedKeys: equalCleanup.cleanedKeys,
+      })) {
         return this.status(instanceId);
       }
       await this.cleanupTerminal(instanceId, scanned.txId, 'committed', actor);
