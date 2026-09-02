@@ -3,12 +3,14 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
   existsSync,
+  chmodSync,
   cpSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -566,12 +568,15 @@ class FakeSettings implements MigrationSettingsRenderer {
 interface FixtureOptions {
   preexisting?: boolean;
   originalRunning?: boolean;
-  barrierFailure?: { phase: NodeMigrationState; boundary: string };
-  cleanupFailure?: boolean;
-  onBarrier?: ((event: {
+  barrierFailure?: {
     phase: NodeMigrationState;
     boundary: string;
-  }) => void | Promise<void>) | undefined;
+    artifact?: Parameters<PlatformNodeOperationBarrier['reach']>[0]['artifact'];
+  };
+  cleanupFailure?: boolean;
+  onBarrier?: ((event: Parameters<PlatformNodeOperationBarrier['reach']>[0]) => (
+    void | Promise<void>
+  )) | undefined;
   onProxyClose?: (() => void) | undefined;
   enableRepair?: boolean;
   repairFailure?: boolean;
@@ -662,6 +667,10 @@ function migrationFixture(options: FixtureOptions = {}) {
       if (
         controls.barrierFailure?.phase === event.phase
         && controls.barrierFailure.boundary === event.boundary
+        && (
+          controls.barrierFailure.artifact === undefined
+          || controls.barrierFailure.artifact === event.artifact
+        )
       ) throw new Error('token=barrier-secret');
     },
   };
@@ -785,6 +794,90 @@ async function interruptedMigration(
     await f.checkpoint.create('line-a', txId);
     f.repo.updateNodeMigration('line-a', phase);
   }
+}
+
+function reopenMigrationFixture(
+  f: ReturnType<typeof migrationFixture>,
+  bootstrapRecovery?: () => Promise<unknown>,
+) {
+  f.db.close();
+  const db = openDb(join(f.root, 'manager.db'));
+  const repo = new InstanceRepo(db, deriveKey('migration-test-master-key', 'instance'));
+  const gate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repo));
+  const barrier: PlatformNodeOperationBarrier = {
+    async reach(event) {
+      assert.equal(repo.nodeMigration(event.instanceId)?.phase, event.phase);
+      f.barrierEvents.push({ ...event });
+      f.events.push(`reopened-barrier:${event.phase}:${event.boundary}`);
+    },
+  };
+  const service = new PlatformMigrationService({
+    repo,
+    gate,
+    proxySessions: f.proxySessions,
+    docker: f.docker,
+    adminRuntime: f.adminRuntime,
+    admin: f.admin,
+    platformPackages: f.packages,
+    checkpoint: f.checkpointPort,
+    settings: new FakeSettings(gate),
+    barrier,
+    instanceDataRoot: f.root,
+    txId: () => 'tx-reopened-unused',
+    ...(bootstrapRecovery ? {
+      bootstrapRecovery: { recoverInterruptedBootstraps: bootstrapRecovery },
+    } : {}),
+    executionRuntime: {
+      now: f.time.now,
+      sleep: f.time.sleep,
+      startHeartbeat: f.time.startHeartbeat,
+      executionOwner: () => 'owner-reopened-recovery-0001',
+      leaseDurationMs: 1_000,
+    },
+  });
+  return { db, repo, gate, service };
+}
+
+function installPhaseRealisticRunningEffects(
+  f: ReturnType<typeof migrationFixture>,
+  phase: NodeMigrationState,
+): void {
+  if (!['staged', 'cutover', 'verifying', 'rolling_back'].includes(phase)) return;
+  writeInstalledPackage(f.instanceRoot);
+  f.state.staged = true;
+  f.admin.beforeModules = [rawPlatformInventory(), stagedPlatformInventory()];
+  if (['cutover', 'verifying', 'rolling_back'].includes(phase)) {
+    writeFileSync(
+      join(f.instanceRoot, 'settings.js'),
+      `module.exports={nodesExcludes:${JSON.stringify(LEGACY_RUNTIME_EXCLUDES)}};\n`,
+      { mode: 0o600 },
+    );
+    f.state.cutover = true;
+  }
+}
+
+function installPhaseRealisticStoppedEffects(
+  f: ReturnType<typeof migrationFixture>,
+  txId: string,
+  phase: NodeMigrationState,
+): void {
+  if (!['cutover', 'verifying', 'rolling_back'].includes(phase)) return;
+  const target = join(f.instanceRoot, 'settings.js');
+  const original = readFileSync(target);
+  const backup = join(f.instanceRoot, `.settings.js.tle-${txId}.backup`);
+  const backupManifest = join(f.instanceRoot, `.settings.js.tle-${txId}.backup-manifest`);
+  const manifest = join(f.instanceRoot, `.settings.js.tle-${txId}.manifest`);
+  const desired = Buffer.from(
+    `module.exports={nodesExcludes:${JSON.stringify(LEGACY_RUNTIME_EXCLUDES)}};\n`,
+  );
+  writeFileSync(backup, original, { mode: 0o600 });
+  writeFileSync(backupManifest, `${JSON.stringify({
+    key: 'settings.js', exists: true, kind: 'file', mode: 0o600, sha256: sha256(original),
+  })}\n`, { mode: 0o600 });
+  writeFileSync(target, desired, { mode: 0o600 });
+  writeFileSync(manifest, `${JSON.stringify({
+    key: 'settings.js', exists: true, kind: 'file', mode: 0o600, sha256: sha256(desired),
+  })}\n`, { mode: 0o600 });
 }
 
 function claimReplacementExecution(
@@ -1137,6 +1230,50 @@ test('explicit pending start claims once, starts once, verifies, commits, and re
   );
 });
 
+test('C35 crash immediately after atomic pending claim is recoverable before production start', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  f.controls.barrierFailure = {
+    phase: 'verifying',
+    boundary: 'after-phase-persist',
+  };
+  const startsBefore = f.docker.runtimeCalls.filter((call) => call === 'start').length;
+
+  const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+    f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+
+  assert.equal(result.phase, 'rolled_back');
+  assert.equal(f.docker.runtimeCalls.filter((call) => call === 'start').length, startsBefore);
+  assert.equal(f.docker.inspection.running, false);
+});
+
+test('C35 fresh service waits for claimed verifying owner expiry then recovers without a start', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  const journal = f.repo.nodeMigration('line-a')!;
+  const claimed = f.repo.claimPendingStartVerifyingExact(
+    'line-a', journal.txId, 'owner-crashed-pending-start-0001',
+    f.time.now(), 1_000,
+  );
+  assert.equal(claimed?.phase, 'verifying');
+  const effectsBefore = [...f.docker.runtimeCalls];
+  const reopened = reopenMigrationFixture(f);
+
+  const recovery = reopened.service.recoverInterrupted();
+  assert.equal(f.time.pendingSleeps, 1);
+  f.time.advance(1_000);
+  const result = await recovery;
+
+  assert.deepEqual(result.map((entry) => entry.phase), ['rolled_back']);
+  assert.equal(f.docker.inspection.running, false);
+  assert.equal(
+    f.docker.runtimeCalls.filter((effect) => effect === 'start').length,
+    effectsBefore.filter((effect) => effect === 'start').length,
+  );
+  reopened.db.close();
+});
+
 test('pending start verification failure restores the immutable checkpoint and leaves production stopped', async () => {
   const f = migrationFixture({ originalRunning: false });
   const settingsBefore = sha256(readFileSync(join(f.instanceRoot, 'settings.js')));
@@ -1160,6 +1297,79 @@ test('pending start verification failure restores the immutable checkpoint and l
   assert.equal(sha256(readFileSync(join(f.instanceRoot, 'settings.js'))), settingsBefore);
   assert.equal(sha256(readFileSync(join(f.instanceRoot, 'package.json'))), packageBefore);
   assert.equal(f.repo.nodeRuntime('line-a')?.mode, 'legacy');
+});
+
+test('C37 stopped evidence ownership is verified before the pending-start commit', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  let observedPhase = '';
+  (f.service as unknown as {
+    verifyStoppedEvidenceOwned(instanceId: string, txId: string): Promise<void>;
+  }).verifyStoppedEvidenceOwned = async () => {
+    observedPhase = f.repo.nodeMigration('line-a')?.phase ?? '';
+    throw new Error('owned evidence verification failed');
+  };
+
+  const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+    f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+
+  assert.equal(observedPhase, 'verifying');
+  assert.equal(result.phase, 'rolled_back');
+  assert.equal(f.docker.inspection.running, false);
+});
+
+test('C37 committed recovery retries stopped evidence cleanup before checkpoint cleanup', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  const originalCleanup = (f.service as unknown as {
+    cleanupStoppedEvidence(instanceId: string, txId: string): Promise<void>;
+  }).cleanupStoppedEvidence.bind(f.service);
+  let failures = 1;
+  (f.service as unknown as {
+    cleanupStoppedEvidence(instanceId: string, txId: string): Promise<void>;
+  }).cleanupStoppedEvidence = async (instanceId, txId) => {
+    if (failures-- > 0) {
+      rmSync(join(f.instanceRoot, `.settings.js.tle-${txId}.backup`));
+      throw new Error('credential sidecar cleanup failed after partial progress');
+    }
+    await originalCleanup(instanceId, txId);
+  };
+
+  const committed = await f.gate.run('line-a', 'start-instance', (lease) => (
+    f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+  assert.equal(committed.phase, 'committed');
+  assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), true);
+  assert.ok(readdirSync(f.instanceRoot).some((entry) => entry.includes('.tle-tx-01.')));
+  assert.equal(
+    (f.db.prepare(
+      "SELECT COUNT(*) AS n FROM audit WHERE action = 'stopped_evidence_cleanup_pending'",
+    ).get() as { n: number }).n,
+    1,
+  );
+
+  const freshGate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(f.repo));
+  const freshService = f.createService(f.repo, freshGate, 'tx-fresh-recovery');
+  await freshService.recoverInterrupted();
+  assert.equal(readdirSync(f.instanceRoot).some((entry) => entry.includes('.tle-tx-01.')), false);
+  assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), false);
+});
+
+test('C37 tampered stopped backup blocks commit and retains evidence for manual recovery', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  const backup = join(f.instanceRoot, '.settings.js.tle-tx-01.backup');
+  writeFileSync(backup, 'foreign-backup', { mode: 0o600 });
+
+  const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+    f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+
+  assert.equal(result.phase, 'manual_required');
+  assert.equal(f.docker.inspection.running, false);
+  assert.equal(readFileSync(backup, 'utf8'), 'foreign-backup');
+  assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), true);
 });
 
 test('stopped live apply covers all four file/directory states without overwriting nonempty targets', async () => {
@@ -1188,6 +1398,95 @@ test('stopped live apply covers all four file/directory states without overwriti
   assert.ok(liveEvents.every((event) => event.artifact));
   assert.ok(liveEvents.every((event, index) => index === 0 || event.sequence > liveEvents[index - 1]!.sequence));
 });
+
+for (const artifact of ['edge-module', 'common-module'] as const) {
+  for (const boundary of ['after-live-backup', 'after-live-rename'] as const) {
+    test(`equal ${artifact} cleanup crash at ${boundary} never deletes the preexisting directory`, async () => {
+      const f = migrationFixture({
+        originalRunning: false,
+        preexisting: true,
+        barrierFailure: { phase: 'cutover', boundary, artifact },
+      });
+      const relative = artifact === 'edge-module'
+        ? join('node_modules', ...PLATFORM_NODE_PACKAGE.name.split('/'))
+        : join('node_modules', ...PLATFORM_COMMON_PACKAGE.name.split('/'));
+      const before = sha256(readFileSync(join(f.instanceRoot, relative, 'package.json')));
+
+      const result = await f.service.migrate('line-a', 'admin');
+
+      assert.equal(result.phase, 'rolled_back');
+      assert.equal(sha256(readFileSync(join(f.instanceRoot, relative, 'package.json'))), before);
+      assert.equal(f.docker.inspection.running, false);
+      assert.ok(f.barrierEvents.some((event) => (
+        event.phase === 'cutover' && event.boundary === boundary && event.artifact === artifact
+      )));
+    });
+  }
+}
+
+test('stopped export ignores settings/package/lock backup variants exactly', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  const ignored = ['settings.js.backup', 'package.json.backup', 'package-lock.json.backup'] as const;
+  for (const path of ignored) writeFileSync(join(f.instanceRoot, path), `live-${path}`, { mode: 0o600 });
+  f.docker.afterProbeRestart = (probeRoot) => {
+    for (const path of ignored) writeFileSync(join(probeRoot, path), `probe-${path}`, { mode: 0o600 });
+  };
+
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+
+  for (const path of ignored) {
+    assert.equal(readFileSync(join(f.instanceRoot, path), 'utf8'), `live-${path}`);
+    assert.equal(
+      readdirSync(f.instanceRoot).some((entry) => entry.includes(`${path}.tle-tx-01`)),
+      false,
+    );
+  }
+});
+
+for (const drift of ['hash', 'mode', 'existence', 'type', 'symlink', 'directory-hash'] as const) {
+  test(`prepared stopped partial ${drift} drift is rejected before the first live mutation`, async () => {
+    const f = migrationFixture({
+      originalRunning: false,
+      onBarrier: (event) => {
+        if (event.phase !== 'cutover' || event.boundary !== 'after-phase-persist') return;
+        const settingsPartial = join(f.instanceRoot, '.settings.js.tle-tx-01.partial');
+        if (drift === 'hash') writeFileSync(settingsPartial, 'tampered-partial', { mode: 0o600 });
+        if (drift === 'mode') chmodSync(settingsPartial, 0o644);
+        if (drift === 'existence') rmSync(settingsPartial);
+        if (drift === 'type') {
+          rmSync(settingsPartial);
+          mkdirSync(settingsPartial);
+        }
+        if (drift === 'symlink') {
+          rmSync(settingsPartial);
+          symlinkSync(join(f.instanceRoot, 'settings.js'), settingsPartial);
+        }
+        if (drift === 'directory-hash') {
+          writeFileSync(join(
+            f.instanceRoot,
+            'node_modules',
+            '@mqttsnet',
+            '.thinglinks-edge-nodes.tle-tx-01.partial',
+            'package.json',
+          ), '{"tampered":true}\n', { mode: 0o600 });
+        }
+      },
+    });
+    const before = sha256(readFileSync(join(f.instanceRoot, 'settings.js')));
+
+    const result = await f.service.migrate('line-a', 'admin');
+
+    assert.equal(result.phase, 'manual_required', drift);
+    assert.equal(sha256(readFileSync(join(f.instanceRoot, 'settings.js'))), before, drift);
+    assert.equal(
+      f.barrierEvents.some((event) => (
+        event.boundary === 'after-live-backup' || event.boundary === 'after-live-rename'
+      )),
+      false,
+      drift,
+    );
+  });
+}
 
 for (const boundary of ['after-live-backup', 'after-live-rename'] as const) {
   test(`stopped crash at ${boundary} restores checkpoint bytes and original stopped state`, async () => {
@@ -1699,6 +1998,170 @@ test('startup recovery restores every stopped phase from the immutable checkpoin
       lock: sha256(readFileSync(join(f.instanceRoot, 'package-lock.json'))),
     }, before, phase);
   }
+});
+
+test('C34 stopped staged cutover and verifying recovery never calls unreachable live Admin', async () => {
+  for (const phase of ['staged', 'cutover', 'verifying'] as const) {
+    const f = migrationFixture({ originalRunning: false });
+    const txId = `tx-stopped-no-admin-${phase}`;
+    await interruptedMigration(f, txId, phase, undefined, false);
+    let adminCalls = 0;
+    const unreachable = async () => {
+      adminCalls += 1;
+      throw new Error('stopped production Admin must stay unreachable');
+    };
+    f.admin.installedModules = unreachable;
+    f.admin.uninstallPlatformModule = unreachable;
+    f.admin.currentFlows = unreachable;
+    f.adminRuntime.waitReady = unreachable;
+
+    const result = await f.service.recoverInterrupted();
+
+    assert.deepEqual(result.map((entry) => entry.phase), ['rolled_back'], phase);
+    assert.equal(adminCalls, 0, phase);
+    assert.equal(f.docker.inspection.running, false, phase);
+  }
+});
+
+test('C40 fresh file-backed service recovers every running and stopped phase with realistic effects', async () => {
+  for (const originalRunning of [true, false]) {
+    for (const phase of [
+      'preparing', 'checkpointed', 'staged', 'cutover', 'verifying', 'rolling_back',
+    ] as const) {
+      const f = migrationFixture({ originalRunning });
+      const txId = `tx-c40-${originalRunning ? 'running' : 'stopped'}-${phase}`;
+      const before = {
+        settings: sha256(readFileSync(join(f.instanceRoot, 'settings.js'))),
+        flows: sha256(readFileSync(join(f.instanceRoot, 'flows.json'))),
+        credentials: sha256(readFileSync(join(f.instanceRoot, 'flows_cred.json'))),
+        package: sha256(readFileSync(join(f.instanceRoot, 'package.json'))),
+        lock: sha256(readFileSync(join(f.instanceRoot, 'package-lock.json'))),
+      };
+      await interruptedMigration(f, txId, phase, undefined, originalRunning);
+      if (originalRunning) installPhaseRealisticRunningEffects(f, phase);
+      else installPhaseRealisticStoppedEffects(f, txId, phase);
+      if (!originalRunning && phase === 'staged') {
+        const journal = f.repo.nodeMigration('line-a')!;
+        await f.docker.createMigrationProbe({
+          spec: {
+            id: 'line-a', imageTag: '5.0.4-24-minimal', memoryMb: 512, cpus: 0.5,
+            ports: [], adminRoot: '/red/line-a/', ingestToken: 'probe-only-token',
+          },
+          txId,
+          imageId: journal.imageIdBefore,
+          checkpointDir: journal.checkpointDir,
+        });
+      }
+      let adminCalls = 0;
+      if (!originalRunning) {
+        const unreachable = async () => {
+          adminCalls += 1;
+          throw new Error('stopped production Admin is unreachable');
+        };
+        f.admin.installedModules = unreachable;
+        f.admin.uninstallPlatformModule = unreachable;
+        f.admin.currentFlows = unreachable;
+        f.adminRuntime.waitReady = unreachable;
+      }
+      let bootstrapRecoveries = 0;
+      const recoveryEventStart = f.events.length;
+      const reopened = reopenMigrationFixture(f, async () => {
+        bootstrapRecoveries += 1;
+        f.events.push('c40-bootstrap-recovery');
+        return [{ instanceId: 'bootstrap-residual', residuals: ['data'] }];
+      });
+
+      const result = await reopened.service.recoverInterrupted();
+
+      assert.deepEqual(result.map((entry) => entry.phase), ['rolled_back'], `${originalRunning}/${phase}`);
+      assert.equal(bootstrapRecoveries, 1, phase);
+      assert.equal(f.events[recoveryEventStart], 'c40-bootstrap-recovery', phase);
+      assert.equal(f.docker.inspection.running, originalRunning, phase);
+      assert.equal(adminCalls, 0, phase);
+      assert.deepEqual({
+        settings: sha256(readFileSync(join(f.instanceRoot, 'settings.js'))),
+        flows: sha256(readFileSync(join(f.instanceRoot, 'flows.json'))),
+        credentials: sha256(readFileSync(join(f.instanceRoot, 'flows_cred.json'))),
+        package: sha256(readFileSync(join(f.instanceRoot, 'package.json'))),
+        lock: sha256(readFileSync(join(f.instanceRoot, 'package-lock.json'))),
+      }, before, `${originalRunning}/${phase}`);
+      reopened.db.close();
+    }
+  }
+});
+
+test('C40 fresh recovery preserves pending and terminals without repeating cutover', async () => {
+  const pending = migrationFixture({ originalRunning: false });
+  assert.equal((await pending.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  const pendingRuntimeEffects = [...pending.docker.runtimeCalls];
+  const reopenedPending = reopenMigrationFixture(pending);
+  assert.deepEqual(
+    (await reopenedPending.service.recoverInterrupted()).map((entry) => entry.phase),
+    ['pending_start_verification'],
+  );
+  assert.deepEqual(pending.docker.runtimeCalls, pendingRuntimeEffects);
+  assert.equal(pending.docker.inspection.running, false);
+  reopenedPending.db.close();
+
+  const committed = migrationFixture({ originalRunning: false });
+  assert.equal((await committed.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  assert.equal((await committed.gate.run('line-a', 'start-instance', (lease) => (
+    committed.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ))).phase, 'committed');
+  const committedEffects = [...committed.docker.runtimeCalls];
+  const reopenedCommitted = reopenMigrationFixture(committed);
+  assert.deepEqual(
+    (await reopenedCommitted.service.recoverInterrupted()).map((entry) => entry.phase),
+    ['committed'],
+  );
+  assert.deepEqual(committed.docker.runtimeCalls, committedEffects);
+  reopenedCommitted.db.close();
+
+  const rolledBack = migrationFixture({ originalRunning: false });
+  await interruptedMigration(rolledBack, 'tx-c40-terminal-rollback', 'checkpointed', undefined, false);
+  assert.deepEqual(
+    (await rolledBack.service.recoverInterrupted()).map((entry) => entry.phase),
+    ['rolled_back'],
+  );
+  const rolledBackEffects = [...rolledBack.docker.runtimeCalls];
+  const reopenedRolledBack = reopenMigrationFixture(rolledBack);
+  assert.deepEqual(
+    (await reopenedRolledBack.service.recoverInterrupted()).map((entry) => entry.phase),
+    ['rolled_back'],
+  );
+  assert.deepEqual(rolledBack.docker.runtimeCalls, rolledBackEffects);
+  reopenedRolledBack.db.close();
+});
+
+test('C40 fresh recovery marks tampered checkpoint and impossible projection manual without destructive retry', async () => {
+  const tampered = migrationFixture({ originalRunning: false });
+  await interruptedMigration(tampered, 'tx-c40-tampered', 'checkpointed', undefined, false);
+  writeFileSync(
+    join(tampered.root, '.thinglinks-migration', 'line-a', 'tx-c40-tampered', 'manifest.json'),
+    '{"tampered":true}\n',
+  );
+  const tamperedReopened = reopenMigrationFixture(tampered);
+  assert.deepEqual(
+    (await tamperedReopened.service.recoverInterrupted()).map((entry) => entry.phase),
+    ['manual_required'],
+  );
+  assert.equal(tampered.docker.inspection.running, false);
+  tamperedReopened.db.close();
+
+  const impossible = migrationFixture({ originalRunning: false });
+  await interruptedMigration(impossible, 'tx-c40-impossible', 'checkpointed', undefined, false);
+  impossible.db.prepare(
+    "UPDATE instance SET node_migration_state = 'staged' WHERE id = 'line-a'",
+  ).run();
+  const effectsBefore = [...impossible.docker.runtimeCalls];
+  const impossibleReopened = reopenMigrationFixture(impossible);
+  assert.equal(impossibleReopened.repo.nodeMigration('line-a')?.phase, 'manual_required');
+  assert.deepEqual(
+    (await impossibleReopened.service.recoverInterrupted()).map((entry) => entry.phase),
+    ['manual_required'],
+  );
+  assert.deepEqual(impossible.docker.runtimeCalls, effectsBefore);
+  impossibleReopened.db.close();
 });
 
 test('public rollback is busy during active migration and preparing without ready finalizes cleanly', async () => {

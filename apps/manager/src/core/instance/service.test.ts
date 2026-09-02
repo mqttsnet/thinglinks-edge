@@ -390,6 +390,45 @@ test('same-image rebuild plus compensation failure persists a manual fence witho
   await assert.rejects(() => f.service.start('line-a', 'admin'), /manual_required/);
 });
 
+for (const terminal of ['committed', 'rolled_back'] as const) {
+  test(`same-image double failure fences an exact clean ${terminal} journal`, async () => {
+    const f = fixture(persistedPolicy(terminal));
+    const txId = f.repo.nodeMigration('line-a')?.txId;
+    assert.ok(txId);
+    (f.docker as unknown as { recreateInstance(): Promise<void> }).recreateInstance = async () => {
+      throw new Error('password=must-not-escape');
+    };
+
+    await assert.rejects(
+      () => f.service.recreateSameImage('line-a'),
+      (error: unknown) => /人工处理/.test((error as Error).message)
+        && !/must-not-escape|password/.test((error as Error).message),
+    );
+
+    assert.equal(f.repo.nodeMigration('line-a')?.txId, txId);
+    assert.equal(f.repo.nodeMigration('line-a')?.phase, 'manual_required');
+    assert.equal(f.repo.nodeMigration('line-a')?.error, 'compensation');
+    assert.equal(f.repo.nodeRuntime('line-a')?.migrationState, 'manual_required');
+  });
+}
+
+test('same-image double failure verifies the manual fence instead of swallowing a no-op repository write', async () => {
+  const f = fixture(persistedPolicy('committed'));
+  (f.docker as unknown as { recreateInstance(): Promise<void> }).recreateInstance = async () => {
+    throw new Error('token=must-not-escape');
+  };
+  (f.repo as unknown as {
+    fenceSameImageRebuildFailureExact(): void;
+  }).fenceSameImageRebuildFailureExact = () => undefined;
+
+  await assert.rejects(
+    () => f.service.recreateSameImage('line-a'),
+    (error: unknown) => /未能持久化人工围栏/.test((error as Error).message)
+      && !/must-not-escape|token=/.test((error as Error).message),
+  );
+  assert.equal(f.repo.nodeRuntime('line-a')?.migrationState, 'committed');
+});
+
 test('platform migration lease reuses same-image under-lease primitive without nested gate acquisition', async () => {
   const f = fixture();
   await f.gate.run('line-a', 'platform-migration', async (lease) => {

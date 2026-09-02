@@ -127,14 +127,14 @@ export function assemblePlatformOperationBarrier(overrides: InternalManagerOverr
   };
 }
 
-export interface ManagerStartupHooks<Server = unknown> {
-  initializeData: () => Promise<void> | void;
-  bootstrapTrust: () => Promise<void> | void;
-  constructServices: () => Promise<void> | void;
-  reconcileNetworks: () => Promise<void>;
-  recoverInterrupted: () => Promise<void>;
-  startBackground: () => Promise<void> | void;
-  buildServer: () => Promise<{
+export interface ManagerStartupHooks<Context, Server = unknown> {
+  initializeData: () => Promise<Context> | Context;
+  bootstrapTrust: (context: Context) => Promise<void> | void;
+  constructServices: (context: Context) => Promise<void> | void;
+  reconcileNetworks: (context: Context) => Promise<void>;
+  recoverInterrupted: (context: Context) => Promise<void>;
+  startBackground: (context: Context) => Promise<void> | void;
+  buildServer: (context: Context) => Promise<{
     server: Server;
     listen: () => Promise<void>;
   }> | {
@@ -143,16 +143,16 @@ export interface ManagerStartupHooks<Server = unknown> {
   };
 }
 
-export async function startManagerRuntime<Server>(
-  hooks: ManagerStartupHooks<Server>,
+export async function startManagerRuntime<Context, Server>(
+  hooks: ManagerStartupHooks<Context, Server>,
 ): Promise<Server> {
-  await hooks.initializeData();
-  await hooks.bootstrapTrust();
-  await hooks.constructServices();
-  await hooks.reconcileNetworks();
-  await hooks.recoverInterrupted();
-  await hooks.startBackground();
-  const built = await hooks.buildServer();
+  const context = await hooks.initializeData();
+  await hooks.bootstrapTrust(context);
+  await hooks.constructServices(context);
+  await hooks.reconcileNetworks(context);
+  await hooks.recoverInterrupted(context);
+  await hooks.startBackground(context);
+  const built = await hooks.buildServer(context);
   await built.listen();
   return built.server;
 }
@@ -320,28 +320,57 @@ async function runPreflightCli(argv: string[]): Promise<void> {
   if (!report.ok) process.exitCode = 1;
 }
 
+interface ProductionManagerStartupContext {
+  config: ReturnType<typeof loadConfig>;
+  db: ReturnType<typeof openDb>;
+  nodeStore: NodeStore;
+  nodeCatalog: NodeCatalog;
+  platformNodeServices?: ReturnType<typeof assemblePlatformNodeServices>;
+  reconcileNetworks?: () => Promise<void>;
+  recoverInterrupted?: () => Promise<void>;
+  startBackground?: () => Promise<void>;
+  buildServer?: () => {
+    server: ReturnType<typeof buildServer>;
+    listen: () => Promise<void>;
+  };
+}
+
+function requireStartupPhase<T>(value: T | undefined, phase: string): T {
+  if (value === undefined) throw new Error(`Manager startup phase ${phase} was not constructed`);
+  return value;
+}
+
 export async function main(overrides: InternalManagerOverrides = {}): Promise<void> {
-  const config = loadConfig();
+  await startManagerRuntime<ProductionManagerStartupContext, ReturnType<typeof buildServer>>({
+    initializeData: () => {
+      const config = loadConfig();
+      const db = openDb(join(config.dataDir, 'edge.db'));
+      const nodeStore = new NodeStore(join(config.dataDir, 'npm'));
+      const nodeCatalog = new NodeCatalog(db);
+      for (const seedDir of [
+        join(config.dataDir, 'npm-seed'), process.env['NODE_SEED_DIR'] ?? '',
+      ]) {
+        const line = describeSeed(seedDir, seedFromDir(nodeStore, seedDir));
+        if (line) console.log(`[nodes] ${line}`);
+      }
+      return { config, db, nodeStore, nodeCatalog };
+    },
+    bootstrapTrust: (context) => {
+      context.platformNodeServices = assemblePlatformNodeServices({
+        store: context.nodeStore,
+        catalog: context.nodeCatalog,
+      });
+    },
+    constructServices: async (context) => {
+  const { config, db, nodeStore, nodeCatalog } = context;
   const key = deriveKey(requireMasterKey(), 'thinglinks-edge:instance-cred');
-  const db = openDb(join(config.dataDir, 'edge.db'));
-
-  // Generic seed import is the first database-backed startup action.
-  const nodeStore = new NodeStore(join(config.dataDir, 'npm'));
-  const nodeCatalog = new NodeCatalog(db);
-  for (const seedDir of [join(config.dataDir, 'npm-seed'), process.env['NODE_SEED_DIR'] ?? '']) {
-    const line = describeSeed(seedDir, seedFromDir(nodeStore, seedDir));
-    if (line) console.log(`[nodes] ${line}`);
-  }
-  const platformNodeServices = assemblePlatformNodeServices({
-    store: nodeStore,
-    catalog: nodeCatalog,
-  });
-
+  const platformNodeServices = requireStartupPhase(
+    context.platformNodeServices, 'bootstrapTrust',
+  );
   // 主密钥同时用于两步验证的 TOTP 密钥加密，与实例凭据同一套
   const auth = new AuthService(db, key);
   const repo = new InstanceRepo(db, key);
   const platformOperation = assemblePlatformOperationBarrier(overrides);
-  // Trust is established before any Docker/gate/Admin/migration service exists.
   const operationGate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repo));
   const proxySessions = new ProxySessionRegistry();
   const instanceUpstreamFor = (id: string) => `http://${containerName(id)}:1880`;
@@ -736,23 +765,16 @@ export async function main(overrides: InternalManagerOverrides = {}): Promise<vo
   });
   drainerRef = drainer;
 
-  await startManagerRuntime({
-    // These phases are already materialized above in lexical order. Keeping them
-    // explicit in the production orchestrator makes the startup contract testable
-    // without carrying configuration or secrets through ManagerStartupHooks.
-    initializeData: () => undefined,
-    bootstrapTrust: () => undefined,
-    constructServices: () => undefined,
-    reconcileNetworks,
-    recoverInterrupted: async () => {
+  context.reconcileNetworks = reconcileNetworks;
+  context.recoverInterrupted = async () => {
       const recovered = await migrationService.recoverInterrupted();
       for (const result of recovered) {
         if (result.phase === 'manual_required') {
           console.warn(`[warn] 实例 ${result.instanceId} 的节点迁移需人工处理`);
         }
       }
-    },
-    startBackground: async () => {
+    };
+  context.startBackground = async () => {
       startMetrics();
       try {
         await cloud.apply(cloudConfig.get());
@@ -761,8 +783,8 @@ export async function main(overrides: InternalManagerOverrides = {}): Promise<vo
         console.error(`[cloud] 接入配置无法应用：${(e as Error).message}`);
       }
       drainer.start();
-    },
-    buildServer: () => {
+    };
+  context.buildServer = () => {
       const app = buildServer({
         ...platformNodeServices.serverDeps,
         ...instanceAdmin.serverDeps,
@@ -782,20 +804,33 @@ export async function main(overrides: InternalManagerOverrides = {}): Promise<vo
       });
       return {
         server: app,
-        listen: () => app.listen({
-          host: config.listenAddr, port: config.listenPort,
-        }).then(() => undefined),
+        listen: async () => {
+          await app.listen({ host: config.listenAddr, port: config.listenPort });
+          console.log(
+            `[ready] ${describe()} 监听 ${config.listenAddr}:${config.listenPort}` +
+              ` · 外部地址 ${config.externalUrl}` +
+              ` · docker 端点 ${describeDockerEndpoint(connection)}` +
+              ` · 缓存写满策略 ${fullPolicy}` +
+              ` · 指标采样 ${metricsIntervalSec > 0 ? `${metricsIntervalSec}s` : '已关闭'}` +
+              ` · 云对接 ${cloud.state}`,
+          );
+        },
       };
+    };
     },
+    reconcileNetworks: (context) => requireStartupPhase(
+      context.reconcileNetworks, 'constructServices.reconcileNetworks',
+    )(),
+    recoverInterrupted: (context) => requireStartupPhase(
+      context.recoverInterrupted, 'constructServices.recoverInterrupted',
+    )(),
+    startBackground: (context) => requireStartupPhase(
+      context.startBackground, 'constructServices.startBackground',
+    )(),
+    buildServer: (context) => requireStartupPhase(
+      context.buildServer, 'constructServices.buildServer',
+    )(),
   });
-  console.log(
-    `[ready] ${describe()} 监听 ${config.listenAddr}:${config.listenPort}` +
-      ` · 外部地址 ${config.externalUrl}` +
-      ` · docker 端点 ${describeDockerEndpoint(connection)}` +
-      ` · 缓存写满策略 ${fullPolicy}` +
-      ` · 指标采样 ${metricsIntervalSec > 0 ? `${metricsIntervalSec}s` : '已关闭'}` +
-      ` · 云对接 ${cloud.state}`,
-  );
 }
 
 // 直接运行时启动服务；被 import 时只导出

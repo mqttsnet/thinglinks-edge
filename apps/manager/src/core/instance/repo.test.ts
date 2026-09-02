@@ -888,3 +888,156 @@ test('same-image compensation manual fence is atomic and never replaces a migrat
   );
   assert.equal(withJournal.nodeMigration('line-a')?.phase, 'preparing');
 });
+
+test('C33 exact same-image fence advances committed and rolled_back journals atomically', () => {
+  for (const terminal of ['committed', 'rolled_back'] as const) {
+    const repo = fresh();
+    const txId = `tx-fence-${terminal}`;
+    const owner = `owner-fence-${terminal}-0001`;
+    repo.create(rec(), [], cred());
+    repo.beginNodeMigration(migrationBegin('line-a', txId, {
+      executionOwner: owner,
+      executionLeaseExpiresAt: 10_000,
+    }));
+    if (terminal === 'committed') {
+      repo.transitionNodeMigrationExact(
+        'line-a', txId, owner, 1_000, ['preparing'], 'verifying',
+      );
+      repo.commitNodeMigrationExact(
+        'line-a', txId, owner, 1_000, 'verifying',
+        PLATFORM_NODE_PACKAGE.version, 'admin',
+      );
+    } else {
+      repo.transitionNodeMigrationExact(
+        'line-a', txId, owner, 1_000, ['preparing'], 'rolling_back', 'rollback',
+      );
+      repo.finishNodeMigrationRollbackExact(
+        'line-a', txId, owner, 1_000, 'rolling_back', 'rolled_back', 'admin',
+      );
+    }
+
+    repo.fenceSameImageRebuildFailureExact(
+      'line-a', txId, terminal, 'system',
+    );
+
+    assert.equal(repo.nodeMigration('line-a')?.phase, 'manual_required', terminal);
+    assert.equal(repo.nodeMigration('line-a')?.error, 'compensation', terminal);
+    assert.equal(repo.nodeMigration('line-a')?.executionOwner, '', terminal);
+    assert.equal(repo.nodeRuntime('line-a')?.migrationState, 'manual_required', terminal);
+    assert.equal(repo.nodeRuntime('line-a')?.migrationError, 'compensation', terminal);
+  }
+});
+
+test('C33 exact fence rejects active or stale journals and audit failure rolls back both terminal rows', () => {
+  const active = fresh();
+  active.create(rec(), [], cred());
+  active.beginNodeMigration(migrationBegin('line-a', 'tx-fence-active'));
+  assert.throws(
+    () => active.fenceSameImageRebuildFailureExact(
+      'line-a', 'tx-fence-active', 'committed', 'system',
+    ),
+    /终态|phase|状态|CAS/i,
+  );
+  assert.equal(active.nodeMigration('line-a')?.phase, 'preparing');
+
+  const db = openDb(':memory:');
+  const repo = new InstanceRepo(db, KEY);
+  const txId = 'tx-fence-audit';
+  const owner = 'owner-fence-audit-0001';
+  repo.create(rec(), [], cred());
+  repo.beginNodeMigration(migrationBegin('line-a', txId, {
+    executionOwner: owner,
+    executionLeaseExpiresAt: 10_000,
+  }));
+  repo.transitionNodeMigrationExact('line-a', txId, owner, 1_000, ['preparing'], 'verifying');
+  repo.commitNodeMigrationExact(
+    'line-a', txId, owner, 1_000, 'verifying', PLATFORM_NODE_PACKAGE.version, 'admin',
+  );
+  db.exec(`CREATE TRIGGER reject_exact_rebuild_fence_audit
+    BEFORE INSERT ON audit
+    WHEN NEW.action = 'same-image-rebuild-manual'
+    BEGIN SELECT RAISE(ABORT, 'exact rebuild fence audit rejected'); END;`);
+
+  assert.throws(
+    () => repo.fenceSameImageRebuildFailureExact('line-a', txId, 'committed', 'system'),
+    /exact rebuild fence audit rejected/,
+  );
+  assert.equal(repo.nodeMigration('line-a')?.phase, 'committed');
+  assert.equal(repo.nodeRuntime('line-a')?.migrationState, 'committed');
+  assert.throws(
+    () => repo.fenceSameImageRebuildFailureExact('line-a', 'tx-stale', 'committed', 'system'),
+    /终态|phase|状态|CAS/i,
+  );
+});
+
+test('C35 claims pending owner and verifying phase/projection in one atomic transaction', () => {
+  const db = openDb(':memory:');
+  const repo = new InstanceRepo(db, KEY);
+  const txId = 'tx-pending-verifying';
+  const parkedOwner = 'owner-pending-verifying-park';
+  const startOwner = 'owner-pending-verifying-start';
+  repo.create(rec(), [], cred());
+  repo.beginNodeMigration(migrationBegin('line-a', txId, {
+    executionOwner: parkedOwner,
+    executionLeaseExpiresAt: 10_000,
+  }));
+  repo.parkNodeMigrationPendingStartExact(
+    'line-a', txId, parkedOwner, 1_000, 'preparing',
+  );
+
+  const claimed = repo.claimPendingStartVerifyingExact(
+    'line-a', txId, startOwner, 2_000, 1_000,
+  );
+  assert.equal(claimed?.phase, 'verifying');
+  assert.equal(claimed?.executionOwner, startOwner);
+  assert.equal(claimed?.executionLeaseExpiresAt, 3_000);
+  assert.equal(repo.nodeRuntime('line-a')?.migrationState, 'verifying');
+  assert.equal(
+    repo.claimPendingStartVerifyingExact(
+      'line-a', txId, 'owner-pending-verifying-peer', 2_100, 1_000,
+    ),
+    undefined,
+  );
+  assert.equal(
+    repo.claimPendingStartVerifyingExact(
+      'line-a', txId, startOwner, 2_500, 1_000,
+    )?.executionLeaseExpiresAt,
+    3_500,
+  );
+  assert.equal(
+    repo.claimPendingStartVerifyingExact(
+      'line-a', txId, startOwner, 3_500, 1_000,
+    ),
+    undefined,
+  );
+});
+
+test('C35 verifying claim rolls journal back when projection CAS aborts', () => {
+  const db = openDb(':memory:');
+  const repo = new InstanceRepo(db, KEY);
+  const txId = 'tx-pending-verifying-atomic';
+  const parkedOwner = 'owner-pending-verifying-atomic';
+  repo.create(rec(), [], cred());
+  repo.beginNodeMigration(migrationBegin('line-a', txId, {
+    executionOwner: parkedOwner,
+    executionLeaseExpiresAt: 10_000,
+  }));
+  repo.parkNodeMigrationPendingStartExact(
+    'line-a', txId, parkedOwner, 1_000, 'preparing',
+  );
+  db.exec(`CREATE TRIGGER reject_pending_verifying_projection
+    BEFORE UPDATE OF node_migration_state ON instance
+    WHEN NEW.node_migration_state = 'verifying'
+    BEGIN SELECT RAISE(ABORT, 'pending verifying projection rejected'); END;`);
+
+  assert.throws(
+    () => repo.claimPendingStartVerifyingExact(
+      'line-a', txId, 'owner-pending-verifying-claim', 2_000, 1_000,
+    ),
+    /pending verifying projection rejected/,
+  );
+  assert.equal(repo.nodeMigration('line-a')?.phase, 'pending_start_verification');
+  assert.equal(repo.nodeMigration('line-a')?.executionOwner, '');
+  assert.equal(repo.nodeMigration('line-a')?.executionLeaseExpiresAt, 0);
+  assert.equal(repo.nodeRuntime('line-a')?.migrationState, 'pending_start_verification');
+});

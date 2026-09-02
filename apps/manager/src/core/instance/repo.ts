@@ -546,6 +546,57 @@ export class InstanceRepo {
     })();
   }
 
+  /** C33: atomically fence one exact clean terminal journal after rebuild compensation fails. */
+  fenceSameImageRebuildFailureExact(
+    instanceId: string,
+    txId: string,
+    expectedPhase: 'committed' | 'rolled_back',
+    actor: string,
+  ): void {
+    if (!TX_ID.test(txId)) throw new RepoError('重建人工围栏事务 id 无效');
+    requireSafeText(actor, '操作人', 128);
+    this.db.transaction(() => {
+      const current = this.db.prepare(
+        `SELECT m.phase, m.error, m.execution_owner, m.execution_lease_expires_at
+         FROM instance_node_migration m
+         JOIN instance i ON i.id = m.instance_id
+         WHERE m.instance_id = ? AND m.tx_id = ?
+           AND m.phase = ? AND m.error = 'none'
+           AND m.execution_owner = '' AND m.execution_lease_expires_at = 0
+           AND i.node_migration_state = m.phase AND i.node_migration_error = m.error`,
+      ).get(instanceId, txId, expectedPhase) as {
+        phase: NodeMigrationPhase;
+        error: NodeMigrationErrorCode;
+        execution_owner: string;
+        execution_lease_expires_at: number;
+      } | undefined;
+      if (!current) throw new RepoError('重建人工围栏终态 CAS 未命中');
+      const journal = this.db.prepare(
+        `UPDATE instance_node_migration
+         SET phase = 'manual_required', error = 'compensation',
+             execution_owner = '', execution_lease_expires_at = 0,
+             updated_at = datetime('now')
+         WHERE instance_id = ? AND tx_id = ?
+           AND phase = ? AND error = 'none'
+           AND execution_owner = '' AND execution_lease_expires_at = 0`,
+      ).run(instanceId, txId, expectedPhase);
+      if (journal.changes !== 1) throw new RepoError('重建人工围栏 journal CAS 未命中');
+      const projection = this.db.prepare(
+        `UPDATE instance
+         SET node_migration_state = 'manual_required', node_migration_error = 'compensation'
+         WHERE id = ? AND node_migration_state = ? AND node_migration_error = 'none'`,
+      ).run(instanceId, expectedPhase);
+      if (projection.changes !== 1) throw new RepoError('重建人工围栏 projection CAS 未命中');
+      recordAudit(this.db, {
+        actor,
+        action: 'same-image-rebuild-manual',
+        target: instanceId,
+        detail: JSON.stringify({ code: 'compensation' }),
+        result: 'fail',
+      });
+    })();
+  }
+
   beginNodeMigration(input: BeginNodeMigrationInput): void {
     requireEnum(input.operationKind, NODE_MIGRATION_KINDS, '迁移操作类型');
     if (input.phase !== 'preparing') throw new RepoError('迁移只能从 preparing 开始');
@@ -791,6 +842,64 @@ export class InstanceRepo {
     ).run(owner, expiresAt, instanceId, txId, owner, nowMs);
     if (updated.changes !== 1) return undefined;
     return this.nodeMigration(instanceId);
+  }
+
+  /** C35: claim the exact pending tx and publish verifying in one SQLite transaction. */
+  claimPendingStartVerifyingExact(
+    instanceId: string,
+    txId: string,
+    owner: string,
+    nowMs: number,
+    leaseDurationMs: number,
+  ): InstanceNodeMigrationJournal | undefined {
+    if (!TX_ID.test(txId)) throw new RepoError('待启动验证 claim 参数无效');
+    requireExecutionOwner(owner);
+    const expiresAt = executionLeaseExpiry(nowMs, leaseDurationMs);
+    return this.db.transaction(() => {
+      const current = this.db.prepare(
+        `SELECT m.phase, m.error, m.execution_owner, m.execution_lease_expires_at
+         FROM instance_node_migration m
+         JOIN instance i ON i.id = m.instance_id
+         WHERE m.instance_id = ? AND m.tx_id = ? AND m.operation_kind = 'migration'
+           AND m.error = 'none'
+           AND (
+             (m.phase = 'pending_start_verification'
+               AND m.execution_owner = '' AND m.execution_lease_expires_at = 0)
+             OR (m.phase = 'verifying'
+               AND m.execution_owner = ? AND m.execution_lease_expires_at > ?)
+           )
+           AND i.node_migration_state = m.phase AND i.node_migration_error = m.error`,
+      ).get(instanceId, txId, owner, nowMs) as {
+        phase: 'pending_start_verification' | 'verifying';
+        error: 'none';
+        execution_owner: string;
+        execution_lease_expires_at: number;
+      } | undefined;
+      if (!current) return undefined;
+      const journal = this.db.prepare(
+        `UPDATE instance_node_migration
+         SET phase = 'verifying', error = 'none',
+             execution_owner = ?, execution_lease_expires_at = ?,
+             updated_at = datetime('now')
+         WHERE instance_id = ? AND tx_id = ? AND operation_kind = 'migration'
+           AND phase = ? AND error = 'none'
+           AND execution_owner = ? AND execution_lease_expires_at = ?`,
+      ).run(
+        owner, expiresAt, instanceId, txId, current.phase,
+        current.execution_owner, current.execution_lease_expires_at,
+      );
+      if (journal.changes !== 1) return undefined;
+      if (current.phase === 'pending_start_verification') {
+        const projection = this.db.prepare(
+          `UPDATE instance
+           SET node_migration_state = 'verifying', node_migration_error = 'none'
+           WHERE id = ? AND node_migration_state = 'pending_start_verification'
+             AND node_migration_error = 'none'`,
+        ).run(instanceId);
+        if (projection.changes !== 1) throw new RepoError('待启动验证 projection CAS 未命中');
+      }
+      return this.nodeMigration(instanceId);
+    })();
   }
 
   /** Renew only a still-live exact owner; an expired active worker cannot resurrect itself. */
@@ -1176,6 +1285,37 @@ export class InstanceRepo {
       action: 'checkpoint_cleanup_pending',
       target: instanceId,
       detail: JSON.stringify({ code: 'checkpoint_cleanup_pending' }),
+      result: 'fail',
+    });
+  }
+
+  /** C37 controlled retry marker for committed stopped-copy evidence cleanup. */
+  recordStoppedEvidenceCleanupPendingExact(
+    instanceId: string,
+    txId: string,
+    actor: string,
+  ): void {
+    if (!TX_ID.test(txId)) throw new RepoError('停机证据清理事务 id 无效');
+    requireSafeText(actor, '操作人', 128);
+    const journal = this.nodeMigration(instanceId);
+    if (!journal || journal.txId !== txId || journal.phase !== 'committed') {
+      throw new RepoError('停机证据清理日志不是 exact committed');
+    }
+    const alreadyRecorded = this.db.prepare(
+      `SELECT 1 FROM audit
+       WHERE action = 'stopped_evidence_cleanup_pending' AND target = ?
+         AND id > COALESCE((
+           SELECT MAX(id) FROM audit
+           WHERE action = 'commit-node-migration' AND target = ?
+         ), 0)
+       LIMIT 1`,
+    ).get(instanceId, instanceId);
+    if (alreadyRecorded) return;
+    recordAudit(this.db, {
+      actor,
+      action: 'stopped_evidence_cleanup_pending',
+      target: instanceId,
+      detail: JSON.stringify({ code: 'stopped_evidence_cleanup_pending' }),
       result: 'fail',
     });
   }

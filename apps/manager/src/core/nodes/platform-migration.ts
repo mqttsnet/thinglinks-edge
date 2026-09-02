@@ -480,11 +480,8 @@ function assertCheckpointMatchesPreflight(
 
 const STOPPED_EXPORT_PATHS = Object.freeze([
   'settings.js',
-  'settings.js.backup',
   'package.json',
-  'package.json.backup',
   'package-lock.json',
-  'package-lock.json.backup',
   '.config.nodes.json',
   '.config.nodes.json.backup',
   '.config.modules.json',
@@ -608,11 +605,32 @@ async function copyArtifact(source: string, destination: string, fact: StoppedAr
     preserveTimestamps: false,
   });
   await chmod(destination, fact.mode);
+  await syncArtifactTree(destination);
   const copied = await artifactFact(dirname(destination), basename(destination));
   if (!sameArtifact({ ...copied, key: fact.key }, fact)) {
     throw new Error(`stopped artifact copy mismatch ${fact.key}`);
   }
   await syncDirectory(dirname(destination));
+}
+
+async function syncArtifactTree(path: string): Promise<void> {
+  const stat = await lstat(path);
+  if (stat.isSymbolicLink() || (!stat.isFile() && !stat.isDirectory())) {
+    throw new Error('stopped partial contains an untrusted filesystem type');
+  }
+  if (stat.isFile()) {
+    const handle = await open(path, 'r');
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    return;
+  }
+  const entries = await readdir(path, { withFileTypes: true });
+  entries.sort((a, b) => a.name.localeCompare(b.name));
+  for (const entry of entries) await syncArtifactTree(join(path, entry.name));
+  await syncDirectory(path);
 }
 
 async function writeArtifactManifest(path: string, fact: StoppedArtifactFact): Promise<void> {
@@ -624,7 +642,8 @@ async function writeArtifactManifest(path: string, fact: StoppedArtifactFact): P
     await marker.sync();
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-    if (await readFile(path, 'utf8') !== serialized) {
+    const existing = await readArtifactManifest(path, fact.key);
+    if (!existing || !sameArtifact(existing, fact)) {
       throw new Error('stale artifact manifest differs', { cause: error });
     }
   } finally {
@@ -636,16 +655,29 @@ async function readArtifactManifest(
   path: string,
   key: string,
 ): Promise<StoppedArtifactFact | undefined> {
+  let before;
   try {
-    const fact = JSON.parse(await readFile(path, 'utf8')) as StoppedArtifactFact;
-    if (!fact || typeof fact !== 'object' || fact.key !== key || typeof fact.exists !== 'boolean') {
-      throw new Error('artifact manifest identity mismatch');
-    }
-    return fact;
+    before = await lstat(path);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
     throw error;
   }
+  if (!before.isFile() || before.isSymbolicLink() || (before.mode & 0o777) !== 0o600) {
+    throw new Error('artifact manifest is untrusted');
+  }
+  const serialized = await readFile(path, 'utf8');
+  const after = await lstat(path);
+  if (
+    !after.isFile() || after.isSymbolicLink()
+    || after.dev !== before.dev || after.ino !== before.ino
+    || after.size !== before.size || after.mtimeMs !== before.mtimeMs
+    || (after.mode & 0o777) !== 0o600
+  ) throw new Error('artifact manifest changed while reading');
+  const fact = JSON.parse(serialized) as StoppedArtifactFact;
+  if (!fact || typeof fact !== 'object' || fact.key !== key || typeof fact.exists !== 'boolean') {
+    throw new Error('artifact manifest identity mismatch');
+  }
+  return fact;
 }
 
 export class PlatformMigrationService {
@@ -1104,6 +1136,33 @@ export class PlatformMigrationService {
   ): Promise<number> {
     const liveRoot = join(this.o.instanceDataRoot, execution.instanceId);
     let sequence = startSequence;
+    // C36 closing pass: recursively flush and revalidate every complete partial
+    // immediately before the first live rename. No live mutation may precede this loop.
+    for (const fact of facts) {
+      const target = join(liveRoot, fact.key);
+      await trustedArtifactParent(liveRoot, fact.key, false);
+      const partial = stoppedSidecar(target, execution.txId, 'partial');
+      const manifest = stoppedSidecar(target, execution.txId, 'manifest');
+      const observed = await artifactFact(dirname(partial), basename(partial));
+      const marker = await readArtifactManifest(manifest, fact.key);
+      if (!fact.exists) {
+        if (observed.exists || marker) {
+          throw controlled('cutover', `unexpected absent-artifact partial ${fact.key}`);
+        }
+        continue;
+      }
+      if (!observed.exists || !marker || !sameArtifact(marker, fact)) {
+        throw controlled('cutover', `prepared stopped artifact is incomplete ${fact.key}`);
+      }
+      await syncArtifactTree(partial).catch(() => {
+        throw controlled('cutover', `prepared stopped artifact is untrusted ${fact.key}`);
+      });
+      const flushed = await artifactFact(dirname(partial), basename(partial));
+      if (!sameArtifact({ ...flushed, key: fact.key } as StoppedArtifactFact, fact)) {
+        throw controlled('cutover', `prepared stopped artifact drifted ${fact.key}`);
+      }
+      await syncDirectory(dirname(partial));
+    }
     for (const fact of facts) {
       execution.renew(['cutover']);
       const target = join(liveRoot, fact.key);
@@ -1131,9 +1190,22 @@ export class PlatformMigrationService {
       }
 
       if (live.exists && sameArtifact(live, fact)) {
-        await rm(partial, { recursive: true, force: true });
+        // C32: make recovery forget the desired artifact before consuming the
+        // unused partial. A crash in either deletion window can only preserve live.
         await rm(manifest, { force: true });
         await syncDirectory(dirname(target));
+        await this.barrierOwned(execution, {
+          instanceId: execution.instanceId, txId: execution.txId, phase: 'cutover',
+          sequence: sequence++, artifact: this.artifactBarrierKey(fact.key),
+          boundary: 'after-live-backup',
+        });
+        await rm(partial, { recursive: true, force: true });
+        await syncDirectory(dirname(target));
+        await this.barrierOwned(execution, {
+          instanceId: execution.instanceId, txId: execution.txId, phase: 'cutover',
+          sequence: sequence++, artifact: this.artifactBarrierKey(fact.key),
+          boundary: 'after-live-rename',
+        });
         continue;
       }
       if (live.exists) {
@@ -1180,6 +1252,14 @@ export class PlatformMigrationService {
       const partialFact = await artifactFact(dirname(partial), basename(partial));
       const marker = await readArtifactManifest(manifest, key);
       const priorMarker = await readArtifactManifest(backupManifest, key);
+      const live = await artifactFact(liveRoot, key);
+      if (partialFact.exists) {
+        const normalizedPartial = { ...partialFact, key } as StoppedArtifactFact;
+        const owned = marker
+          ? sameArtifact(normalizedPartial, marker)
+          : live.exists && sameArtifact(normalizedPartial, live);
+        if (!owned) throw new Error(`stopped partial owner mismatch ${key}`);
+      }
       if (backupFact.exists) {
         if (!priorMarker) throw new Error(`stopped backup owner missing ${key}`);
         const normalized = { ...backupFact, key } as StoppedArtifactFact;
@@ -1187,7 +1267,6 @@ export class PlatformMigrationService {
           throw new Error(`stopped backup owner mismatch ${key}`);
         }
       }
-      const live = await artifactFact(liveRoot, key);
       if (backupFact.exists) {
         if (live.exists && marker) {
           if (!sameArtifact(live, marker)) throw new Error(`foreign live artifact ${key}`);
@@ -1222,7 +1301,49 @@ export class PlatformMigrationService {
     }
   }
 
+  private async verifyStoppedEvidenceOwned(
+    instanceId: string,
+    txId: string,
+    allowCommittedCleanupResidue = false,
+  ): Promise<void> {
+    const liveRoot = join(this.o.instanceDataRoot, instanceId);
+    for (const key of STOPPED_EXPORT_PATHS) {
+      const target = join(liveRoot, key);
+      await trustedArtifactParent(liveRoot, key, false);
+      const partial = stoppedSidecar(target, txId, 'partial');
+      const backup = stoppedSidecar(target, txId, 'backup');
+      const manifest = stoppedSidecar(target, txId, 'manifest');
+      const backupManifest = stoppedSidecar(target, txId, 'backup-manifest');
+      const partialFact = await artifactFact(dirname(partial), basename(partial));
+      const backupFact = await artifactFact(dirname(backup), basename(backup));
+      const live = await artifactFact(liveRoot, key);
+      const desired = await readArtifactManifest(manifest, key);
+      const prior = await readArtifactManifest(backupManifest, key);
+      if (partialFact.exists) {
+        if (!desired || !sameArtifact(
+          { ...partialFact, key } as StoppedArtifactFact,
+          desired,
+        )) {
+          throw new Error(`stopped partial owner mismatch ${key}`);
+        }
+      } else if (desired && (!live.exists || !sameArtifact(live, desired))) {
+        throw new Error(`stopped live desired owner mismatch ${key}`);
+      }
+      if (backupFact.exists) {
+        if (!prior || !sameArtifact(
+          { ...backupFact, key } as StoppedArtifactFact,
+          prior,
+        )) {
+          throw new Error(`stopped backup owner mismatch ${key}`);
+        }
+      } else if (prior && !allowCommittedCleanupResidue) {
+        throw new Error(`orphan stopped backup manifest ${key}`);
+      }
+    }
+  }
+
   private async cleanupStoppedEvidence(instanceId: string, txId: string): Promise<void> {
+    await this.verifyStoppedEvidenceOwned(instanceId, txId, true);
     const liveRoot = join(this.o.instanceDataRoot, instanceId);
     for (const key of STOPPED_EXPORT_PATHS) {
       const target = join(liveRoot, key);
@@ -1230,24 +1351,34 @@ export class PlatformMigrationService {
       const backup = stoppedSidecar(target, txId, 'backup');
       const manifest = stoppedSidecar(target, txId, 'manifest');
       const backupManifest = stoppedSidecar(target, txId, 'backup-manifest');
-      const partialFact = await artifactFact(dirname(partial), basename(partial));
-      const backupFact = await artifactFact(dirname(backup), basename(backup));
-      if (partialFact.exists) {
-        const expected = await readArtifactManifest(manifest, key);
-        if (!expected || !sameArtifact({ ...partialFact, key } as StoppedArtifactFact, expected)) {
-          throw new Error(`stopped partial cleanup owner mismatch ${key}`);
-        }
-        await rm(partial, { recursive: true, force: false });
-      }
-      if (backupFact.exists) {
-        const expected = await readArtifactManifest(backupManifest, key);
-        if (!expected || !sameArtifact({ ...backupFact, key } as StoppedArtifactFact, expected)) {
-          throw new Error(`stopped backup cleanup owner mismatch ${key}`);
-        }
-        await rm(backup, { recursive: true, force: false });
-      }
+      await rm(partial, { recursive: true, force: true });
+      await rm(backup, { recursive: true, force: true });
       await rm(manifest, { force: true });
       await rm(backupManifest, { force: true });
+      await syncExistingDirectory(dirname(target));
+      for (const sidecar of [partial, backup, manifest, backupManifest]) {
+        if ((await artifactFact(dirname(sidecar), basename(sidecar))).exists) {
+          throw new Error(`stopped evidence cleanup did not remove ${key}`);
+        }
+      }
+    }
+  }
+
+  private async cleanupCommittedStoppedEvidence(
+    instanceId: string,
+    txId: string,
+    actor: string,
+  ): Promise<boolean> {
+    try {
+      await this.cleanupStoppedEvidence(instanceId, txId);
+      return true;
+    } catch {
+      try {
+        this.o.repo.recordStoppedEvidenceCleanupPendingExact(instanceId, txId, actor);
+      } catch {
+        // The committed journal plus retained sidecars/checkpoint remain recovery authority.
+      }
+      return false;
     }
   }
 
@@ -1352,7 +1483,7 @@ export class PlatformMigrationService {
       || scanned.executionLeaseExpiresAt !== 0
     ) throw controlled('state-inconsistent', 'pending-start migration identity is invalid');
     const owner = this.executionRuntime.executionOwner();
-    const claimed = this.o.repo.claimPendingStartExecutionExact(
+    const claimed = this.o.repo.claimPendingStartVerifyingExact(
       instanceId,
       scanned.txId,
       owner,
@@ -1362,23 +1493,21 @@ export class PlatformMigrationService {
     if (!claimed) throw controlled('state-inconsistent', 'pending-start execution claim failed');
     const execution = this.startExecutionSession(instanceId, scanned.txId, owner);
     try {
-      execution.renew(['pending_start_verification']);
-      this.o.repo.transitionNodeMigrationExact(
-        instanceId, scanned.txId, owner, this.executionRuntime.now(),
-        ['pending_start_verification'], 'verifying',
-      );
       await this.reachOwned(execution, 'verifying', 200);
       execution.renew(['verifying']);
       await this.o.docker.start(instanceId);
       await this.o.adminRuntime.waitReady(instanceId, { timeoutMs: 30_000, intervalMs: 250 });
       await this.verifyCutover(instanceId, this.o.repo.nodeMigration(instanceId)!);
       execution.renew(['verifying']);
+      await this.verifyStoppedEvidenceOwned(instanceId, scanned.txId);
       this.o.repo.commitNodeMigrationExact(
         instanceId, scanned.txId, owner, this.executionRuntime.now(),
         'verifying', PLATFORM_NODE_PACKAGE.version, actor,
       );
       await this.reach(instanceId, scanned.txId, 'committed', 201);
-      await this.cleanupStoppedEvidence(instanceId, scanned.txId);
+      if (!await this.cleanupCommittedStoppedEvidence(instanceId, scanned.txId, actor)) {
+        return this.status(instanceId);
+      }
       await this.cleanupTerminal(instanceId, scanned.txId, 'committed', actor);
       return this.status(instanceId);
     } catch (error) {
@@ -1599,6 +1728,16 @@ export class PlatformMigrationService {
     for (const journal of this.o.repo.nodeMigrations()) {
       if (journal.operationKind !== 'migration') continue;
       if (journal.phase === 'committed' || journal.phase === 'rolled_back') {
+        if (
+          journal.phase === 'committed'
+          && !journal.originalRunning
+          && !await this.cleanupCommittedStoppedEvidence(
+            journal.instanceId, journal.txId, 'system',
+          )
+        ) {
+          results.push(this.status(journal.instanceId));
+          continue;
+        }
         await this.cleanupTerminal(journal.instanceId, journal.txId, journal.phase, 'system');
         results.push(this.status(journal.instanceId));
         continue;
@@ -1713,7 +1852,9 @@ export class PlatformMigrationService {
     return this.rollbackExactJournal(
       journal,
       cause,
-      !journal.stagedBefore && !['preparing', 'checkpointed'].includes(journal.phase),
+      journal.originalRunning
+        && !journal.stagedBefore
+        && !['preparing', 'checkpointed'].includes(journal.phase),
       execution,
     );
   }

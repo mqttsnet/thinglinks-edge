@@ -623,6 +623,8 @@ export class InstanceService {
     this.o.gate.assertLease(lease, id, ['same-image-rebuild', 'platform-migration']);
     const inst = this.o.repo.get(id);
     if (!inst) throw new ServiceError(`实例 ${id} 不存在`);
+    const runtimeBefore = this.o.repo.nodeRuntime(id);
+    const journalBefore = this.o.repo.nodeMigration(id);
     const inspection = await this.o.docker.inspectMigrationRuntime(id).catch(() => {
       throw new ServiceError(`实例 ${id} 无法读取受管容器身份，拒绝同镜像重建`);
     });
@@ -656,15 +658,37 @@ export class InstanceService {
         // after a partial replacement, so compensation cannot drift to a new image/spec.
         await apply();
       } catch {
+        let fenced = false;
         try {
-          this.o.repo.fenceSameImageRebuildFailure(id, 'system');
+          if (
+            journalBefore
+            && (journalBefore.phase === 'committed' || journalBefore.phase === 'rolled_back')
+          ) {
+            this.o.repo.fenceSameImageRebuildFailureExact(
+              id, journalBefore.txId, journalBefore.phase, 'system',
+            );
+          } else if (!journalBefore && runtimeBefore?.migrationState === 'idle') {
+            this.o.repo.fenceSameImageRebuildFailure(id, 'system');
+          }
+          const runtimeAfter = this.o.repo.nodeRuntime(id);
+          const journalAfter = this.o.repo.nodeMigration(id);
+          fenced = runtimeAfter?.migrationState === 'manual_required'
+            && runtimeAfter.migrationError === 'compensation'
+            && (
+              journalBefore
+                ? journalAfter?.txId === journalBefore.txId
+                  && journalAfter.phase === 'manual_required'
+                  && journalAfter.error === 'compensation'
+                : journalAfter === undefined
+            );
         } catch {
           // An active migration journal remains its own recovery authority.
         }
-        recordAudit(this.o.db, {
-          actor: 'system', action: 'same-image-rebuild', target: id, result: 'fail',
-          detail: JSON.stringify({ code: 'compensation', reason }),
-        });
+        if (!fenced) {
+          throw new ServiceError(
+            `实例 ${id} 同镜像重建与自动恢复均失败，且未能持久化人工围栏，需立即人工处理`,
+          );
+        }
         throw new ServiceError(
           `实例 ${id} 同镜像重建失败且自动恢复未完成，数据目录仍保留，需人工处理`,
         );
