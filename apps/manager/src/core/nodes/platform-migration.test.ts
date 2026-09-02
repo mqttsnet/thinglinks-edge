@@ -458,6 +458,39 @@ function writeJson(path: string, value: unknown): void {
   writeFileSync(path, `${JSON.stringify(value)}\n`, { mode: 0o600 });
 }
 
+function platformNodeConfig(): Record<string, unknown> {
+  return {
+    modules: {
+      [PLATFORM_NODE_PACKAGE.name]: {
+        module: PLATFORM_NODE_PACKAGE.name,
+        version: PLATFORM_NODE_PACKAGE.version,
+        types: [...PLATFORM_NODE_TYPES],
+        metadata: { enabled: true, source: 'npm' },
+      },
+    },
+  };
+}
+
+function reorderedPlatformNodeConfig(): Record<string, unknown> {
+  return {
+    modules: {
+      [PLATFORM_NODE_PACKAGE.name]: {
+        metadata: { source: 'npm', enabled: true },
+        types: [...PLATFORM_NODE_TYPES],
+        version: PLATFORM_NODE_PACKAGE.version,
+        module: PLATFORM_NODE_PACKAGE.name,
+      },
+    },
+  };
+}
+
+function configureProbeNodeConfig(f: ReturnType<typeof migrationFixture>): void {
+  f.docker.afterProbeRestart = (probeRoot) => {
+    writeJson(join(probeRoot, '.config.nodes.json'), platformNodeConfig());
+    writeJson(join(probeRoot, '.config.nodes.json.backup'), { previous: 'probe-main' });
+  };
+}
+
 function mutateJson(
   path: string,
   mutate: (value: Record<string, unknown>) => void,
@@ -593,6 +626,12 @@ class FakeDocker implements PlatformMigrationDocker {
     this.inspection = { ...this.inspection, running: true };
     const settings = readFileSync(join(this.instanceRoot, 'settings.js'), 'utf8');
     this.state.cutover = LEGACY_RUNTIME_EXCLUDES.every((file) => settings.includes(file));
+    const nodeConfig = join(this.instanceRoot, '.config.nodes.json');
+    if (this.state.cutover && existsSync(nodeConfig)) {
+      const mode = lstatSync(nodeConfig).mode & 0o777;
+      writeFileSync(join(this.instanceRoot, '.config.nodes.json.backup'), readFileSync(nodeConfig));
+      chmodSync(join(this.instanceRoot, '.config.nodes.json.backup'), mode);
+    }
     this.afterStart?.();
   }
 
@@ -2232,6 +2271,306 @@ test('C61 ownership loss on the second settle final export is fenced before auth
   )), false);
 });
 
+test('C62 staged explicit start accepts semantic node-config serialization and backup rotation', async () => {
+  const f = migrationFixture({ originalRunning: false, preexisting: true });
+  f.admin.beforeModules = [rawPlatformInventory(), capturedNodeRed504StagedPlatformInventory()];
+  configureProbeNodeConfig(f);
+
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  const authorityPath = join(stoppedAuthorityPath(f), 'manifest.json');
+  const authority = JSON.parse(readFileSync(authorityPath, 'utf8')) as {
+    version: number;
+    artifacts: Array<{
+      key: string;
+      desired: TestArtifactFact;
+      postStart: Record<string, unknown>;
+    }>;
+  };
+  assert.equal(authority.version, 2);
+  const nodePost = authority.artifacts.filter((artifact) => (
+    artifact.key === '.config.nodes.json' || artifact.key === '.config.nodes.json.backup'
+  ));
+  assert.equal(nodePost.length, 2);
+  assert.equal(nodePost[0]?.postStart['comparison'], 'canonical-json');
+  assert.deepEqual(nodePost[0]?.postStart, nodePost[1]?.postStart);
+  assert.notEqual(nodePost[0]?.desired.sha256, nodePost[1]?.desired.sha256);
+
+  f.docker.afterStart = () => {
+    writeFileSync(
+      join(f.instanceRoot, '.config.nodes.json'),
+      `${JSON.stringify(reorderedPlatformNodeConfig(), null, 2)}\n`,
+      { mode: 0o600 },
+    );
+    writeFileSync(
+      join(f.instanceRoot, '.config.nodes.json.backup'),
+      `  ${JSON.stringify(platformNodeConfig())}  \n`,
+      { mode: 0o600 },
+    );
+  };
+
+  const committed = await f.gate.run('line-a', 'start-instance', (lease) => (
+    f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+
+  assert.equal(committed.phase, 'committed');
+  assert.equal(f.repo.nodeRuntime('line-a')?.mode, 'npm');
+  assert.equal(f.docker.runtimeCalls.filter((call) => call === 'start').length, 1);
+  assert.equal(f.admin.uninstallCalls, 0);
+});
+
+test('C62 node-config semantic authority rejects every non-serialization drift', async () => {
+  const cases: Array<{
+    name: string;
+    write(root: string): void;
+  }> = [
+    { name: 'changed value', write: (root) => {
+      const value = platformNodeConfig();
+      const modules = value['modules'] as Record<string, Record<string, unknown>>;
+      const metadata = modules[PLATFORM_NODE_PACKAGE.name]!['metadata'] as Record<string, unknown>;
+      metadata['enabled'] = false;
+      writeJson(join(root, '.config.nodes.json'), value);
+    } },
+    { name: 'changed type', write: (root) => {
+      const value = platformNodeConfig();
+      const modules = value['modules'] as Record<string, Record<string, unknown>>;
+      modules[PLATFORM_NODE_PACKAGE.name]!['metadata'] = 'npm';
+      writeJson(join(root, '.config.nodes.json'), value);
+    } },
+    { name: 'changed module', write: (root) => {
+      const value = platformNodeConfig();
+      const modules = value['modules'] as Record<string, Record<string, unknown>>;
+      modules[PLATFORM_NODE_PACKAGE.name]!['module'] = '@mqttsnet/other-nodes';
+      writeJson(join(root, '.config.nodes.json'), value);
+    } },
+    { name: 'changed version', write: (root) => {
+      const value = platformNodeConfig();
+      const modules = value['modules'] as Record<string, Record<string, unknown>>;
+      modules[PLATFORM_NODE_PACKAGE.name]!['version'] = '0.0.2';
+      writeJson(join(root, '.config.nodes.json'), value);
+    } },
+    { name: 'changed type list', write: (root) => {
+      const value = platformNodeConfig();
+      const modules = value['modules'] as Record<string, Record<string, unknown>>;
+      modules[PLATFORM_NODE_PACKAGE.name]!['types'] = [...PLATFORM_NODE_TYPES].reverse();
+      writeJson(join(root, '.config.nodes.json'), value);
+    } },
+    { name: 'extra key', write: (root) => {
+      const value = platformNodeConfig();
+      value['unexpected'] = true;
+      writeJson(join(root, '.config.nodes.json'), value);
+    } },
+    { name: 'top-level array', write: (root) => {
+      writeJson(join(root, '.config.nodes.json'), [platformNodeConfig()]);
+    } },
+    { name: 'malformed JSON', write: (root) => {
+      writeFileSync(join(root, '.config.nodes.json'), '{"broken":', { mode: 0o600 });
+    } },
+    { name: 'leading UTF-8 BOM', write: (root) => {
+      writeFileSync(
+        join(root, '.config.nodes.json'),
+        Buffer.concat([
+          Buffer.from([0xef, 0xbb, 0xbf]),
+          Buffer.from(`${JSON.stringify(reorderedPlatformNodeConfig())}\n`),
+        ]),
+        { mode: 0o600 },
+      );
+      writeJson(join(root, '.config.nodes.json.backup'), reorderedPlatformNodeConfig());
+    } },
+    { name: 'oversize JSON', write: (root) => {
+      writeJson(join(root, '.config.nodes.json'), { padding: 'x'.repeat(1_048_576) });
+    } },
+    { name: 'wrong mode', write: (root) => {
+      writeFileSync(
+        join(root, '.config.nodes.json'),
+        `${JSON.stringify(reorderedPlatformNodeConfig())}\n`,
+        { mode: 0o640 },
+      );
+      chmodSync(join(root, '.config.nodes.json'), 0o640);
+    } },
+    { name: 'backup wrong semantics', write: (root) => {
+      writeJson(join(root, '.config.nodes.json'), reorderedPlatformNodeConfig());
+      writeJson(join(root, '.config.nodes.json.backup'), { previous: 'not-main' });
+    } },
+  ];
+
+  for (const item of cases) {
+    const f = migrationFixture({ originalRunning: false });
+    configureProbeNodeConfig(f);
+    assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+    f.docker.afterStart = () => item.write(f.instanceRoot);
+
+    const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+      f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+    ));
+
+    assert.equal(result.phase, 'manual_required', item.name);
+    assert.equal(f.docker.inspection.running, false, item.name);
+    assert.equal(existsSync(stoppedAuthorityPath(f)), true, item.name);
+  }
+});
+
+test('C62 probe semantic authority rejects BOM and lone-surrogate parser differentials', async () => {
+  const cases = [
+    {
+      name: 'BOM',
+      bytes: Buffer.concat([
+        Buffer.from([0xef, 0xbb, 0xbf]),
+        Buffer.from(`${JSON.stringify(platformNodeConfig())}\n`),
+      ]),
+    },
+    { name: 'lone surrogate', bytes: Buffer.from('{"bad":"\\ud800"}\n') },
+  ];
+
+  for (const item of cases) {
+    const f = migrationFixture({ originalRunning: false });
+    f.docker.afterProbeRestart = (probeRoot) => {
+      writeFileSync(join(probeRoot, '.config.nodes.json'), item.bytes, { mode: 0o600 });
+      writeJson(join(probeRoot, '.config.nodes.json.backup'), { previous: 'probe-main' });
+    };
+
+    const result = await f.service.migrate('line-a', 'admin');
+
+    assert.equal(result.phase, 'rolled_back', item.name);
+    assert.equal(existsSync(stoppedAuthorityPath(f)), false, item.name);
+    assert.deepEqual(txSidecars(f.instanceRoot, 'tx-01'), [], item.name);
+  }
+});
+
+test('C62 semantic fallback never applies to non-node-config artifacts', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  configureProbeNodeConfig(f);
+  f.docker.afterProbeRestart = (probeRoot) => {
+    writeJson(join(probeRoot, '.config.nodes.json'), platformNodeConfig());
+    writeJson(join(probeRoot, '.config.nodes.json.backup'), { previous: 'probe-main' });
+    writeFileSync(join(probeRoot, '.config.modules.json'), '{"a":1,"b":2}\n', { mode: 0o600 });
+  };
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  f.docker.afterStart = () => {
+    writeJson(join(f.instanceRoot, '.config.nodes.json'), reorderedPlatformNodeConfig());
+    writeJson(join(f.instanceRoot, '.config.nodes.json.backup'), reorderedPlatformNodeConfig());
+    writeFileSync(join(f.instanceRoot, '.config.modules.json'), '{ "b": 2, "a": 1 }\n', {
+      mode: 0o600,
+    });
+  };
+
+  const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+    f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+
+  assert.equal(result.phase, 'manual_required');
+  assert.equal(f.docker.inspection.running, false);
+});
+
+test('C62 coordinated live and desired-marker rewrite cannot bypass Manager authority', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  configureProbeNodeConfig(f);
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  f.docker.afterStart = () => {
+    const value = platformNodeConfig();
+    value['attacker'] = true;
+    writeJson(join(f.instanceRoot, '.config.nodes.json'), value);
+    writeJson(join(f.instanceRoot, '.config.nodes.json.backup'), value);
+    writeForgedDesiredSidecar(f.instanceRoot, 'tx-01', '.config.nodes.json');
+    writeForgedDesiredSidecar(f.instanceRoot, 'tx-01', '.config.nodes.json.backup');
+  };
+
+  const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+    f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+
+  assert.equal(result.phase, 'manual_required');
+  assert.equal(f.docker.inspection.running, false);
+  assert.equal(existsSync(stoppedAuthorityPath(f)), true);
+});
+
+test('C62 rollback accepts only authorized post-start node config and restores all prior bytes', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  const before = migrationEvidence(f.instanceRoot);
+  configureProbeNodeConfig(f);
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  const unhealthy = healthyPlatformInventory();
+  unhealthy.nodeSets[0] = { ...unhealthy.nodeSets[0]!, enabled: false, err: 'load_failed' };
+  unhealthy.enabled = false;
+  unhealthy.errors = ['load_failed'];
+  unhealthy.health = 'failed';
+  f.admin.afterRestart = unhealthy;
+  f.docker.afterStart = () => {
+    writeJson(join(f.instanceRoot, '.config.nodes.json'), reorderedPlatformNodeConfig());
+    writeFileSync(
+      join(f.instanceRoot, '.config.nodes.json.backup'),
+      `${JSON.stringify(platformNodeConfig(), null, 2)}\n`,
+      { mode: 0o600 },
+    );
+  };
+
+  const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+    f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+
+  assert.equal(result.phase, 'rolled_back');
+  assert.equal(f.docker.inspection.running, false);
+  assert.deepEqual(migrationEvidenceDiff(f.instanceRoot, before), []);
+  assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), false);
+});
+
+test('C62 equal raw prior and desired are restored byte-exact after semantic post-start rewrite', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  const before = migrationEvidence(f.instanceRoot);
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  const unhealthy = healthyPlatformInventory();
+  unhealthy.nodeSets[0] = { ...unhealthy.nodeSets[0]!, enabled: false, err: 'load_failed' };
+  unhealthy.enabled = false;
+  unhealthy.errors = ['load_failed'];
+  unhealthy.health = 'failed';
+  f.admin.afterRestart = unhealthy;
+  f.docker.afterStart = () => {
+    writeFileSync(join(f.instanceRoot, '.config.nodes.json'), '{ }\n', { mode: 0o600 });
+    writeFileSync(join(f.instanceRoot, '.config.nodes.json.backup'), '{\n}\n', { mode: 0o600 });
+  };
+
+  const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+    f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+
+  assert.equal(result.phase, 'rolled_back');
+  assert.equal(f.docker.inspection.running, false);
+  assert.deepEqual(migrationEvidenceDiff(f.instanceRoot, before), []);
+  assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), false);
+});
+
+test('C62 legacy v1 authority remains exact-only and can complete recovery', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  const manifest = join(stoppedAuthorityPath(f), 'manifest.json');
+  const v2 = JSON.parse(readFileSync(manifest, 'utf8')) as {
+    instanceId: string;
+    txId: string;
+    targetIntegrity: string;
+    artifacts: Array<{
+      key: string;
+      desired: TestArtifactFact;
+      prior: TestArtifactFact;
+    }>;
+  };
+  writeFileSync(manifest, `${JSON.stringify({
+    version: 1,
+    instanceId: v2.instanceId,
+    txId: v2.txId,
+    targetIntegrity: v2.targetIntegrity,
+    artifacts: v2.artifacts.map(({ key, desired, prior }) => ({ key, desired, prior })),
+  })}\n`, { mode: 0o600 });
+  f.docker.afterStart = () => {
+    rmSync(join(f.instanceRoot, '.config.nodes.json.backup'), { force: true });
+  };
+
+  const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+    f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+
+  assert.equal(result.phase, 'committed');
+  assert.equal(f.repo.nodeRuntime('line-a')?.mode, 'npm');
+});
+
 test('C60 ownership loss during quiescence polling writes no authority or sidecars', async () => {
   const f = migrationFixture({ originalRunning: false });
   let replaced = false;
@@ -3102,7 +3441,12 @@ test('C42 Manager-only authority is complete, tx-bound, and permission restricte
     instanceId: string;
     txId: string;
     targetIntegrity: string;
-    artifacts: Array<{ key: string; desired: TestArtifactFact; prior: TestArtifactFact }>;
+    artifacts: Array<{
+      key: string;
+      desired: TestArtifactFact;
+      prior: TestArtifactFact;
+      postStart: Record<string, unknown>;
+    }>;
   };
   assert.deepEqual(
     {
@@ -3112,7 +3456,7 @@ test('C42 Manager-only authority is complete, tx-bound, and permission restricte
       targetIntegrity: authority.targetIntegrity,
     },
     {
-      version: 1,
+      version: 2,
       instanceId: 'line-a',
       txId: 'tx-01',
       targetIntegrity: PLATFORM_NODE_PACKAGE.integrity,
@@ -3132,6 +3476,15 @@ test('C42 Manager-only authority is complete, tx-bound, and permission restricte
   for (const artifact of authority.artifacts) {
     assert.equal(artifact.desired.key, artifact.key);
     assert.equal(artifact.prior.key, artifact.key);
+    if (artifact.key === '.config.nodes.json' || artifact.key === '.config.nodes.json.backup') {
+      assert.deepEqual(Object.keys(artifact.postStart).sort(), [
+        'canonicalSha256', 'comparison', 'exists', 'kind', 'mode',
+      ]);
+      assert.equal(artifact.postStart['comparison'], 'canonical-json');
+      assert.match(String(artifact.postStart['canonicalSha256']), /^[a-f0-9]{64}$/);
+    } else {
+      assert.deepEqual(artifact.postStart, { comparison: 'exact', fact: artifact.desired });
+    }
   }
 });
 

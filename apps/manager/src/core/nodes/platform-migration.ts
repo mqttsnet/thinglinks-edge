@@ -533,8 +533,18 @@ type StoppedArtifactFact =
   | { key: string; exists: false }
   | { key: string; exists: true; kind: 'file' | 'directory'; mode: number; sha256: string };
 
+type StoppedPostStartExpectation =
+  | { comparison: 'exact'; fact: StoppedArtifactFact }
+  | {
+    comparison: 'canonical-json';
+    exists: true;
+    kind: 'file';
+    mode: number;
+    canonicalSha256: string;
+  };
+
 interface StoppedEvidenceAuthority {
-  version: 1;
+  version: 1 | 2;
   instanceId: string;
   txId: string;
   targetIntegrity: string;
@@ -542,11 +552,17 @@ interface StoppedEvidenceAuthority {
     key: string;
     desired: StoppedArtifactFact;
     prior: StoppedArtifactFact;
+    postStart: StoppedPostStartExpectation;
   }>;
 }
 
 const STOPPED_EVIDENCE_TX = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const AUTHORITY_MANIFEST = 'manifest.json';
+const NODE_CONFIG_PATH = '.config.nodes.json';
+const NODE_CONFIG_BACKUP_PATH = '.config.nodes.json.backup';
+const MAX_NODE_CONFIG_JSON_BYTES = 1024 * 1024;
+const MAX_CANONICAL_JSON_DEPTH = 64;
+const MAX_CANONICAL_JSON_VALUES = 100_000;
 
 function exactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
   const actual = Object.keys(value).sort();
@@ -583,6 +599,48 @@ function exactAuthorityFact(value: unknown, expectedKey: string): StoppedArtifac
     kind: record['kind'],
     mode: record['mode'] as number,
     sha256: record['sha256'],
+  };
+}
+
+function exactPostStartExpectation(
+  value: unknown,
+  key: string,
+  desired: StoppedArtifactFact,
+): StoppedPostStartExpectation {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('stopped post-start expectation must be an object');
+  }
+  const record = value as Record<string, unknown>;
+  if (record['comparison'] === 'exact') {
+    if (!exactKeys(record, ['comparison', 'fact'])) {
+      throw new Error('exact post-start expectation field set mismatch');
+    }
+    const fact = exactAuthorityFact(record['fact'], key);
+    if (!sameArtifact(fact, desired)) {
+      throw new Error('exact post-start expectation differs from desired');
+    }
+    return { comparison: 'exact', fact };
+  }
+  if (
+    record['comparison'] !== 'canonical-json'
+    || (key !== NODE_CONFIG_PATH && key !== NODE_CONFIG_BACKUP_PATH)
+    || !exactKeys(record, [
+      'comparison', 'exists', 'kind', 'mode', 'canonicalSha256',
+    ])
+    || record['exists'] !== true
+    || record['kind'] !== 'file'
+    || !Number.isInteger(record['mode'])
+    || (record['mode'] as number) < 0
+    || (record['mode'] as number) > 0o777
+    || typeof record['canonicalSha256'] !== 'string'
+    || !/^[a-f0-9]{64}$/.test(record['canonicalSha256'])
+  ) throw new Error('canonical post-start expectation is invalid');
+  return {
+    comparison: 'canonical-json',
+    exists: true,
+    kind: 'file',
+    mode: record['mode'] as number,
+    canonicalSha256: record['canonicalSha256'],
   };
 }
 
@@ -640,8 +698,9 @@ function exactStoppedAuthority(
   if (!exactKeys(record, ['version', 'instanceId', 'txId', 'targetIntegrity', 'artifacts'])) {
     throw new Error('stopped authority field set mismatch');
   }
+  const version = record['version'];
   if (
-    record['version'] !== 1
+    (version !== 1 && version !== 2)
     || record['instanceId'] !== expected.instanceId
     || record['txId'] !== expected.txId
     || record['targetIntegrity'] !== expected.targetIntegrity
@@ -654,17 +713,47 @@ function exactStoppedAuthority(
       throw new Error('stopped authority artifact invalid');
     }
     const artifact = value as Record<string, unknown>;
-    if (!exactKeys(artifact, ['key', 'desired', 'prior']) || artifact['key'] !== key) {
+    const expectedKeys = version === 1
+      ? ['key', 'desired', 'prior']
+      : ['key', 'desired', 'prior', 'postStart'];
+    if (!exactKeys(artifact, expectedKeys) || artifact['key'] !== key) {
       throw new Error('stopped authority artifact order mismatch');
     }
+    const desired = exactAuthorityFact(artifact['desired'], key);
+    const postStart = version === 1
+      ? { comparison: 'exact' as const, fact: desired }
+      : exactPostStartExpectation(artifact['postStart'], key, desired);
     return {
       key,
-      desired: exactAuthorityFact(artifact['desired'], key),
+      desired,
       prior: exactAuthorityFact(artifact['prior'], key),
+      postStart,
     };
   });
+  const nodePost = artifacts.filter((artifact) => (
+    artifact.key === NODE_CONFIG_PATH || artifact.key === NODE_CONFIG_BACKUP_PATH
+  ));
+  if (version === 2) {
+    const main = nodePost.find((artifact) => artifact.key === NODE_CONFIG_PATH);
+    if (
+      nodePost.length !== 2
+      || !main?.desired.exists
+      || main.desired.kind !== 'file'
+      || nodePost.some((artifact) => artifact.postStart.comparison !== 'canonical-json')
+      || nodePost[0]!.postStart.comparison !== 'canonical-json'
+      || nodePost[1]!.postStart.comparison !== 'canonical-json'
+      || nodePost[0]!.postStart.canonicalSha256 !== nodePost[1]!.postStart.canonicalSha256
+      || nodePost[0]!.postStart.mode !== nodePost[1]!.postStart.mode
+      || nodePost[0]!.postStart.mode !== main.desired.mode
+      || artifacts.some((artifact) => (
+        artifact.key !== NODE_CONFIG_PATH
+        && artifact.key !== NODE_CONFIG_BACKUP_PATH
+        && artifact.postStart.comparison !== 'exact'
+      ))
+    ) throw new Error('stopped authority post-start policy mismatch');
+  }
   return {
-    version: 1,
+    version,
     instanceId: expected.instanceId,
     txId: expected.txId,
     targetIntegrity: expected.targetIntegrity,
@@ -871,6 +960,97 @@ async function artifactFact(root: string, key: string): Promise<StoppedArtifactF
   return { key, exists: true, kind: 'directory', mode, sha256: hash(JSON.stringify(entries)) };
 }
 
+function canonicalJson(value: unknown, depth = 0, state = { values: 0 }): string {
+  state.values += 1;
+  if (state.values > MAX_CANONICAL_JSON_VALUES || depth > MAX_CANONICAL_JSON_DEPTH) {
+    throw new Error('node config JSON structure exceeds limits');
+  }
+  if (value === null) return 'null';
+  if (typeof value === 'string') {
+    assertNoLoneSurrogate(value);
+    return JSON.stringify(value);
+  }
+  if (typeof value === 'boolean') return JSON.stringify(value);
+  if (typeof value === 'number' && Number.isFinite(value)) return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => canonicalJson(entry, depth + 1, state)).join(',')}]`;
+  }
+  if (typeof value !== 'object' || Object.getPrototypeOf(value) !== Object.prototype) {
+    throw new Error('node config JSON contains an unsupported value');
+  }
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map((key) => {
+    assertNoLoneSurrogate(key);
+    return `${JSON.stringify(key)}:${canonicalJson(record[key], depth + 1, state)}`;
+  }).join(',')}}`;
+}
+
+function assertNoLoneSurrogate(value: string): void {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (index + 1 >= value.length || next < 0xdc00 || next > 0xdfff) {
+        throw new Error('node config JSON contains a lone surrogate');
+      }
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      throw new Error('node config JSON contains a lone surrogate');
+    }
+  }
+}
+
+async function canonicalNodeConfigExpectation(
+  root: string,
+  key: string,
+  expectedRaw?: StoppedArtifactFact,
+): Promise<Extract<StoppedPostStartExpectation, { comparison: 'canonical-json' }>> {
+  const absolute = join(root, key);
+  const handle = await open(absolute, FS_CONSTANTS.O_RDONLY | FS_CONSTANTS.O_NOFOLLOW);
+  try {
+    const before = await handle.stat();
+    if (
+      !before.isFile()
+      || before.size > MAX_NODE_CONFIG_JSON_BYTES
+      || before.size <= 0
+    ) throw new Error('node config JSON file is invalid');
+    const bytes = await handle.readFile();
+    const after = await handle.stat();
+    if (
+      !after.isFile()
+      || after.dev !== before.dev || after.ino !== before.ino
+      || after.size !== before.size || after.mtimeMs !== before.mtimeMs
+      || (after.mode & 0o777) !== (before.mode & 0o777)
+    ) throw new Error('node config JSON changed while reading');
+    if (
+      expectedRaw
+      && (
+        !expectedRaw.exists
+        || expectedRaw.kind !== 'file'
+        || expectedRaw.mode !== (before.mode & 0o777)
+        || expectedRaw.sha256 !== hash(bytes)
+      )
+    ) throw new Error('node config JSON differs from raw authority');
+    const decoded = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+    const parsed = JSON.parse(decoded) as unknown;
+    if (
+      !parsed
+      || typeof parsed !== 'object'
+      || Array.isArray(parsed)
+      || Object.getPrototypeOf(parsed) !== Object.prototype
+    ) throw new Error('node config JSON root must be a plain object');
+    return {
+      comparison: 'canonical-json',
+      exists: true,
+      kind: 'file',
+      mode: before.mode & 0o777,
+      canonicalSha256: hash(canonicalJson(parsed)),
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
 function sameArtifact(left: StoppedArtifactFact, right: StoppedArtifactFact): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
@@ -881,6 +1061,22 @@ function sameArtifactFacts(
 ): boolean {
   return left.length === right.length
     && left.every((fact, index) => sameArtifact(fact, right[index]!));
+}
+
+async function matchesPostStartExpectation(
+  root: string,
+  key: string,
+  expected: StoppedPostStartExpectation,
+): Promise<boolean> {
+  if (expected.comparison === 'exact') {
+    return sameArtifact(await artifactFact(root, key), expected.fact);
+  }
+  try {
+    return JSON.stringify(await canonicalNodeConfigExpectation(root, key))
+      === JSON.stringify(expected);
+  } catch {
+    return false;
+  }
 }
 
 function stoppedSidecar(
@@ -1514,11 +1710,29 @@ export class PlatformMigrationService {
   private async persistStoppedAuthority(
     journal: InstanceNodeMigrationJournal,
     desiredFacts: readonly StoppedArtifactFact[],
+    probeRoot: string,
   ): Promise<StoppedEvidenceAuthority> {
     if (desiredFacts.length !== STOPPED_EXPORT_PATHS.length) {
       throw controlled('cutover', 'stopped desired authority set is incomplete');
     }
     const liveRoot = join(this.o.instanceDataRoot, journal.instanceId);
+    const nodeConfigDesired = desiredFacts.find((fact) => fact.key === NODE_CONFIG_PATH);
+    if (!nodeConfigDesired) {
+      throw controlled('cutover', 'stopped node config authority is missing');
+    }
+    let nodeConfigPostStart: Extract<
+      StoppedPostStartExpectation,
+      { comparison: 'canonical-json' }
+    >;
+    try {
+      nodeConfigPostStart = await canonicalNodeConfigExpectation(
+        probeRoot,
+        NODE_CONFIG_PATH,
+        nodeConfigDesired,
+      );
+    } catch {
+      throw controlled('cutover', 'stopped node config semantic authority is invalid');
+    }
     const artifacts = [] as StoppedEvidenceAuthority['artifacts'];
     for (let index = 0; index < STOPPED_EXPORT_PATHS.length; index += 1) {
       const key = STOPPED_EXPORT_PATHS[index]!;
@@ -1526,10 +1740,20 @@ export class PlatformMigrationService {
       if (!desired || desired.key !== key) {
         throw controlled('cutover', 'stopped desired authority order mismatch');
       }
-      artifacts.push({ key, desired, prior: await artifactFact(liveRoot, key) });
+      const postStart: StoppedPostStartExpectation = (
+        key === NODE_CONFIG_PATH || key === NODE_CONFIG_BACKUP_PATH
+      )
+        ? { ...nodeConfigPostStart }
+        : { comparison: 'exact', fact: desired };
+      artifacts.push({
+        key,
+        desired,
+        prior: await artifactFact(liveRoot, key),
+        postStart,
+      });
     }
     const authority: StoppedEvidenceAuthority = {
-      version: 1,
+      version: 2,
       instanceId: journal.instanceId,
       txId: journal.txId,
       targetIntegrity: journal.targetIntegrity,
@@ -1715,6 +1939,12 @@ export class PlatformMigrationService {
         const manifest = stoppedSidecar(target, journal.txId, 'manifest');
         const backupManifest = stoppedSidecar(target, journal.txId, 'backup-manifest');
         const live = await artifactFact(liveRoot, key);
+        const liveIsDesired = sameArtifact(live, desired);
+        const liveIsPostStart = await matchesPostStartExpectation(
+          liveRoot,
+          key,
+          artifact.postStart,
+        );
         const partialFact = await artifactFact(dirname(partial), basename(partial));
         const backupFact = await artifactFact(dirname(backup), basename(backup));
         const desiredMarker = await readArtifactManifest(manifest, key);
@@ -1744,7 +1974,7 @@ export class PlatformMigrationService {
             !prior.exists || !priorMarker
             || !sameArtifact({ ...backupFact, key } as StoppedArtifactFact, prior)
           ) throw new Error(`stopped backup differs from authority ${key}`);
-          if (sameArtifact(live, desired)) {
+          if (liveIsDesired || liveIsPostStart) {
             if (!desiredMarker) throw new Error(`applied desired marker missing ${key}`);
             if (live.exists) await rm(target, { recursive: true, force: false });
           } else if (live.exists && !sameArtifact(live, prior)) {
@@ -1761,9 +1991,20 @@ export class PlatformMigrationService {
             await copyArtifact(backup, target, prior);
           }
         } else if (sameArtifact(prior, desired)) {
-          if (!sameArtifact(live, prior)) throw new Error(`equal live differs from authority ${key}`);
+          if (sameArtifact(live, prior)) {
+            // Already restored or never rewritten.
+          } else if (liveIsPostStart) {
+            if (!desiredMarker) throw new Error(`equal desired marker missing ${key}`);
+            if (live.exists) await rm(target, { recursive: true, force: false });
+            if (prior.exists) {
+              if (!partialFact.exists) throw new Error(`equal desired partial missing ${key}`);
+              await copyArtifact(partial, target, prior);
+            }
+          } else {
+            throw new Error(`equal live differs from authority ${key}`);
+          }
         } else if (!prior.exists) {
-          if (sameArtifact(live, desired)) {
+          if (liveIsDesired || liveIsPostStart) {
             if (!desiredMarker) throw new Error(`created desired marker missing ${key}`);
             if (live.exists) await rm(target, { recursive: true, force: false });
           } else if (!sameArtifact(live, prior)) {
@@ -1856,7 +2097,7 @@ export class PlatformMigrationService {
     instanceId: string,
     txId: string,
     allowCommittedCleanupResidue = false,
-  ): Promise<StoppedArtifactFact[]> {
+  ): Promise<StoppedEvidenceAuthority['artifacts']> {
     const liveRoot = join(this.o.instanceDataRoot, instanceId);
     const journal = this.o.repo.nodeMigration(instanceId);
     if (!journal || journal.txId !== txId) throw new Error('stopped evidence journal identity mismatch');
@@ -1883,10 +2124,9 @@ export class PlatformMigrationService {
       const backupManifest = stoppedSidecar(target, txId, 'backup-manifest');
       const partialFact = await artifactFact(dirname(partial), basename(partial));
       const backupFact = await artifactFact(dirname(backup), basename(backup));
-      const live = await artifactFact(liveRoot, key);
       const desiredMarker = await readArtifactManifest(manifest, key);
       const priorMarker = await readArtifactManifest(backupManifest, key);
-      if (!sameArtifact(live, requiredDesired)) {
+      if (!await matchesPostStartExpectation(liveRoot, key, artifact.postStart)) {
         throw new Error(`stopped live differs from Manager authority ${key}`);
       }
       if (!allowCommittedCleanupResidue && !desiredMarker) {
@@ -1940,7 +2180,7 @@ export class PlatformMigrationService {
         throw new Error(`orphan stopped backup marker mismatch ${key}`);
       }
     }
-    return authority.artifacts.map((artifact) => artifact.desired);
+    return authority.artifacts;
   }
 
   private async verifyRolledBackStoppedEvidenceOwned(
@@ -2030,13 +2270,14 @@ export class PlatformMigrationService {
   private async verifyInitialCommittedCleanup(
     instanceId: string,
     txId: string,
-    desiredFacts: readonly StoppedArtifactFact[],
+    artifacts: readonly StoppedEvidenceAuthority['artifacts'][number][],
     precleanedKeys: ReadonlySet<string>,
   ): Promise<void> {
     const liveRoot = join(this.o.instanceDataRoot, instanceId);
-    for (const desired of desiredFacts) {
-      if (!sameArtifact(await artifactFact(liveRoot, desired.key), desired)) {
-        throw new Error(`committed live desired drift ${desired.key}`);
+    for (const artifact of artifacts) {
+      const { desired } = artifact;
+      if (!await matchesPostStartExpectation(liveRoot, artifact.key, artifact.postStart)) {
+        throw new Error(`committed live desired drift ${artifact.key}`);
       }
       const target = join(liveRoot, desired.key);
       const manifest = stoppedSidecar(target, txId, 'manifest');
@@ -2105,7 +2346,7 @@ export class PlatformMigrationService {
     txId: string,
     actor: string,
     initial?: {
-      desiredFacts: readonly StoppedArtifactFact[];
+      artifacts: readonly StoppedEvidenceAuthority['artifacts'][number][];
       precleanedKeys: ReadonlySet<string>;
     },
   ): Promise<boolean> {
@@ -2126,7 +2367,7 @@ export class PlatformMigrationService {
       }
       if (initial) {
         await this.verifyInitialCommittedCleanup(
-          instanceId, txId, initial.desiredFacts, initial.precleanedKeys,
+          instanceId, txId, initial.artifacts, initial.precleanedKeys,
         );
       }
       await this.cleanupStoppedEvidence(instanceId, txId);
@@ -2262,7 +2503,7 @@ export class PlatformMigrationService {
         throw controlled('verification', 'probe runtime artifact facts did not converge');
       }
       execution.renew(['staged']);
-      const authority = await this.persistStoppedAuthority(journal, exported);
+      const authority = await this.persistStoppedAuthority(journal, exported, handle.dataRoot);
       execution.renew(['staged']);
       await this.prepareStoppedPartials(instanceId, txId, handle.dataRoot, exported);
       const cleanup = await this.o.docker.cleanupMigrationProbe(handle);
@@ -2332,15 +2573,19 @@ export class PlatformMigrationService {
       await this.o.adminRuntime.waitReady(instanceId, { timeoutMs: 30_000, intervalMs: 250 });
       await this.verifyCutover(instanceId, this.o.repo.nodeMigration(instanceId)!);
       execution.renew(['verifying']);
-      const desiredFacts = await this.verifyStoppedEvidenceOwned(instanceId, scanned.txId);
+      const artifacts = await this.verifyStoppedEvidenceOwned(instanceId, scanned.txId);
+      const desiredFacts = artifacts.map((artifact) => artifact.desired);
       const equalCleanup = await this.cleanupEqualStoppedEvidenceBeforeCommit(
         execution, desiredFacts, 201,
       );
-      for (const desired of desiredFacts) {
-        if (!sameArtifact(
-          await artifactFact(join(this.o.instanceDataRoot, instanceId), desired.key),
-          desired,
-        )) throw controlled('verification', `stopped live artifact drifted before commit ${desired.key}`);
+      const liveRoot = join(this.o.instanceDataRoot, instanceId);
+      for (const artifact of artifacts) {
+        if (!await matchesPostStartExpectation(liveRoot, artifact.key, artifact.postStart)) {
+          throw controlled(
+            'verification',
+            `stopped live artifact drifted before commit ${artifact.key}`,
+          );
+        }
       }
       execution.renew(['verifying']);
       this.o.repo.commitNodeMigrationExact(
@@ -2349,7 +2594,7 @@ export class PlatformMigrationService {
       );
       await this.reach(instanceId, scanned.txId, 'committed', equalCleanup.sequence);
       if (!await this.cleanupCommittedStoppedEvidence(instanceId, scanned.txId, actor, {
-        desiredFacts,
+        artifacts,
         precleanedKeys: equalCleanup.cleanedKeys,
       })) {
         return this.status(instanceId);
