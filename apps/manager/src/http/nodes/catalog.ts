@@ -43,6 +43,35 @@ export interface CatalogDeps {
   upstream?: UpstreamRegistry | undefined;
 }
 
+/**
+ * inventoryOf 已按 Node-RED node set 聚合出模块来源和模块健康度；HTTP 响应再保留
+ * 这台实例的整体健康与重复类型 owner。这里不看可选 file 字段，来源只来自已有聚合。
+ */
+function inventoryEvidence<T extends {
+  ok: boolean;
+  modules: Array<{ module: string; types: string[]; health: 'healthy' | 'conflict' | 'failed' }>;
+}>(inventory: T): T & {
+  health?: 'healthy' | 'conflict' | 'failed';
+  conflicts: Array<{ type: string; owners: string[] }>;
+} {
+  if (!inventory.ok) return { ...inventory, conflicts: [] };
+  const ownersByType = new Map<string, Set<string>>();
+  for (const module of inventory.modules) {
+    for (const type of module.types) {
+      const owners = ownersByType.get(type) ?? new Set<string>();
+      owners.add(module.module);
+      ownersByType.set(type, owners);
+    }
+  }
+  const conflicts = [...ownersByType.entries()]
+    .filter(([, owners]) => owners.size > 1)
+    .map(([type, owners]) => ({ type, owners: [...owners].sort() }))
+    .sort((left, right) => left.type.localeCompare(right.type));
+  const health = inventory.modules.some((module) => module.health === 'failed') ? 'failed'
+    : conflicts.length > 0 ? 'conflict' : 'healthy';
+  return { ...inventory, health, conflicts };
+}
+
 export function registerNodeCatalog(
   api: FastifyInstance, ctx: HttpContext, deps: CatalogDeps,
 ): void {
@@ -418,7 +447,7 @@ export function registerNodeCatalog(
         out.push({ instanceId: id, ok: false, reason: t.error, modules: [], unapproved: 0 });
         continue;
       }
-      out.push(await inventoryOf(id, t, approved));
+      out.push(inventoryEvidence(await inventoryOf(id, t, approved)));
     }
     return reply.send({ instances: out });
   });
@@ -480,7 +509,7 @@ export function registerNodeCatalog(
     if (!guard(req, reply, { csrf: false, need: 'instance:view', instance: id })) return;
     const t = targetFor(ctx, id);
     if ('error' in t) return reply.code(t.code).send({ error: t.error });
-    return reply.send(await inventoryOf(id, t, catalog.names()));
+    return reply.send(inventoryEvidence(await inventoryOf(id, t, catalog.names())));
   });
 
   // ── 平台节点包迁移 ──────────────────────────────────

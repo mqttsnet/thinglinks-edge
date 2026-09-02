@@ -26,7 +26,7 @@ import { api, ApiError } from '../../api/client';
 import type {
   CatalogEntry, StorePackage, InstanceInventory, InventoryItem, Instance, NodeCompliance,
   NpmSource, NodeSearchHit, PlatformNodeMigration, PlatformMigrationPhase,
-  PlatformMigrationErrorCode,
+  PlatformMigrationErrorCode, NodeInventoryHealth, NodeInventorySource,
 } from '../../api/types';
 import { can, canOperate, loadPermissions } from '../../api/permissions';
 // approvedAt 来自 SQLite 的 datetime('now')：是 UTC 但不带 Z，
@@ -135,8 +135,9 @@ function platformState(instanceId: string) {
     cached,
     approved,
     installed: observed !== undefined,
-    active: observed?.enabled === true && observed.health !== 'failed' && observed.health !== 'conflict',
+    active: observed?.enabled === true && observed.health === 'healthy',
     health: observed?.health,
+    source: observed?.source,
     errors: observed?.errors ?? [],
   };
 }
@@ -505,6 +506,19 @@ const COMPLIANCE: Record<NodeCompliance, { text: string; type: 'default' | 'succ
   unapproved: { text: '未批准', type: 'warning' },
 };
 
+const INVENTORY_SOURCE: Record<NodeInventorySource, string> = {
+  builtin: '镜像内置', raw: 'legacy 原始节点', npm: 'npm 平台/第三方包',
+  mixed: '镜像与 legacy 混合', unknown: 'Manager 未识别来源',
+};
+
+const INVENTORY_HEALTH: Record<NodeInventoryHealth, string> = {
+  healthy: '加载健康', conflict: '存在类型冲突', failed: '加载失败',
+};
+
+function instanceInventory(instanceId: string): InstanceInventory | undefined {
+  return inventory.value.find((item) => item.instanceId === instanceId);
+}
+
 /** 未批准的排在最前 —— 这一页要人看见的就是它们 */
 function sortedModules(inv: InstanceInventory): InventoryItem[] {
   const rank = (m: InventoryItem) => (m.compliance === 'unapproved' ? 0 : 1);
@@ -613,10 +627,23 @@ onMounted(async () => {
             <span><b>实例安装：</b>{{ platformState(item.id).installed ? '台账已观察到精确版本' : '台账未观察到精确版本' }}</span>
             <span><b>实例激活：</b>{{ platformState(item.id).active ? '已启用且无已知加载冲突' : '尚无健康激活证据' }}</span>
           </div>
-          <div v-if="platformState(item.id).health || platformState(item.id).errors.length" class="meta">
+          <div v-if="platformState(item.id).source || platformState(item.id).health
+                       || platformState(item.id).errors.length || instanceInventory(item.id)?.health" class="meta">
+            <span v-if="platformState(item.id).source">
+              平台模块来源：{{ INVENTORY_SOURCE[platformState(item.id).source!] }}
+            </span>
             <span>Manager 台账加载健康：{{ platformState(item.id).health ?? '旧 Manager 未提供' }}</span>
+            <span v-if="instanceInventory(item.id)?.health">
+              实例台账健康：{{ INVENTORY_HEALTH[instanceInventory(item.id)!.health!] }}
+            </span>
             <span v-if="platformState(item.id).errors.length">加载/冲突证据：{{ platformState(item.id).errors.join('；') }}</span>
           </div>
+          <NAlert v-if="instanceInventory(item.id)?.conflicts?.length" type="warning" :bordered="false" class="warn">
+            <b>Manager 观察到的类型冲突：</b>
+            <span v-for="conflict in instanceInventory(item.id)!.conflicts!" :key="conflict.type" class="conflict">
+              {{ conflict.type }}：{{ conflict.owners.join('、') }}
+            </span>
+          </NAlert>
           <p v-if="migrations[item.id]" class="meta">
             运行模式：{{ migrations[item.id]!.runtimeMode === 'npm' ? 'npm 发布包' : 'legacy 镜像节点' }}
             <template v-if="migrations[item.id]!.platformVersion"> · 平台版本：{{ migrations[item.id]!.platformVersion }}</template>
@@ -801,6 +828,9 @@ onMounted(async () => {
               <NTag v-if="inv.unapproved > 0" size="small" :bordered="false" type="warning">
                 {{ inv.unapproved }} 个未批准
               </NTag>
+              <NTag v-if="inv.health" size="small" :bordered="false">
+                {{ INVENTORY_HEALTH[inv.health] }}
+              </NTag>
             </div>
             <NButton v-if="inv.ok && canOperate(inv.instanceId)" size="tiny" secondary
                      @click="openInstall(inv.instanceId)">装节点包</NButton>
@@ -811,6 +841,12 @@ onMounted(async () => {
             <br>
             实例停着时读不到是正常的 —— 清单存在实例自己的管理接口后面，容器停着那个接口就不存在。
           </NAlert>
+          <NAlert v-if="inv.conflicts?.length" type="warning" :bordered="false" class="warn">
+            <b>类型冲突（Manager 当前台账）：</b>
+            <span v-for="conflict in inv.conflicts" :key="conflict.type" class="conflict">
+              {{ conflict.type }}：{{ conflict.owners.join('、') }}
+            </span>
+          </NAlert>
 
           <div v-else class="mods">
             <div v-for="m in sortedModules(inv)" :key="m.module"
@@ -820,6 +856,8 @@ onMounted(async () => {
               <NTag size="small" :bordered="false" :type="COMPLIANCE[m.compliance].type">
                 {{ COMPLIANCE[m.compliance].text }}
               </NTag>
+              <span v-if="m.source" class="off">来源：{{ INVENTORY_SOURCE[m.source] }}</span>
+              <span v-if="m.health" class="off">加载：{{ INVENTORY_HEALTH[m.health] }}</span>
               <NButton v-if="manage && m.compliance === 'unapproved'" size="tiny" secondary
                        @click="openApprove(m.module)">补批准</NButton>
               <span v-if="!m.enabled" class="off">有节点被禁用</span>
@@ -1103,6 +1141,7 @@ h2 { margin: 0 0 4px; font-size: 20px; }
   gap: 8px 16px; margin-top: 12px; font-size: 12px; color: var(--text-2); }
 .platform-state b { color: var(--text-1); }
 .n-alert a { color: var(--primary); text-decoration: underline; }
+.conflict { display: inline-block; margin-left: 8px; overflow-wrap: anywhere; }
 
 .filt { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 
