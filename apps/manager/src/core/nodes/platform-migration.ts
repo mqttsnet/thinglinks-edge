@@ -1137,6 +1137,7 @@ export class PlatformMigrationService {
     replaceRolledBackTxId?: string,
   ): Promise<PlatformMigrationResult> {
     this.o.gate.assertLease(lease, instanceId, ['platform-migration']);
+    const txId = this.o.txId?.() ?? `migration-${randomUUID()}`;
     if (initialFacts.needsEnvironmentRepair) {
       if (!this.o.repair) {
         throw controlled('preflight', 'container environment identity requires same-image repair');
@@ -1146,6 +1147,17 @@ export class PlatformMigrationService {
       ).catch(() => {
         throw controlled('preflight', 'same-image environment repair failed');
       });
+      try {
+        await this.o.barrier.reach({
+          instanceId,
+          txId,
+          phase: 'preparing',
+          sequence: 0,
+          boundary: 'after-same-image-rebuild',
+        });
+      } catch {
+        throw controlled('preflight', 'same-image environment repair barrier failed');
+      }
       initialFacts = await this.preflight(instanceId);
       if (initialFacts.needsEnvironmentRepair) {
         throw controlled('preflight', 'container environment identity repair did not converge');
@@ -1159,7 +1171,6 @@ export class PlatformMigrationService {
     if (!samePreflightFacts(initialFacts, facts)) {
       throw controlled('preflight', 'migration facts changed while editor sessions drained');
     }
-    const txId = this.o.txId?.() ?? `migration-${randomUUID()}`;
     const executionOwner = this.executionRuntime.executionOwner();
     const executionLeaseExpiresAt = this.executionRuntime.now()
       + this.executionRuntime.leaseDurationMs;

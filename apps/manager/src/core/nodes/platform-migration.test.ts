@@ -745,10 +745,14 @@ function migrationFixture(options: FixtureOptions = {}) {
   };
   const barrier: PlatformNodeOperationBarrier = {
     async reach(event) {
-      assert.equal(repo.nodeMigration(event.instanceId)?.phase, event.phase);
+      if (event.boundary === 'after-same-image-rebuild') {
+        assert.notEqual(repo.nodeMigration(event.instanceId)?.txId, event.txId);
+      } else {
+        assert.equal(repo.nodeMigration(event.instanceId)?.phase, event.phase);
+      }
       barrierEvents.push({ ...event });
       events.push(`barrier:${event.phase}:${event.boundary}`);
-      await options.onBarrier?.({ phase: event.phase, boundary: event.boundary });
+      await options.onBarrier?.(event);
       if (
         controls.barrierFailure?.phase === event.phase
         && controls.barrierFailure.boundary === event.boundary
@@ -762,8 +766,8 @@ function migrationFixture(options: FixtureOptions = {}) {
   const createService = (
     selectedRepo: InstanceRepo,
     selectedGate: InstanceOperationGate,
-    txId: string,
-    executionOwner = `owner-${txId}-0000000000000000`,
+    txId: string | (() => string),
+    executionOwner = `owner-${typeof txId === 'string' ? txId : 'generated'}-0000000000000000`,
   ) => new PlatformMigrationService({
     repo: selectedRepo,
     gate: selectedGate,
@@ -806,7 +810,7 @@ function migrationFixture(options: FixtureOptions = {}) {
     } : {}),
     barrier,
     instanceDataRoot: root,
-    txId: () => txId,
+    txId: typeof txId === 'string' ? () => txId : txId,
     executionRuntime: {
       now: time.now,
       sleep: time.sleep,
@@ -1205,6 +1209,130 @@ test('every missing or wrong managed environment identity repairs once before mi
       );
     }
   }
+});
+
+test('C46 same-image rebuild emits the exact pre-journal barrier before re-preflight and drain', async () => {
+  const fixtureRef: { current?: ReturnType<typeof migrationFixture> } = {};
+  let observedAtBarrier: {
+    inspectCalls: number;
+    journalAbsent: boolean;
+    proxySessions: number;
+    installCalls: number;
+  } | undefined;
+  const f = migrationFixture({
+    enableRepair: true,
+    onBarrier: (event) => {
+      if (event.boundary !== 'after-same-image-rebuild') return;
+      const current = fixtureRef.current;
+      assert.ok(current);
+      observedAtBarrier = {
+        inspectCalls: current.docker.inspectCalls,
+        journalAbsent: current.repo.nodeMigration('line-a') === undefined,
+        proxySessions: current.proxySessions.count('line-a'),
+        installCalls: current.admin.installCalls,
+      };
+    },
+  });
+  fixtureRef.current = f;
+  f.docker.inspection.environment = ['TLE_INSTANCE_ID=wrong-instance'];
+
+  const result = await f.service.migrate('line-a', 'admin');
+
+  assert.equal(result.phase, 'committed');
+  assert.deepEqual(
+    f.barrierEvents.find((event) => event.boundary === 'after-same-image-rebuild'),
+    {
+      instanceId: 'line-a',
+      txId: 'tx-01',
+      phase: 'preparing',
+      sequence: 0,
+      boundary: 'after-same-image-rebuild',
+    },
+  );
+  assert.deepEqual(observedAtBarrier, {
+    inspectCalls: 1,
+    journalAbsent: true,
+    proxySessions: 1,
+    installCalls: 0,
+  });
+  assert.ok(f.docker.inspectCalls >= 3);
+  assert.ok(f.events.indexOf('same-image-rebuild')
+    < f.events.indexOf('barrier:preparing:after-same-image-rebuild'));
+  assert.ok(f.events.indexOf('barrier:preparing:after-same-image-rebuild')
+    < f.events.indexOf('proxy-close:1012'));
+  assert.ok(f.events.indexOf('barrier:preparing:after-same-image-rebuild')
+    < f.events.indexOf('barrier:preparing:after-phase-persist'));
+});
+
+test('C46 same-image barrier throw is a controlled preflight failure with no migration effects', async () => {
+  for (const originalRunning of [true, false]) {
+    const f = migrationFixture({
+      originalRunning,
+      enableRepair: true,
+      barrierFailure: {
+        phase: 'preparing',
+        boundary: 'after-same-image-rebuild',
+      },
+    });
+    f.docker.inspection.environment = ['TLE_INSTANCE_ID=wrong-instance'];
+
+    await assert.rejects(
+      () => f.service.migrate('line-a', 'admin'),
+      (error: unknown) => (
+        error instanceof PlatformMigrationError
+        && error.code === 'preflight'
+        && error.message === 'same-image environment repair barrier failed'
+        && !/barrier-secret|token=/.test(error.message)
+      ),
+    );
+
+    assert.deepEqual(f.docker.runtimeCalls, ['same-image-rebuild']);
+    assert.equal(f.repo.nodeMigration('line-a'), undefined);
+    assert.equal(f.repo.nodeRuntime('line-a')?.mode, 'legacy');
+    assert.equal(f.proxySessions.count('line-a'), 1);
+    assert.equal(f.admin.installCalls, 0);
+    assert.equal(f.docker.inspection.running, originalRunning);
+    assert.equal(
+      f.events.some((event) => event.startsWith('checkpoint:create:')),
+      false,
+    );
+    assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), false);
+  }
+});
+
+test('C46 migration journal reuses the single transaction id preallocated for repair', async () => {
+  const f = migrationFixture({ enableRepair: true });
+  f.docker.inspection.environment = ['TLE_INSTANCE_ID=wrong-instance'];
+  let txIdCalls = 0;
+  const service = f.createService(
+    f.repo,
+    f.gate,
+    () => `tx-c46-${++txIdCalls}`,
+    'owner-tx-c46-0000000000000000',
+  );
+
+  const result = await service.migrate('line-a', 'admin');
+
+  assert.equal(result.phase, 'committed');
+  assert.equal(txIdCalls, 1);
+  assert.equal(
+    f.barrierEvents.find((event) => event.boundary === 'after-same-image-rebuild')?.txId,
+    'tx-c46-1',
+  );
+  assert.equal(f.repo.nodeMigration('line-a')?.txId, 'tx-c46-1');
+});
+
+test('C46 migration without environment repair emits no same-image boundary', async () => {
+  const f = migrationFixture();
+
+  const result = await f.service.migrate('line-a', 'admin');
+
+  assert.equal(result.phase, 'committed');
+  assert.equal(
+    f.barrierEvents.some((event) => event.boundary === 'after-same-image-rebuild'),
+    false,
+  );
+  assert.equal(f.repo.nodeMigration('line-a')?.txId, 'tx-01');
 });
 
 test('failed environment repair performs no migration side effect and preserves running or stopped state', async () => {
