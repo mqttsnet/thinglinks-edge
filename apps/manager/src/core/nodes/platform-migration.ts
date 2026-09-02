@@ -1245,11 +1245,24 @@ async function canonicalNodeConfigExpectation(
     const bytes = await handle.readFile();
     const after = await handle.stat();
     if (
-      !after.isFile()
+      bytes.length !== before.size
+      || !after.isFile()
       || after.dev !== before.dev || after.ino !== before.ino
-      || after.size !== before.size || after.mtimeMs !== before.mtimeMs
-      || (after.mode & 0o777) !== (before.mode & 0o777)
+      || after.size !== before.size
+      || after.mode !== before.mode
+      || after.mtimeMs !== before.mtimeMs
+      || after.ctimeMs !== before.ctimeMs
     ) throw new Error('node config JSON changed while reading');
+    const current = await lstat(absolute);
+    if (
+      !current.isFile()
+      || current.isSymbolicLink()
+      || current.dev !== after.dev || current.ino !== after.ino
+      || current.size !== after.size
+      || current.mode !== after.mode
+      || current.mtimeMs !== after.mtimeMs
+      || current.ctimeMs !== after.ctimeMs
+    ) throw new Error('node config JSON pathname changed while reading');
     if (
       expectedRaw
       && (
@@ -1455,6 +1468,132 @@ async function readArtifactManifest(
     throw new Error('artifact manifest identity mismatch');
   }
   return fact;
+}
+
+interface StoppedAuthorityRestorePlan {
+  readonly artifact: StoppedEvidenceAuthority['artifacts'][number];
+  readonly target: string;
+  readonly partial: string;
+  readonly backup: string;
+  readonly manifest: string;
+  readonly backupManifest: string;
+  readonly live: StoppedArtifactFact;
+  readonly partialFact: StoppedArtifactFact;
+  readonly backupFact: StoppedArtifactFact;
+  readonly desiredMarker: StoppedArtifactFact | undefined;
+  readonly priorMarker: StoppedArtifactFact | undefined;
+  readonly liveIsPostStart: boolean;
+  readonly removeLive: boolean;
+  readonly restoreFrom: 'backup' | 'partial' | undefined;
+}
+
+async function buildStoppedAuthorityRestorePlan(
+  liveRoot: string,
+  txId: string,
+  artifact: StoppedEvidenceAuthority['artifacts'][number],
+): Promise<StoppedAuthorityRestorePlan> {
+  const { key, desired, prior } = artifact;
+  const target = join(liveRoot, key);
+  await trustedArtifactParent(liveRoot, key, false);
+  const partial = stoppedSidecar(target, txId, 'partial');
+  const backup = stoppedSidecar(target, txId, 'backup');
+  const manifest = stoppedSidecar(target, txId, 'manifest');
+  const backupManifest = stoppedSidecar(target, txId, 'backup-manifest');
+  const live = await artifactFact(liveRoot, key);
+  const liveIsDesired = sameArtifact(live, desired);
+  const liveIsPostStart = await matchesPostStartExpectation(
+    liveRoot,
+    key,
+    artifact.postStart,
+  );
+  const partialFact = await artifactFact(dirname(partial), basename(partial));
+  const backupFact = await artifactFact(dirname(backup), basename(backup));
+  const desiredMarker = await readArtifactManifest(manifest, key);
+  const priorMarker = await readArtifactManifest(backupManifest, key);
+  if (desiredMarker && !sameArtifact(desiredMarker, desired)) {
+    throw new Error(`stopped desired marker differs from authority ${key}`);
+  }
+  if (priorMarker && !sameArtifact(priorMarker, prior)) {
+    throw new Error(`stopped prior marker differs from authority ${key}`);
+  }
+  if (partialFact.exists && !sameArtifact(
+    { ...partialFact, key } as StoppedArtifactFact,
+    desired,
+  )) throw new Error(`stopped partial differs from authority ${key}`);
+  if (
+    desired.exists
+    && desiredMarker
+    && !partialFact.exists
+    && !backupFact.exists
+    && !sameArtifact(prior, desired)
+    && sameArtifact(live, prior)
+  ) {
+    throw new Error(`stopped prepared partial disappeared before mutation ${key}`);
+  }
+
+  let removeLive = false;
+  let restoreFrom: StoppedAuthorityRestorePlan['restoreFrom'];
+  if (backupFact.exists) {
+    if (
+      !prior.exists || !priorMarker
+      || !sameArtifact({ ...backupFact, key } as StoppedArtifactFact, prior)
+    ) throw new Error(`stopped backup differs from authority ${key}`);
+    if (liveIsDesired || liveIsPostStart) {
+      if (!desiredMarker) throw new Error(`applied desired marker missing ${key}`);
+    } else if (live.exists && !sameArtifact(live, prior)) {
+      throw new Error(`foreign stopped restore target ${key}`);
+    }
+    if (!sameArtifact(live, prior)) {
+      removeLive = live.exists;
+      restoreFrom = 'backup';
+    }
+  } else if (sameArtifact(prior, desired)) {
+    if (sameArtifact(live, prior)) {
+      // Already restored or never rewritten.
+    } else if (liveIsPostStart) {
+      if (!desiredMarker) throw new Error(`equal desired marker missing ${key}`);
+      removeLive = live.exists;
+      if (prior.exists) {
+        if (!partialFact.exists) throw new Error(`equal desired partial missing ${key}`);
+        restoreFrom = 'partial';
+      }
+    } else {
+      throw new Error(`equal live differs from authority ${key}`);
+    }
+  } else if (!prior.exists) {
+    if (liveIsDesired || liveIsPostStart) {
+      if (!desiredMarker) throw new Error(`created desired marker missing ${key}`);
+      removeLive = live.exists;
+    } else if (!sameArtifact(live, prior)) {
+      throw new Error(`created live differs from authority ${key}`);
+    }
+  } else if (!sameArtifact(live, prior)) {
+    throw new Error(`changed live lacks authoritative backup ${key}`);
+  }
+
+  return Object.freeze({
+    artifact,
+    target,
+    partial,
+    backup,
+    manifest,
+    backupManifest,
+    live,
+    partialFact,
+    backupFact,
+    desiredMarker,
+    priorMarker,
+    liveIsPostStart,
+    removeLive,
+    restoreFrom,
+  });
+}
+
+function sameStoppedAuthorityRestorePlan(
+  left: StoppedAuthorityRestorePlan,
+  right: StoppedAuthorityRestorePlan,
+): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 export class PlatformMigrationService {
@@ -2200,90 +2339,53 @@ export class PlatformMigrationService {
   ): Promise<void> {
     const liveRoot = join(this.o.instanceDataRoot, journal.instanceId);
     if (authority) {
-      for (const artifact of [...authority.artifacts].reverse()) {
-        const { key, desired, prior } = artifact;
-        const target = join(liveRoot, key);
-        await trustedArtifactParent(liveRoot, key, false);
-        const partial = stoppedSidecar(target, journal.txId, 'partial');
-        const backup = stoppedSidecar(target, journal.txId, 'backup');
-        const manifest = stoppedSidecar(target, journal.txId, 'manifest');
-        const backupManifest = stoppedSidecar(target, journal.txId, 'backup-manifest');
-        const live = await artifactFact(liveRoot, key);
-        const liveIsDesired = sameArtifact(live, desired);
-        const liveIsPostStart = await matchesPostStartExpectation(
+      const plans = Object.freeze(await Promise.all(
+        [...authority.artifacts].reverse().map((artifact) => (
+          buildStoppedAuthorityRestorePlan(liveRoot, journal.txId, artifact)
+        )),
+      ));
+      // Closing read-only pass: no restore mutation is allowed until every
+      // authority artifact and sidecar still matches the immutable plan.
+      for (const plan of plans) {
+        const observed = await buildStoppedAuthorityRestorePlan(
           liveRoot,
-          key,
-          artifact.postStart,
+          journal.txId,
+          plan.artifact,
         );
-        const partialFact = await artifactFact(dirname(partial), basename(partial));
-        const backupFact = await artifactFact(dirname(backup), basename(backup));
-        const desiredMarker = await readArtifactManifest(manifest, key);
-        const priorMarker = await readArtifactManifest(backupManifest, key);
-        if (desiredMarker && !sameArtifact(desiredMarker, desired)) {
-          throw new Error(`stopped desired marker differs from authority ${key}`);
+        if (!sameStoppedAuthorityRestorePlan(observed, plan)) {
+          throw new Error(`stopped restore plan changed before mutation ${plan.artifact.key}`);
         }
-        if (priorMarker && !sameArtifact(priorMarker, prior)) {
-          throw new Error(`stopped prior marker differs from authority ${key}`);
+      }
+      for (const plan of plans) {
+        // Recheck this exact entry immediately before its first rm/copy. This
+        // cannot make path operations atomic, but it fails closed on observed
+        // races and never uses facts captured from a different pathname.
+        const observed = await buildStoppedAuthorityRestorePlan(
+          liveRoot,
+          journal.txId,
+          plan.artifact,
+        );
+        if (!sameStoppedAuthorityRestorePlan(observed, plan)) {
+          throw new Error(`stopped restore plan changed during execution ${plan.artifact.key}`);
         }
-        if (partialFact.exists && !sameArtifact(
-          { ...partialFact, key } as StoppedArtifactFact,
-          desired,
-        )) throw new Error(`stopped partial differs from authority ${key}`);
-        if (
-          desired.exists
-          && desiredMarker
-          && !partialFact.exists
-          && !backupFact.exists
-          && !sameArtifact(prior, desired)
-          && sameArtifact(live, prior)
-        ) {
-          throw new Error(`stopped prepared partial disappeared before mutation ${key}`);
+        if (plan.removeLive) {
+          await rm(plan.target, { recursive: true, force: false });
         }
-        if (backupFact.exists) {
-          if (
-            !prior.exists || !priorMarker
-            || !sameArtifact({ ...backupFact, key } as StoppedArtifactFact, prior)
-          ) throw new Error(`stopped backup differs from authority ${key}`);
-          if (liveIsDesired || liveIsPostStart) {
-            if (!desiredMarker) throw new Error(`applied desired marker missing ${key}`);
-            if (live.exists) await rm(target, { recursive: true, force: false });
-          } else if (live.exists && !sameArtifact(live, prior)) {
-            throw new Error(`foreign stopped restore target ${key}`);
-          }
-          const afterRemoval = await artifactFact(liveRoot, key);
+        if (plan.restoreFrom) {
+          const prior = plan.artifact.prior;
+          const afterRemoval = await artifactFact(liveRoot, plan.artifact.key);
           if (afterRemoval.exists) {
             if (!sameArtifact(afterRemoval, prior)) {
-              throw new Error(`stopped restore target occupied ${key}`);
+              throw new Error(`stopped restore target occupied ${plan.artifact.key}`);
             }
           } else {
-            // Preserve the authoritative backup until rolled_back plus its audit are
-            // durable. A terminal-publication failure must leave retryable evidence.
-            await copyArtifact(backup, target, prior);
+            // Preserve the authoritative source until rolled_back plus its audit
+            // are durable. A terminal-publication failure stays retryable.
+            const source = plan.restoreFrom === 'backup' ? plan.backup : plan.partial;
+            await copyArtifact(source, plan.target, prior);
           }
-        } else if (sameArtifact(prior, desired)) {
-          if (sameArtifact(live, prior)) {
-            // Already restored or never rewritten.
-          } else if (liveIsPostStart) {
-            if (!desiredMarker) throw new Error(`equal desired marker missing ${key}`);
-            if (live.exists) await rm(target, { recursive: true, force: false });
-            if (prior.exists) {
-              if (!partialFact.exists) throw new Error(`equal desired partial missing ${key}`);
-              await copyArtifact(partial, target, prior);
-            }
-          } else {
-            throw new Error(`equal live differs from authority ${key}`);
-          }
-        } else if (!prior.exists) {
-          if (liveIsDesired || liveIsPostStart) {
-            if (!desiredMarker) throw new Error(`created desired marker missing ${key}`);
-            if (live.exists) await rm(target, { recursive: true, force: false });
-          } else if (!sameArtifact(live, prior)) {
-            throw new Error(`created live differs from authority ${key}`);
-          }
-        } else if (!sameArtifact(live, prior)) {
-          throw new Error(`changed live lacks authoritative backup ${key}`);
         }
-        await syncExistingDirectory(dirname(target));
+        await syncExistingDirectory(dirname(plan.target));
       }
       return;
     }

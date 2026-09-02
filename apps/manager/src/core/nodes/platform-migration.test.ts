@@ -312,6 +312,46 @@ async function withOpenCompletionHook<T>(
   }
 }
 
+interface TestFsMutationCounts {
+  rm: number;
+  cp: number;
+  rename: number;
+}
+
+async function withFsMutationCounts<T>(
+  action: (
+    counts: TestFsMutationCounts,
+    enable: () => void,
+  ) => Promise<T>,
+): Promise<T> {
+  const originalRm = fs.promises.rm;
+  const originalCp = fs.promises.cp;
+  const originalRename = fs.promises.rename;
+  const counts: TestFsMutationCounts = { rm: 0, cp: 0, rename: 0 };
+  let enabled = false;
+  fs.promises.rm = (async (...args: unknown[]) => {
+    if (enabled) counts.rm += 1;
+    return Reflect.apply(originalRm, fs.promises, args);
+  }) as typeof originalRm;
+  fs.promises.cp = (async (...args: unknown[]) => {
+    if (enabled) counts.cp += 1;
+    return Reflect.apply(originalCp, fs.promises, args);
+  }) as typeof originalCp;
+  fs.promises.rename = (async (...args: unknown[]) => {
+    if (enabled) counts.rename += 1;
+    return Reflect.apply(originalRename, fs.promises, args);
+  }) as typeof originalRename;
+  syncBuiltinESMExports();
+  try {
+    return await action(counts, () => { enabled = true; });
+  } finally {
+    fs.promises.rm = originalRm;
+    fs.promises.cp = originalCp;
+    fs.promises.rename = originalRename;
+    syncBuiltinESMExports();
+  }
+}
+
 function writeTestManifest(path: string, fact: TestArtifactFact): void {
   writeFileSync(path, `${JSON.stringify(fact)}\n`, { mode: 0o600 });
 }
@@ -328,6 +368,23 @@ function txSidecars(root: string, txId: string): string[] {
   };
   walk(root);
   return found.sort();
+}
+
+function relativeArtifactEvidence(
+  root: string,
+  paths: readonly string[],
+): Map<string, TestArtifactFact> {
+  return new Map(paths.map((path) => [path, testArtifactFact(root, path)]));
+}
+
+function absoluteArtifactEvidence(
+  root: string,
+  paths: readonly string[],
+): Map<string, TestArtifactFact> {
+  return new Map(paths.map((path) => {
+    const key = relative(root, path);
+    return [key, testArtifactFact(root, key)];
+  }));
 }
 
 function stoppedAuthorityPath(
@@ -386,15 +443,15 @@ function downgradeStoppedAuthorityToV1(f: ReturnType<typeof migrationFixture>): 
 
 function downgradeStoppedAuthorityToV2(f: ReturnType<typeof migrationFixture>): void {
   const manifest = join(stoppedAuthorityPath(f), 'manifest.json');
-  const v3 = readTestStoppedAuthority(f);
-  const main = v3.artifacts.find((artifact) => artifact.key === '.config.nodes.json');
+  const authority = readTestStoppedAuthority(f);
+  const main = authority.artifacts.find((artifact) => artifact.key === '.config.nodes.json');
   assert.equal(main?.postStart?.['comparison'], 'canonical-json');
   writeFileSync(manifest, `${JSON.stringify({
     version: 2,
-    instanceId: v3.instanceId,
-    txId: v3.txId,
-    targetIntegrity: v3.targetIntegrity,
-    artifacts: v3.artifacts.map((artifact) => ({
+    instanceId: authority.instanceId,
+    txId: authority.txId,
+    targetIntegrity: authority.targetIntegrity,
+    artifacts: authority.artifacts.map((artifact) => ({
       key: artifact.key,
       desired: artifact.desired,
       prior: artifact.prior,
@@ -2750,6 +2807,99 @@ test('C64 probe backup must be a same-mode strictly parsed ordinary JSON file', 
     assert.deepEqual(txSidecars(f.instanceRoot, 'tx-01'), [], item.name);
     assert.deepEqual(migrationEvidenceDiff(f.instanceRoot, before), [], item.name);
   }
+});
+
+for (const key of ['.config.nodes.json', '.config.nodes.json.backup'] as const) {
+  test(`C65 atomic replacement of open ${key} cannot commit a foreign pathname`, async () => {
+    const f = migrationFixture({ originalRunning: false });
+    configureProbeNodeConfig(f);
+    assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+    f.docker.afterStart = () => {
+      writeJson(join(f.instanceRoot, '.config.nodes.json'), reorderedPlatformNodeConfig());
+      writeJson(join(f.instanceRoot, '.config.nodes.json.backup'), { previous: 'probe-main' });
+    };
+    const target = resolve(f.instanceRoot, key);
+    let postStartReads = 0;
+    let replaced = false;
+
+    const result = await withOpenCompletionHook((absolute) => {
+      if (!f.docker.inspection.running || absolute !== target) return;
+      postStartReads += 1;
+      if (postStartReads !== 2) return;
+      const replacement = `${target}.foreign`;
+      writeJson(replacement, { generation: 'foreign-C' });
+      renameSync(replacement, target);
+      replaced = true;
+    }, () => f.gate.run('line-a', 'start-instance', (lease) => (
+      f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+    )));
+
+    assert.equal(replaced, true, key);
+    assert.notEqual(result.phase, 'committed', key);
+    assert.notEqual(f.repo.nodeRuntime('line-a')?.mode, 'npm', key);
+    assert.deepEqual(JSON.parse(readFileSync(target, 'utf8')), {
+      generation: 'foreign-C',
+    }, key);
+  });
+}
+
+test('C65 rollback validates every authority artifact before any filesystem mutation', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  configureProbeNodeConfig(f);
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  const authorityKeys = readTestStoppedAuthority(f).artifacts.map((artifact) => artifact.key);
+  let liveBefore: Map<string, TestArtifactFact> | undefined;
+  let sidecarPathsBefore: string[] | undefined;
+  let sidecarsBefore: Map<string, TestArtifactFact> | undefined;
+
+  const { result, counts } = await withFsMutationCounts(async (counts, enable) => {
+    f.docker.afterStart = () => {
+      writeJson(join(f.instanceRoot, '.config.nodes.json.backup'), { generation: 'foreign-C' });
+      liveBefore = relativeArtifactEvidence(f.instanceRoot, authorityKeys);
+      sidecarPathsBefore = txSidecars(f.instanceRoot, 'tx-01');
+      sidecarsBefore = absoluteArtifactEvidence(f.instanceRoot, sidecarPathsBefore);
+      enable();
+    };
+    const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+      f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+    ));
+    return { result, counts };
+  });
+
+  assert.equal(result.phase, 'manual_required');
+  assert.deepEqual(counts, { rm: 0, cp: 0, rename: 0 });
+  assert.ok(liveBefore);
+  assert.deepEqual(relativeArtifactEvidence(f.instanceRoot, authorityKeys), liveBefore);
+  assert.ok(sidecarPathsBefore);
+  assert.deepEqual(txSidecars(f.instanceRoot, 'tx-01'), sidecarPathsBefore);
+  assert.ok(sidecarsBefore);
+  assert.deepEqual(absoluteArtifactEvidence(f.instanceRoot, sidecarPathsBefore), sidecarsBefore);
+});
+
+test('C65 prior-absent probe backup B is removed on a later authorized rollback', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  rmSync(join(f.instanceRoot, '.config.nodes.json.backup'), { force: true });
+  const before = migrationEvidence(f.instanceRoot);
+  configureProbeNodeConfig(f);
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  const unhealthy = healthyPlatformInventory();
+  unhealthy.nodeSets[0] = { ...unhealthy.nodeSets[0]!, enabled: false, err: 'load_failed' };
+  unhealthy.enabled = false;
+  unhealthy.errors = ['load_failed'];
+  unhealthy.health = 'failed';
+  f.admin.afterRestart = unhealthy;
+  f.docker.afterStart = () => {
+    writeJson(join(f.instanceRoot, '.config.nodes.json'), reorderedPlatformNodeConfig());
+    writeJson(join(f.instanceRoot, '.config.nodes.json.backup'), { previous: 'probe-main' });
+  };
+
+  const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+    f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+
+  assert.equal(result.phase, 'rolled_back');
+  assert.equal(existsSync(join(f.instanceRoot, '.config.nodes.json.backup')), false);
+  assert.deepEqual(migrationEvidenceDiff(f.instanceRoot, before), []);
 });
 
 test('C62 node-config semantic authority rejects every non-serialization drift', async () => {
