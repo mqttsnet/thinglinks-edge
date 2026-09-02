@@ -14,9 +14,11 @@
  * 比没有报告更危险 —— 它让人以为查过了。
  */
 import { execFileSync } from 'node:child_process';
-import { readFileSync, readdirSync, statSync, mkdtempSync } from 'node:fs';
+import { readFileSync, readdirSync, rmSync, statSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { gzipSync } from 'node:zlib';
+import Fastify from 'fastify';
 
 import { openDb } from '../dist/core/db.js';
 import { deriveKey } from '../dist/core/auth/crypto.js';
@@ -26,6 +28,16 @@ import { UserRepo } from '../dist/core/auth/user-repo.js';
 import { canInstance, can } from '../dist/core/auth/authz.js';
 import { parseEnvelope } from '../dist/core/cloud/envelope.js';
 import { assertValidSpec } from '../dist/core/instance/container-spec.js';
+import { NodeStore } from '../dist/core/nodes/store.js';
+import { NodeCatalog } from '../dist/core/nodes/catalog.js';
+import { ensurePlatformApproval } from '../dist/core/nodes/platform-package.js';
+import {
+  PLATFORM_COMMON_PACKAGE,
+  PLATFORM_NODE_PACKAGE,
+  PLATFORM_NODE_TYPES,
+} from '../dist/core/nodes/platform-contract.js';
+import { registerNpmRegistry } from '../dist/http/nodes/registry.js';
+import { tarArchive } from '../dist/core/archive/tar.js';
 
 const REPO = resolve(import.meta.dirname, '..', '..', '..');
 const MGR = join(REPO, 'apps/manager/src');
@@ -51,6 +63,66 @@ const walk = (dir, out = []) => {
 };
 const sources = walk(MGR);
 const readAll = (files) => files.map((f) => ({ f, text: readFileSync(f, 'utf8') }));
+
+async function catalogueTrustBoundary(root, db) {
+  const generic = 'node-red-contrib-baseline-catalogue';
+  const store = new NodeStore(join(root, 'catalogue-store'));
+  store.add(gzipSync(tarArchive([
+    {
+      name: 'package/package.json',
+      content: JSON.stringify({
+        name: generic,
+        version: '1.0.0',
+        description: 'baseline catalogue fixture',
+        keywords: ['node-red'],
+        'node-red': { nodes: { baseline: 'baseline.js' } },
+      }),
+    },
+    { name: 'package/baseline.js', content: 'module.exports = function () {};\n' },
+  ])));
+  const catalog = new NodeCatalog(db);
+  catalog.approve({ module: generic, version: '1.0.0', note: 'baseline', actor: 'baseline' });
+  ensurePlatformApproval(catalog, 'system');
+  const calls = [];
+  const platformPackages = {
+    snapshotForRegistry(name, version) {
+      calls.push([name, version]);
+      if (name !== PLATFORM_NODE_PACKAGE.name || version !== PLATFORM_NODE_PACKAGE.version) {
+        return undefined;
+      }
+      return {
+        buffer: Buffer.from('not-served-by-catalogue'),
+        meta: {
+          name,
+          version,
+          description: 'ThingLinks Edge platform nodes',
+          keywords: ['node-red', 'thinglinks'],
+          types: [...PLATFORM_NODE_TYPES],
+          updatedAt: new Date(0).toISOString(),
+        },
+      };
+    },
+  };
+  const app = Fastify({ logger: false });
+  try {
+    registerNpmRegistry(
+      app,
+      { config: { basePath: '' } },
+      { store, catalog, internalBase: 'http://registry.invalid/npm', platformPackages },
+    );
+    const response = await app.inject({ method: 'GET', url: '/npm/-/catalogue.json' });
+    const body = response.json();
+    const ids = (body.modules ?? []).map((item) => item.id).sort();
+    return response.statusCode === 200
+      && JSON.stringify(ids) === JSON.stringify([PLATFORM_NODE_PACKAGE.name, generic].sort())
+      && !ids.includes(PLATFORM_COMMON_PACKAGE.name)
+      && JSON.stringify(calls) === JSON.stringify([
+        [PLATFORM_NODE_PACKAGE.name, PLATFORM_NODE_PACKAGE.version],
+      ]);
+  } finally {
+    await app.close();
+  }
+}
 
 async function main() {
   console.log('\n──── 安全基线 7 组 · 逐条对照 ────\n');
@@ -192,13 +264,8 @@ async function main() {
   check(G3, '匿名的私有源只有 GET，没有任何写入路径',
         registryVerbs.length > 0 && registryVerbs.every((v) => v === 'get'),
         registryVerbs.join(' '));
-  check(G3, '私有源目录只列普通批准包与经固定信任重验的 Edge，永不列 common',
-        /const approved = catalog\.names\(\)/.test(registrySrc)
-        && /filter\(\(name\) => !isPlatformPackageName\(name\)\)/.test(registrySrc)
-        && /approved:\s*genericApproved/.test(registrySrc)
-        && /edgeApproval\?\.version === PLATFORM_NODE_PACKAGE\.version/.test(registrySrc)
-        && /platformPackages\.snapshotForRegistry\(/.test(registrySrc)
-        && /common 永不出现在 palette/.test(registrySrc));
+  check(G3, '运行期 catalogue 只列普通批准包与经固定信任重验的 Edge，永不列 common',
+        await catalogueTrustBoundary(dbDir, db));
 
   check(G3, '角色表未知角色按最小权限处理，不按 admin 兜底',
         can('nobody', 'instance:list') === false && can('', 'user:manage') === false);
@@ -287,6 +354,7 @@ async function main() {
   const naCount = rows.filter((r) => r.kind === 'na').length;
   const pass = checks.filter((r) => r.ok).length;
   console.log(`\n  断言 ${pass}/${checks.length} 通过 · 不适用 ${naCount} 条（已逐条写明理由）\n`);
+  rmSync(dbDir, { recursive: true, force: true });
   process.exit(pass === checks.length ? 0 : 1);
 }
 
