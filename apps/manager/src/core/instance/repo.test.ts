@@ -558,3 +558,52 @@ test('exact tx phase CAS refuses a stale replacement and leaves the new journal 
   repo.transitionNodeMigrationExact('line-a', 'tx-new', ['preparing'], 'checkpointed');
   assert.equal(repo.nodeMigration('line-a')?.phase, 'checkpointed');
 });
+
+test('exact Task 8 finalizers reject stale tx ownership and preserve the replacement journal', () => {
+  const scenarios = [
+    {
+      name: 'commit',
+      prepare: (repo: InstanceRepo) => repo.transitionNodeMigrationExact(
+        'line-a', 'tx-old', ['preparing'], 'verifying',
+      ),
+      finalize: (repo: InstanceRepo) => repo.commitNodeMigrationExact(
+        'line-a', 'tx-old', 'verifying', PLATFORM_NODE_PACKAGE.version, 'admin',
+      ),
+      phase: 'verifying',
+    },
+    {
+      name: 'rollback',
+      prepare: (repo: InstanceRepo) => repo.transitionNodeMigrationExact(
+        'line-a', 'tx-old', ['preparing'], 'rolling_back', 'rollback',
+      ),
+      finalize: (repo: InstanceRepo) => repo.finishNodeMigrationRollbackExact(
+        'line-a', 'tx-old', 'rolling_back', 'rolled_back', 'admin',
+      ),
+      phase: 'rolling_back',
+    },
+    {
+      name: 'manual',
+      prepare: () => undefined,
+      finalize: (repo: InstanceRepo) => repo.finishNodeMigrationManualExact(
+        'line-a', 'tx-old', ['preparing'], 'rollback', 'admin',
+      ),
+      phase: 'preparing',
+    },
+  ] as const;
+
+  for (const scenario of scenarios) {
+    const db = openDb(':memory:');
+    const repo = new InstanceRepo(db, KEY);
+    repo.create(rec(), [], cred());
+    repo.beginNodeMigration(migrationBegin('line-a', 'tx-old'));
+    scenario.prepare(repo);
+    db.prepare(
+      'UPDATE instance_node_migration SET tx_id = ? WHERE instance_id = ?',
+    ).run('tx-replacement', 'line-a');
+
+    assert.throws(() => scenario.finalize(repo), /所有权|CAS|变化/i, scenario.name);
+    assert.equal(repo.nodeMigration('line-a')?.txId, 'tx-replacement', scenario.name);
+    assert.equal(repo.nodeMigration('line-a')?.phase, scenario.phase, scenario.name);
+    assert.equal(repo.nodeRuntime('line-a')?.migrationState, scenario.phase, scenario.name);
+  }
+});

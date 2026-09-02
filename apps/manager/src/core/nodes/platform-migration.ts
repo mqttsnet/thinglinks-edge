@@ -33,6 +33,7 @@ import type {
 import type { PlatformNodeOperationBarrier } from './platform-operation-barrier.ts';
 import {
   LEGACY_PLATFORM_FILES,
+  PLATFORM_COMMON_PACKAGE,
   PLATFORM_NODE_PACKAGE,
   PLATFORM_NODE_TYPES,
 } from './platform-contract.ts';
@@ -332,16 +333,21 @@ function assertNpmOwners(modules: readonly InstalledModule[]): InstalledModule {
   return platform;
 }
 
-function flowEvidenceHealthy(value: unknown): boolean {
-  if (Array.isArray(value)) return true;
-  return !!value && typeof value === 'object' && Array.isArray((value as { flows?: unknown }).flows);
-}
-
-function flowIdentity(value: unknown): string | undefined {
-  if (!flowEvidenceHealthy(value)) return undefined;
-  const serialized = JSON.stringify(value);
-  if (typeof serialized !== 'string') return undefined;
-  return hash(serialized);
+function flowIds(value: unknown): string[] | undefined {
+  const entries = Array.isArray(value)
+    ? value
+    : value && typeof value === 'object' && Array.isArray((value as { flows?: unknown }).flows)
+      ? (value as { flows: unknown[] }).flows
+      : undefined;
+  if (!entries) return undefined;
+  const ids = new Set<string>();
+  for (const entry of entries) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return undefined;
+    const id = (entry as { id?: unknown }).id;
+    if (typeof id !== 'string' || id.length === 0 || ids.has(id)) return undefined;
+    ids.add(id);
+  }
+  return [...ids].sort();
 }
 
 function samePreflightFacts(left: PreflightFacts, right: PreflightFacts): boolean {
@@ -527,12 +533,14 @@ export class PlatformMigrationService {
       failureCode = 'verification';
       this.o.repo.transitionNodeMigrationExact(instanceId, txId, ['cutover'], 'verifying');
       await this.reach(instanceId, txId, 'verifying', 6);
-      await this.verifyCutover(
+      await this.verifyCutover(instanceId, this.o.repo.nodeMigration(instanceId)!);
+      this.o.repo.commitNodeMigrationExact(
         instanceId,
-        this.o.repo.nodeMigration(instanceId)!,
-        facts.flowIdentity,
+        txId,
+        'verifying',
+        PLATFORM_NODE_PACKAGE.version,
+        actor,
       );
-      this.o.repo.commitNodeMigration(instanceId, PLATFORM_NODE_PACKAGE.version, actor);
       await this.reach(instanceId, txId, 'committed', 7);
       await this.cleanupTerminal(instanceId, txId, 'committed', actor);
       return this.status(instanceId);
@@ -541,14 +549,15 @@ export class PlatformMigrationService {
         if (error instanceof PlatformMigrationError) throw error;
         throw controlled('preflight', 'migration preflight failed');
       }
-      if (this.o.repo.nodeMigration(instanceId)?.phase === 'committed') {
+      const current = this.o.repo.nodeMigration(instanceId);
+      if (current?.txId === txId && current.phase === 'committed') {
         // A verifier interruption after the atomic final commit must never run rollback.
         return this.status(instanceId);
       }
       const cause = error instanceof PlatformMigrationError
         ? error
         : controlled(failureCode, `${failureCode} external operation failed`);
-      return this.rollbackUnderLease(instanceId, cause, lease, installedByTx);
+      return this.rollbackUnderLease(instanceId, txId, cause, lease, installedByTx);
     }
   }
 
@@ -556,39 +565,50 @@ export class PlatformMigrationService {
     const controlledCause = cause instanceof PlatformMigrationError
       ? cause
       : controlled('rollback', 'rollback requested after a controlled migration failure');
+    if (this.o.gate.current(instanceId)) {
+      return this.o.gate.run(instanceId, 'platform-recovery', async () => this.status(instanceId));
+    }
+    const scanned = this.o.repo.nodeMigration(instanceId);
+    if (!scanned || ![
+      'preparing', 'checkpointed', 'staged', 'cutover', 'verifying', 'rolling_back',
+    ].includes(scanned.phase)) return this.status(instanceId);
     return this.o.gate.run(instanceId, 'platform-recovery', async (lease) => {
       this.o.gate.assertLease(lease, instanceId, ['platform-recovery']);
-      const existing = this.o.repo.nodeMigration(instanceId);
-      if (!existing || ['committed', 'rolled_back', 'rolled_back_dirty', 'manual_required'].includes(existing.phase)) {
+      const current = this.o.repo.nodeMigration(instanceId);
+      if (
+        !current
+        || current.txId !== scanned.txId
+        || current.phase !== scanned.phase
+        || current.error !== scanned.error
+      ) {
         return this.status(instanceId);
       }
-      return this.rollbackExactJournal(
-        instanceId,
-        controlledCause,
-        !existing.stagedBefore && !['preparing', 'checkpointed'].includes(existing.phase),
-      );
+      return this.recoverExactJournal(current, controlledCause);
     });
   }
 
   private async rollbackUnderLease(
     instanceId: string,
+    txId: string,
     cause: PlatformMigrationError,
     lease: InstanceOperationLease,
     installedByTx: boolean,
   ): Promise<PlatformMigrationResult> {
     this.o.gate.assertLease(lease, instanceId, ['platform-migration']);
-    return this.rollbackExactJournal(instanceId, cause, installedByTx);
+    const journal = this.o.repo.nodeMigration(instanceId);
+    if (!journal || journal.txId !== txId) return this.status(instanceId);
+    return this.rollbackExactJournal(journal, cause, installedByTx);
   }
 
-  /** Recovery path: operate only on the durable exact journal, never reacquire its blocked gate. */
+  /** Recovery path: claim and operate only on the caller-observed exact durable journal. */
   private async rollbackExactJournal(
-    instanceId: string,
+    journal: InstanceNodeMigrationJournal,
     cause: PlatformMigrationError,
     installedByTx: boolean,
   ): Promise<PlatformMigrationResult> {
-    const journal = this.o.repo.nodeMigration(instanceId);
-    if (!journal) return this.status(instanceId);
+    const { instanceId } = journal;
     let cleanupDirty = false;
+    let claimed = false;
     try {
       this.o.repo.transitionNodeMigrationExact(
         instanceId,
@@ -597,6 +617,7 @@ export class PlatformMigrationService {
         'rolling_back',
         cause.code,
       );
+      claimed = true;
       await this.reach(instanceId, journal.txId, 'rolling_back', 100);
       if (installedByTx && !journal.stagedBefore) {
         cleanupDirty = await this.cleanupAttemptedInstall(instanceId);
@@ -629,13 +650,17 @@ export class PlatformMigrationService {
             throw controlled('rollback', 'preexisting platform package integrity changed during rollback');
           });
         }
-        if (!flowEvidenceHealthy(await this.o.admin.currentFlows(instanceId))) {
-          throw controlled('rollback', 'legacy flow health could not be restored');
-        }
+        await this.verifyAdminFlowIds(
+          instanceId,
+          await this.liveFlowIds(instanceId, 'rollback'),
+          'rollback',
+        );
       }
       if (cleanupDirty) {
-        this.o.repo.finishNodeMigrationRollback(
+        this.o.repo.finishNodeMigrationRollbackExact(
           instanceId,
+          journal.txId,
+          'rolling_back',
           'rolled_back_dirty',
           journal.actor,
         );
@@ -643,7 +668,13 @@ export class PlatformMigrationService {
           .catch(() => undefined);
         return this.status(instanceId);
       }
-      this.o.repo.finishNodeMigrationRollback(instanceId, 'rolled_back', journal.actor);
+      this.o.repo.finishNodeMigrationRollbackExact(
+        instanceId,
+        journal.txId,
+        'rolling_back',
+        'rolled_back',
+        journal.actor,
+      );
       try {
         await this.reach(instanceId, journal.txId, 'rolled_back', 101);
       } catch {
@@ -652,8 +683,15 @@ export class PlatformMigrationService {
       await this.cleanupTerminal(instanceId, journal.txId, 'rolled_back', journal.actor);
       return this.status(instanceId);
     } catch {
+      if (!claimed) return this.status(instanceId);
       try {
-        this.o.repo.finishNodeMigrationManual(instanceId, 'rollback', journal.actor);
+        this.o.repo.finishNodeMigrationManualExact(
+          instanceId,
+          journal.txId,
+          ['rolling_back'],
+          'rollback',
+          journal.actor,
+        );
         await this.reach(instanceId, journal.txId, 'manual_required', 102)
           .catch(() => undefined);
       } catch {
@@ -684,7 +722,10 @@ export class PlatformMigrationService {
           if (!current || current.txId !== journal.txId || current.phase !== journal.phase) {
             return this.status(journal.instanceId);
           }
-          return this.recoverExactJournal(current);
+          return this.recoverExactJournal(
+            current,
+            controlled('rollback', 'interrupted migration recovery requested'),
+          );
         }));
       } catch {
         results.push(this.status(journal.instanceId));
@@ -693,39 +734,68 @@ export class PlatformMigrationService {
     return results;
   }
 
-  private async recoverExactJournal(journal: InstanceNodeMigrationJournal): Promise<PlatformMigrationResult> {
-      if (journal.phase === 'preparing') {
-        let ready: boolean;
+  private async recoverExactJournal(
+    journal: InstanceNodeMigrationJournal,
+    cause: PlatformMigrationError,
+  ): Promise<PlatformMigrationResult> {
+    if (journal.phase === 'preparing') {
+      let ready: boolean;
+      try {
+        ready = await this.o.checkpoint.readyExists(journal.instanceId, journal.txId);
+      } catch {
         try {
-          ready = await this.o.checkpoint.readyExists(journal.instanceId, journal.txId);
+          this.o.repo.finishNodeMigrationManualExact(
+            journal.instanceId,
+            journal.txId,
+            ['preparing'],
+            'checkpoint',
+            journal.actor,
+          );
         } catch {
-          this.o.repo.finishNodeMigrationManual(journal.instanceId, 'checkpoint', journal.actor);
-          return this.status(journal.instanceId);
+          // Exact ownership was lost; the replacement journal remains authoritative.
         }
-        if (!ready) {
+        return this.status(journal.instanceId);
+      }
+      if (!ready) {
+        try {
+          await this.o.checkpoint.cleanupPartial(journal.instanceId, journal.txId);
+          this.o.repo.transitionNodeMigrationExact(
+            journal.instanceId,
+            journal.txId,
+            ['preparing'],
+            'rolling_back',
+            'checkpoint',
+          );
+          await this.reach(journal.instanceId, journal.txId, 'rolling_back', 100);
+          this.o.repo.finishNodeMigrationRollbackExact(
+            journal.instanceId,
+            journal.txId,
+            'rolling_back',
+            'rolled_back',
+            journal.actor,
+          );
+          await this.cleanupTerminal(journal.instanceId, journal.txId, 'rolled_back', journal.actor);
+        } catch {
           try {
-            await this.o.checkpoint.cleanupPartial(journal.instanceId, journal.txId);
-            this.o.repo.transitionNodeMigrationExact(
+            this.o.repo.finishNodeMigrationManualExact(
               journal.instanceId,
               journal.txId,
-              ['preparing'],
-              'rolling_back',
-              'checkpoint',
+              ['preparing', 'rolling_back'],
+              'rollback',
+              journal.actor,
             );
-            await this.reach(journal.instanceId, journal.txId, 'rolling_back', 100);
-            this.o.repo.finishNodeMigrationRollback(journal.instanceId, 'rolled_back', journal.actor);
-            await this.cleanupTerminal(journal.instanceId, journal.txId, 'rolled_back', journal.actor);
           } catch {
-            this.o.repo.finishNodeMigrationManual(journal.instanceId, 'rollback', journal.actor);
+            // Exact ownership was lost; do not finalize the replacement journal.
           }
-          return this.status(journal.instanceId);
         }
+        return this.status(journal.instanceId);
       }
-      return this.rollbackExactJournal(
-          journal.instanceId,
-          controlled('rollback', 'interrupted migration recovery requested'),
-          !journal.stagedBefore && !['preparing', 'checkpointed'].includes(journal.phase),
-      );
+    }
+    return this.rollbackExactJournal(
+      journal,
+      cause,
+      !journal.stagedBefore && !['preparing', 'checkpointed'].includes(journal.phase),
+    );
   }
 
   private async cleanupTerminal(
@@ -824,8 +894,12 @@ export class PlatformMigrationService {
 
     let preflightFlowIdentity: string;
     try {
-      preflightFlowIdentity = flowIdentity(await this.o.admin.currentFlows(instanceId)) ?? '';
-      if (!preflightFlowIdentity) throw controlled('preflight', 'existing flow preflight is unhealthy');
+      const expectedFlowIds = await this.liveFlowIds(instanceId, 'preflight');
+      const observedFlowIds = flowIds(await this.o.admin.currentFlows(instanceId));
+      if (!observedFlowIds || JSON.stringify(observedFlowIds) !== JSON.stringify(expectedFlowIds)) {
+        throw controlled('preflight', 'Admin flow ids do not match flows.json');
+      }
+      preflightFlowIdentity = hash(JSON.stringify(expectedFlowIds));
     } catch (error) {
       if (error instanceof PlatformMigrationError) throw error;
       throw controlled('preflight', 'existing flow preflight failed');
@@ -888,11 +962,47 @@ export class PlatformMigrationService {
     return { exists: true, sha256: hash(await readFile(absolute)) };
   }
 
+  private async liveFlowIds(
+    instanceId: string,
+    code: 'preflight' | 'verification' | 'rollback',
+  ): Promise<string[]> {
+    let serialized: string;
+    try {
+      serialized = await readFile(join(this.o.instanceDataRoot, instanceId, 'flows.json'), 'utf8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      throw controlled(code, 'flows.json could not be read for identity verification');
+    }
+    try {
+      const ids = flowIds(JSON.parse(serialized));
+      if (!ids) throw new Error('invalid flow file');
+      return ids;
+    } catch {
+      throw controlled(code, 'flows.json has invalid flow identity data');
+    }
+  }
+
+  private async verifyAdminFlowIds(
+    instanceId: string,
+    expected: readonly string[],
+    code: 'verification' | 'rollback',
+  ): Promise<void> {
+    let observed: string[] | undefined;
+    try {
+      observed = flowIds(await this.o.admin.currentFlows(instanceId));
+    } catch {
+      throw controlled(code, 'Admin flow identity could not be read');
+    }
+    if (!observed || JSON.stringify(observed) !== JSON.stringify(expected)) {
+      throw controlled(code, 'Admin flow ids do not match restored flows.json');
+    }
+  }
+
   private async platformFootprint(instanceId: string): Promise<boolean> {
     const root = join(this.o.instanceDataRoot, instanceId);
     const candidates = [
-      join(root, 'node_modules', ...PLATFORM_NODE_PACKAGE.name.split('/'), 'package.json'),
-      join(root, 'node_modules', '@mqttsnet', 'thinglinks-node-red-common', 'package.json'),
+      join(root, 'node_modules', ...PLATFORM_NODE_PACKAGE.name.split('/')),
+      join(root, 'node_modules', ...PLATFORM_COMMON_PACKAGE.name.split('/')),
     ];
     for (const path of candidates) {
       try {
@@ -904,7 +1014,11 @@ export class PlatformMigrationService {
     }
     for (const path of ['package.json', 'package-lock.json']) {
       try {
-        if ((await readFile(join(root, path), 'utf8')).includes(PLATFORM_NODE_PACKAGE.name)) {
+        const serialized = await readFile(join(root, path), 'utf8');
+        if (
+          serialized.includes(PLATFORM_NODE_PACKAGE.name)
+          || serialized.includes(PLATFORM_COMMON_PACKAGE.name)
+        ) {
           return true;
         }
       } catch {
@@ -947,7 +1061,6 @@ export class PlatformMigrationService {
   private async verifyCutover(
     instanceId: string,
     journal: InstanceNodeMigrationJournal,
-    expectedFlowIdentity: string,
   ): Promise<void> {
     const inspection = await this.o.docker.inspectMigrationRuntime(instanceId).catch(() => {
       throw controlled('verification', 'post-cutover container inspection failed');
@@ -975,9 +1088,10 @@ export class PlatformMigrationService {
       JSON.stringify(flows) !== JSON.stringify(journal.snapshot.flows)
       || JSON.stringify(credentials) !== JSON.stringify(journal.snapshot.credentials)
     ) throw controlled('verification', 'existing flow or credential hash changed');
-    const flow = await this.o.admin.currentFlows(instanceId).catch(() => undefined);
-    if (!flowEvidenceHealthy(flow) || flowIdentity(flow) !== expectedFlowIdentity) {
-      throw controlled('verification', 'existing flow health check failed');
-    }
+    await this.verifyAdminFlowIds(
+      instanceId,
+      await this.liveFlowIds(instanceId, 'verification'),
+      'verification',
+    );
   }
 }

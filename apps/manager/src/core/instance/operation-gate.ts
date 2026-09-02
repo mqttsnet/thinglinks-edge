@@ -74,7 +74,17 @@ export class InstanceRepositoryOperationPolicy implements RepositoryOperationPol
 
   assertAllowed(instanceId: string, operation: InstanceOperation): void {
     const runtime = this.repo.nodeRuntime(instanceId);
-    if (!runtime) return;
+    if (!runtime) {
+      if (operation === 'platform-recovery') {
+        throw new InstanceBusyError(
+          instanceId,
+          'platform-migration',
+          operation,
+          '没有可恢复的持久化迁移事务',
+        );
+      }
+      return;
+    }
     const journal = this.repo.nodeMigration(instanceId);
     if (!journal && runtime.migrationState !== 'idle') {
       throw new InstanceBusyError(
@@ -111,6 +121,14 @@ export class InstanceRepositoryOperationPolicy implements RepositoryOperationPol
       && ['none', 'checkpoint', 'install', 'cutover', 'verification', 'rollback']
         .includes(journal.error)
     ) return;
+    if (operation === 'platform-recovery') {
+      throw new InstanceBusyError(
+        instanceId,
+        'platform-migration',
+        operation,
+        `持久化迁移状态 ${runtime.migrationState}/${runtime.migrationError} 不可恢复`,
+      );
+    }
     if (
       runtime.migrationError === 'none'
       && ORDINARY_SAFE_STATES.has(runtime.migrationState)

@@ -21,6 +21,7 @@ import {
   type NodeMigrationState,
 } from '../instance/repo.ts';
 import {
+  InstanceBusyError,
   InstanceOperationGate,
   InstanceRepositoryOperationPolicy,
   type InstanceOperationLease,
@@ -51,6 +52,12 @@ import {
 
 const roots: string[] = [];
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../../../..');
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
 
 after(() => {
   for (const root of roots) rmSync(root, { recursive: true, force: true });
@@ -447,7 +454,7 @@ interface FixtureOptions {
   onBarrier?: ((event: {
     phase: NodeMigrationState;
     boundary: string;
-  }) => void) | undefined;
+  }) => void | Promise<void>) | undefined;
   onProxyClose?: (() => void) | undefined;
 }
 
@@ -522,7 +529,7 @@ function migrationFixture(options: FixtureOptions = {}) {
     async reach(event) {
       assert.equal(repo.nodeMigration(event.instanceId)?.phase, event.phase);
       events.push(`barrier:${event.phase}:${event.boundary}`);
-      options.onBarrier?.({ phase: event.phase, boundary: event.boundary });
+      await options.onBarrier?.({ phase: event.phase, boundary: event.boundary });
       if (
         controls.barrierFailure?.phase === event.phase
         && controls.barrierFailure.boundary === event.boundary
@@ -841,14 +848,22 @@ test('running migration checkpoints, stages once, cuts over, verifies, and commi
   );
 });
 
-test('cutover requires the Admin flow identity to remain exactly the preflight identity, including empty flows', async () => {
-  const changed = migrationFixture();
-  changed.docker.afterRestart = () => {
-    changed.admin.flowValue = [{ id: 'unrelated-flow', type: 'debug' }];
-  };
-  assert.equal((await changed.service.migrate('line-a', 'admin')).phase, 'rolled_back');
+test('flow identity comes from flows.json: restored nonempty mismatches are manual and empty matches pass', async () => {
+  for (const [name, adminFlows] of [
+    ['empty', []],
+    ['unrelated', [{ id: 'unrelated-flow', type: 'debug' }]],
+  ] as const) {
+    const changed = migrationFixture();
+    changed.docker.afterRestart = () => {
+      changed.admin.flowValue = adminFlows;
+    };
+    const result = await changed.service.migrate('line-a', 'admin');
+    assert.equal(result.phase, 'manual_required', name);
+    assert.equal(result.error, 'rollback', name);
+  }
 
   const empty = migrationFixture();
+  writeJson(join(empty.instanceRoot, 'flows.json'), []);
   empty.admin.flowValue = [];
   assert.equal((await empty.service.migrate('line-a', 'admin')).phase, 'committed');
 });
@@ -982,6 +997,64 @@ test('partial uninstall residual is rolled_back_dirty before checkpoint restorat
   assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), true);
 });
 
+test('common-only root dependency, lock entry, or directory residual makes rollback dirty', async () => {
+  const cases: Array<{
+    name: string;
+    leaveResidual: (instanceRoot: string) => void;
+  }> = [
+    {
+      name: 'root dependency',
+      leaveResidual: (instanceRoot) => writeJson(join(instanceRoot, 'package.json'), {
+        name: 'line-a-runtime',
+        dependencies: { [PLATFORM_COMMON_PACKAGE.name]: PLATFORM_COMMON_PACKAGE.version },
+      }),
+    },
+    {
+      name: 'lock entry',
+      leaveResidual: (instanceRoot) => writeJson(join(instanceRoot, 'package-lock.json'), {
+        packages: {
+          '': { dependencies: {} },
+          [join('node_modules', ...PLATFORM_COMMON_PACKAGE.name.split('/'))]: {
+            version: PLATFORM_COMMON_PACKAGE.version,
+            integrity: PLATFORM_COMMON_PACKAGE.integrity,
+          },
+        },
+      }),
+    },
+    {
+      name: 'common directory',
+      leaveResidual: (instanceRoot) => mkdirSync(join(
+        instanceRoot,
+        'node_modules',
+        ...PLATFORM_COMMON_PACKAGE.name.split('/'),
+      ), { recursive: true }),
+    },
+  ];
+
+  for (const item of cases) {
+    const f = migrationFixture();
+    const unhealthy = healthyPlatformInventory();
+    unhealthy.nodeSets[0] = { ...unhealthy.nodeSets[0]!, enabled: false, err: 'load_failed' };
+    unhealthy.enabled = false;
+    unhealthy.errors = ['load_failed'];
+    unhealthy.health = 'failed';
+    f.admin.afterRestart = unhealthy;
+    f.admin.uninstallPlatformModule = async () => {
+      f.admin.uninstallCalls += 1;
+      removeInstalledPackage(f.instanceRoot);
+      f.state.staged = false;
+      f.admin.beforeModules = [rawPlatformInventory()];
+      item.leaveResidual(f.instanceRoot);
+    };
+
+    const result = await f.service.migrate('line-a', 'admin');
+
+    assert.equal(result.phase, 'rolled_back_dirty', item.name);
+    assert.equal(f.admin.uninstallCalls, 1, item.name);
+    assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), true, item.name);
+  }
+});
+
 test('every running failure boundary restores checkpoint bytes, legacy ownership, image, and running state', async () => {
   const cases: Array<{
     name: string;
@@ -1068,20 +1141,24 @@ test('every running failure boundary restores checkpoint bytes, legacy ownership
 
 test('rollback preserves an exact preexisting package and dirty cleanup never deletes it', async () => {
   const f = migrationFixture({ preexisting: true });
+  const preservedPaths = [
+    'package.json',
+    'package-lock.json',
+    join('node_modules', ...PLATFORM_NODE_PACKAGE.name.split('/'), 'package.json'),
+    join('node_modules', ...PLATFORM_COMMON_PACKAGE.name.split('/'), 'package.json'),
+  ];
+  const preserved = new Map(preservedPaths.map((path) => [
+    path,
+    readFileSync(join(f.instanceRoot, path)),
+  ]));
   f.docker.failAt = 'settings';
   const result = await f.service.migrate('line-a', 'admin');
   assert.equal(result.phase, 'rolled_back');
   assert.equal(f.admin.uninstallCalls, 0);
   assert.equal(f.repo.nodeMigration('line-a')?.stagedBefore, true);
-  assert.equal(
-    readFileSync(join(
-      f.instanceRoot,
-      'node_modules',
-      ...PLATFORM_NODE_PACKAGE.name.split('/'),
-      'package.json',
-    ), 'utf8').includes(PLATFORM_NODE_PACKAGE.version),
-    true,
-  );
+  for (const [path, bytes] of preserved) {
+    assert.deepEqual(readFileSync(join(f.instanceRoot, path)), bytes, path);
+  }
 });
 
 test('uninstall-only failure with restored raw service is rolled_back_dirty and retains checkpoint', async () => {
@@ -1204,6 +1281,94 @@ test('recovery and public rollback finalize exact interrupted journals without r
   const f = migrationFixture();
   await interruptedMigration(f, 'tx-public-rollback', 'checkpointed');
   assert.equal((await f.service.rollback('line-a', new Error('operator requested'))).phase, 'rolled_back');
+});
+
+test('public rollback is busy during active migration and preparing without ready finalizes cleanly', async () => {
+  const reachedPreparing = deferred<void>();
+  const releasePreparing = deferred<void>();
+  const active = migrationFixture({
+    onBarrier: async (event) => {
+      if (event.phase === 'preparing' && event.boundary === 'after-phase-persist') {
+        reachedPreparing.resolve();
+        await releasePreparing.promise;
+      }
+    },
+  });
+  const migrating = active.service.migrate('line-a', 'admin');
+  await reachedPreparing.promise;
+  await assert.rejects(
+    () => active.service.rollback('line-a', new Error('operator requested')),
+    (error: unknown) => error instanceof InstanceBusyError
+      && error.activeOperation === 'platform-migration'
+      && error.requestedOperation === 'platform-recovery',
+  );
+  releasePreparing.resolve();
+  assert.equal((await migrating).phase, 'committed');
+
+  const preparing = migrationFixture();
+  await interruptedMigration(preparing, 'tx-preparing-no-ready', 'preparing');
+  const result = await preparing.service.rollback('line-a', new Error('operator requested'));
+  assert.equal(result.phase, 'rolled_back');
+  assert.equal(result.error, 'none');
+  assert.deepEqual(preparing.docker.runtimeCalls, []);
+  assert.equal(await preparing.checkpoint.readyExists('line-a', 'tx-preparing-no-ready'), false);
+});
+
+test('stale recovery scan cannot claim or finalize a replacement tx before runtime effects', async () => {
+  const f = migrationFixture();
+  await interruptedMigration(f, 'tx-stale-scan', 'preparing');
+  const originalReadyExists = f.checkpointPort.readyExists.bind(f.checkpointPort);
+  let replaced = false;
+  f.checkpointPort.readyExists = async (instanceId, txId) => {
+    if (!replaced && txId === 'tx-stale-scan') {
+      replaced = true;
+      f.db.prepare(
+        `UPDATE instance_node_migration
+         SET tx_id = 'tx-replacement', checkpoint_dir = '.thinglinks-migration/line-a/tx-replacement'
+         WHERE instance_id = 'line-a' AND tx_id = 'tx-stale-scan'`,
+      ).run();
+      return false;
+    }
+    return originalReadyExists(instanceId, txId);
+  };
+
+  const results = await f.service.recoverInterrupted();
+
+  assert.deepEqual(results.map((result) => result.phase), ['preparing']);
+  assert.equal(f.repo.nodeMigration('line-a')?.txId, 'tx-replacement');
+  assert.equal(f.repo.nodeMigration('line-a')?.phase, 'preparing');
+  assert.deepEqual(f.docker.runtimeCalls, []);
+  assert.equal(f.admin.uninstallCalls, 0);
+  assert.equal(
+    (f.db.prepare(
+      "SELECT COUNT(*) AS n FROM audit WHERE action IN ('rollback-node-migration', 'manual-node-migration')",
+    ).get() as { n: number }).n,
+    0,
+  );
+});
+
+test('repeated exact recovery is idempotent after one interrupted rollback', async () => {
+  const f = migrationFixture();
+  await interruptedMigration(f, 'tx-repeat-recovery', 'checkpointed');
+
+  assert.deepEqual((await f.service.recoverInterrupted()).map((result) => result.phase), ['rolled_back']);
+  const calls = {
+    runtime: [...f.docker.runtimeCalls],
+    uninstall: f.admin.uninstallCalls,
+    rollbackAudits: (f.db.prepare(
+      "SELECT COUNT(*) AS n FROM audit WHERE action = 'rollback-node-migration'",
+    ).get() as { n: number }).n,
+  };
+
+  assert.deepEqual((await f.service.recoverInterrupted()).map((result) => result.phase), ['rolled_back']);
+  assert.deepEqual(f.docker.runtimeCalls, calls.runtime);
+  assert.equal(f.admin.uninstallCalls, calls.uninstall);
+  assert.equal(
+    (f.db.prepare(
+      "SELECT COUNT(*) AS n FROM audit WHERE action = 'rollback-node-migration'",
+    ).get() as { n: number }).n,
+    calls.rollbackAudits,
+  );
 });
 
 test('two service objects over one SQLite file race one first migration and one clean rollback retry', async () => {

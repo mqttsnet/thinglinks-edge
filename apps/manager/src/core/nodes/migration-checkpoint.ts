@@ -220,6 +220,14 @@ export class MigrationCheckpointStore {
     this.instanceDataRoot = resolve(instanceDataRoot);
   }
 
+  /** Internal test seam for deterministic cross-file races; production construction is unchanged. */
+  protected captureBoundary(
+    _boundary: 'after-file-capture' | 'before-closing-pass',
+    _path?: MigrationCheckpointFilePath,
+  ): void {
+    // No production side effect.
+  }
+
   private paths(instanceId: string, txId: string): {
     live: string;
     migrationRoot: string;
@@ -332,6 +340,7 @@ export class MigrationCheckpointStore {
         size: sourceFile.size,
         sha256: sourceFile.sha256,
       });
+      this.captureBoundary('after-file-capture', path);
     }
 
     const checkpointManifest: MigrationCheckpointManifest = {
@@ -349,6 +358,7 @@ export class MigrationCheckpointStore {
     } finally {
       await manifestHandle.close();
     }
+    this.captureBoundary('before-closing-pass');
     // Closing pass: no earlier copied file may be published if any allowlisted
     // source changed, appeared, disappeared, or changed metadata mid-capture.
     try {

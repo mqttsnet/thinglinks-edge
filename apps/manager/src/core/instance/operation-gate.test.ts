@@ -57,6 +57,33 @@ function beginBootstrap(repo: InstanceRepo, txId: string): void {
   });
 }
 
+function beginMigration(repo: InstanceRepo, txId: string): void {
+  repo.beginNodeMigration({
+    instanceId: 'line-a',
+    txId,
+    operationKind: 'migration',
+    phase: 'preparing',
+    originalRunning: true,
+    stagedBefore: false,
+    modeBefore: 'legacy',
+    imageIdBefore: `sha256:${'a'.repeat(64)}`,
+    targetIntegrity: PLATFORM_NODE_PACKAGE.integrity,
+    checkpointDir: `.thinglinks-migration/line-a/${txId}`,
+    snapshot: {
+      version: 1,
+      kind: 'migration',
+      settings: { exists: true, sha256: 'a'.repeat(64) },
+      flows: { exists: true, sha256: 'b'.repeat(64) },
+      credentials: { exists: true, sha256: 'c'.repeat(64) },
+      packageManifest: { exists: true, sha256: 'd'.repeat(64) },
+      lock: { exists: true, sha256: 'e'.repeat(64) },
+      legacyManifestSha256: 'f'.repeat(64),
+      nodeInventorySha256: '1'.repeat(64),
+    },
+    actor: 'admin',
+  });
+}
+
 test('same instance rejects concurrent mutations', async () => {
   const gate = new InstanceOperationGate(ALLOW_ALL_POLICY);
   const release = deferred<void>();
@@ -67,6 +94,22 @@ test('same instance rejects concurrent mutations', async () => {
   );
   release.resolve();
   await first;
+});
+
+test('active platform migration blocks the internal recovery lease', async () => {
+  const gate = new InstanceOperationGate(ALLOW_ALL_POLICY);
+  const release = deferred<void>();
+  const active = gate.run('line-a', 'platform-migration', async () => release.promise);
+
+  await assert.rejects(
+    () => gate.run('line-a', 'platform-recovery', async () => undefined),
+    (error: unknown) => error instanceof InstanceBusyError
+      && error.activeOperation === 'platform-migration'
+      && error.requestedOperation === 'platform-recovery',
+  );
+
+  release.resolve();
+  await active;
 });
 
 test('different instances may operate concurrently', async () => {
@@ -220,6 +263,68 @@ test('all interrupted durable phases block ordinary writes after restart', async
     await assert.rejects(
       () => gate.run('line-a', 'proxy-write', async () => undefined),
       new RegExp(phase),
+    );
+  }
+});
+
+test('platform recovery policy allows only consistent recoverable migration journals', async () => {
+  for (const phase of [
+    'preparing', 'checkpointed', 'staged', 'cutover', 'verifying', 'rolling_back',
+  ] as const) {
+    const { repo } = repositoryFixture();
+    beginMigration(repo, `tx-recoverable-${phase}`);
+    if (phase !== 'preparing') repo.updateNodeMigration('line-a', phase);
+    const gate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repo));
+    await gate.run('line-a', 'platform-recovery', async () => undefined);
+  }
+
+  for (const phase of [
+    'idle', 'committed', 'rolled_back', 'rolled_back_dirty',
+    'manual_required', 'pending_start_verification',
+  ] as const) {
+    const { repo } = repositoryFixture();
+    if (phase !== 'idle') {
+      beginMigration(repo, `tx-blocked-${phase}`);
+      if (phase === 'committed') {
+        repo.updateNodeMigration('line-a', 'verifying');
+        repo.commitNodeMigration('line-a', PLATFORM_NODE_PACKAGE.version, 'admin');
+      } else {
+        repo.updateNodeMigration(
+          'line-a',
+          phase,
+          phase === 'rolled_back_dirty' || phase === 'manual_required' ? 'rollback' : 'none',
+        );
+      }
+    }
+    const gate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repo));
+    await assert.rejects(
+      () => gate.run('line-a', 'platform-recovery', async () => undefined),
+      (error: unknown) => error instanceof InstanceBusyError
+        && error.requestedOperation === 'platform-recovery',
+      phase,
+    );
+  }
+
+  {
+    const { repo } = repositoryFixture();
+    beginBootstrap(repo, 'tx-bootstrap-not-recovery');
+    repo.updateNodeMigration('line-a', 'checkpointed');
+    const gate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repo));
+    await assert.rejects(
+      () => gate.run('line-a', 'platform-recovery', async () => undefined),
+      (error: unknown) => error instanceof InstanceBusyError,
+      'bootstrap journal',
+    );
+  }
+  {
+    const { repo } = repositoryFixture();
+    beginMigration(repo, 'tx-inconsistent-error');
+    repo.updateNodeMigration('line-a', 'preparing', 'state-inconsistent');
+    const gate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repo));
+    await assert.rejects(
+      () => gate.run('line-a', 'platform-recovery', async () => undefined),
+      (error: unknown) => error instanceof InstanceBusyError,
+      'dirty recoverable phase',
     );
   }
 });

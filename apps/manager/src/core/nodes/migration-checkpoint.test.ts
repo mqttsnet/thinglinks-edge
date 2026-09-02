@@ -23,6 +23,28 @@ import {
 
 const roots: string[] = [];
 
+class HookedCheckpointStore extends MigrationCheckpointStore {
+  private readonly hook: (
+    boundary: 'after-file-capture' | 'before-closing-pass',
+    path?: typeof CHECKPOINT_FILE_PATHS[number],
+  ) => void;
+
+  constructor(
+    root: string,
+    hook: HookedCheckpointStore['hook'],
+  ) {
+    super(root);
+    this.hook = hook;
+  }
+
+  protected override captureBoundary(
+    boundary: 'after-file-capture' | 'before-closing-pass',
+    path?: typeof CHECKPOINT_FILE_PATHS[number],
+  ): void {
+    this.hook(boundary, path);
+  }
+}
+
 after(() => {
   for (const root of roots) rmSync(root, { recursive: true, force: true });
 });
@@ -102,6 +124,28 @@ test('preparing recovery removes only the tx partial and traversal is rejected',
     () => f.store.cleanupPartial('../escape', 'tx-01'),
     (error: unknown) => error instanceof MigrationCheckpointError,
   );
+});
+
+test('closing pass rejects cross-file mutation, appearance, and disappearance without publishing ready', async () => {
+  const cases: Array<{ name: string; mutate: (f: ReturnType<typeof fixture>) => void }> = [
+    { name: 'earlier file changes', mutate: (f) => writeFileSync(join(f.live, 'settings.js'), 'changed-after-capture') },
+    { name: 'missing file appears', mutate: (f) => writeFileSync(join(f.live, 'settings.js.backup'), 'appeared-after-capture') },
+    { name: 'present file disappears', mutate: (f) => rmSync(join(f.live, 'settings.js')) },
+  ];
+  for (const item of cases) {
+    const f = fixture();
+    const store = new HookedCheckpointStore(f.root, (boundary, path) => {
+      if (
+        (item.name === 'earlier file changes'
+          && boundary === 'after-file-capture'
+          && path === 'settings.js')
+        || (item.name !== 'earlier file changes' && boundary === 'before-closing-pass')
+      ) item.mutate(f);
+    });
+    await assert.rejects(() => store.create('line-a', 'tx-01'), /changed|appeared|capture/i, item.name);
+    assert.equal(existsSync(join(f.root, '.thinglinks-migration', 'line-a', 'tx-01')), false, item.name);
+    assert.equal(existsSync(join(f.root, '.thinglinks-migration', 'line-a', 'tx-01.partial')), false, item.name);
+  }
 });
 
 test('restore validates trusted checkpoint bytes and restores exact existence, mode, and hash', async () => {

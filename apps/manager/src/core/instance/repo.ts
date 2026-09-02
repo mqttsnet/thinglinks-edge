@@ -671,6 +671,54 @@ export class InstanceRepo {
     })();
   }
 
+  /** Task-8 atomic commit bound to the exact migration tx and verifying phase. */
+  commitNodeMigrationExact(
+    instanceId: string,
+    txId: string,
+    expectedPhase: 'verifying',
+    platformVersion: string,
+    actor: string,
+  ): void {
+    if (!TX_ID.test(txId)) throw new RepoError('迁移事务 CAS 参数无效');
+    requireSafeText(platformVersion, '平台节点版本', 128);
+    requireSafeText(actor, '操作人', 128);
+    this.db.transaction(() => {
+      const ready = this.db.prepare(
+        `SELECT m.mode_before
+         FROM instance_node_migration m
+         JOIN instance i ON i.id = m.instance_id
+         WHERE m.instance_id = ? AND m.tx_id = ? AND m.operation_kind = 'migration'
+           AND m.phase = ? AND m.error = 'none'
+           AND i.node_migration_state = m.phase AND i.node_migration_error = m.error
+           AND i.node_runtime_mode = m.mode_before`,
+      ).get(instanceId, txId, expectedPhase) as { mode_before: NodeRuntimeMode } | undefined;
+      if (!ready) throw new RepoError('迁移事务所有权或提交阶段已变化');
+
+      const journal = this.db.prepare(
+        `UPDATE instance_node_migration
+         SET phase = 'committed', error = 'none', updated_at = datetime('now')
+         WHERE instance_id = ? AND tx_id = ? AND operation_kind = 'migration'
+           AND phase = ? AND error = 'none'`,
+      ).run(instanceId, txId, expectedPhase);
+      if (journal.changes !== 1) throw new RepoError('迁移事务提交 CAS 未命中');
+      const projection = this.db.prepare(
+        `UPDATE instance
+         SET node_runtime_mode = 'npm', platform_node_version = ?,
+             node_migration_state = 'committed', node_migration_error = 'none'
+         WHERE id = ? AND node_runtime_mode = ?
+           AND node_migration_state = ? AND node_migration_error = 'none'`,
+      ).run(platformVersion, instanceId, ready.mode_before, expectedPhase);
+      if (projection.changes !== 1) throw new RepoError('迁移投影提交 CAS 未命中');
+      recordAudit(this.db, {
+        actor,
+        action: 'commit-node-migration',
+        target: instanceId,
+        detail: `platformVersion=${platformVersion}`,
+        result: 'ok',
+      });
+    })();
+  }
+
   /** Atomically publish a verified rollback terminal and its controlled audit. */
   finishNodeMigrationRollback(
     instanceId: string,
@@ -700,6 +748,51 @@ export class InstanceRepo {
     })();
   }
 
+  /** Task-8 rollback terminal bound to the exact tx and rolling_back phase. */
+  finishNodeMigrationRollbackExact(
+    instanceId: string,
+    txId: string,
+    expectedPhase: 'rolling_back',
+    phase: 'rolled_back' | 'rolled_back_dirty',
+    actor: string,
+  ): void {
+    if (!TX_ID.test(txId)) throw new RepoError('迁移事务 CAS 参数无效');
+    requireSafeText(actor, '操作人', 128);
+    const error: NodeMigrationErrorCode = phase === 'rolled_back' ? 'none' : 'rollback';
+    this.db.transaction(() => {
+      const current = this.db.prepare(
+        `SELECT m.error
+         FROM instance_node_migration m
+         JOIN instance i ON i.id = m.instance_id
+         WHERE m.instance_id = ? AND m.tx_id = ? AND m.operation_kind = 'migration'
+           AND m.phase = ? AND i.node_runtime_mode = 'legacy'
+           AND i.node_migration_state = m.phase AND i.node_migration_error = m.error`,
+      ).get(instanceId, txId, expectedPhase) as { error: NodeMigrationErrorCode } | undefined;
+      if (!current) throw new RepoError('迁移事务所有权或回滚阶段已变化');
+      const journal = this.db.prepare(
+        `UPDATE instance_node_migration
+         SET phase = ?, error = ?, updated_at = datetime('now')
+         WHERE instance_id = ? AND tx_id = ? AND operation_kind = 'migration'
+           AND phase = ? AND error = ?`,
+      ).run(phase, error, instanceId, txId, expectedPhase, current.error);
+      if (journal.changes !== 1) throw new RepoError('迁移事务回滚 CAS 未命中');
+      const projection = this.db.prepare(
+        `UPDATE instance
+         SET node_migration_state = ?, node_migration_error = ?
+         WHERE id = ? AND node_runtime_mode = 'legacy'
+           AND node_migration_state = ? AND node_migration_error = ?`,
+      ).run(phase, error, instanceId, expectedPhase, current.error);
+      if (projection.changes !== 1) throw new RepoError('迁移投影回滚 CAS 未命中');
+      recordAudit(this.db, {
+        actor,
+        action: 'rollback-node-migration',
+        target: instanceId,
+        detail: JSON.stringify({ phase }),
+        result: phase === 'rolled_back' ? 'ok' : 'fail',
+      });
+    })();
+  }
+
   /** Fail closed with one audit; callers provide only a closed code, never external text. */
   finishNodeMigrationManual(
     instanceId: string,
@@ -710,6 +803,57 @@ export class InstanceRepo {
     requireSafeText(actor, '操作人', 128);
     this.db.transaction(() => {
       this.updateNodeMigration(instanceId, 'manual_required', error);
+      recordAudit(this.db, {
+        actor,
+        action: 'manual-node-migration',
+        target: instanceId,
+        detail: JSON.stringify({ code: error }),
+        result: 'fail',
+      });
+    })();
+  }
+
+  /** Task-8 fail-closed terminal bound to the exact tx and caller-observed phases. */
+  finishNodeMigrationManualExact(
+    instanceId: string,
+    txId: string,
+    expectedPhases: readonly NodeMigrationState[],
+    error: Exclude<NodeMigrationErrorCode, 'none'>,
+    actor: string,
+  ): void {
+    if (!TX_ID.test(txId) || expectedPhases.length === 0) {
+      throw new RepoError('迁移事务 CAS 参数无效');
+    }
+    for (const phase of expectedPhases) requireEnum(phase, NODE_MIGRATION_PHASES, '预期迁移阶段');
+    requireEnum(error, NODE_MIGRATION_ERROR_CODES.filter((code) => code !== 'none'), '迁移错误码');
+    requireSafeText(actor, '操作人', 128);
+    const marks = expectedPhases.map(() => '?').join(', ');
+    this.db.transaction(() => {
+      const current = this.db.prepare(
+        `SELECT m.phase, m.error
+         FROM instance_node_migration m
+         JOIN instance i ON i.id = m.instance_id
+         WHERE m.instance_id = ? AND m.tx_id = ? AND m.operation_kind = 'migration'
+           AND m.phase IN (${marks})
+           AND i.node_migration_state = m.phase AND i.node_migration_error = m.error`,
+      ).get(instanceId, txId, ...expectedPhases) as {
+        phase: NodeMigrationPhase;
+        error: NodeMigrationErrorCode;
+      } | undefined;
+      if (!current) throw new RepoError('迁移事务所有权或人工处理阶段已变化');
+      const journal = this.db.prepare(
+        `UPDATE instance_node_migration
+         SET phase = 'manual_required', error = ?, updated_at = datetime('now')
+         WHERE instance_id = ? AND tx_id = ? AND operation_kind = 'migration'
+           AND phase = ? AND error = ?`,
+      ).run(error, instanceId, txId, current.phase, current.error);
+      if (journal.changes !== 1) throw new RepoError('迁移事务人工处理 CAS 未命中');
+      const projection = this.db.prepare(
+        `UPDATE instance
+         SET node_migration_state = 'manual_required', node_migration_error = ?
+         WHERE id = ? AND node_migration_state = ? AND node_migration_error = ?`,
+      ).run(error, instanceId, current.phase, current.error);
+      if (projection.changes !== 1) throw new RepoError('迁移投影人工处理 CAS 未命中');
       recordAudit(this.db, {
         actor,
         action: 'manual-node-migration',
