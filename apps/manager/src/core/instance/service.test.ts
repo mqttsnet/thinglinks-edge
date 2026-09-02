@@ -93,7 +93,16 @@ function persistedPolicy(
   };
 }
 
-function fixture(policySetup?: PolicySetup) {
+function fixture(
+  policySetup?: PolicySetup,
+  pendingStartCompletion?: {
+    completePendingStartUnderLease(
+      id: string,
+      lease: InstanceOperationLease,
+      actor: string,
+    ): Promise<{ phase: string }>;
+  },
+) {
   const db = openDb(':memory:');
   const repo = new InstanceRepo(db, deriveKey('service-gate-test', 'instance'));
   repo.create(record(), [], [{ username: 'admin', password: 'old-password', permissions: '*' }]);
@@ -111,18 +120,43 @@ function fixture(policySetup?: PolicySetup) {
     list: async () => [{ id: 'line-a', state: 'running', running: true }],
     assertImagePresent: async (image: string) => { calls.push(`assertImagePresent:${image}`); },
     imageRef: (tag: string) => `nodered/node-red:${tag}`,
+    inspectMigrationRuntime: async () => ({
+      running: true,
+      imageId: `sha256:${'a'.repeat(64)}`,
+      environment: [],
+    }),
+    recreateInstance: async (input: { spec: { id: string }; running: boolean; imageId: string }) => {
+      calls.push(`recreate:${input.spec.id}:${input.running}:${input.imageId}`);
+    },
     createInstance: async (input: { id: string }, _settings: string, mode: string) => {
       calls.push(`create:${input.id}:${mode}`);
     },
   } as unknown as DockerClient;
   const gate = new InstanceOperationGate(
-    policySetup?.(repo, db) ?? { assertAllowed: () => undefined },
+    policySetup?.(repo, db) ?? new InstanceRepositoryOperationPolicy(repo),
   );
   const service = new InstanceService({
     db,
     repo,
     docker,
     gate,
+    adminRuntime: {
+      target: () => ({
+        upstream: 'http://127.0.0.1:1880', adminRoot: '/red/line-a/',
+        username: 'admin', password: 'old-password',
+      }),
+      waitReady: async (id) => { calls.push(`ready:${id}`); },
+    },
+    instanceDataRoot: '/tmp/thinglinks-service-test-instances',
+    platformPackages: { verifyForInstall: () => ({}) } as never,
+    barrier: { reach: async () => undefined },
+    pendingStartCompletion: pendingStartCompletion ?? {
+      completePendingStartUnderLease: async (id) => {
+        await docker.assertManaged(id);
+        await docker.start(id);
+        return { phase: 'committed' };
+      },
+    },
     basePath: '',
     portRange: { min: 30_000, max: 30_100 },
     allowedImageTags: ['5.0.4-24-minimal', '5.1.0-24-minimal'],
@@ -245,6 +279,137 @@ test('under-lease primitives reject wrong-operation and expired leases before Do
   assert.deepEqual(f.calls, []);
 });
 
+test('public same-image rebuild is gated and passes the complete persisted spec with immutable image id', async () => {
+  const f = fixture();
+  f.repo.bindPort('line-a', {
+    hostPort: 30005, containerPort: 502, protocol: 'tcp', hostIp: '127.0.0.1', purpose: 'modbus',
+  });
+  let captured: Record<string, any> | undefined;
+  (f.docker as unknown as { recreateInstance(input: Record<string, any>): Promise<void> })
+    .recreateInstance = async (input) => {
+      captured = input;
+      f.calls.push(`recreate:${input.spec.id}:${input.running}:${input.imageId}`);
+    };
+  await f.service.recreateSameImage('line-a');
+
+  const recreated = f.calls.find((call) => call.startsWith('recreate:'));
+  assert.equal(
+    recreated,
+    `recreate:line-a:true:sha256:${'a'.repeat(64)}`,
+  );
+  assert.deepEqual(f.calls.slice(-2), [recreated, 'ready:line-a']);
+  assert.deepEqual(captured?.spec, {
+    id: 'line-a', imageTag: '5.0.4-24-minimal', memoryMb: 512, cpus: 0.5,
+    ports: [{
+      hostPort: 30005, containerPort: 502, protocol: 'tcp',
+      hostIp: '127.0.0.1', purpose: 'modbus',
+    }],
+    adminRoot: '/red/line-a/', ingestToken: 'ingest-token',
+  });
+  assert.equal(captured?.runtimeMode, 'legacy');
+  assert.match(captured?.settingsJs ?? '', /\/red\/line-a\//);
+  assert.equal(f.repo.get('line-a')?.imageTag, '5.0.4-24-minimal');
+});
+
+test('same-image rebuild preserves an originally stopped instance and does not wait for readiness', async () => {
+  const f = fixture();
+  (f.docker as unknown as {
+    inspectMigrationRuntime: () => Promise<{ running: boolean; imageId: string; environment: string[] }>;
+  }).inspectMigrationRuntime = async () => ({
+    running: false, imageId: `sha256:${'b'.repeat(64)}`, environment: [],
+  });
+
+  await f.service.recreateSameImage('line-a');
+  assert.deepEqual(f.calls, [`recreate:line-a:false:sha256:${'b'.repeat(64)}`]);
+});
+
+test('same-image rebuild compensates with the same immutable input and original running state', async () => {
+  const f = fixture();
+  let attempts = 0;
+  (f.docker as unknown as {
+    recreateInstance: (input: { spec: { id: string }; running: boolean; imageId: string }) => Promise<void>;
+  }).recreateInstance = async (input) => {
+    attempts += 1;
+    f.calls.push(`recreate:${input.spec.id}:${input.running}:${input.imageId}`);
+    if (attempts === 1) throw new Error('raw-token-must-not-escape');
+  };
+
+  await assert.rejects(
+    () => f.service.recreateSameImage('line-a'),
+    (error: unknown) => {
+      assert.match((error as Error).message, /恢复|rebuild/i);
+      assert.doesNotMatch((error as Error).message, /raw-token/);
+      return true;
+    },
+  );
+  assert.equal(attempts, 2);
+  assert.equal(f.calls.filter((call) => call === 'ready:line-a').length, 1);
+  assert.equal(new Set(
+    f.calls.filter((call) => call.startsWith('recreate:')),
+  ).size, 1, 'compensation must reuse the exact captured immutable input');
+});
+
+test('same-image stopped rebuild failure compensates without starting or readiness probing', async () => {
+  const f = fixture();
+  (f.docker as unknown as {
+    inspectMigrationRuntime: () => Promise<{ running: boolean; imageId: string; environment: string[] }>;
+  }).inspectMigrationRuntime = async () => ({
+    running: false, imageId: `sha256:${'c'.repeat(64)}`, environment: [],
+  });
+  let attempts = 0;
+  (f.docker as unknown as { recreateInstance(): Promise<void> }).recreateInstance = async () => {
+    attempts += 1;
+    f.calls.push('recreate-stopped');
+    if (attempts === 1) throw new Error('raw-secret');
+  };
+
+  await assert.rejects(() => f.service.recreateSameImage('line-a'), /恢复/);
+  assert.equal(attempts, 2);
+  assert.equal(f.calls.some((call) => call.startsWith('start:') || call.startsWith('ready:')), false);
+});
+
+test('same-image rebuild plus compensation failure persists a manual fence without raw errors', async () => {
+  const f = fixture(undefined, undefined);
+  (f.docker as unknown as { recreateInstance(): Promise<void> }).recreateInstance = async () => {
+    throw new Error('TLE_INGEST_TOKEN=raw-secret-must-not-escape');
+  };
+
+  await assert.rejects(
+    () => f.service.recreateSameImage('line-a'),
+    (error: unknown) => {
+      assert.match((error as Error).message, /人工处理/);
+      assert.doesNotMatch((error as Error).message, /raw-secret|TLE_INGEST_TOKEN/);
+      return true;
+    },
+  );
+
+  assert.deepEqual(f.repo.nodeRuntime('line-a'), {
+    mode: 'legacy', platformVersion: '',
+    migrationState: 'manual_required', migrationError: 'compensation',
+  });
+  await assert.rejects(() => f.service.start('line-a', 'admin'), /manual_required/);
+});
+
+test('platform migration lease reuses same-image under-lease primitive without nested gate acquisition', async () => {
+  const f = fixture();
+  await f.gate.run('line-a', 'platform-migration', async (lease) => {
+    await f.service.recreateSameImageUnderLease('line-a', lease, 'environment-repair');
+    assert.equal(f.gate.current('line-a'), 'platform-migration');
+    await assert.rejects(() => f.service.recreateSameImage('line-a'), /platform-migration/);
+  });
+  assert.equal(f.calls.filter((call) => call.startsWith('recreate:')).length, 1);
+
+  const fabricated = {
+    instanceId: 'line-a', operation: 'platform-migration',
+  } as InstanceOperationLease;
+  await assert.rejects(
+    () => f.service.recreateSameImageUnderLease(
+      'line-a', fabricated, 'environment-repair',
+    ),
+    /lease.*invalid|invalid.*lease/i,
+  );
+});
+
 test('repository-backed manual_required blocks every public service mutator before side effects', async () => {
   const actions = [
     (f: ReturnType<typeof fixture>) => f.service.start('line-a', 'admin'),
@@ -305,6 +470,50 @@ test('clean pending_start_verification permits only the public start facade', as
       beforeAudit,
     );
   }
+});
+
+test('pending public start owns one start lease and delegates one exact internal start path', async () => {
+  let completions = 0;
+  const holder: { fixture?: ReturnType<typeof fixture> } = {};
+  const completion = {
+    completePendingStartUnderLease: async (
+      id: string,
+      lease: InstanceOperationLease,
+      actor: string,
+    ) => {
+      completions += 1;
+      assert.equal(actor, 'admin');
+      assert.ok(holder.fixture);
+      holder.fixture.gate.assertLease(lease, id, ['start-instance']);
+      assert.equal(holder.fixture.gate.current(id), 'start-instance');
+      await (holder.fixture.docker as unknown as { start(id: string): Promise<void> }).start(id);
+      return { phase: 'committed' };
+    },
+  };
+  const f = fixture(persistedPolicy('pending_start_verification'), completion);
+  holder.fixture = f;
+
+  await f.service.start('line-a', 'admin');
+
+  assert.equal(completions, 1);
+  assert.equal(f.calls.filter((call) => call === 'start:line-a').length, 1);
+  assert.equal(f.gate.current('line-a'), undefined);
+});
+
+test('pending public start surfaces failed verification and does not report a successful start audit', async () => {
+  const f = fixture(persistedPolicy('pending_start_verification'), {
+    completePendingStartUnderLease: async () => ({ phase: 'rolled_back' }),
+  });
+
+  await assert.rejects(() => f.service.start('line-a', 'admin'), /保持停机/);
+
+  assert.equal(
+    (f.db.prepare(
+      "SELECT COUNT(*) AS n FROM audit WHERE action = 'start-instance' AND result = 'ok'",
+    ).get() as { n: number }).n,
+    0,
+  );
+  assert.equal(f.gate.current('line-a'), undefined);
 });
 
 test('image upgrade and rollback both preserve the explicitly persisted npm runtime mode', async () => {

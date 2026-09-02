@@ -508,6 +508,44 @@ export class InstanceRepo {
     };
   }
 
+  /**
+   * Same-image rebuild is not a package migration and therefore has no checkpoint
+   * journal. If both replacement and compensation fail, persist a conservative
+   * manual fence on the instance projection so no later public write can race the
+   * damaged container. Existing migration journals remain the sole authority and
+   * must be finalized by their exact owner instead.
+   */
+  fenceSameImageRebuildFailure(instanceId: string, actor: string): void {
+    requireSafeText(actor, '操作人', 128);
+    this.db.transaction(() => {
+      const current = this.db.prepare(
+        `SELECT node_migration_state, node_migration_error
+         FROM instance WHERE id = ?`,
+      ).get(instanceId) as {
+        node_migration_state: NodeMigrationState;
+        node_migration_error: NodeMigrationErrorCode;
+      } | undefined;
+      if (!current) throw new RepoError(`实例 ${instanceId} 不存在`);
+      if (this.nodeMigration(instanceId)) throw new RepoError('已有迁移日志，重建失败由迁移恢复接管');
+      if (!['idle', 'committed', 'rolled_back'].includes(current.node_migration_state)) {
+        throw new RepoError('实例当前状态不允许建立重建人工围栏');
+      }
+      const updated = this.db.prepare(
+        `UPDATE instance
+         SET node_migration_state = 'manual_required', node_migration_error = 'compensation'
+         WHERE id = ? AND node_migration_state = ? AND node_migration_error = ?`,
+      ).run(instanceId, current.node_migration_state, current.node_migration_error);
+      if (updated.changes !== 1) throw new RepoError('重建人工围栏 CAS 未命中');
+      recordAudit(this.db, {
+        actor,
+        action: 'same-image-rebuild-manual',
+        target: instanceId,
+        detail: JSON.stringify({ code: 'compensation' }),
+        result: 'fail',
+      });
+    })();
+  }
+
   beginNodeMigration(input: BeginNodeMigrationInput): void {
     requireEnum(input.operationKind, NODE_MIGRATION_KINDS, '迁移操作类型');
     if (input.phase !== 'preparing') throw new RepoError('迁移只能从 preparing 开始');
@@ -666,6 +704,91 @@ export class InstanceRepo {
              AND i.node_migration_error = instance_node_migration.error
          )`,
     ).run(owner, expiresAt, instanceId, txId, ...expected, owner, nowMs);
+    if (updated.changes !== 1) return undefined;
+    return this.nodeMigration(instanceId);
+  }
+
+  /**
+   * C31 stopped-migration handoff: publish the exact owned tx as pending-start and
+   * release its execution owner in the same transaction as the instance projection.
+   */
+  parkNodeMigrationPendingStartExact(
+    instanceId: string,
+    txId: string,
+    owner: string,
+    nowMs: number,
+    expectedPhase: NodeMigrationPhase,
+  ): void {
+    if (!TX_ID.test(txId)) throw new RepoError('迁移事务 CAS 参数无效');
+    requireExecutionOwner(owner);
+    requireExecutionNow(nowMs);
+    requireEnum(expectedPhase, NODE_MIGRATION_PHASES, '预期迁移阶段');
+    this.db.transaction(() => {
+      const current = this.db.prepare(
+        `SELECT m.error, m.execution_lease_expires_at
+         FROM instance_node_migration m
+         JOIN instance i ON i.id = m.instance_id
+         WHERE m.instance_id = ? AND m.tx_id = ? AND m.operation_kind = 'migration'
+           AND m.phase = ? AND m.error = 'none'
+           AND m.execution_owner = ? AND m.execution_lease_expires_at > ?
+           AND i.node_migration_state = m.phase AND i.node_migration_error = m.error`,
+      ).get(instanceId, txId, expectedPhase, owner, nowMs) as {
+        error: NodeMigrationErrorCode;
+        execution_lease_expires_at: number;
+      } | undefined;
+      if (!current) throw new RepoError('迁移事务所有权或 pending 阶段已变化');
+      const journal = this.db.prepare(
+        `UPDATE instance_node_migration
+         SET phase = 'pending_start_verification', error = 'none',
+             execution_owner = '', execution_lease_expires_at = 0,
+             updated_at = datetime('now')
+         WHERE instance_id = ? AND tx_id = ? AND operation_kind = 'migration'
+           AND phase = ? AND error = 'none'
+           AND execution_owner = ? AND execution_lease_expires_at = ?`,
+      ).run(
+        instanceId, txId, expectedPhase, owner, current.execution_lease_expires_at,
+      );
+      if (journal.changes !== 1) throw new RepoError('迁移事务 pending CAS 未命中');
+      const projection = this.db.prepare(
+        `UPDATE instance
+         SET node_migration_state = 'pending_start_verification', node_migration_error = 'none'
+         WHERE id = ? AND node_migration_state = ? AND node_migration_error = 'none'`,
+      ).run(instanceId, expectedPhase);
+      if (projection.changes !== 1) throw new RepoError('迁移投影 pending CAS 未命中');
+    })();
+  }
+
+  /**
+   * C31 explicit-start claim. Only an exact clean ownerless pending tx can be
+   * claimed; the same still-live owner may renew idempotently, while peers and
+   * expired owners have no effect.
+   */
+  claimPendingStartExecutionExact(
+    instanceId: string,
+    txId: string,
+    owner: string,
+    nowMs: number,
+    leaseDurationMs: number,
+  ): InstanceNodeMigrationJournal | undefined {
+    if (!TX_ID.test(txId)) throw new RepoError('迁移执行 claim 参数无效');
+    requireExecutionOwner(owner);
+    const expiresAt = executionLeaseExpiry(nowMs, leaseDurationMs);
+    const updated = this.db.prepare(
+      `UPDATE instance_node_migration
+       SET execution_owner = ?, execution_lease_expires_at = ?, updated_at = datetime('now')
+       WHERE instance_id = ? AND tx_id = ? AND operation_kind = 'migration'
+         AND phase = 'pending_start_verification' AND error = 'none'
+         AND (
+           (execution_owner = '' AND execution_lease_expires_at = 0)
+           OR (execution_owner = ? AND execution_lease_expires_at > ?)
+         )
+         AND EXISTS (
+           SELECT 1 FROM instance i
+           WHERE i.id = instance_node_migration.instance_id
+             AND i.node_migration_state = 'pending_start_verification'
+             AND i.node_migration_error = 'none'
+         )`,
+    ).run(owner, expiresAt, instanceId, txId, owner, nowMs);
     if (updated.changes !== 1) return undefined;
     return this.nodeMigration(instanceId);
   }

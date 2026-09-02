@@ -709,3 +709,182 @@ test('exact Task 8 rollback and manual terminals clear execution ownership', () 
     assert.equal(repo.nodeMigration('line-a')?.executionLeaseExpiresAt, 0, terminal);
   }
 });
+
+test('C31 parks an exact owned migration pending and clears execution ownership atomically', () => {
+  const repo = fresh();
+  repo.create(rec(), [], cred());
+  const txId = 'tx-pending-park';
+  const owner = 'owner-pending-park-0001';
+  repo.beginNodeMigration(migrationBegin('line-a', txId, {
+    executionOwner: owner,
+    executionLeaseExpiresAt: 10_000,
+  }));
+  repo.transitionNodeMigrationExact(
+    'line-a', txId, owner, 1_000, ['preparing'], 'cutover',
+  );
+
+  repo.parkNodeMigrationPendingStartExact(
+    'line-a', txId, owner, 1_000, 'cutover',
+  );
+
+  const journal = repo.nodeMigration('line-a');
+  assert.equal(journal?.phase, 'pending_start_verification');
+  assert.equal(journal?.error, 'none');
+  assert.equal(journal?.executionOwner, '');
+  assert.equal(journal?.executionLeaseExpiresAt, 0);
+  assert.deepEqual(repo.nodeRuntime('line-a'), {
+    mode: 'legacy', platformVersion: '',
+    migrationState: 'pending_start_verification', migrationError: 'none',
+  });
+  assert.throws(
+    () => repo.parkNodeMigrationPendingStartExact(
+      'line-a', 'tx-stale', owner, 1_000, 'cutover',
+    ),
+    /所有权|CAS|变化/i,
+  );
+});
+
+test('C31 pending park rolls back the journal update when projection CAS fails', () => {
+  const db = openDb(':memory:');
+  const repo = new InstanceRepo(db, KEY);
+  const txId = 'tx-pending-atomic';
+  const owner = 'owner-pending-atomic-0001';
+  repo.create(rec(), [], cred());
+  repo.beginNodeMigration(migrationBegin('line-a', txId, {
+    executionOwner: owner,
+    executionLeaseExpiresAt: 10_000,
+  }));
+  repo.transitionNodeMigrationExact(
+    'line-a', txId, owner, 1_000, ['preparing'], 'cutover',
+  );
+  db.exec(`CREATE TRIGGER reject_pending_projection
+    BEFORE UPDATE OF node_migration_state ON instance
+    WHEN NEW.node_migration_state = 'pending_start_verification'
+    BEGIN SELECT RAISE(ABORT, 'pending projection rejected'); END;`);
+
+  assert.throws(
+    () => repo.parkNodeMigrationPendingStartExact(
+      'line-a', txId, owner, 1_000, 'cutover',
+    ),
+    /pending projection rejected/,
+  );
+  const journal = repo.nodeMigration('line-a');
+  assert.equal(journal?.phase, 'cutover');
+  assert.equal(journal?.executionOwner, owner);
+  assert.equal(journal?.executionLeaseExpiresAt, 10_000);
+  assert.equal(repo.nodeRuntime('line-a')?.migrationState, 'cutover');
+});
+
+test('C31 pending start claim is exact, peer-fenced, and same-owner idempotent only while live', () => {
+  const repo = fresh();
+  repo.create(rec(), [], cred());
+  const txId = 'tx-pending-claim';
+  const parkedOwner = 'owner-pending-parked-0001';
+  const startOwner = 'owner-pending-start-0001';
+  const peerOwner = 'owner-pending-peer-0001';
+  repo.beginNodeMigration(migrationBegin('line-a', txId, {
+    executionOwner: parkedOwner,
+    executionLeaseExpiresAt: 10_000,
+  }));
+  repo.parkNodeMigrationPendingStartExact(
+    'line-a', txId, parkedOwner, 1_000, 'preparing',
+  );
+
+  assert.equal(
+    repo.claimPendingStartExecutionExact(
+      'line-a', 'tx-stale', startOwner, 2_000, 1_000,
+    ),
+    undefined,
+  );
+  assert.equal(
+    repo.claimPendingStartExecutionExact(
+      'line-a', txId, startOwner, 2_000, 1_000,
+    )?.executionLeaseExpiresAt,
+    3_000,
+  );
+  assert.equal(
+    repo.claimPendingStartExecutionExact(
+      'line-a', txId, peerOwner, 2_100, 1_000,
+    ),
+    undefined,
+  );
+  assert.equal(
+    repo.claimPendingStartExecutionExact(
+      'line-a', txId, startOwner, 2_500, 1_000,
+    )?.executionLeaseExpiresAt,
+    3_500,
+  );
+  assert.equal(
+    repo.claimPendingStartExecutionExact(
+      'line-a', txId, startOwner, 3_500, 1_000,
+    ),
+    undefined,
+  );
+
+  repo.transitionNodeMigrationExact(
+    'line-a', txId, startOwner, 3_000,
+    ['pending_start_verification'], 'verifying',
+  );
+  repo.commitNodeMigrationExact(
+    'line-a', txId, startOwner, 3_000,
+    'verifying', PLATFORM_NODE_PACKAGE.version, 'admin',
+  );
+  assert.equal(repo.nodeMigration('line-a')?.executionOwner, '');
+  assert.equal(repo.nodeMigration('line-a')?.executionLeaseExpiresAt, 0);
+});
+
+test('C31 pending start claim leaves the ownerless journal unchanged when SQLite aborts the claim', () => {
+  const db = openDb(':memory:');
+  const repo = new InstanceRepo(db, KEY);
+  const txId = 'tx-pending-claim-atomic';
+  const parkedOwner = 'owner-pending-atomic-0002';
+  repo.create(rec(), [], cred());
+  repo.beginNodeMigration(migrationBegin('line-a', txId, {
+    executionOwner: parkedOwner,
+    executionLeaseExpiresAt: 10_000,
+  }));
+  repo.parkNodeMigrationPendingStartExact(
+    'line-a', txId, parkedOwner, 1_000, 'preparing',
+  );
+  db.exec(`CREATE TRIGGER reject_pending_claim
+    BEFORE UPDATE OF execution_owner ON instance_node_migration
+    WHEN NEW.execution_owner != ''
+    BEGIN SELECT RAISE(ABORT, 'pending claim rejected'); END;`);
+
+  assert.throws(
+    () => repo.claimPendingStartExecutionExact(
+      'line-a', txId, 'owner-pending-start-atomic', 2_000, 1_000,
+    ),
+    /pending claim rejected/,
+  );
+  assert.equal(repo.nodeMigration('line-a')?.phase, 'pending_start_verification');
+  assert.equal(repo.nodeMigration('line-a')?.executionOwner, '');
+  assert.equal(repo.nodeMigration('line-a')?.executionLeaseExpiresAt, 0);
+});
+
+test('same-image compensation manual fence is atomic and never replaces a migration journal', () => {
+  const db = openDb(':memory:');
+  const repo = new InstanceRepo(db, KEY);
+  repo.create(rec(), [], cred());
+  db.exec(`CREATE TRIGGER reject_rebuild_manual_audit
+    BEFORE INSERT ON audit
+    WHEN NEW.action = 'same-image-rebuild-manual'
+    BEGIN SELECT RAISE(ABORT, 'manual audit rejected'); END;`);
+  assert.throws(() => repo.fenceSameImageRebuildFailure('line-a', 'system'), /manual audit rejected/);
+  assert.equal(repo.nodeRuntime('line-a')?.migrationState, 'idle');
+  db.exec('DROP TRIGGER reject_rebuild_manual_audit');
+
+  repo.fenceSameImageRebuildFailure('line-a', 'system');
+  assert.equal(repo.nodeRuntime('line-a')?.migrationState, 'manual_required');
+  assert.equal(repo.nodeRuntime('line-a')?.migrationError, 'compensation');
+  assert.equal(repo.nodeMigration('line-a'), undefined);
+
+  const withJournal = fresh();
+  withJournal.create(rec(), [], cred());
+  withJournal.beginNodeMigration(migrationBegin('line-a', 'tx-existing-journal'));
+  assert.throws(
+    () => withJournal.fenceSameImageRebuildFailure('line-a', 'system'),
+    /已有迁移日志/,
+  );
+  assert.equal(withJournal.nodeMigration('line-a')?.phase, 'preparing');
+});

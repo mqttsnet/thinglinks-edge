@@ -1,14 +1,21 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
-import { lstat, readFile, readdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import {
+  chmod, cp, lstat, mkdir, open, readFile, readdir, rename, rm, rmdir,
+} from 'node:fs/promises';
+import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import {
   getFlows,
   getInstalledModules,
   stageModule,
   uninstallModule,
+  type AdminTarget,
   type InstalledModule,
 } from '../flows/admin-client.ts';
 import type { InstanceAdminRuntime } from '../instance/admin-runtime.ts';
+import type {
+  CreateMigrationProbeInput,
+  MigrationProbeHandle,
+} from '../instance/docker-client.ts';
 import type {
   InstanceOperationGate,
   InstanceOperationLease,
@@ -75,6 +82,15 @@ export interface PlatformMigrationDocker {
   restart(instanceId: string): Promise<void>;
   stop(instanceId: string): Promise<void>;
   start(instanceId: string): Promise<void>;
+  createMigrationProbe(input: CreateMigrationProbeInput): Promise<MigrationProbeHandle>;
+  writeMigrationProbeSettings(handle: MigrationProbeHandle, settingsJs: string): Promise<void>;
+  restartMigrationProbe(handle: MigrationProbeHandle): Promise<void>;
+  cleanupMigrationProbe(handle: MigrationProbeHandle): Promise<{
+    residuals: Array<'container' | 'network' | 'data'>;
+  }>;
+  cleanupMigrationProbeByTx(instanceId: string, txId: string): Promise<{
+    residuals: Array<'container' | 'network' | 'data'>;
+  }>;
 }
 
 export interface PlatformMigrationAdminActions {
@@ -82,6 +98,10 @@ export interface PlatformMigrationAdminActions {
   stagePlatformModule(instanceId: string): Promise<InstalledModule>;
   uninstallPlatformModule(instanceId: string): Promise<void>;
   currentFlows(instanceId: string): Promise<unknown>;
+  waitReadyAt(target: AdminTarget): Promise<void>;
+  installedModulesAt(target: AdminTarget): Promise<InstalledModule[]>;
+  stagePlatformModuleAt(target: AdminTarget): Promise<InstalledModule>;
+  currentFlowsAt(target: AdminTarget): Promise<unknown>;
 }
 
 export class NodeRedPlatformMigrationAdminActions implements PlatformMigrationAdminActions {
@@ -110,6 +130,33 @@ export class NodeRedPlatformMigrationAdminActions implements PlatformMigrationAd
   currentFlows(instanceId: string): Promise<unknown> {
     return getFlows(this.runtime.target(instanceId));
   }
+
+  async waitReadyAt(target: AdminTarget): Promise<void> {
+    const deadline = Date.now() + 30_000;
+    let last: unknown;
+    while (Date.now() < deadline) {
+      try {
+        await getInstalledModules(target);
+        return;
+      } catch (error) {
+        last = error;
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+    }
+    throw last instanceof Error ? last : new Error('probe Admin API readiness timed out');
+  }
+
+  installedModulesAt(target: AdminTarget): Promise<InstalledModule[]> {
+    return getInstalledModules(target);
+  }
+
+  stagePlatformModuleAt(target: AdminTarget): Promise<InstalledModule> {
+    return stageModule(target, PLATFORM_NODE_PACKAGE.name, PLATFORM_NODE_PACKAGE.version);
+  }
+
+  currentFlowsAt(target: AdminTarget): Promise<unknown> {
+    return getFlows(target);
+  }
 }
 
 export interface PlatformPackageInstallVerifier {
@@ -122,6 +169,14 @@ export interface MigrationSettingsRenderer {
     lease: InstanceOperationLease,
     runtimeMode: NodeRuntimeMode,
   ): string;
+}
+
+export interface MigrationSameImageRepair {
+  recreateSameImageUnderLease(
+    instanceId: string,
+    lease: InstanceOperationLease,
+    reason: 'environment-repair',
+  ): Promise<void>;
 }
 
 export interface MigrationCheckpointPort {
@@ -148,6 +203,10 @@ export interface PlatformMigrationServiceOptions {
   platformPackages: PlatformPackageInstallVerifier;
   checkpoint: MigrationCheckpointPort;
   settings: MigrationSettingsRenderer;
+  repair?: MigrationSameImageRepair | undefined;
+  bootstrapRecovery?: {
+    recoverInterruptedBootstraps(): Promise<unknown>;
+  } | undefined;
   barrier: PlatformNodeOperationBarrier;
   instanceDataRoot: string;
   txId?: (() => string) | undefined;
@@ -168,13 +227,15 @@ interface PreflightFacts {
   snapshot: MigrationNodeMigrationSnapshot;
   stagedBefore: boolean;
   flowIdentity: string;
+  needsEnvironmentRepair: boolean;
 }
 
 const TARGET_TYPES = new Set<string>(PLATFORM_NODE_TYPES);
-const IMAGE_ID = /^sha256:[a-fA-F0-9]{64}$/;
+const IMAGE_ID = /^sha256:[a-f0-9]{64}$/;
 const RECOVERABLE_PHASES = [
   'preparing', 'checkpointed', 'staged', 'cutover', 'verifying', 'rolling_back',
 ] as const;
+const OWNED_PHASES = [...RECOVERABLE_PHASES, 'pending_start_verification'] as const;
 const DEFAULT_EXECUTION_LEASE_MS = 15_000;
 const MAX_EXECUTION_LEASE_MS = 59_000;
 
@@ -194,7 +255,7 @@ interface MigrationExecutionSession {
   readonly instanceId: string;
   readonly txId: string;
   readonly owner: string;
-  renew(expected: readonly (typeof RECOVERABLE_PHASES)[number][]): InstanceNodeMigrationJournal;
+  renew(expected: readonly (typeof OWNED_PHASES)[number][]): InstanceNodeMigrationJournal;
   stop(): void;
 }
 
@@ -387,6 +448,7 @@ function flowIds(value: unknown): string[] | undefined {
 
 function samePreflightFacts(left: PreflightFacts, right: PreflightFacts): boolean {
   return left.stagedBefore === right.stagedBefore
+    && left.needsEnvironmentRepair === right.needsEnvironmentRepair
     && left.flowIdentity === right.flowIdentity
     && JSON.stringify(left.inspection) === JSON.stringify(right.inspection)
     && JSON.stringify(left.snapshot) === JSON.stringify(right.snapshot);
@@ -413,6 +475,176 @@ function assertCheckpointMatchesPreflight(
     if (actual.exists && expected.exists && actual.sha256 !== expected.sha256) {
       throw controlled('checkpoint', `${path} checkpoint hash changed after preflight`);
     }
+  }
+}
+
+const STOPPED_EXPORT_PATHS = Object.freeze([
+  'settings.js',
+  'settings.js.backup',
+  'package.json',
+  'package.json.backup',
+  'package-lock.json',
+  'package-lock.json.backup',
+  '.config.nodes.json',
+  '.config.nodes.json.backup',
+  '.config.modules.json',
+  '.config.modules.json.backup',
+  join('node_modules', ...PLATFORM_NODE_PACKAGE.name.split('/')),
+  join('node_modules', ...PLATFORM_COMMON_PACKAGE.name.split('/')),
+] as const);
+
+type StoppedArtifactFact =
+  | { key: string; exists: false }
+  | { key: string; exists: true; kind: 'file' | 'directory'; mode: number; sha256: string };
+
+async function artifactFact(root: string, key: string): Promise<StoppedArtifactFact> {
+  const absolute = join(root, key);
+  let stat;
+  try {
+    stat = await lstat(absolute);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { key, exists: false };
+    throw error;
+  }
+  if (stat.isSymbolicLink() || (!stat.isFile() && !stat.isDirectory())) {
+    throw new Error(`untrusted stopped artifact ${key}`);
+  }
+  const mode = stat.mode & 0o777;
+  if (stat.isFile()) {
+    return { key, exists: true, kind: 'file', mode, sha256: hash(await readFile(absolute)) };
+  }
+  const entries: Array<{ path: string; kind: 'file' | 'directory'; mode: number; sha256?: string }> = [];
+  const walk = async (directory: string, prefix: string): Promise<void> => {
+    const children = await readdir(directory, { withFileTypes: true });
+    children.sort((a, b) => a.name.localeCompare(b.name));
+    for (const child of children) {
+      const path = prefix ? join(prefix, child.name) : child.name;
+      const childAbsolute = join(directory, child.name);
+      const childStat = await lstat(childAbsolute);
+      if (childStat.isSymbolicLink() || (!childStat.isFile() && !childStat.isDirectory())) {
+        throw new Error(`untrusted stopped artifact entry ${key}/${path}`);
+      }
+      if (childStat.isDirectory()) {
+        entries.push({ path, kind: 'directory', mode: childStat.mode & 0o777 });
+        await walk(childAbsolute, path);
+      } else {
+        entries.push({
+          path, kind: 'file', mode: childStat.mode & 0o777,
+          sha256: hash(await readFile(childAbsolute)),
+        });
+      }
+    }
+  };
+  await walk(absolute, '');
+  return { key, exists: true, kind: 'directory', mode, sha256: hash(JSON.stringify(entries)) };
+}
+
+function sameArtifact(left: StoppedArtifactFact, right: StoppedArtifactFact): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function stoppedSidecar(
+  path: string,
+  txId: string,
+  suffix: 'partial' | 'backup' | 'manifest' | 'backup-manifest',
+): string {
+  return join(dirname(path), `.${basename(path)}.tle-${txId}.${suffix}`);
+}
+
+async function syncDirectory(path: string): Promise<void> {
+  const handle = await open(path, 'r');
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function syncExistingDirectory(path: string): Promise<void> {
+  try {
+    await syncDirectory(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+}
+
+async function trustedArtifactParent(
+  root: string,
+  key: string,
+  create: boolean,
+): Promise<string | undefined> {
+  const parent = dirname(join(root, key));
+  const rel = relative(root, parent);
+  if (rel.startsWith('..') || isAbsolute(rel)) throw new Error('stopped artifact parent escapes root');
+  const rootStat = await lstat(root);
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+    throw new Error('stopped live root is untrusted');
+  }
+  let current = root;
+  for (const segment of rel === '' ? [] : rel.split(sep)) {
+    current = join(current, segment);
+    let stat;
+    try {
+      stat = await lstat(current);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      if (!create) return undefined;
+      await mkdir(current, { mode: 0o700 });
+      stat = await lstat(current);
+    }
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new Error('stopped artifact parent is untrusted');
+    }
+  }
+  return parent;
+}
+
+async function copyArtifact(source: string, destination: string, fact: StoppedArtifactFact): Promise<void> {
+  if (!fact.exists) throw new Error('cannot copy absent stopped artifact');
+  await cp(source, destination, {
+    recursive: fact.kind === 'directory',
+    errorOnExist: true,
+    force: false,
+    preserveTimestamps: false,
+  });
+  await chmod(destination, fact.mode);
+  const copied = await artifactFact(dirname(destination), basename(destination));
+  if (!sameArtifact({ ...copied, key: fact.key }, fact)) {
+    throw new Error(`stopped artifact copy mismatch ${fact.key}`);
+  }
+  await syncDirectory(dirname(destination));
+}
+
+async function writeArtifactManifest(path: string, fact: StoppedArtifactFact): Promise<void> {
+  const serialized = `${JSON.stringify(fact)}\n`;
+  let marker;
+  try {
+    marker = await open(path, 'wx', 0o600);
+    await marker.writeFile(serialized, 'utf8');
+    await marker.sync();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    if (await readFile(path, 'utf8') !== serialized) {
+      throw new Error('stale artifact manifest differs', { cause: error });
+    }
+  } finally {
+    await marker?.close();
+  }
+}
+
+async function readArtifactManifest(
+  path: string,
+  key: string,
+): Promise<StoppedArtifactFact | undefined> {
+  try {
+    const fact = JSON.parse(await readFile(path, 'utf8')) as StoppedArtifactFact;
+    if (!fact || typeof fact !== 'object' || fact.key !== key || typeof fact.exists !== 'boolean') {
+      throw new Error('artifact manifest identity mismatch');
+    }
+    return fact;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
   }
 }
 
@@ -450,7 +682,7 @@ export class PlatformMigrationService {
   ): MigrationExecutionSession {
     let lost = false;
     const renew = (
-      expected: readonly (typeof RECOVERABLE_PHASES)[number][],
+      expected: readonly (typeof OWNED_PHASES)[number][],
     ): InstanceNodeMigrationJournal => {
       if (lost) throw new RepoError('迁移执行租约所有权已变化');
       try {
@@ -472,7 +704,7 @@ export class PlatformMigrationService {
       () => {
         if (lost) return;
         try {
-          renew(RECOVERABLE_PHASES);
+          renew(OWNED_PHASES);
         } catch {
           lost = true;
         }
@@ -575,6 +807,20 @@ export class PlatformMigrationService {
     replaceRolledBackTxId?: string,
   ): Promise<PlatformMigrationResult> {
     this.o.gate.assertLease(lease, instanceId, ['platform-migration']);
+    if (initialFacts.needsEnvironmentRepair) {
+      if (!this.o.repair) {
+        throw controlled('preflight', 'container environment identity requires same-image repair');
+      }
+      await this.o.repair.recreateSameImageUnderLease(
+        instanceId, lease, 'environment-repair',
+      ).catch(() => {
+        throw controlled('preflight', 'same-image environment repair failed');
+      });
+      initialFacts = await this.preflight(instanceId);
+      if (initialFacts.needsEnvironmentRepair) {
+        throw controlled('preflight', 'container environment identity repair did not converge');
+      }
+    }
     await this.o.proxySessions.closeAndDrain(instanceId, { code: 1012, timeoutMs: 5_000 });
 
     // Proxy drain is the only mutation between the two passes. Re-read every mutable
@@ -633,6 +879,13 @@ export class PlatformMigrationService {
         ['preparing'], 'checkpointed',
       );
       await this.reachOwned(execution, 'checkpointed', 2);
+
+      if (!facts.inspection.running) {
+        failureCode = 'verification';
+        return await this.migrateStoppedInstance(
+          instanceId, lease, facts, txId, execution,
+        );
+      }
 
       failureCode = 'install';
       if (!facts.stagedBefore) {
@@ -728,6 +981,428 @@ export class PlatformMigrationService {
     }
   }
 
+  private probeAdminTarget(instanceId: string, handle: MigrationProbeHandle): AdminTarget {
+    const live = this.o.adminRuntime.target(instanceId);
+    return { ...live, upstream: handle.adminUpstream };
+  }
+
+  private async probeFlowIds(root: string): Promise<string[]> {
+    try {
+      const value = JSON.parse(await readFile(join(root, 'flows.json'), 'utf8'));
+      const ids = flowIds(value);
+      if (!ids) throw new Error('invalid probe flows');
+      return ids;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      throw controlled('verification', 'probe flow identity is invalid');
+    }
+  }
+
+  private async verifyProbePackageFiles(root: string): Promise<void> {
+    const json = async (path: string): Promise<Record<string, unknown>> => {
+      const parsed = JSON.parse(await readFile(join(root, path), 'utf8')) as unknown;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error(path);
+      return parsed as Record<string, unknown>;
+    };
+    try {
+      const edgePath = join('node_modules', ...PLATFORM_NODE_PACKAGE.name.split('/'));
+      const commonPath = join('node_modules', ...PLATFORM_COMMON_PACKAGE.name.split('/'));
+      const packageJson = await json('package.json');
+      const lock = await json('package-lock.json');
+      const edge = await json(join(edgePath, 'package.json'));
+      const common = await json(join(commonPath, 'package.json'));
+      const dependencies = packageJson['dependencies'] as Record<string, unknown> | undefined;
+      const packages = lock['packages'] as Record<string, Record<string, unknown>> | undefined;
+      const edgeLock = packages?.[edgePath];
+      const commonLock = packages?.[commonPath];
+      const lockRootDependencies = packages?.['']?.['dependencies'] as Record<string, unknown> | undefined;
+      const edgeDependencies = edge['dependencies'] as Record<string, unknown> | undefined;
+      const edgeLockDependencies = edgeLock?.['dependencies'] as Record<string, unknown> | undefined;
+      const nodeRed = edge['node-red'] as Record<string, unknown> | undefined;
+      const registrations = nodeRed?.['nodes'] as Record<string, unknown> | undefined;
+      const observedRegistrations = Object.entries(registrations ?? {}).sort(([a], [b]) => a.localeCompare(b));
+      const expectedRegistrations = PLATFORM_NODE_TYPES
+        .map((type) => [type, `${type}.js`] as const)
+        .sort(([a], [b]) => a.localeCompare(b));
+      if (
+        dependencies?.[PLATFORM_NODE_PACKAGE.name] !== PLATFORM_NODE_PACKAGE.version
+        || lockRootDependencies?.[PLATFORM_NODE_PACKAGE.name] !== PLATFORM_NODE_PACKAGE.version
+        || edge['name'] !== PLATFORM_NODE_PACKAGE.name
+        || edge['version'] !== PLATFORM_NODE_PACKAGE.version
+        || edgeDependencies?.[PLATFORM_COMMON_PACKAGE.name] !== PLATFORM_COMMON_PACKAGE.version
+        || JSON.stringify(observedRegistrations) !== JSON.stringify(expectedRegistrations)
+        || common['name'] !== PLATFORM_COMMON_PACKAGE.name
+        || common['version'] !== PLATFORM_COMMON_PACKAGE.version
+        || Object.prototype.hasOwnProperty.call(common, 'node-red')
+        || edgeLock?.['version'] !== PLATFORM_NODE_PACKAGE.version
+        || edgeLock?.['integrity'] !== PLATFORM_NODE_PACKAGE.integrity
+        || edgeLockDependencies?.[PLATFORM_COMMON_PACKAGE.name] !== PLATFORM_COMMON_PACKAGE.version
+        || commonLock?.['version'] !== PLATFORM_COMMON_PACKAGE.version
+        || commonLock?.['integrity'] !== PLATFORM_COMMON_PACKAGE.integrity
+      ) throw new Error('package identity');
+    } catch {
+      throw controlled('verification', 'probe package filesystem evidence is invalid');
+    }
+  }
+
+  private async exportStoppedProbe(root: string): Promise<StoppedArtifactFact[]> {
+    const facts: StoppedArtifactFact[] = [];
+    for (const key of STOPPED_EXPORT_PATHS) facts.push(await artifactFact(root, key));
+    return facts;
+  }
+
+  private artifactBarrierKey(key: string): NonNullable<
+    Parameters<PlatformNodeOperationBarrier['reach']>[0]['artifact']
+  > {
+    if (key.startsWith('settings.js')) return 'settings';
+    if (key.startsWith('package.json')) return 'package-manifest';
+    if (key.startsWith('package-lock.json')) return 'package-lock';
+    if (key.startsWith('.config.nodes.json')) return 'node-config';
+    if (key.startsWith('.config.modules.json')) return 'module-config';
+    if (key.includes(PLATFORM_NODE_PACKAGE.name)) return 'edge-module';
+    return 'common-module';
+  }
+
+  private async prepareStoppedPartials(
+    instanceId: string,
+    txId: string,
+    probeRoot: string,
+    facts: readonly StoppedArtifactFact[],
+  ): Promise<void> {
+    const liveRoot = join(this.o.instanceDataRoot, instanceId);
+    for (const fact of facts) {
+      if (!fact.exists) continue;
+      const target = join(liveRoot, fact.key);
+      const partial = stoppedSidecar(target, txId, 'partial');
+      const manifest = stoppedSidecar(target, txId, 'manifest');
+      await trustedArtifactParent(liveRoot, fact.key, true);
+      try {
+        const existing = await artifactFact(dirname(partial), basename(partial));
+        if (existing.exists) {
+          const normalized = { ...existing, key: fact.key } as StoppedArtifactFact;
+          if (!sameArtifact(normalized, fact)) throw new Error('stale stopped partial differs');
+        } else {
+          await copyArtifact(join(probeRoot, fact.key), partial, fact);
+        }
+        await writeArtifactManifest(manifest, fact);
+        await syncDirectory(dirname(target));
+      } catch {
+        throw controlled('cutover', `could not prepare stopped artifact ${fact.key}`);
+      }
+    }
+    for (const fact of facts) {
+      if (!sameArtifact(await artifactFact(probeRoot, fact.key), fact)) {
+        throw controlled('cutover', `probe artifact changed during export ${fact.key}`);
+      }
+    }
+  }
+
+  private async applyStoppedArtifacts(
+    execution: MigrationExecutionSession,
+    facts: readonly StoppedArtifactFact[],
+    startSequence: number,
+  ): Promise<number> {
+    const liveRoot = join(this.o.instanceDataRoot, execution.instanceId);
+    let sequence = startSequence;
+    for (const fact of facts) {
+      execution.renew(['cutover']);
+      const target = join(liveRoot, fact.key);
+      await trustedArtifactParent(liveRoot, fact.key, false);
+      const partial = stoppedSidecar(target, execution.txId, 'partial');
+      const backup = stoppedSidecar(target, execution.txId, 'backup');
+      const manifest = stoppedSidecar(target, execution.txId, 'manifest');
+      const backupManifest = stoppedSidecar(target, execution.txId, 'backup-manifest');
+      const live = await artifactFact(liveRoot, fact.key);
+      const backupFact = await artifactFact(dirname(backup), basename(backup));
+      if (backupFact.exists) throw controlled('cutover', `stopped backup already exists ${fact.key}`);
+
+      if (!fact.exists) {
+        if (!live.exists) continue;
+        await writeArtifactManifest(backupManifest, live);
+        await syncDirectory(dirname(target));
+        await rename(target, backup);
+        await syncDirectory(dirname(target));
+        await this.barrierOwned(execution, {
+          instanceId: execution.instanceId, txId: execution.txId, phase: 'cutover',
+          sequence: sequence++, artifact: this.artifactBarrierKey(fact.key),
+          boundary: 'after-live-backup',
+        });
+        continue;
+      }
+
+      if (live.exists && sameArtifact(live, fact)) {
+        await rm(partial, { recursive: true, force: true });
+        await rm(manifest, { force: true });
+        await syncDirectory(dirname(target));
+        continue;
+      }
+      if (live.exists) {
+        await writeArtifactManifest(backupManifest, live);
+        await syncDirectory(dirname(target));
+        await rename(target, backup);
+        await syncDirectory(dirname(target));
+        await this.barrierOwned(execution, {
+          instanceId: execution.instanceId, txId: execution.txId, phase: 'cutover',
+          sequence: sequence++, artifact: this.artifactBarrierKey(fact.key),
+          boundary: 'after-live-backup',
+        });
+      }
+      const targetAfterBackup = await artifactFact(liveRoot, fact.key);
+      if (targetAfterBackup.exists) {
+        throw controlled('cutover', `stopped target remained occupied ${fact.key}`);
+      }
+      await rename(partial, target);
+      await syncExistingDirectory(dirname(target));
+      await this.barrierOwned(execution, {
+        instanceId: execution.instanceId, txId: execution.txId, phase: 'cutover',
+        sequence: sequence++, artifact: this.artifactBarrierKey(fact.key),
+        boundary: 'after-live-rename',
+      });
+    }
+    for (const fact of facts) {
+      if (!sameArtifact(await artifactFact(liveRoot, fact.key), fact)) {
+        throw controlled('verification', `stopped live artifact mismatch ${fact.key}`);
+      }
+    }
+    return sequence;
+  }
+
+  private async restoreStoppedArtifacts(journal: InstanceNodeMigrationJournal): Promise<void> {
+    const liveRoot = join(this.o.instanceDataRoot, journal.instanceId);
+    for (const key of [...STOPPED_EXPORT_PATHS].reverse()) {
+      const target = join(liveRoot, key);
+      await trustedArtifactParent(liveRoot, key, false);
+      const partial = stoppedSidecar(target, journal.txId, 'partial');
+      const backup = stoppedSidecar(target, journal.txId, 'backup');
+      const manifest = stoppedSidecar(target, journal.txId, 'manifest');
+      const backupManifest = stoppedSidecar(target, journal.txId, 'backup-manifest');
+      const backupFact = await artifactFact(dirname(backup), basename(backup));
+      const partialFact = await artifactFact(dirname(partial), basename(partial));
+      const marker = await readArtifactManifest(manifest, key);
+      const priorMarker = await readArtifactManifest(backupManifest, key);
+      if (backupFact.exists) {
+        if (!priorMarker) throw new Error(`stopped backup owner missing ${key}`);
+        const normalized = { ...backupFact, key } as StoppedArtifactFact;
+        if (!sameArtifact(normalized, priorMarker)) {
+          throw new Error(`stopped backup owner mismatch ${key}`);
+        }
+      }
+      const live = await artifactFact(liveRoot, key);
+      if (backupFact.exists) {
+        if (live.exists && marker) {
+          if (!sameArtifact(live, marker)) throw new Error(`foreign live artifact ${key}`);
+          await rm(target, { recursive: true, force: false });
+        } else if (live.exists) {
+          // A deletion operation has no marker. Any replacement after its backup is foreign.
+          throw new Error(`occupied stopped restore target ${key}`);
+        }
+      } else if (marker && !partialFact.exists && live.exists) {
+        // No backup means the target was originally absent; a consumed partial plus
+        // exact marker proves this live value belongs to the interrupted tx.
+        if (!sameArtifact(live, marker)) throw new Error(`foreign live artifact ${key}`);
+        await rm(target, { recursive: true, force: false });
+      }
+      if (backupFact.exists) {
+        const afterRemoval = await artifactFact(liveRoot, key);
+        if (afterRemoval.exists) throw new Error(`stopped restore target occupied ${key}`);
+        await rename(backup, target);
+      }
+      await rm(partial, { recursive: true, force: true });
+      await rm(manifest, { force: true });
+      await rm(backupManifest, { force: true });
+      await syncExistingDirectory(dirname(target));
+    }
+    for (const parent of [
+      join(liveRoot, 'node_modules', '@mqttsnet'),
+      join(liveRoot, 'node_modules'),
+    ]) {
+      await rmdir(parent).catch((error: NodeJS.ErrnoException) => {
+        if (!['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes(error.code ?? '')) throw error;
+      });
+    }
+  }
+
+  private async cleanupStoppedEvidence(instanceId: string, txId: string): Promise<void> {
+    const liveRoot = join(this.o.instanceDataRoot, instanceId);
+    for (const key of STOPPED_EXPORT_PATHS) {
+      const target = join(liveRoot, key);
+      const partial = stoppedSidecar(target, txId, 'partial');
+      const backup = stoppedSidecar(target, txId, 'backup');
+      const manifest = stoppedSidecar(target, txId, 'manifest');
+      const backupManifest = stoppedSidecar(target, txId, 'backup-manifest');
+      const partialFact = await artifactFact(dirname(partial), basename(partial));
+      const backupFact = await artifactFact(dirname(backup), basename(backup));
+      if (partialFact.exists) {
+        const expected = await readArtifactManifest(manifest, key);
+        if (!expected || !sameArtifact({ ...partialFact, key } as StoppedArtifactFact, expected)) {
+          throw new Error(`stopped partial cleanup owner mismatch ${key}`);
+        }
+        await rm(partial, { recursive: true, force: false });
+      }
+      if (backupFact.exists) {
+        const expected = await readArtifactManifest(backupManifest, key);
+        if (!expected || !sameArtifact({ ...backupFact, key } as StoppedArtifactFact, expected)) {
+          throw new Error(`stopped backup cleanup owner mismatch ${key}`);
+        }
+        await rm(backup, { recursive: true, force: false });
+      }
+      await rm(manifest, { force: true });
+      await rm(backupManifest, { force: true });
+    }
+  }
+
+  private async migrateStoppedInstance(
+    instanceId: string,
+    lease: InstanceOperationLease,
+    facts: PreflightFacts,
+    txId: string,
+    execution: MigrationExecutionSession,
+  ): Promise<PlatformMigrationResult> {
+    const inst = this.o.repo.get(instanceId);
+    const journal = this.o.repo.nodeMigration(instanceId);
+    if (!inst || !journal || journal.txId !== txId || journal.originalRunning) {
+      throw controlled('state-inconsistent', 'stopped migration journal identity is invalid');
+    }
+    this.o.repo.transitionNodeMigrationExact(
+      instanceId, txId, execution.owner, this.executionRuntime.now(),
+      ['checkpointed'], 'staged',
+    );
+    await this.reachOwned(execution, 'staged', 3);
+    let handle: MigrationProbeHandle | undefined;
+    try {
+      handle = await this.o.docker.createMigrationProbe({
+        spec: {
+          id: instanceId,
+          imageTag: inst.imageTag,
+          memoryMb: inst.memLimit,
+          cpus: inst.cpuLimit,
+          ports: this.o.repo.ports(instanceId),
+          adminRoot: inst.adminRoot,
+          ingestToken: this.o.repo.ingestToken(instanceId),
+        },
+        txId,
+        imageId: facts.inspection.imageId,
+        checkpointDir: journal.checkpointDir,
+      });
+      const target = this.probeAdminTarget(instanceId, handle);
+      await this.o.admin.waitReadyAt(target);
+      this.o.platformPackages.verifyForInstall();
+      // The immutable checkpoint intentionally contains no node_modules directories.
+      // Always install into the isolated copy, even when production had a staged copy.
+      const installed = await this.o.admin.stagePlatformModuleAt(target);
+      assertHealthyPlatformModule(installed);
+      const settings = this.o.settings.renderNodeSettingsUnderLease(instanceId, lease, 'npm');
+      execution.renew(['staged']);
+      await this.o.docker.writeMigrationProbeSettings(handle, settings);
+      await this.barrierOwned(execution, {
+        instanceId, txId, phase: 'staged', sequence: 4, artifact: 'settings',
+        boundary: 'after-settings-write',
+      });
+      await this.o.docker.restartMigrationProbe(handle);
+      await this.o.admin.waitReadyAt(target);
+      assertNpmOwners(await this.o.admin.installedModulesAt(target));
+      await this.verifyProbePackageFiles(handle.dataRoot);
+      const expectedFlows = await this.probeFlowIds(handle.dataRoot);
+      const observedFlows = flowIds(await this.o.admin.currentFlowsAt(target));
+      if (!observedFlows || JSON.stringify(observedFlows) !== JSON.stringify(expectedFlows)) {
+        throw controlled('verification', 'probe Admin flow identity mismatch');
+      }
+      const exported = await this.exportStoppedProbe(handle.dataRoot);
+      await this.prepareStoppedPartials(instanceId, txId, handle.dataRoot, exported);
+      const cleanup = await this.o.docker.cleanupMigrationProbe(handle);
+      handle = undefined;
+      if (cleanup.residuals.length > 0) {
+        throw controlled('verification', 'probe resource cleanup left residuals');
+      }
+      this.o.repo.transitionNodeMigrationExact(
+        instanceId, txId, execution.owner, this.executionRuntime.now(),
+        ['staged'], 'cutover',
+      );
+      await this.reachOwned(execution, 'cutover', 5);
+      const nextSequence = await this.applyStoppedArtifacts(execution, exported, 6);
+      this.o.repo.parkNodeMigrationPendingStartExact(
+        instanceId, txId, execution.owner, this.executionRuntime.now(), 'cutover',
+      );
+      await this.reach(instanceId, txId, 'pending_start_verification', nextSequence);
+      return this.status(instanceId);
+    } finally {
+      if (handle) await this.o.docker.cleanupMigrationProbe(handle).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Explicit-start continuation for a parked stopped migration. The caller already
+   * owns the single start-instance gate lease; this method claims the exact pending
+   * tx before the one production start and never enters a public facade recursively.
+   */
+  async completePendingStartUnderLease(
+    instanceId: string,
+    lease: InstanceOperationLease,
+    actor: string,
+  ): Promise<PlatformMigrationResult> {
+    this.o.gate.assertLease(lease, instanceId, ['start-instance']);
+    const scanned = this.o.repo.nodeMigration(instanceId);
+    if (
+      !scanned
+      || scanned.operationKind !== 'migration'
+      || scanned.phase !== 'pending_start_verification'
+      || scanned.error !== 'none'
+      || scanned.originalRunning
+      || scanned.executionOwner !== ''
+      || scanned.executionLeaseExpiresAt !== 0
+    ) throw controlled('state-inconsistent', 'pending-start migration identity is invalid');
+    const owner = this.executionRuntime.executionOwner();
+    const claimed = this.o.repo.claimPendingStartExecutionExact(
+      instanceId,
+      scanned.txId,
+      owner,
+      this.executionRuntime.now(),
+      this.executionRuntime.leaseDurationMs,
+    );
+    if (!claimed) throw controlled('state-inconsistent', 'pending-start execution claim failed');
+    const execution = this.startExecutionSession(instanceId, scanned.txId, owner);
+    try {
+      execution.renew(['pending_start_verification']);
+      this.o.repo.transitionNodeMigrationExact(
+        instanceId, scanned.txId, owner, this.executionRuntime.now(),
+        ['pending_start_verification'], 'verifying',
+      );
+      await this.reachOwned(execution, 'verifying', 200);
+      execution.renew(['verifying']);
+      await this.o.docker.start(instanceId);
+      await this.o.adminRuntime.waitReady(instanceId, { timeoutMs: 30_000, intervalMs: 250 });
+      await this.verifyCutover(instanceId, this.o.repo.nodeMigration(instanceId)!);
+      execution.renew(['verifying']);
+      this.o.repo.commitNodeMigrationExact(
+        instanceId, scanned.txId, owner, this.executionRuntime.now(),
+        'verifying', PLATFORM_NODE_PACKAGE.version, actor,
+      );
+      await this.reach(instanceId, scanned.txId, 'committed', 201);
+      await this.cleanupStoppedEvidence(instanceId, scanned.txId);
+      await this.cleanupTerminal(instanceId, scanned.txId, 'committed', actor);
+      return this.status(instanceId);
+    } catch (error) {
+      const current = this.o.repo.nodeMigration(instanceId);
+      if (current?.txId === scanned.txId && current.phase === 'committed') {
+        return this.status(instanceId);
+      }
+      const cause = error instanceof PlatformMigrationError
+        ? error
+        : controlled('verification', 'pending-start verification failed');
+      const journal = this.o.repo.nodeMigration(instanceId);
+      if (
+        journal?.txId === scanned.txId
+        && journal.executionOwner === owner
+        && OWNED_PHASES.includes(journal.phase as (typeof OWNED_PHASES)[number])
+      ) {
+        return this.rollbackExactJournal(journal, cause, false, execution);
+      }
+      return this.status(instanceId);
+    } finally {
+      execution.stop();
+    }
+  }
+
   async rollback(instanceId: string, cause: unknown): Promise<PlatformMigrationResult> {
     const controlledCause = cause instanceof PlatformMigrationError
       ? cause
@@ -808,6 +1483,18 @@ export class PlatformMigrationService {
       );
       claimed = true;
       await this.reachOwned(execution, 'rolling_back', 100);
+      if (!journal.originalRunning) {
+        const cleanup = await this.o.docker.cleanupMigrationProbeByTx(
+          instanceId, journal.txId,
+        );
+        if (cleanup.residuals.length > 0) {
+          throw controlled('rollback', 'stopped probe cleanup left residuals');
+        }
+        execution.renew(['rolling_back']);
+        const current = await this.o.docker.inspectMigrationRuntime(instanceId);
+        if (current.running) await this.o.docker.stop(instanceId);
+        await this.restoreStoppedArtifacts(journal);
+      }
       if (installedByTx && !journal.stagedBefore) {
         cleanupDirty = await this.cleanupAttemptedInstall(instanceId, execution);
       }
@@ -905,6 +1592,9 @@ export class PlatformMigrationService {
   }
 
   async recoverInterrupted(): Promise<PlatformMigrationResult[]> {
+    if (this.o.bootstrapRecovery) {
+      await this.o.bootstrapRecovery.recoverInterruptedBootstraps();
+    }
     const results: PlatformMigrationResult[] = [];
     for (const journal of this.o.repo.nodeMigrations()) {
       if (journal.operationKind !== 'migration') continue;
@@ -1073,44 +1763,83 @@ export class PlatformMigrationService {
     } catch {
       throw controlled('preflight', 'managed container inspection failed');
     }
-    if (!inspection.running) throw controlled('preflight', 'Task 8 requires an originally running instance');
     if (!IMAGE_ID.test(inspection.imageId)) throw controlled('preflight', 'immutable image id is missing or invalid');
     const expected = this.o.docker.expectedMigrationEnvironment();
     const environment = exactEnvironment(inspection.environment);
-    if (
+    const needsEnvironmentRepair = (
       !expected.managerUrl
       || normalizeManagerUrl(environment.get('TLE_MANAGER_URL') ?? '')
         !== normalizeManagerUrl(expected.managerUrl)
-    ) throw controlled('preflight', 'normalized Manager URL identity mismatch');
+      || !expected.npmRegistry
+      || environment.get('NPM_CONFIG_REGISTRY') !== expected.npmRegistry
+      || environment.get('TLE_INSTANCE_ID') !== instanceId
+      || !safeDigestEqual(
+        environment.get('TLE_INGEST_TOKEN'),
+        this.o.repo.ingestToken(instanceId),
+      )
+    );
+    if (needsEnvironmentRepair && !this.o.repair) {
+      throw controlled('preflight', 'container environment identity mismatch');
+    }
     if (
       !expected.npmRegistry
-      || environment.get('NPM_CONFIG_REGISTRY') !== expected.npmRegistry
-    ) throw controlled('preflight', 'private registry identity mismatch');
-    if (environment.get('TLE_INSTANCE_ID') !== instanceId) {
-      throw controlled('preflight', 'container instance identity mismatch');
-    }
-    if (!safeDigestEqual(
-      environment.get('TLE_INGEST_TOKEN'),
-      this.o.repo.ingestToken(instanceId),
-    )) throw controlled('preflight', 'container ingest token digest mismatch');
+    ) throw controlled('preflight', 'private registry identity is not configured');
 
     const legacyManifest = await this.verifyLegacyFiles(instanceId);
-    let modules: InstalledModule[];
-    try {
-      modules = await this.o.admin.installedModules(instanceId);
-    } catch {
-      throw controlled('preflight', 'Admin inventory preflight failed');
-    }
-    assertRawOwners(modules);
-    const platformModules = modules.filter((module) => module.module === PLATFORM_NODE_PACKAGE.name);
-    if (platformModules.length > 1) {
-      throw controlled('preflight', 'preexisting platform package inventory is ambiguous');
-    }
-    const stagedBefore = platformModules.length === 1;
     const footprint = await this.platformFootprint(instanceId);
+    let stagedBefore: boolean;
+    let nodeInventorySha256: string;
+    let preflightFlowIdentity: string;
+    if (inspection.running) {
+      let modules: InstalledModule[];
+      try {
+        modules = await this.o.admin.installedModules(instanceId);
+      } catch {
+        throw controlled('preflight', 'Admin inventory preflight failed');
+      }
+      assertRawOwners(modules);
+      const platformModules = modules.filter(
+        (module) => module.module === PLATFORM_NODE_PACKAGE.name,
+      );
+      if (platformModules.length > 1) {
+        throw controlled('preflight', 'preexisting platform package inventory is ambiguous');
+      }
+      stagedBefore = platformModules.length === 1;
+      if (stagedBefore) {
+        assertStagedEvidence(platformModules[0]!);
+        if (!footprint) throw controlled('preflight', 'preexisting platform package is partial on disk');
+      } else if (footprint) {
+        throw controlled('preflight', 'partial platform package files exist without Admin inventory');
+      }
+      try {
+        const expectedFlowIds = await this.liveFlowIds(instanceId, 'preflight');
+        const observedFlowIds = flowIds(await this.o.admin.currentFlows(instanceId));
+        if (!observedFlowIds || JSON.stringify(observedFlowIds) !== JSON.stringify(expectedFlowIds)) {
+          throw controlled('preflight', 'Admin flow ids do not match flows.json');
+        }
+        preflightFlowIdentity = hash(JSON.stringify(expectedFlowIds));
+      } catch (error) {
+        if (error instanceof PlatformMigrationError) throw error;
+        throw controlled('preflight', 'existing flow preflight failed');
+      }
+      nodeInventorySha256 = hash(stableInventory(modules));
+    } else {
+      stagedBefore = footprint;
+      if (stagedBefore) {
+        await verifyInstalledPlatformFiles({
+          instanceDataRoot: this.o.instanceDataRoot,
+          instanceId,
+          readFile,
+        }).catch(() => {
+          throw controlled('preflight', 'stopped preexisting platform package is partial on disk');
+        });
+      }
+      preflightFlowIdentity = hash(JSON.stringify(
+        await this.liveFlowIds(instanceId, 'preflight'),
+      ));
+      nodeInventorySha256 = hash(JSON.stringify({ stopped: true, stagedBefore }));
+    }
     if (stagedBefore) {
-      assertStagedEvidence(platformModules[0]!);
-      if (!footprint) throw controlled('preflight', 'preexisting platform package is partial on disk');
       await verifyInstalledPlatformFiles({
         instanceDataRoot: this.o.instanceDataRoot,
         instanceId,
@@ -1118,21 +1847,6 @@ export class PlatformMigrationService {
       }).catch(() => {
         throw controlled('preflight', 'preexisting platform package integrity is invalid');
       });
-    } else if (footprint) {
-      throw controlled('preflight', 'partial platform package files exist without Admin inventory');
-    }
-
-    let preflightFlowIdentity: string;
-    try {
-      const expectedFlowIds = await this.liveFlowIds(instanceId, 'preflight');
-      const observedFlowIds = flowIds(await this.o.admin.currentFlows(instanceId));
-      if (!observedFlowIds || JSON.stringify(observedFlowIds) !== JSON.stringify(expectedFlowIds)) {
-        throw controlled('preflight', 'Admin flow ids do not match flows.json');
-      }
-      preflightFlowIdentity = hash(JSON.stringify(expectedFlowIds));
-    } catch (error) {
-      if (error instanceof PlatformMigrationError) throw error;
-      throw controlled('preflight', 'existing flow preflight failed');
     }
     const snapshot: MigrationNodeMigrationSnapshot = {
       version: 1,
@@ -1143,9 +1857,13 @@ export class PlatformMigrationService {
       packageManifest: await this.fileFact(instanceId, 'package.json'),
       lock: await this.fileFact(instanceId, 'package-lock.json'),
       legacyManifestSha256: hash(legacyManifest),
-      nodeInventorySha256: hash(stableInventory(modules)),
+      nodeInventorySha256,
     };
-    return { inspection, snapshot, stagedBefore, flowIdentity: preflightFlowIdentity };
+    return {
+      inspection, snapshot, stagedBefore,
+      flowIdentity: preflightFlowIdentity,
+      needsEnvironmentRepair,
+    };
   }
 
   private async verifyLegacyFiles(instanceId: string): Promise<string> {

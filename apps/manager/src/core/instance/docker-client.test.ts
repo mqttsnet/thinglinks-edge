@@ -19,6 +19,14 @@ import {
   type DockerClientOptions,
 } from './docker-client.ts';
 import { BOOTSTRAP_TX_LABEL } from './container-spec.ts';
+import {
+  MIGRATION_PROBE_LABEL,
+  MIGRATION_TX_LABEL,
+  migrationProbeDataDir,
+  migrationProbeName,
+  migrationProbeNetworkName,
+} from './container-spec.ts';
+import { MigrationCheckpointStore } from '../nodes/migration-checkpoint.ts';
 
 const roots: string[] = [];
 after(() => {
@@ -121,6 +129,155 @@ test('migration inspection returns immutable running and environment evidence on
     () => f.docker.inspectMigrationRuntime('line-a'),
     /归属|managed|owner/i,
   );
+});
+
+test('same-image recreate uses the immutable image id and preserves stopped state without a host-side reconstruction', async () => {
+  const f = fixture();
+  const raw = rawOf(f.docker);
+  const calls: string[] = [];
+  const imageId = `sha256:${'a'.repeat(64)}`;
+  let created: Record<string, unknown> | undefined;
+  raw.getImage = (ref: string) => ({
+    inspect: async () => { calls.push(`image:${ref}`); return {}; },
+  });
+  raw.listNetworks = async () => [{ Name: 'test-edge-line-a', Id: 'network-id' }];
+  raw.getNetwork = () => ({
+    inspect: async () => ({
+      Id: 'network-id',
+      Labels: { [MANAGED_LABEL]: 'true', [instanceLabel]: 'line-a' },
+      Containers: {},
+    }),
+  });
+  raw.createContainer = async (options: Record<string, unknown>) => {
+    created = options;
+    return { putArchive: async () => { calls.push('settings'); } };
+  };
+  f.docker.remove = async (id) => { calls.push(`remove:${id}`); };
+  f.docker.start = async (id) => { calls.push(`start:${id}`); };
+
+  await f.docker.recreateInstance({
+    spec: {
+      id: 'line-a', imageTag: '5.0.4-24-minimal', memoryMb: 768, cpus: 0.75,
+      ports: [{ hostPort: 30005, containerPort: 502, protocol: 'tcp', hostIp: '127.0.0.1' }],
+      adminRoot: '/red/line-a/', ingestToken: 'opaque-token',
+    },
+    settingsJs: 'module.exports = {};',
+    runtimeMode: 'npm',
+    imageId,
+    running: false,
+  });
+
+  assert.equal(created?.['Image'], imageId);
+  assert.equal((created?.['HostConfig'] as Record<string, unknown>)['Memory'], 768 * 1024 * 1024);
+  assert.deepEqual(calls, [`image:${imageId}`, `remove:line-a`, 'settings']);
+});
+
+test('same-image recreate starts exactly once only when the captured original state was running', async () => {
+  const f = fixture();
+  const raw = rawOf(f.docker);
+  const imageId = `sha256:${'b'.repeat(64)}`;
+  const calls: string[] = [];
+  raw.getImage = () => ({ inspect: async () => ({}) });
+  raw.listNetworks = async () => [{ Name: 'test-edge-line-a', Id: 'network-id' }];
+  raw.getNetwork = () => ({
+    inspect: async () => ({
+      Id: 'network-id',
+      Labels: { [MANAGED_LABEL]: 'true', [instanceLabel]: 'line-a' },
+      Containers: {},
+    }),
+  });
+  raw.createContainer = async () => ({ putArchive: async () => undefined });
+  f.docker.remove = async () => { calls.push('remove'); };
+  f.docker.start = async () => { calls.push('start'); };
+
+  await f.docker.recreateInstance({
+    spec: {
+      id: 'line-a', imageTag: '5.0.4-24-minimal', memoryMb: 512, cpus: 0.5,
+      ports: [], adminRoot: '/red/line-a/',
+    },
+    settingsJs: 'module.exports = {};', runtimeMode: 'legacy', imageId, running: true,
+  });
+  assert.deepEqual(calls, ['remove', 'start']);
+});
+
+test('stopped probe restores only immutable checkpoint files and owns exact container/network/work root', async () => {
+  const f = fixture({ managerContainer: 'manager-ref' });
+  const root = dirname(f.legacyDir);
+  const txId = 'tx-probe-01';
+  const live = join(root, 'line-a');
+  mkdirSync(live, { recursive: true });
+  writeFileSync(join(live, 'settings.js'), 'checkpoint-settings', { mode: 0o600 });
+  writeFileSync(join(live, 'package.json'), '{"name":"line-a"}\n', { mode: 0o640 });
+  writeFileSync(join(live, 'not-allowlisted.txt'), 'must-not-copy');
+  await new MigrationCheckpointStore(root).create('line-a', txId);
+
+  const raw = rawOf(f.docker);
+  let networkOptions: Record<string, unknown> | undefined;
+  let containerOptions: Record<string, unknown> | undefined;
+  let connected = '';
+  let started = 0;
+  let containerExists = true;
+  let networkExists = true;
+  raw.getImage = () => ({ inspect: async () => ({}) });
+  raw.createNetwork = async (options: Record<string, unknown>) => {
+    networkOptions = options;
+    return { id: 'probe-network-id' };
+  };
+  raw.createContainer = async (options: Record<string, unknown>) => {
+    containerOptions = options;
+    return { id: 'probe-container-id', start: async () => { started += 1; } };
+  };
+  raw.getContainer = (ref: string) => ({
+    inspect: async () => {
+      if (ref === 'manager-ref') return { Id: 'manager-id' };
+      if (!containerExists) throw missing();
+      return { Id: ref, Config: { Labels: containerOptions?.['Labels'] } };
+    },
+    remove: async () => { containerExists = false; },
+  });
+  raw.getNetwork = () => ({
+    inspect: async () => {
+      if (!networkExists) throw missing();
+      return {
+        Id: 'probe-network-id', Labels: networkOptions?.['Labels'], Containers: {},
+      };
+    },
+    connect: async ({ Container }: { Container: string }) => { connected = Container; },
+    disconnect: async () => undefined,
+    remove: async () => { networkExists = false; },
+  });
+
+  const handle = await f.docker.createMigrationProbe({
+    spec: {
+      id: 'line-a', imageTag: '5.0.4-24-minimal', memoryMb: 512, cpus: 0.5,
+      ports: [{ hostPort: 30001, containerPort: 1883, protocol: 'tcp', hostIp: '127.0.0.1' }],
+      adminRoot: '/red/line-a/', ingestToken: 'opaque-token',
+    },
+    txId,
+    imageId: `sha256:${'e'.repeat(64)}`,
+    checkpointDir: `.thinglinks-migration/line-a/${txId}`,
+  });
+
+  const probeRoot = migrationProbeDataDir(root, 'line-a', txId);
+  assert.equal(handle.containerId, 'probe-container-id');
+  assert.equal(handle.networkId, 'probe-network-id');
+  assert.equal(handle.containerName, migrationProbeName('line-a', txId));
+  assert.equal(handle.networkName, migrationProbeNetworkName('line-a', txId));
+  assert.equal(readFileSync(join(probeRoot, 'settings.js'), 'utf8'), 'checkpoint-settings');
+  assert.equal(existsSync(join(probeRoot, 'not-allowlisted.txt')), false);
+  assert.equal(containerOptions?.['name'], migrationProbeName('line-a', txId));
+  assert.equal(containerOptions?.['Image'], `sha256:${'e'.repeat(64)}`);
+  assert.deepEqual((containerOptions?.['HostConfig'] as Record<string, unknown>)['PortBindings'], {});
+  assert.equal((containerOptions?.['Labels'] as Record<string, unknown>)[MIGRATION_TX_LABEL], txId);
+  assert.equal((networkOptions?.['Labels'] as Record<string, unknown>)[MIGRATION_PROBE_LABEL], 'true');
+  assert.equal(networkOptions?.['Internal'], true);
+  assert.equal(connected, 'manager-id');
+  assert.equal(started, 1);
+
+  assert.deepEqual(await f.docker.cleanupMigrationProbe(handle), { residuals: [] });
+  assert.equal(containerExists, false);
+  assert.equal(networkExists, false);
+  assert.equal(existsSync(probeRoot), false);
 });
 
 test('npm-mode data preparation never copies legacy raw nodes', async () => {

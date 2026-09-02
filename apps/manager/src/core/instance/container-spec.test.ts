@@ -2,6 +2,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   assertValidId, assertValidSpec, buildCreateOptions, assertSafeCreateOptions,
+  buildMigrationProbeCreateOptions, assertSafeMigrationProbeOptions,
+  migrationProbeDataDir, migrationProbeName, migrationProbeNetworkName,
+  MIGRATION_TX_LABEL, MIGRATION_PROBE_LABEL,
   SpecError, containerName, instanceDataDir, BOOTSTRAP_TX_LABEL, type InstanceSpec,
 } from './container-spec.ts';
 
@@ -68,6 +71,77 @@ test('bootstrap container gets the exact tx owner label while ordinary rebuilds 
     'bootstrap-tx-01',
   );
   guard(bootstrap);
+});
+
+test('same-image rebuild pins only a lowercase sha256 immutable image id', () => {
+  const imageId = `sha256:${'a'.repeat(64)}`;
+  const rebuilt = buildCreateOptions(spec(), {
+    network: 'tle-net', imageRepo: 'nodered/node-red',
+    instanceDataRoot: DATA_ROOT, timezone: 'Asia/Shanghai',
+    imageIdOverride: imageId,
+  });
+  assert.equal(rebuilt['Image'], imageId);
+  guard(rebuilt);
+
+  for (const bad of [
+    'sha256:short',
+    `sha256:${'A'.repeat(64)}`,
+    `nodered/node-red:${'a'.repeat(64)}`,
+    `${'a'.repeat(64)}`,
+  ]) {
+    assert.throws(() => buildCreateOptions(spec(), {
+      network: 'tle-net', imageRepo: 'nodered/node-red',
+      instanceDataRoot: DATA_ROOT, timezone: 'Asia/Shanghai',
+      imageIdOverride: bad,
+    }), SpecError, bad);
+  }
+});
+
+test('stopped migration probe has deterministic tx ownership, immutable image, and no host port', () => {
+  const txId = 'migration-tx-01';
+  const imageId = `sha256:${'c'.repeat(64)}`;
+  const options = buildMigrationProbeCreateOptions(spec(), {
+    instanceDataRoot: DATA_ROOT,
+    imageRepo: 'nodered/node-red',
+    timezone: 'Asia/Shanghai',
+    txId,
+    imageId,
+    networkId: 'probe-network-immutable-id',
+  });
+  const labels = options['Labels'] as Record<string, unknown>;
+  const host = options['HostConfig'] as Record<string, unknown>;
+  assert.equal(options['name'], migrationProbeName('line-a', txId));
+  assert.equal(options['Image'], imageId);
+  assert.equal(labels[MIGRATION_TX_LABEL], txId);
+  assert.equal(labels[MIGRATION_PROBE_LABEL], 'true');
+  assert.deepEqual(host['Binds'], [`${migrationProbeDataDir(DATA_ROOT, 'line-a', txId)}:/data`]);
+  assert.equal(host['NetworkMode'], 'probe-network-immutable-id');
+  assert.deepEqual(host['PortBindings'], {});
+  assert.deepEqual(options['ExposedPorts'], {});
+  assertSafeMigrationProbeOptions(options, { instanceDataRoot: DATA_ROOT, instanceId: 'line-a', txId });
+  assert.notEqual(migrationProbeNetworkName('line-a', txId), migrationProbeName('line-a', txId));
+});
+
+test('probe spec rejects path/tx/image tampering and an injected host port', () => {
+  const txId = 'migration-tx-01';
+  const options = buildMigrationProbeCreateOptions(spec(), {
+    instanceDataRoot: DATA_ROOT,
+    imageRepo: 'nodered/node-red',
+    timezone: 'Asia/Shanghai',
+    txId,
+    imageId: `sha256:${'d'.repeat(64)}`,
+    networkId: 'probe-network-immutable-id',
+  });
+  ((options['HostConfig'] as Record<string, unknown>)['PortBindings'] as Record<string, unknown>)['1880/tcp'] = [
+    { HostIp: '0.0.0.0', HostPort: '1880' },
+  ];
+  assert.throws(
+    () => assertSafeMigrationProbeOptions(options, {
+      instanceDataRoot: DATA_ROOT, instanceId: 'line-a', txId,
+    }),
+    SpecError,
+  );
+  assert.throws(() => migrationProbeDataDir(DATA_ROOT, 'line-a', '../escape'), SpecError);
 });
 
 test('1880 绝不映射宿主 —— 唯一入口必须是 Manager 反代', () => {

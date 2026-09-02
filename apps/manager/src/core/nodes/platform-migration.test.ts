@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
   existsSync,
+  cpSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -28,7 +29,7 @@ import {
 } from '../instance/operation-gate.ts';
 import { ProxySessionRegistry } from '../instance/proxy-session-registry.ts';
 import type { InstanceAdminRuntime } from '../instance/admin-runtime.ts';
-import type { InstalledModule } from '../flows/admin-client.ts';
+import type { AdminTarget, InstalledModule } from '../flows/admin-client.ts';
 import { renderSettings } from '../instance/settings-template.ts';
 import type { PlatformNodeOperationBarrier } from './platform-operation-barrier.ts';
 import {
@@ -258,6 +259,8 @@ function removeInstalledPackage(instanceRoot: string): void {
 interface RuntimeState {
   cutover: boolean;
   staged: boolean;
+  probeRoot?: string;
+  probeCutover?: boolean;
 }
 
 class FakeDocker implements PlatformMigrationDocker {
@@ -272,6 +275,7 @@ class FakeDocker implements PlatformMigrationDocker {
   inspectCalls = 0;
   afterRestart: (() => void) | undefined;
   afterStart: (() => void) | undefined;
+  afterProbeRestart: ((probeRoot: string) => void) | undefined;
   private readonly instanceRoot: string;
   private readonly state: RuntimeState;
 
@@ -331,6 +335,59 @@ class FakeDocker implements PlatformMigrationDocker {
     const settings = readFileSync(join(this.instanceRoot, 'settings.js'), 'utf8');
     this.state.cutover = LEGACY_RUNTIME_EXCLUDES.every((file) => settings.includes(file));
     this.afterStart?.();
+  }
+
+  async createMigrationProbe(input: Parameters<PlatformMigrationDocker['createMigrationProbe']>[0]) {
+    this.runtimeCalls.push('probe-create');
+    const root = dirname(this.instanceRoot);
+    const dataRoot = join(root, '.thinglinks-probes', input.spec.id, input.txId);
+    const checkpoint = join(root, input.checkpointDir);
+    mkdirSync(dataRoot, { recursive: true });
+    const manifest = JSON.parse(readFileSync(join(checkpoint, 'manifest.json'), 'utf8')) as {
+      files: Array<{ path: string; exists: boolean }>;
+    };
+    for (const fact of manifest.files) {
+      if (fact.exists) cpSync(join(checkpoint, 'files', fact.path), join(dataRoot, fact.path));
+    }
+    writeFileSync(join(dataRoot, '.thinglinks-probe-owner'), input.txId);
+    this.state.probeRoot = dataRoot;
+    this.state.probeCutover = false;
+    return {
+      instanceId: input.spec.id,
+      txId: input.txId,
+      containerId: 'probe-container-id',
+      networkId: 'probe-network-id',
+      containerName: `tle-nr-migrate-${input.spec.id}-fake`,
+      networkName: `tle-nr-migrate-${input.spec.id}-fake-net`,
+      dataRoot,
+      adminUpstream: `http://tle-nr-migrate-${input.spec.id}-fake:1880`,
+    };
+  }
+
+  async writeMigrationProbeSettings(_handle: unknown, settings: string): Promise<void> {
+    this.runtimeCalls.push('probe-write-settings');
+    assert.ok(this.state.probeRoot);
+    writeFileSync(join(this.state.probeRoot, 'settings.js'), settings, { mode: 0o600 });
+  }
+
+  async restartMigrationProbe(): Promise<void> {
+    this.runtimeCalls.push('probe-restart');
+    this.state.probeCutover = true;
+    if (this.state.probeRoot) this.afterProbeRestart?.(this.state.probeRoot);
+  }
+
+  async cleanupMigrationProbe(): Promise<{ residuals: [] }> {
+    this.runtimeCalls.push('probe-cleanup');
+    if (this.state.probeRoot) rmSync(this.state.probeRoot, { recursive: true, force: true });
+    this.state.probeRoot = undefined;
+    return { residuals: [] };
+  }
+
+  async cleanupMigrationProbeByTx(): Promise<{ residuals: [] }> {
+    this.runtimeCalls.push('probe-recovery-cleanup');
+    if (this.state.probeRoot) rmSync(this.state.probeRoot, { recursive: true, force: true });
+    this.state.probeRoot = undefined;
+    return { residuals: [] };
   }
 }
 
@@ -419,6 +476,27 @@ class FakeAdminActions implements PlatformMigrationAdminActions {
     }
     return this.flowValue;
   }
+
+  async waitReadyAt(): Promise<void> {}
+
+  async installedModulesAt(_target: AdminTarget): Promise<InstalledModule[]> {
+    if (!this.state.probeRoot) throw new Error('probe root missing');
+    return this.state.staged ? [builtinInventory(), healthyPlatformInventory()] : [builtinInventory()];
+  }
+
+  async stagePlatformModuleAt(_target: AdminTarget): Promise<InstalledModule> {
+    this.installCalls += 1;
+    if (!this.state.probeRoot) throw new Error('probe root missing');
+    writeInstalledPackage(this.state.probeRoot);
+    this.state.staged = true;
+    return healthyPlatformInventory();
+  }
+
+  async currentFlowsAt(_target: AdminTarget): Promise<unknown> {
+    if (!this.state.probeRoot) throw new Error('probe root missing');
+    const path = join(this.state.probeRoot, 'flows.json');
+    return existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : [];
+  }
 }
 
 class FakePackageVerifier implements PlatformPackageInstallVerifier {
@@ -495,6 +573,9 @@ interface FixtureOptions {
     boundary: string;
   }) => void | Promise<void>) | undefined;
   onProxyClose?: (() => void) | undefined;
+  enableRepair?: boolean;
+  repairFailure?: boolean;
+  onBootstrapRecovery?: (() => Promise<void> | void) | undefined;
 }
 
 function migrationFixture(options: FixtureOptions = {}) {
@@ -534,6 +615,7 @@ function migrationFixture(options: FixtureOptions = {}) {
   const time = new ManualMigrationTime();
   const proxySessions = new ProxySessionRegistry();
   const events: string[] = [];
+  const barrierEvents: Parameters<PlatformNodeOperationBarrier['reach']>[0][] = [];
   const controls: {
     barrierFailure: FixtureOptions['barrierFailure'];
     cleanupFailure: boolean;
@@ -574,6 +656,7 @@ function migrationFixture(options: FixtureOptions = {}) {
   const barrier: PlatformNodeOperationBarrier = {
     async reach(event) {
       assert.equal(repo.nodeMigration(event.instanceId)?.phase, event.phase);
+      barrierEvents.push({ ...event });
       events.push(`barrier:${event.phase}:${event.boundary}`);
       await options.onBarrier?.({ phase: event.phase, boundary: event.boundary });
       if (
@@ -597,6 +680,36 @@ function migrationFixture(options: FixtureOptions = {}) {
     platformPackages: packages,
     checkpoint,
     settings: new FakeSettings(selectedGate),
+    ...(options.enableRepair ? {
+      repair: {
+        recreateSameImageUnderLease: async (
+          instanceId: string,
+          lease: InstanceOperationLease,
+        ) => {
+          selectedGate.assertLease(lease, instanceId, ['platform-migration']);
+          events.push('same-image-rebuild');
+          docker.runtimeCalls.push('same-image-rebuild');
+          if (options.repairFailure) throw new Error('TLE_INGEST_TOKEN=must-not-escape');
+          docker.inspection = {
+            ...docker.inspection,
+            environment: [
+              `TLE_INSTANCE_ID=${instanceId}`,
+              `TLE_MANAGER_URL=${docker.expected.managerUrl}`,
+              `TLE_INGEST_TOKEN=${token}`,
+              `NPM_CONFIG_REGISTRY=${docker.expected.npmRegistry}`,
+            ],
+          };
+        },
+      },
+    } : {}),
+    ...(options.onBootstrapRecovery ? {
+      bootstrapRecovery: {
+        recoverInterruptedBootstraps: async () => {
+          events.push('bootstrap-recovery');
+          await options.onBootstrapRecovery?.();
+        },
+      },
+    } : {}),
     barrier,
     instanceDataRoot: root,
     txId: () => txId,
@@ -624,6 +737,7 @@ function migrationFixture(options: FixtureOptions = {}) {
     checkpoint: realCheckpoint,
     proxySessions,
     events,
+    barrierEvents,
     controls,
     checkpointPort: checkpoint,
     createService,
@@ -636,13 +750,14 @@ async function interruptedMigration(
   txId: string,
   phase: Exclude<NodeMigrationState, 'idle' | 'committed' | 'rolled_back' | 'rolled_back_dirty' | 'manual_required'>,
   execution?: { owner: string; expiresAt: number },
+  originalRunning = true,
 ): Promise<void> {
   f.repo.beginNodeMigration({
     instanceId: 'line-a',
     txId,
     operationKind: 'migration',
     phase: 'preparing',
-    originalRunning: true,
+    originalRunning,
     stagedBefore: false,
     modeBefore: 'legacy',
     imageIdBefore: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
@@ -665,6 +780,7 @@ async function interruptedMigration(
       executionLeaseExpiresAt: execution.expiresAt,
     } : {}),
   });
+  f.docker.inspection = { ...f.docker.inspection, running: originalRunning };
   if (phase !== 'preparing') {
     await f.checkpoint.create('line-a', txId);
     f.repo.updateNodeMigration('line-a', phase);
@@ -749,7 +865,7 @@ test('rejects mutable image tags during read-only preflight without draining edi
   assert.equal(f.repo.nodeMigration('line-a'), undefined);
 });
 
-test('environment identity, running state, token digest, third-party ownership, and staged identity fail closed', async () => {
+test('environment identity, token digest, third-party ownership, and staged identity fail closed', async () => {
   const cases: Array<{
     name: string;
     mutate: (f: ReturnType<typeof migrationFixture>) => void;
@@ -770,9 +886,6 @@ test('environment identity, running state, token digest, third-party ownership, 
     { name: 'token', mutate: (f) => {
       f.docker.inspection.environment = f.docker.inspection.environment
         .map((entry) => entry.startsWith('TLE_INGEST_TOKEN=') ? 'TLE_INGEST_TOKEN=wrong-token' : entry);
-    } },
-    { name: 'stopped', mutate: (f) => {
-      f.docker.inspection = { ...f.docker.inspection, running: false };
     } },
     { name: 'third-party owner', mutate: (f) => {
       f.admin.beforeModules.push({
@@ -807,6 +920,60 @@ test('environment identity, running state, token digest, third-party ownership, 
     assert.deepEqual(f.docker.runtimeCalls, [], item.name);
     assert.equal(f.admin.installCalls, 0, item.name);
     assert.equal(f.repo.nodeMigration('line-a'), undefined, item.name);
+  }
+});
+
+test('every missing or wrong managed environment identity repairs once before migration side effects', async () => {
+  const mutations: Array<[string, (environment: string[]) => string[]]> = [
+    ['manager missing', (env) => env.filter((entry) => !entry.startsWith('TLE_MANAGER_URL='))],
+    ['manager wrong', (env) => env.map((entry) => entry.startsWith('TLE_MANAGER_URL=')
+      ? 'TLE_MANAGER_URL=http://wrong.invalid/' : entry)],
+    ['registry missing', (env) => env.filter((entry) => !entry.startsWith('NPM_CONFIG_REGISTRY='))],
+    ['registry wrong', (env) => env.map((entry) => entry.startsWith('NPM_CONFIG_REGISTRY=')
+      ? 'NPM_CONFIG_REGISTRY=http://wrong.invalid/npm/' : entry)],
+    ['instance missing', (env) => env.filter((entry) => !entry.startsWith('TLE_INSTANCE_ID='))],
+    ['instance wrong', (env) => env.map((entry) => entry.startsWith('TLE_INSTANCE_ID=')
+      ? 'TLE_INSTANCE_ID=line-b' : entry)],
+    ['token missing', (env) => env.filter((entry) => !entry.startsWith('TLE_INGEST_TOKEN='))],
+    ['token wrong', (env) => env.map((entry) => entry.startsWith('TLE_INGEST_TOKEN=')
+      ? 'TLE_INGEST_TOKEN=raw-wrong-token' : entry)],
+  ];
+  for (const originalRunning of [true, false]) {
+    for (const [name, mutate] of mutations) {
+      const f = migrationFixture({ originalRunning, enableRepair: true });
+      f.docker.inspection.environment = mutate(f.docker.inspection.environment);
+
+      const result = await f.service.migrate('line-a', 'admin');
+
+      assert.equal(
+        result.phase,
+        originalRunning ? 'committed' : 'pending_start_verification',
+        `${name}/${originalRunning ? 'running' : 'stopped'}`,
+      );
+      assert.equal(f.events.filter((event) => event === 'same-image-rebuild').length, 1);
+      assert.ok(f.events.indexOf('same-image-rebuild') < f.events.indexOf('proxy-close:1012'));
+      assert.doesNotMatch(
+        JSON.stringify(f.db.prepare('SELECT * FROM instance_node_migration').all()),
+        /raw-wrong-token|db-ingest-token-value|TLE_INGEST_TOKEN/,
+      );
+    }
+  }
+});
+
+test('failed environment repair performs no migration side effect and preserves running or stopped state', async () => {
+  for (const originalRunning of [true, false]) {
+    const f = migrationFixture({ originalRunning, enableRepair: true, repairFailure: true });
+    f.docker.inspection.environment = ['TLE_INSTANCE_ID=wrong-instance'];
+    await assert.rejects(
+      () => f.service.migrate('line-a', 'admin'),
+      (error: unknown) => error instanceof PlatformMigrationError
+        && error.code === 'preflight'
+        && !/must-not-escape|TLE_INGEST_TOKEN/.test(error.message),
+    );
+    assert.equal(f.repo.nodeMigration('line-a'), undefined);
+    assert.equal(f.proxySessions.count('line-a'), 1);
+    assert.equal(f.docker.inspection.running, originalRunning);
+    assert.equal(f.admin.installCalls, 0);
   }
 });
 
@@ -926,6 +1093,126 @@ test('running migration checkpoints, stages once, cuts over, verifies, and commi
     [['line-a', 'committed']],
   );
 });
+
+test('stopped migration verifies an isolated probe, applies allowlisted state, and parks ownerless', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  const flowBefore = sha256(readFileSync(join(f.instanceRoot, 'flows.json')));
+
+  const result = await f.service.migrate('line-a', 'admin');
+
+  assert.equal(result.phase, 'pending_start_verification', JSON.stringify({ result, events: f.events, runtime: f.docker.runtimeCalls }));
+  assert.equal(result.runtimeMode, 'legacy');
+  assert.equal(f.repo.nodeMigration('line-a')?.executionOwner, '');
+  assert.equal(f.repo.nodeMigration('line-a')?.executionLeaseExpiresAt, 0);
+  assert.equal(f.docker.inspection.running, false);
+  assert.equal(sha256(readFileSync(join(f.instanceRoot, 'flows.json'))), flowBefore);
+  assert.deepEqual(f.docker.runtimeCalls, [
+    'probe-create', 'probe-write-settings', 'probe-restart', 'probe-cleanup',
+  ]);
+  assert.equal(existsSync(join(f.instanceRoot, 'node_modules', '@mqttsnet', 'thinglinks-edge-nodes')), true);
+  assert.equal(existsSync(join(f.root, '.thinglinks-probes', 'line-a', 'tx-01')), false);
+  assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), true);
+});
+
+test('explicit pending start claims once, starts once, verifies, commits, and removes rollback evidence', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  const startsBefore = f.docker.runtimeCalls.filter((call) => call === 'start').length;
+
+  const completed = await f.gate.run('line-a', 'start-instance', (lease) => (
+    f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+
+  assert.equal(completed.phase, 'committed');
+  assert.equal(f.repo.nodeRuntime('line-a')?.mode, 'npm');
+  assert.equal(
+    f.docker.runtimeCalls.filter((call) => call === 'start').length,
+    startsBefore + 1,
+  );
+  assert.equal(f.repo.nodeMigration('line-a')?.executionOwner, '');
+  assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), false);
+  assert.equal(
+    readdirSync(f.instanceRoot).some((name) => name.includes('.tle-tx-01.')),
+    false,
+  );
+});
+
+test('pending start verification failure restores the immutable checkpoint and leaves production stopped', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  const settingsBefore = sha256(readFileSync(join(f.instanceRoot, 'settings.js')));
+  const packageBefore = sha256(readFileSync(join(f.instanceRoot, 'package.json')));
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  const unhealthy = healthyPlatformInventory();
+  unhealthy.enabled = false;
+  unhealthy.health = 'failed';
+  unhealthy.errors = ['load_failed'];
+  unhealthy.nodeSets[0] = {
+    ...unhealthy.nodeSets[0]!, enabled: false, err: 'load_failed',
+  };
+  f.admin.afterRestart = unhealthy;
+
+  const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+    f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+
+  assert.equal(result.phase, 'rolled_back');
+  assert.equal(f.docker.inspection.running, false);
+  assert.equal(sha256(readFileSync(join(f.instanceRoot, 'settings.js'))), settingsBefore);
+  assert.equal(sha256(readFileSync(join(f.instanceRoot, 'package.json'))), packageBefore);
+  assert.equal(f.repo.nodeRuntime('line-a')?.mode, 'legacy');
+});
+
+test('stopped live apply covers all four file/directory states without overwriting nonempty targets', async () => {
+  const f = migrationFixture({ originalRunning: false, preexisting: true });
+  writeFileSync(join(f.instanceRoot, '.config.modules.json.backup'), 'delete-on-cutover', { mode: 0o640 });
+  f.docker.afterProbeRestart = (probeRoot) => {
+    rmSync(join(probeRoot, '.config.modules.json.backup'));
+    writeFileSync(join(probeRoot, '.config.nodes.json.backup'), 'create-on-cutover', { mode: 0o600 });
+    writeFileSync(join(
+      probeRoot, 'node_modules', '@mqttsnet', 'thinglinks-edge-nodes', 'probe-only.txt',
+    ), 'directory-swap', { mode: 0o600 });
+  };
+
+  const result = await f.service.migrate('line-a', 'admin');
+
+  assert.equal(result.phase, 'pending_start_verification', JSON.stringify({ result, events: f.events, runtime: f.docker.runtimeCalls }));
+  assert.equal(readFileSync(join(f.instanceRoot, '.config.nodes.json.backup'), 'utf8'), 'create-on-cutover');
+  assert.equal(existsSync(join(f.instanceRoot, '.config.modules.json.backup')), false);
+  assert.equal(readFileSync(join(
+    f.instanceRoot, 'node_modules', '@mqttsnet', 'thinglinks-edge-nodes', 'probe-only.txt',
+  ), 'utf8'), 'directory-swap');
+  const liveEvents = f.barrierEvents.filter((event) => (
+    event.boundary === 'after-live-backup' || event.boundary === 'after-live-rename'
+  ));
+  assert.ok(liveEvents.length >= 4);
+  assert.ok(liveEvents.every((event) => event.artifact));
+  assert.ok(liveEvents.every((event, index) => index === 0 || event.sequence > liveEvents[index - 1]!.sequence));
+});
+
+for (const boundary of ['after-live-backup', 'after-live-rename'] as const) {
+  test(`stopped crash at ${boundary} restores checkpoint bytes and original stopped state`, async () => {
+    const f = migrationFixture({
+      originalRunning: false,
+      barrierFailure: { phase: 'cutover', boundary },
+    });
+    const before = {
+      settings: sha256(readFileSync(join(f.instanceRoot, 'settings.js'))),
+      package: sha256(readFileSync(join(f.instanceRoot, 'package.json'))),
+      lock: sha256(readFileSync(join(f.instanceRoot, 'package-lock.json'))),
+    };
+
+    const result = await f.service.migrate('line-a', 'admin');
+
+    assert.equal(result.phase, 'rolled_back', JSON.stringify({ result, events: f.events, runtime: f.docker.runtimeCalls, files: readdirSync(f.instanceRoot) }));
+    assert.equal(f.docker.inspection.running, false);
+    assert.deepEqual({
+      settings: sha256(readFileSync(join(f.instanceRoot, 'settings.js'))),
+      package: sha256(readFileSync(join(f.instanceRoot, 'package.json'))),
+      lock: sha256(readFileSync(join(f.instanceRoot, 'package-lock.json'))),
+    }, before);
+    assert.equal(existsSync(join(f.instanceRoot, 'node_modules', '@mqttsnet')), false);
+  });
+}
 
 test('flow identity comes from flows.json: restored nonempty mismatches are manual and empty matches pass', async () => {
   for (const [name, adminFlows] of [
@@ -1352,7 +1639,11 @@ test('recovery and public rollback finalize exact interrupted journals without r
 
     const result = await f.service.recoverInterrupted();
 
-    assert.deepEqual(result.map((entry) => entry.phase), ['rolled_back'], phase);
+    assert.deepEqual(
+      result.map((entry) => entry.phase),
+      ['rolled_back'],
+      `${phase}: ${JSON.stringify({ result, events: f.events, runtime: f.docker.runtimeCalls })}`,
+    );
     assert.equal(f.repo.nodeMigration('line-a')?.phase, 'rolled_back', phase);
     assert.equal(await f.checkpoint.readyExists('line-a', `tx-recover-${phase}`), false, phase);
   }
@@ -1360,6 +1651,54 @@ test('recovery and public rollback finalize exact interrupted journals without r
   const f = migrationFixture();
   await interruptedMigration(f, 'tx-public-rollback', 'checkpointed');
   assert.equal((await f.service.rollback('line-a', new Error('operator requested'))).phase, 'rolled_back');
+});
+
+test('unified recovery awaits bootstrap compensation before scanning migration journals', async () => {
+  let bootstrapDone = false;
+  const f = migrationFixture({
+    onBootstrapRecovery: async () => { bootstrapDone = true; },
+    onBarrier: () => { assert.equal(bootstrapDone, true); },
+  });
+  await interruptedMigration(f, 'tx-after-bootstrap-recovery', 'checkpointed');
+
+  const result = await f.service.recoverInterrupted();
+
+  assert.deepEqual(result.map((entry) => entry.phase), ['rolled_back']);
+  assert.equal(f.events[0], 'bootstrap-recovery');
+});
+
+test('startup recovery restores every stopped phase from the immutable checkpoint without starting production', async () => {
+  for (const phase of [
+    'preparing', 'checkpointed', 'staged', 'cutover', 'verifying', 'rolling_back',
+  ] as const) {
+    const f = migrationFixture({ originalRunning: false });
+    const txId = `tx-stopped-recover-${phase}`;
+    const before = {
+      settings: sha256(readFileSync(join(f.instanceRoot, 'settings.js'))),
+      flows: sha256(readFileSync(join(f.instanceRoot, 'flows.json'))),
+      credentials: sha256(readFileSync(join(f.instanceRoot, 'flows_cred.json'))),
+      package: sha256(readFileSync(join(f.instanceRoot, 'package.json'))),
+      lock: sha256(readFileSync(join(f.instanceRoot, 'package-lock.json'))),
+    };
+    await interruptedMigration(f, txId, phase, undefined, false);
+
+    const result = await f.service.recoverInterrupted();
+
+    assert.deepEqual(
+      result.map((entry) => entry.phase),
+      ['rolled_back'],
+      `${phase}: ${JSON.stringify({ result, events: f.events, runtime: f.docker.runtimeCalls, files: readdirSync(f.instanceRoot) })}`,
+    );
+    assert.equal(f.docker.inspection.running, false, phase);
+    assert.equal(f.docker.runtimeCalls.includes('start'), false, phase);
+    assert.deepEqual({
+      settings: sha256(readFileSync(join(f.instanceRoot, 'settings.js'))),
+      flows: sha256(readFileSync(join(f.instanceRoot, 'flows.json'))),
+      credentials: sha256(readFileSync(join(f.instanceRoot, 'flows_cred.json'))),
+      package: sha256(readFileSync(join(f.instanceRoot, 'package.json'))),
+      lock: sha256(readFileSync(join(f.instanceRoot, 'package-lock.json'))),
+    }, before, phase);
+  }
 });
 
 test('public rollback is busy during active migration and preparing without ready finalizes cleanly', async () => {

@@ -7,15 +7,18 @@ import { NodeStore } from './core/nodes/store.ts';
 import {
   VERSION,
   assembleInstanceAdminRuntime,
+  assemblePlatformOperationBarrier,
   assemblePlatformNodeServices,
   describe,
   startManagerRuntime,
 } from './index.ts';
+import { NOOP_PLATFORM_NODE_BARRIER } from './core/nodes/platform-operation-barrier.ts';
 import { InstanceRepo } from './core/instance/repo.ts';
 import { deriveKey } from './core/auth/crypto.ts';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 test('版本号形如 x.y.z', () => {
   assert.match(VERSION, /^\d+\.\d+\.\d+$/);
@@ -61,24 +64,79 @@ test('Admin runtime composition shares one object with InstanceService and HttpC
   assert.strictEqual(assembled.serverDeps.adminRuntime, assembled.adminRuntime);
 });
 
-test('manager startup awaits network reconciliation then bootstrap recovery before serving', async () => {
+test('manager startup orders data, trust, singleton construction, network, unified recovery, backgrounds, and serving', async () => {
   const events: string[] = [];
   const server = { name: 'server' };
   await startManagerRuntime({
+    initializeData: async () => { events.push('data'); },
+    bootstrapTrust: async () => { events.push('trust'); },
+    constructServices: async () => { events.push('construct'); },
     reconcileNetworks: async () => { events.push('network'); },
-    recoverInterruptedBootstraps: async () => {
+    recoverInterrupted: async () => {
       events.push('recovery:start');
       await new Promise<void>((resolve) => setTimeout(resolve, 5));
       events.push('recovery:end');
     },
     startBackground: async () => { events.push('background'); },
-    buildServer: async () => { events.push('build'); return server; },
-    listen: async (built) => {
-      assert.strictEqual(built, server);
-      events.push('listen');
+    buildServer: async () => {
+      events.push('build');
+      return {
+        server,
+        listen: async () => { events.push('listen'); },
+      };
     },
   });
   assert.deepEqual(events, [
-    'network', 'recovery:start', 'recovery:end', 'background', 'build', 'listen',
+    'data', 'trust', 'construct', 'network',
+    'recovery:start', 'recovery:end', 'background', 'build', 'listen',
   ]);
+});
+
+test('the object-only barrier seam is shared by creation and migration while production is NOOP', async () => {
+  const events: string[] = [];
+  const barrier = { reach: async () => { events.push('reached'); } };
+  const verifier = assemblePlatformOperationBarrier({ barrier });
+  assert.strictEqual(verifier.barrier, barrier);
+  assert.strictEqual(verifier.instanceServiceDeps.barrier, barrier);
+  assert.strictEqual(verifier.migrationServiceDeps.barrier, barrier);
+  await verifier.instanceServiceDeps.barrier.reach({
+    instanceId: 'line-a', txId: 'tx-01', phase: 'preparing', sequence: 1,
+    boundary: 'after-phase-persist',
+  });
+  assert.deepEqual(events, ['reached']);
+
+  process.env['TLE_PLATFORM_NODE_BARRIER'] = 'pause';
+  try {
+    assert.strictEqual(assemblePlatformOperationBarrier().barrier, NOOP_PLATFORM_NODE_BARRIER);
+  } finally {
+    delete process.env['TLE_PLATFORM_NODE_BARRIER'];
+  }
+  assert.throws(
+    () => assemblePlatformOperationBarrier({
+      barrier,
+      hiddenSwitch: true,
+    } as never),
+    /unsupported internal Manager override/,
+  );
+});
+
+test('production composition establishes seed and trust before gate Docker migration and recovery', () => {
+  const source = readFileSync(fileURLToPath(new URL('./index.ts', import.meta.url)), 'utf8');
+  const mainSource = source.slice(source.indexOf('export async function main'));
+  const positions = [
+    'seedFromDir(nodeStore, seedDir)',
+    'assemblePlatformNodeServices({',
+    'new InstanceOperationGate(',
+    'new DockerClient({',
+    'new PlatformMigrationService({',
+    'reconcileNetworks,',
+    'recoverInterrupted: async () =>',
+    'startBackground: async () =>',
+    'buildServer: () =>',
+  ].map((needle) => {
+    const index = mainSource.indexOf(needle);
+    assert.ok(index >= 0, needle);
+    return index;
+  });
+  assert.deepEqual(positions, [...positions].sort((a, b) => a - b));
 });

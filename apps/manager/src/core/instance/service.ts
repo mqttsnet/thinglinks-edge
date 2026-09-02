@@ -19,6 +19,7 @@ import {
 import {
   DockerClient,
   type BootstrapResourceResidual,
+  type RecreateInstanceInput,
 } from './docker-client.ts';
 import { renderSettings } from './settings-template.ts';
 import type { PalettePolicy } from '../nodes/policy.ts';
@@ -116,6 +117,13 @@ export interface InstanceServiceOptions {
   instanceDataRoot: string;
   platformPackages: PlatformPackageService;
   barrier: PlatformNodeOperationBarrier;
+  pendingStartCompletion?: {
+    completePendingStartUnderLease(
+      instanceId: string,
+      lease: InstanceOperationLease,
+      actor: string,
+    ): Promise<{ phase: string }>;
+  } | undefined;
   basePath: string;
   portRange: PortRange;
   /** 允许创建的镜像 tag 白名单 */
@@ -135,6 +143,8 @@ export interface InstanceServiceOptions {
    */
   palettePolicy?: (() => PalettePolicy) | undefined;
 }
+
+export type SameImageRecreateReason = 'operator' | 'environment-repair' | 'rollback';
 
 export class InstanceService {
   private readonly o: InstanceServiceOptions;
@@ -474,6 +484,19 @@ export class InstanceService {
   ): Promise<void> {
     this.o.gate.assertLease(lease, id, ['start-instance']);
     this.assertExists(id);
+    if (this.o.repo.nodeRuntime(id)?.migrationState === 'pending_start_verification') {
+      if (!this.o.pendingStartCompletion) {
+        throw new ServiceError(`实例 ${id} 缺少待启动迁移验证服务`);
+      }
+      const result = await this.o.pendingStartCompletion.completePendingStartUnderLease(
+        id, lease, actor,
+      );
+      if (result.phase !== 'committed') {
+        throw new ServiceError(`实例 ${id} 启动验证失败，已恢复并保持停机`);
+      }
+      recordAudit(this.o.db, { actor, action: 'start-instance', target: id, result: 'ok' });
+      return;
+    }
     await this.o.docker.assertManaged(id);
     await this.o.docker.start(id);
     recordAudit(this.o.db, { actor, action: 'start-instance', target: id, result: 'ok' });
@@ -580,6 +603,82 @@ export class InstanceService {
   ): string {
     this.o.gate.assertLease(lease, id, ['platform-migration']);
     return this.#renderFor(id, runtimeMode);
+  }
+
+  /** Public same-image repair facade; every direct call owns exactly one durable gate lease. */
+  async recreateSameImage(id: string): Promise<void> {
+    return this.o.gate.run(id, 'same-image-rebuild',
+      async (lease) => this.recreateSameImageUnderLease(id, lease, 'operator'));
+  }
+
+  /**
+   * Same-image internal primitive for an outer migration lease. It builds every
+   * mutable field from the repository and pins only the inspected immutable image id.
+   */
+  async recreateSameImageUnderLease(
+    id: string,
+    lease: InstanceOperationLease,
+    reason: SameImageRecreateReason,
+  ): Promise<void> {
+    this.o.gate.assertLease(lease, id, ['same-image-rebuild', 'platform-migration']);
+    const inst = this.o.repo.get(id);
+    if (!inst) throw new ServiceError(`实例 ${id} 不存在`);
+    const inspection = await this.o.docker.inspectMigrationRuntime(id).catch(() => {
+      throw new ServiceError(`实例 ${id} 无法读取受管容器身份，拒绝同镜像重建`);
+    });
+    const runtimeMode = inst.nodeRuntimeMode ?? 'legacy';
+    const input: RecreateInstanceInput = {
+      spec: {
+        id,
+        imageTag: inst.imageTag,
+        memoryMb: inst.memLimit,
+        cpus: inst.cpuLimit,
+        ports: this.o.repo.ports(id),
+        adminRoot: inst.adminRoot,
+        ingestToken: this.o.repo.ingestToken(id),
+      },
+      settingsJs: this.#renderFor(id, runtimeMode),
+      runtimeMode,
+      imageId: inspection.imageId,
+      running: inspection.running,
+    };
+    const apply = async () => {
+      await this.o.docker.recreateInstance(input);
+      if (input.running) {
+        await this.o.adminRuntime.waitReady(id, { timeoutMs: 30_000, intervalMs: 250 });
+      }
+    };
+    try {
+      await apply();
+    } catch {
+      try {
+        // Reapply the exact captured input. No repository or environment fact is reread
+        // after a partial replacement, so compensation cannot drift to a new image/spec.
+        await apply();
+      } catch {
+        try {
+          this.o.repo.fenceSameImageRebuildFailure(id, 'system');
+        } catch {
+          // An active migration journal remains its own recovery authority.
+        }
+        recordAudit(this.o.db, {
+          actor: 'system', action: 'same-image-rebuild', target: id, result: 'fail',
+          detail: JSON.stringify({ code: 'compensation', reason }),
+        });
+        throw new ServiceError(
+          `实例 ${id} 同镜像重建失败且自动恢复未完成，数据目录仍保留，需人工处理`,
+        );
+      }
+      recordAudit(this.o.db, {
+        actor: 'system', action: 'same-image-rebuild', target: id, result: 'fail',
+        detail: JSON.stringify({ code: 'rollback', reason }),
+      });
+      throw new ServiceError(`实例 ${id} 同镜像重建失败，已按原镜像与运行状态恢复`);
+    }
+    recordAudit(this.o.db, {
+      actor: 'system', action: 'same-image-rebuild', target: id, result: 'ok',
+      detail: JSON.stringify({ reason, running: input.running }),
+    });
   }
 
   /**

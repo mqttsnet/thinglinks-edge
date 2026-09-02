@@ -38,7 +38,15 @@ import { UpstreamRegistry } from './core/nodes/upstream.ts';
 import { NpmSourceRepo } from './core/nodes/sources.ts';
 import { seedFromDir, describeSeed } from './core/nodes/seed.ts';
 import { PlatformPackageService } from './core/nodes/platform-package.ts';
-import { NOOP_PLATFORM_NODE_BARRIER } from './core/nodes/platform-operation-barrier.ts';
+import {
+  NOOP_PLATFORM_NODE_BARRIER,
+  type PlatformNodeOperationBarrier,
+} from './core/nodes/platform-operation-barrier.ts';
+import { MigrationCheckpointStore } from './core/nodes/migration-checkpoint.ts';
+import {
+  NodeRedPlatformMigrationAdminActions,
+  PlatformMigrationService,
+} from './core/nodes/platform-migration.ts';
 import type { RegistryDeps } from './http/nodes/registry.ts';
 import { ValueHistory, limitsFromEnv } from './core/edge/history.ts';
 import {
@@ -99,23 +107,54 @@ export function assembleInstanceAdminRuntime(deps: {
   };
 }
 
+export interface InternalManagerOverrides {
+  /** In-process verifier seam only; never sourced from env/HTTP/DB/UI. */
+  barrier?: PlatformNodeOperationBarrier;
+}
+
+export function assemblePlatformOperationBarrier(overrides: InternalManagerOverrides = {}): {
+  barrier: PlatformNodeOperationBarrier;
+  instanceServiceDeps: Pick<InstanceServiceOptions, 'barrier'>;
+  migrationServiceDeps: { barrier: PlatformNodeOperationBarrier };
+} {
+  const keys = Object.keys(overrides);
+  if (keys.some((key) => key !== 'barrier')) throw new Error('unsupported internal Manager override');
+  const barrier = overrides.barrier ?? NOOP_PLATFORM_NODE_BARRIER;
+  return {
+    barrier,
+    instanceServiceDeps: { barrier },
+    migrationServiceDeps: { barrier },
+  };
+}
+
 export interface ManagerStartupHooks<Server = unknown> {
+  initializeData: () => Promise<void> | void;
+  bootstrapTrust: () => Promise<void> | void;
+  constructServices: () => Promise<void> | void;
   reconcileNetworks: () => Promise<void>;
-  recoverInterruptedBootstraps: () => Promise<void>;
+  recoverInterrupted: () => Promise<void>;
   startBackground: () => Promise<void> | void;
-  buildServer: () => Promise<Server> | Server;
-  listen: (server: Server) => Promise<void>;
+  buildServer: () => Promise<{
+    server: Server;
+    listen: () => Promise<void>;
+  }> | {
+    server: Server;
+    listen: () => Promise<void>;
+  };
 }
 
 export async function startManagerRuntime<Server>(
   hooks: ManagerStartupHooks<Server>,
 ): Promise<Server> {
+  await hooks.initializeData();
+  await hooks.bootstrapTrust();
+  await hooks.constructServices();
   await hooks.reconcileNetworks();
-  await hooks.recoverInterruptedBootstraps();
+  await hooks.recoverInterrupted();
   await hooks.startBackground();
-  const server = await hooks.buildServer();
-  await hooks.listen(server);
-  return server;
+  const built = await hooks.buildServer();
+  await built.listen();
+  return built.server;
 }
 
 /**
@@ -281,14 +320,28 @@ async function runPreflightCli(argv: string[]): Promise<void> {
   if (!report.ok) process.exitCode = 1;
 }
 
-export async function main(): Promise<void> {
+export async function main(overrides: InternalManagerOverrides = {}): Promise<void> {
   const config = loadConfig();
   const key = deriveKey(requireMasterKey(), 'thinglinks-edge:instance-cred');
   const db = openDb(join(config.dataDir, 'edge.db'));
 
+  // Generic seed import is the first database-backed startup action.
+  const nodeStore = new NodeStore(join(config.dataDir, 'npm'));
+  const nodeCatalog = new NodeCatalog(db);
+  for (const seedDir of [join(config.dataDir, 'npm-seed'), process.env['NODE_SEED_DIR'] ?? '']) {
+    const line = describeSeed(seedDir, seedFromDir(nodeStore, seedDir));
+    if (line) console.log(`[nodes] ${line}`);
+  }
+  const platformNodeServices = assemblePlatformNodeServices({
+    store: nodeStore,
+    catalog: nodeCatalog,
+  });
+
   // 主密钥同时用于两步验证的 TOTP 密钥加密，与实例凭据同一套
   const auth = new AuthService(db, key);
   const repo = new InstanceRepo(db, key);
+  const platformOperation = assemblePlatformOperationBarrier(overrides);
+  // Trust is established before any Docker/gate/Admin/migration service exists.
   const operationGate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repo));
   const proxySessions = new ProxySessionRegistry();
   const instanceUpstreamFor = (id: string) => `http://${containerName(id)}:1880`;
@@ -363,26 +416,6 @@ export async function main(): Promise<void> {
    *   internal —— 实例容器里的 npm 用，靠容器名解析，Manager 非容器时为空
    *   catalogue —— 现场浏览器里的编辑器前端用，与控制台同源，永远是相对路径
    */
-  const nodeStore = new NodeStore(join(config.dataDir, 'npm'));
-  const nodeCatalog = new NodeCatalog(db);
-
-  /*
-   * 预置节点包（01 号文 5.7「离线场景下节点可用」）。两个来源都扫：
-   *
-   *   <dataDir>/npm-seed  —— bind 挂进来的目录，现场拷个 .tgz 进去重启即可。
-   *                          离线现场最需要的就是这条不依赖任何工具的路子。
-   *   NODE_SEED_DIR       —— 镜像里随包发的那份（离线安装包用）
-   *
-   * 只导入进库，**不自动批准** —— 批准是管理员的动作，见 core/nodes/seed.ts。
-   */
-  for (const seedDir of [join(config.dataDir, 'npm-seed'), process.env['NODE_SEED_DIR'] ?? '']) {
-    const line = describeSeed(seedDir, seedFromDir(nodeStore, seedDir));
-    if (line) console.log(`[nodes] ${line}`);
-  }
-  const platformNodeServices = assemblePlatformNodeServices({
-    store: nodeStore,
-    catalog: nodeCatalog,
-  });
   const npmRegistryUrl = managerContainer
     ? `http://${managerContainer}:${config.listenPort}${config.basePath}/npm/`
     : '';
@@ -441,12 +474,24 @@ export async function main(): Promise<void> {
       : undefined,
     npmRegistry: npmRegistryUrl || undefined,
   });
+  const migrationHolder: { service?: PlatformMigrationService } = {};
+  const pendingStartCompletion = {
+    completePendingStartUnderLease: (
+      instanceId: string,
+      lease: Parameters<PlatformMigrationService['completePendingStartUnderLease']>[1],
+      actor: string,
+    ) => {
+      if (!migrationHolder.service) throw new Error('platform migration service is not constructed');
+      return migrationHolder.service.completePendingStartUnderLease(instanceId, lease, actor);
+    },
+  };
   const service = new InstanceService({
     ...instanceAdmin.instanceServiceDeps,
+    ...platformOperation.instanceServiceDeps,
     db, repo, docker, gate: operationGate,
     instanceDataRoot: config.instanceDataRoot,
     platformPackages: platformNodeServices.platformPackages,
-    barrier: NOOP_PLATFORM_NODE_BARRIER,
+    pendingStartCompletion,
     basePath: config.basePath,
     portRange: config.portRange,
     allowedImageTags: (process.env['ALLOWED_IMAGE_TAGS'] ??
@@ -463,6 +508,22 @@ export async function main(): Promise<void> {
       mode: installMode,
     }),
   });
+  const migrationService = new PlatformMigrationService({
+    repo,
+    gate: operationGate,
+    proxySessions,
+    docker,
+    adminRuntime: instanceAdmin.adminRuntime,
+    admin: new NodeRedPlatformMigrationAdminActions(instanceAdmin.adminRuntime),
+    platformPackages: platformNodeServices.platformPackages,
+    checkpoint: new MigrationCheckpointStore(config.instanceDataRoot),
+    settings: service,
+    repair: service,
+    bootstrapRecovery: service,
+    ...platformOperation.migrationServiceDeps,
+    instanceDataRoot: config.instanceDataRoot,
+  });
+  migrationHolder.service = migrationService;
 
   /*
    * 单独重建 Manager 不会重启历史实例，Docker 也不会把新 Manager 自动接回
@@ -676,14 +737,18 @@ export async function main(): Promise<void> {
   drainerRef = drainer;
 
   await startManagerRuntime({
+    // These phases are already materialized above in lexical order. Keeping them
+    // explicit in the production orchestrator makes the startup contract testable
+    // without carrying configuration or secrets through ManagerStartupHooks.
+    initializeData: () => undefined,
+    bootstrapTrust: () => undefined,
+    constructServices: () => undefined,
     reconcileNetworks,
-    recoverInterruptedBootstraps: async () => {
-      const recovered = await service.recoverInterruptedBootstraps();
+    recoverInterrupted: async () => {
+      const recovered = await migrationService.recoverInterrupted();
       for (const result of recovered) {
-        if (result.residuals.length > 0) {
-          console.warn(
-            `[warn] 实例 ${result.instanceId} 的 bootstrap 补偿仍有残留：${result.residuals.join(',')}`,
-          );
+        if (result.phase === 'manual_required') {
+          console.warn(`[warn] 实例 ${result.instanceId} 的节点迁移需人工处理`);
         }
       }
     },
@@ -697,24 +762,31 @@ export async function main(): Promise<void> {
       }
       drainer.start();
     },
-    buildServer: () => buildServer({
-      ...platformNodeServices.serverDeps,
-      ...instanceAdmin.serverDeps,
-      config, db, auth, repo, service, operationGate, proxySessions,
-      upstreamFor: instanceUpstreamFor,
-      spool, metrics, drainer, outages,
-      cloud, cloudConfig,
-      cloudSink: (payload) => cloud.publish(payload),
-      webRoot: process.env['WEB_ROOT']?.trim() || undefined,
-      nodeStore, nodeCatalog, valueHistory, nodeUpstream, nodeSources,
-      /*
-       * packument 里的包体地址要写成实例视角的绝对地址 —— 取它的是容器里的 npm。
-       * Manager 跑在宿主上（开发态）时给不出这个地址，此时私有源仍可读，
-       * 只是实例侧本来也没配 registry，用不到。
-       */
-      npmRegistryUrl,
-    }),
-    listen: (app) => app.listen({ host: config.listenAddr, port: config.listenPort }).then(() => undefined),
+    buildServer: () => {
+      const app = buildServer({
+        ...platformNodeServices.serverDeps,
+        ...instanceAdmin.serverDeps,
+        config, db, auth, repo, service, operationGate, proxySessions,
+        upstreamFor: instanceUpstreamFor,
+        spool, metrics, drainer, outages,
+        cloud, cloudConfig,
+        cloudSink: (payload) => cloud.publish(payload),
+        webRoot: process.env['WEB_ROOT']?.trim() || undefined,
+        nodeStore, nodeCatalog, valueHistory, nodeUpstream, nodeSources,
+        /*
+         * packument 里的包体地址要写成实例视角的绝对地址 —— 取它的是容器里的 npm。
+         * Manager 跑在宿主上（开发态）时给不出这个地址，此时私有源仍可读，
+         * 只是实例侧本来也没配 registry，用不到。
+         */
+        npmRegistryUrl,
+      });
+      return {
+        server: app,
+        listen: () => app.listen({
+          host: config.listenAddr, port: config.listenPort,
+        }).then(() => undefined),
+      };
+    },
   });
   console.log(
     `[ready] ${describe()} 监听 ${config.listenAddr}:${config.listenPort}` +
