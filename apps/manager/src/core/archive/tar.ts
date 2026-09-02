@@ -5,14 +5,58 @@
  * 因此在同一格式子集上扩了 `tarArchive` / `untar`。
  *
  * 不引第三方 tar 库：本项目已被三个停更包坑过（两个 Mongo 包、http-proxy），
- * 而这里只需要 tar 的一个最简子集（普通文件、无长名、无稀疏），
+ * 而这里只需要 tar 的一个最简子集（普通文件、USTAR prefix 长名、无稀疏），
  * 自己实现 40 行并有测试覆盖，比引入一个可能停更的依赖更可控。
  */
 
 const BLOCK = 512;
+const USTAR_NAME_BYTES = 100;
+const USTAR_PREFIX_BYTES = 155;
+const USTAR_PATH_BYTES = 255;
 
 function writeField(buf: Buffer, offset: number, len: number, value: string): void {
   buf.write(value.slice(0, len - 1), offset, 'utf8');
+}
+
+/** USTAR 文本字段允许占满全部字节；短值由已清零的 header 自动 NUL 终止。 */
+function writeTextField(
+  buf: Buffer,
+  offset: number,
+  len: number,
+  value: string,
+  label: string,
+): void {
+  const bytes = Buffer.from(value, 'utf8');
+  if (bytes.length > len) throw new Error(`${label} 超过 USTAR 字段上限 ${len} 字节`);
+  bytes.copy(buf, offset);
+}
+
+function splitUstarPath(path: string): { name: string; prefix: string } {
+  const total = Buffer.byteLength(path);
+  if (total > USTAR_PATH_BYTES) {
+    throw new Error(`文件名过长（USTAR 上限 ${USTAR_PATH_BYTES} 字节）：${path}`);
+  }
+  if (total <= USTAR_NAME_BYTES) return { name: path, prefix: '' };
+
+  let slash = path.lastIndexOf('/');
+  while (slash >= 0) {
+    const prefix = path.slice(0, slash);
+    const name = path.slice(slash + 1);
+    if (
+      prefix.length > 0
+      && name.length > 0
+      && Buffer.byteLength(prefix) <= USTAR_PREFIX_BYTES
+      && Buffer.byteLength(name) <= USTAR_NAME_BYTES
+    ) return { name, prefix };
+    slash = path.lastIndexOf('/', slash - 1);
+  }
+  throw new Error(`文件名过长（无法按 USTAR name/prefix 安全分割）：${path}`);
+}
+
+function readTextField(header: Buffer, offset: number, len: number): string {
+  const bytes = header.subarray(offset, offset + len);
+  const nul = bytes.indexOf(0);
+  return bytes.subarray(0, nul < 0 ? bytes.length : nul).toString('utf8');
 }
 
 function writeOctal(buf: Buffer, offset: number, len: number, value: number): void {
@@ -36,12 +80,10 @@ export interface TarEntry extends TarOwner {
 function tarMember(name: string, content: string | Buffer, opts: TarOwner = {}): Buffer {
   const { mode = 0o644, uid = 0, gid = 0 } = opts;
   const data = Buffer.isBuffer(content) ? content : Buffer.from(content, 'utf8');
-  if (Buffer.byteLength(name) > 99) {
-    throw new Error(`文件名过长（tar 普通头上限 99 字节）：${name}`);
-  }
+  const path = splitUstarPath(name);
 
   const header = Buffer.alloc(BLOCK, 0);
-  writeField(header, 0, 100, name);
+  writeTextField(header, 0, USTAR_NAME_BYTES, path.name, 'USTAR name');
   writeOctal(header, 100, 8, mode);
   writeOctal(header, 108, 8, uid);
   writeOctal(header, 116, 8, gid);
@@ -50,6 +92,7 @@ function tarMember(name: string, content: string | Buffer, opts: TarOwner = {}):
   header.write('0', 156); // typeflag: 普通文件
   header.write('ustar\0', 257, 'utf8');
   header.write('00', 263, 'utf8');
+  writeTextField(header, 345, USTAR_PREFIX_BYTES, path.prefix, 'USTAR prefix');
 
   // 校验和：先以 8 个空格填充该字段，求和后按 tar 规范写回
   // 字段布局为 6 位八进制 + NUL + 空格，写满 7 位会破坏格式
@@ -104,7 +147,10 @@ export function untar(archive: Buffer): TarEntry[] {
       throw new Error(`tar 校验和不符（偏移 ${off}），归档已损坏`);
     }
 
-    const name = header.subarray(0, 100).toString('utf8').replace(/\0.*$/, '');
+    const leaf = readTextField(header, 0, USTAR_NAME_BYTES);
+    const magic = readTextField(header, 257, 6);
+    const prefix = magic === 'ustar' ? readTextField(header, 345, USTAR_PREFIX_BYTES) : '';
+    const name = prefix ? `${prefix}/${leaf}` : leaf;
     const size = parseInt(
       header.subarray(124, 136).toString('utf8').replace(/\0.*$/, '').trim() || '0', 8);
     const typeflag = String.fromCharCode(header[156] ?? 0x30);

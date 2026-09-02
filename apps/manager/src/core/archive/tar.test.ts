@@ -39,6 +39,63 @@ test('过长文件名被拒绝而不是静默截断', () => {
   assert.throws(() => tarFile('a'.repeat(120), 'x'), /过长/);
 });
 
+const npmCachePath = [
+  'instances', 'a'.repeat(32), '.npm', '_cacache', 'content-v2', 'sha512',
+  '34', 'ab', 'c'.repeat(86),
+].join('/');
+
+test('真实 npm cacache 长路径使用 ustar prefix 且系统 tar 与自身都能还原', () => {
+  assert.ok(Buffer.byteLength(npmCachePath) > 100);
+  assert.ok(Buffer.byteLength(npmCachePath) <= 255);
+  const content = 'cached-package-bytes';
+  assert.equal(roundTrip(npmCachePath, content), content);
+  const own = untar(tarFile(npmCachePath, content));
+  assert.equal(own[0]?.name, npmCachePath);
+  assert.equal(own[0]?.content.toString(), content);
+});
+
+test('ustar name 字段按 UTF-8 字节支持 99、100 并拒绝无斜杠 101', () => {
+  for (const length of [99, 100]) {
+    const name = 'n'.repeat(length);
+    assert.equal(roundTrip(name, `n${length}`), `n${length}`);
+    assert.equal(untar(tarFile(name, 'x'))[0]?.name, name);
+  }
+  assert.throws(() => tarFile('n'.repeat(101), 'x'), /过长/);
+});
+
+test('ustar prefix/name 精确支持 255 字节并拒绝 256 字节', () => {
+  const exact255 = `${'p'.repeat(154)}/${'n'.repeat(100)}`;
+  assert.equal(Buffer.byteLength(exact255), 255);
+  assert.equal(roundTrip(exact255, 'max'), 'max');
+  assert.equal(untar(tarFile(exact255, 'max'))[0]?.name, exact255);
+
+  const exactPrefix155 = `${'p'.repeat(155)}/${'n'.repeat(99)}`;
+  assert.equal(Buffer.byteLength(exactPrefix155), 255);
+  assert.equal(roundTrip(exactPrefix155, 'prefix-max'), 'prefix-max');
+  assert.equal(untar(tarFile(exactPrefix155, 'prefix-max'))[0]?.name, exactPrefix155);
+
+  const over256 = `${'p'.repeat(155)}/${'n'.repeat(100)}`;
+  assert.equal(Buffer.byteLength(over256), 256);
+  assert.throws(() => tarFile(over256, 'x'), /过长/);
+});
+
+test('ustar 只在斜杠处分割，prefix 或最终分量超字段时拒绝', () => {
+  const prefixTooLong = `${'p'.repeat(156)}/${'n'.repeat(98)}`;
+  const finalComponentTooLong = `prefix/${'n'.repeat(101)}`;
+  assert.equal(Buffer.byteLength(prefixTooLong), 255);
+  assert.throws(() => tarFile(prefixTooLong, 'x'), /过长/);
+  assert.throws(() => tarFile(finalComponentTooLong, 'x'), /过长/);
+});
+
+test('ustar 多字节路径按字节分割，不截断 UTF-8 字符', () => {
+  const prefix = '目录'.repeat(25); // 150 bytes
+  const suffix = `${'文件'.repeat(16)}.js`; // 99 bytes
+  const name = `${prefix}/${suffix}`;
+  assert.equal(Buffer.byteLength(name), 250);
+  assert.equal(roundTrip(name, '中文路径'), '中文路径');
+  assert.equal(untar(tarFile(name, '中文路径'))[0]?.name, name);
+});
+
 test('可指定属主 —— 容器内以 node-red(1000) 身份读取', () => {
   const buf = tarFile('settings.js', 'x', { uid: 1000, gid: 1000 });
   // uid 字段在 108 偏移，八进制字符串
