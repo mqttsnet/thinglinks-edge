@@ -14,9 +14,17 @@
  * 比没有报告更危险 —— 它让人以为查过了。
  */
 import { execFileSync } from 'node:child_process';
-import { readFileSync, readdirSync, rmSync, statSync, mkdtempSync } from 'node:fs';
+import {
+  lstatSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  statSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { basename, dirname, join, relative, resolve } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import Fastify from 'fastify';
 
@@ -63,6 +71,55 @@ const walk = (dir, out = []) => {
 };
 const sources = walk(MGR);
 const readAll = (files) => files.map((f) => ({ f, text: readFileSync(f, 'utf8') }));
+
+const isExactPlatformCatalogueEntry = (entry) => {
+  const expectedKeys = ['description', 'id', 'keywords', 'types', 'updated_at', 'version'];
+  return entry !== null
+    && typeof entry === 'object'
+    && JSON.stringify(Object.keys(entry).sort()) === JSON.stringify(expectedKeys)
+    && entry.id === PLATFORM_NODE_PACKAGE.name
+    && PLATFORM_NODE_PACKAGE.version === '0.0.1'
+    && entry.version === PLATFORM_NODE_PACKAGE.version
+    && typeof entry.description === 'string'
+    && entry.description.length > 0
+    && typeof entry.updated_at === 'string'
+    && entry.updated_at.length > 0
+    && Array.isArray(entry.keywords)
+    && entry.keywords.every((keyword) => typeof keyword === 'string' && keyword.length > 0)
+    && entry.keywords.includes('node-red')
+    && entry.keywords.includes('thinglinks')
+    && Array.isArray(entry.types)
+    && JSON.stringify([...entry.types].sort()) === JSON.stringify([...PLATFORM_NODE_TYPES].sort());
+};
+
+function removeBaselineRoot(path) {
+  const parent = realpathSync(tmpdir());
+  let pathStat;
+  let actual;
+  try {
+    pathStat = lstatSync(path);
+    actual = realpathSync(path);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return;
+    throw error;
+  }
+  const rel = relative(parent, actual);
+  if (
+    !pathStat.isDirectory()
+    || pathStat.isSymbolicLink()
+    || dirname(actual) !== parent
+    || rel.startsWith('..')
+    || resolve(parent, rel) !== actual
+    || !basename(actual).startsWith('tle-baseline-')
+  ) throw new Error(`拒绝清理越界的 baseline 临时目录：${actual}`);
+  rmSync(actual, { recursive: true, force: false });
+  try {
+    lstatSync(actual);
+    throw new Error(`baseline 临时目录清理后仍存在：${actual}`);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+}
 
 async function catalogueTrustBoundary(root, db) {
   const generic = 'node-red-contrib-baseline-catalogue';
@@ -112,10 +169,14 @@ async function catalogueTrustBoundary(root, db) {
     );
     const response = await app.inject({ method: 'GET', url: '/npm/-/catalogue.json' });
     const body = response.json();
-    const ids = (body.modules ?? []).map((item) => item.id).sort();
+    const modules = Array.isArray(body.modules) ? body.modules : [];
+    const ids = modules.map((item) => item.id).sort();
+    const edgeEntries = modules.filter((item) => item.id === PLATFORM_NODE_PACKAGE.name);
     return response.statusCode === 200
       && JSON.stringify(ids) === JSON.stringify([PLATFORM_NODE_PACKAGE.name, generic].sort())
-      && !ids.includes(PLATFORM_COMMON_PACKAGE.name)
+      && modules.every((item) => item.id !== PLATFORM_COMMON_PACKAGE.name)
+      && edgeEntries.length === 1
+      && isExactPlatformCatalogueEntry(edgeEntries[0])
       && JSON.stringify(calls) === JSON.stringify([
         [PLATFORM_NODE_PACKAGE.name, PLATFORM_NODE_PACKAGE.version],
       ]);
@@ -125,6 +186,9 @@ async function catalogueTrustBoundary(root, db) {
 }
 
 async function main() {
+  let dbDir;
+  let db;
+  try {
   console.log('\n──── 安全基线 7 组 · 逐条对照 ────\n');
 
   // ── 1. 凭证与密钥 ──────────────────────────────────────
@@ -153,9 +217,9 @@ async function main() {
         everAdded.length === 0, everAdded.join(' '));
 
   // 敏感字段加密落库：直接翻库文件，明文一个字都不该有
-  const dbDir = mkdtempSync(join(tmpdir(), 'tle-baseline-'));
+  dbDir = mkdtempSync(join(realpathSync(tmpdir()), 'tle-baseline-'));
   const dbFile = join(dbDir, 'edge.db');
-  const db = openDb(dbFile);
+  db = openDb(dbFile);
   const repo = new InstanceRepo(db, deriveKey('baseline', 'salt'));
   const CRED = 'plaintext-credential-should-never-hit-disk';
   repo.create(
@@ -354,8 +418,17 @@ async function main() {
   const naCount = rows.filter((r) => r.kind === 'na').length;
   const pass = checks.filter((r) => r.ok).length;
   console.log(`\n  断言 ${pass}/${checks.length} 通过 · 不适用 ${naCount} 条（已逐条写明理由）\n`);
-  rmSync(dbDir, { recursive: true, force: true });
-  process.exit(pass === checks.length ? 0 : 1);
+  return pass === checks.length;
+  } finally {
+    const cleanupErrors = [];
+    try { db?.close(); } catch (error) { cleanupErrors.push(error); }
+    try { if (dbDir) removeBaselineRoot(dbDir); } catch (error) { cleanupErrors.push(error); }
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(cleanupErrors, 'baseline 临时资源清理失败');
+    }
+  }
 }
 
-main().catch((e) => { console.error('\n验证异常：', e.stack ?? e.message); process.exit(1); });
+main()
+  .then((ok) => { process.exitCode = ok ? 0 : 1; })
+  .catch((e) => { console.error('\n验证异常：', e.stack ?? e.message); process.exitCode = 1; });

@@ -73,6 +73,7 @@ const BRIDGE_OUT = `tle-nodes-bridge-out-${RUN_ID}`; // 实例 → 宿主（私�
 const SEED_CONTAINER = `tle-nodes-seed-${RUN_ID}`;
 const REG_PORT = 19100;
 const ADMIN_PW = randomBytes(24).toString('base64url');
+const ADMIN_NEXT_PW = randomBytes(24).toString('base64url');
 const ID = `nodes-${RUN_ID}`;
 const TAG = '5.0.4-24-minimal';
 const PUBLIC_CATALOGUE_URL = 'https://catalogue.nodered.org/catalogue.json';
@@ -130,8 +131,24 @@ const check = (name, ok, detail = '') => {
     throw new Error(`前置条件失败：${name}${detail ? `（${detail}）` : ''}`);
   }
 };
-const requireCheck = (name, ok, detail = '') => {
-  check(name, ok, detail);
+const isExactPlatformCatalogueEntry = (entry) => {
+  const expectedKeys = ['description', 'id', 'keywords', 'types', 'updated_at', 'version'];
+  return entry !== null
+    && typeof entry === 'object'
+    && JSON.stringify(Object.keys(entry).sort()) === JSON.stringify(expectedKeys)
+    && entry.id === PLATFORM_NODE_PACKAGE.name
+    && PLATFORM_NODE_PACKAGE.version === '0.0.1'
+    && entry.version === PLATFORM_NODE_PACKAGE.version
+    && typeof entry.description === 'string'
+    && entry.description.length > 0
+    && typeof entry.updated_at === 'string'
+    && entry.updated_at.length > 0
+    && Array.isArray(entry.keywords)
+    && entry.keywords.every((keyword) => typeof keyword === 'string' && keyword.length > 0)
+    && entry.keywords.includes('node-red')
+    && entry.keywords.includes('thinglinks')
+    && Array.isArray(entry.types)
+    && JSON.stringify([...entry.types].sort()) === JSON.stringify([...PLATFORM_NODE_TYPES].sort());
 };
 const cataloguesFromSettings = (settings) => {
   const match = /^\s*catalogues:\s*(\[[^\r\n]*\])/m.exec(settings);
@@ -486,6 +503,60 @@ async function seedProtectedPlatformPackages(store, imageId) {
   }
 }
 
+async function inspectExpectedContainerNames(remember) {
+  const targets = [
+    ...[...expectedVerifyNames.entries()].map(([role, name]) => ({
+      name,
+      labels: verifyLabels(role),
+    })),
+    { name: containerName(ID), labels: managedInstanceLabels() },
+  ];
+  for (const target of targets) {
+    try {
+      const info = await inspectContainer(target.name);
+      if (!info) continue;
+      remember(new Error(`标签清理后容器名仍被占用：${target.name}`));
+      const immutableId = immutableContainerIds.get(target.name);
+      if (
+        immutableId
+        && info.Id === immutableId
+        && info.Name === `/${target.name}`
+        && hasAllLabels(info.Config?.Labels, target.labels)
+      ) {
+        try {
+          await raw.getContainer(info.Id).remove({ force: true });
+        } catch (error) {
+          remember(error);
+        }
+      }
+    } catch (error) {
+      remember(error);
+    }
+  }
+}
+
+async function inspectExpectedNetworkName(remember) {
+  try {
+    const info = await inspectNetwork(NETWORK_NAME);
+    if (!info) return;
+    remember(new Error(`标签清理后网络名仍被占用：${NETWORK_NAME}`));
+    if (
+      immutableNetworkId
+      && info.Id === immutableNetworkId
+      && info.Name === NETWORK_NAME
+      && hasAllLabels(info.Labels, managedInstanceLabels())
+    ) {
+      try {
+        await raw.getNetwork(info.Id).remove();
+      } catch (error) {
+        remember(error);
+      }
+    }
+  } catch (error) {
+    remember(error);
+  }
+}
+
 async function cleanup() {
   const failures = [];
   const remember = (error) => failures.push(error instanceof Error ? error.message : String(error));
@@ -537,6 +608,9 @@ async function cleanup() {
     remember(error);
   }
 
+  // 标签枚举之后逐一查固定随机名；无标签/错标签替换也必须被发现，且绝不误删。
+  await inspectExpectedContainerNames(remember);
+
   // 所有容器处理完才处理网络；同样只枚举本次随机 run + instance 标签交集。
   try {
     for (const summary of await listVerifyNetworks()) {
@@ -557,6 +631,8 @@ async function cleanup() {
   } catch (error) {
     remember(error);
   }
+
+  await inspectExpectedNetworkName(remember);
 
   try {
     await assertScopedResourcesEmpty();
@@ -640,7 +716,7 @@ async function main() {
   ]);
   await createRunRoot();
   await assertTargetsAbsent();
-  requireCheck('显式 MANAGER_IMAGE 已解析并固定为不可变镜像 ID',
+  check('显式 MANAGER_IMAGE 已解析并固定为不可变镜像 ID',
     /^sha256:[a-f0-9]{64}$/.test(reviewedManagerImageId));
 
   const dataDir = `${TEST_EDGE_ROOT}/manager`;
@@ -666,18 +742,18 @@ async function main() {
     [PLATFORM_NODE_PACKAGE.name, createHash('sha256').update(trusted.buffer).digest('hex')],
     [PLATFORM_COMMON_PACKAGE.name, createHash('sha256').update(trustedCommon.buffer).digest('hex')],
   ]);
-  requireCheck('固定 Edge/common 信任根存在且完整性匹配',
+  check('固定 Edge/common 信任根存在且完整性匹配',
     trusted.meta.name === PLATFORM_NODE_PACKAGE.name
       && trusted.meta.version === PLATFORM_NODE_PACKAGE.version
       && trusted.meta.integrity === PLATFORM_NODE_PACKAGE.integrity
       && trustedCommon.meta.name === PLATFORM_COMMON_PACKAGE.name
       && trustedCommon.meta.version === PLATFORM_COMMON_PACKAGE.version
       && trustedCommon.meta.integrity === PLATFORM_COMMON_PACKAGE.integrity);
-  requireCheck('固定 Edge 被精确批准且 common 从不单独批准',
+  check('固定 Edge 被精确批准且 common 从不单独批准',
     catalog.get(PLATFORM_NODE_PACKAGE.name)?.version === PLATFORM_NODE_PACKAGE.version
       && catalog.get(PLATFORM_NODE_PACKAGE.name)?.note === PLATFORM_APPROVAL_NOTE
       && catalog.get(PLATFORM_COMMON_PACKAGE.name) === undefined);
-  requireCheck('Edge 精确依赖 common，common 不是 Node-RED 节点包',
+  check('Edge 精确依赖 common，common 不是 Node-RED 节点包',
     trusted.meta.dependencies[PLATFORM_COMMON_PACKAGE.name] === PLATFORM_COMMON_PACKAGE.version
       && trustedCommon.meta.hasNodeRedMetadata === false);
   let paletteMode = 'allowlist';
@@ -795,8 +871,8 @@ async function main() {
   const B = `http://127.0.0.1:${PORT}`;
   const H = (s) => ({ cookie: s.cookie, 'content-type': 'application/json', 'x-csrf-token': s.csrf });
 
-  const admin = await adminSession(B, ADMIN_PW);
-  requireCheck('管理员登录成功', Boolean(admin.csrf));
+  const admin = await adminSession(B, ADMIN_PW, ADMIN_NEXT_PW);
+  check('管理员登录成功', Boolean(admin.csrf));
 
   // ── 1. 往私有源导入两个夹具包 ─────────────────────
   for (const name of [OK_PKG, DENIED_PKG]) {
@@ -805,7 +881,7 @@ async function main() {
       headers: { ...H(admin), 'content-type': 'application/octet-stream' },
       body: fixture(name),
     }, `导入节点包 ${name}`);
-    requireCheck(`导入节点包 ${name}`,
+    check(`导入节点包 ${name}`,
       imported.response.status === 200 && imported.body.package?.name === name,
       imported.response.status === 200
         ? '' : `HTTP ${imported.response.status} ${JSON.stringify(imported.body).slice(0, 140)}`);
@@ -814,12 +890,12 @@ async function main() {
   const listedResponse = await fetchJson(
     `${B}/api/nodes/store`, { headers: { cookie: admin.cookie } }, '读取离线包库',
   );
-  requireCheck('读取离线包库', listedResponse.response.status === 200,
+  check('读取离线包库', listedResponse.response.status === 200,
     `HTTP ${listedResponse.response.status}`);
   const listed = listedResponse.body;
   const listedGeneric = (listed.packages ?? [])
     .filter((item) => [OK_PKG, DENIED_PKG].includes(item.module));
-  requireCheck('包库精确列出两个当前夹具且无依赖缺口', listedGeneric.length === 2
+  check('包库精确列出两个当前夹具且无依赖缺口', listedGeneric.length === 2
     && listedGeneric.every((p) => p.missingDeps.length === 0 && p.isNodeRedNode));
   check('包库保留固定 Edge/common 根且版本精确',
     listed.packages?.some((item) => item.module === PLATFORM_NODE_PACKAGE.name
@@ -848,7 +924,7 @@ async function main() {
   check('导入那个被 URL 指向的依赖包', urlLib.status === 200, `HTTP ${urlLib.status}`);
 
   const packumentResponse = await fetchJson(`${B}/npm/${URLDEP_PKG}`, {}, '读取 URL 依赖 packument');
-  requireCheck('读取 URL 依赖 packument', packumentResponse.response.status === 200,
+  check('读取 URL 依赖 packument', packumentResponse.response.status === 200,
     `HTTP ${packumentResponse.response.status}`);
   const packument = packumentResponse.body;
   check('packument 把 URL 依赖改写成库里的版本（否则 npm 会绕开私有源出网）',
@@ -876,10 +952,13 @@ async function main() {
     approvedBody.applied === false, `applied=${approvedBody.applied}`);
 
   const catalogueResponse = await fetchJson(`${B}/npm/-/catalogue.json`, {}, '读取私有 catalogue');
-  requireCheck('读取私有 catalogue', catalogueResponse.response.status === 200,
+  check('读取私有 catalogue', catalogueResponse.response.status === 200,
     `HTTP ${catalogueResponse.response.status}`);
   const cat = catalogueResponse.body;
-  const catIds = (cat.modules ?? []).map((m) => m.id).sort();
+  const catalogueModules = Array.isArray(cat.modules) ? cat.modules : [];
+  const catIds = catalogueModules.map((m) => m.id).sort();
+  const edgeCatalogueEntries = catalogueModules
+    .filter((entry) => entry.id === PLATFORM_NODE_PACKAGE.name);
   check('Community catalogue 使用统一英文命名',
     cat.name === 'ThingLinks Edge Community catalogue',
     `实际 ${JSON.stringify(cat.name)}`);
@@ -888,8 +967,12 @@ async function main() {
       && catIds.includes(OK_PKG)
       && catIds.includes(URLDEP_PKG)
       && catIds.includes(PLATFORM_NODE_PACKAGE.name)
-      && !catIds.includes(PLATFORM_COMMON_PACKAGE.name),
+      && catalogueModules.every((entry) => entry.id !== PLATFORM_COMMON_PACKAGE.name),
     `实际 ${JSON.stringify(catIds)}`);
+  check('固定 Edge catalogue 条目契约精确',
+    edgeCatalogueEntries.length === 1
+      && isExactPlatformCatalogueEntry(edgeCatalogueEntries[0]),
+    JSON.stringify(edgeCatalogueEntries[0] ?? null).slice(0, 240));
 
   // ── 3. 起实例（settings 由当前批准清单生成）─────────
   const created = await fetchJson(`${B}/api/instances`, {
@@ -897,16 +980,16 @@ async function main() {
     body: JSON.stringify({ id: ID, name: ID, imageTag: TAG, memoryMb: 512, cpus: 0.5, ports: [] }),
   }, '创建实例');
   const createdBody = created.body;
-  requireCheck('创建实例完成真实 npm bootstrap', created.response.status === 201,
+  check('创建实例完成真实 npm bootstrap', created.response.status === 201,
     created.response.status === 201
       ? '' : `HTTP ${created.response.status} ${JSON.stringify(createdBody).slice(0, 200)}`);
-  requireCheck('bootstrap 在启动前建立双向桥接', bootstrapBridgesReady);
-  requireCheck('新实例容器与网络归属精确且可按不可变 ID 解析',
+  check('bootstrap 在启动前建立双向桥接', bootstrapBridgesReady);
+  check('新实例容器与网络归属精确且可按不可变 ID 解析',
     Boolean(await exactInstanceContainer()) && Boolean(await exactNetwork()));
 
   let state = 'missing';
   for (let i = 0; i < 40 && state !== 'running'; i++) { await sleep(1000); state = await containerState(ID); }
-  requireCheck('实例容器在运行', state === 'running', `state=${state}`);
+  check('实例容器在运行', state === 'running', `state=${state}`);
 
   // 容器里的实际配置 —— 不看生成函数的输出，看落到盘上的那一份
   const settings = await catInContainer(ID, '/data/settings.js');
@@ -958,7 +1041,7 @@ async function main() {
         username: 'admin', password: repo.credentials(ID)[0].password,
       }),
     }, label);
-    requireCheck(label,
+    check(label,
       tokenResult.response.status === 200
         && typeof tokenResult.body.access_token === 'string'
         && tokenResult.body.access_token.length > 0,
@@ -1011,7 +1094,7 @@ async function main() {
   const searchedResponse = await fetchJson(
     `${B}/api/nodes/search?q=fixture`, { headers: { cookie: admin.cookie } }, '搜索上游节点包',
   );
-  requireCheck('搜索上游节点包', searchedResponse.response.status === 200,
+  check('搜索上游节点包', searchedResponse.response.status === 200,
     `HTTP ${searchedResponse.response.status}`);
   const searched = searchedResponse.body;
   check('在线搜索能搜到源里的包',
@@ -1025,7 +1108,7 @@ async function main() {
     { headers: { cookie: admin.cookie } },
     '读取上游节点版本',
   );
-  requireCheck('读取上游节点版本', versionsResponse.response.status === 200,
+  check('读取上游节点版本', versionsResponse.response.status === 200,
     `HTTP ${versionsResponse.response.status}`);
   const vers = versionsResponse.body;
   check('**选中一个包能列出它的版本**（批准对话框的版本下拉靠它）',
@@ -1038,7 +1121,7 @@ async function main() {
     method: 'POST', headers: H(admin),
     body: JSON.stringify({ module: UPSTREAM_PKG, note: '回源验证' }),
   }, `批准 ${UPSTREAM_PKG}`);
-  requireCheck(`批准 ${UPSTREAM_PKG}`,
+  check(`批准 ${UPSTREAM_PKG}`,
     upstreamApproval.response.status === 200
       && upstreamApproval.body.entry?.module === UPSTREAM_PKG,
     `HTTP ${upstreamApproval.response.status}`);
@@ -1046,18 +1129,18 @@ async function main() {
   const upstreamApply = await fetchJson(`${B}/api/nodes/apply`, {
     method: 'POST', headers: H(admin), body: JSON.stringify({ instances: [ID] }),
   }, '下发回源包批准');
-  requireCheck('下发回源包批准并重启实例',
+  check('下发回源包批准并重启实例',
     upstreamApply.response.status === 200
       && upstreamApply.body.results?.[0]?.ok === true
       && upstreamApply.body.results[0].restarted === true,
     `HTTP ${upstreamApply.response.status}`);
   await sleep(3000);
-  requireCheck('回源包批准下发后实例重新就绪', await ready());
+  check('回源包批准下发后实例重新就绪', await ready());
 
   const beforeStoreResponse = await fetchJson(
     `${B}/api/nodes/store`, { headers: { cookie: admin.cookie } }, '读取回源前包库',
   );
-  requireCheck('读取回源前包库', beforeStoreResponse.response.status === 200,
+  check('读取回源前包库', beforeStoreResponse.response.status === 200,
     `HTTP ${beforeStoreResponse.response.status}`);
   const beforeStore = beforeStoreResponse.body;
   check('回源前库里确实没有这个包（否则下面证明不了什么）',
@@ -1081,7 +1164,7 @@ async function main() {
   const afterStoreResponse = await fetchJson(
     `${B}/api/nodes/store`, { headers: { cookie: admin.cookie } }, '读取回源后包库',
   );
-  requireCheck('读取回源后包库', afterStoreResponse.response.status === 200,
+  check('读取回源后包库', afterStoreResponse.response.status === 200,
     `HTTP ${afterStoreResponse.response.status}`);
   const afterStore = afterStoreResponse.body;
   check('**下载的包顺手入库了**（下次即离线可用）',
@@ -1133,7 +1216,7 @@ async function main() {
   const inventoryResponse = await fetchJson(
     `${B}/api/nodes/inventory/${ID}`, { headers: { cookie: admin.cookie } }, '读取节点台账',
   );
-  requireCheck('读取节点台账', inventoryResponse.response.status === 200,
+  check('读取节点台账', inventoryResponse.response.status === 200,
     `HTTP ${inventoryResponse.response.status}`);
   const inv = inventoryResponse.body;
   const okItem = inv.modules?.find((m) => m.module === OK_PKG);
@@ -1179,7 +1262,7 @@ async function main() {
   const revokedOk = await fetchJson(`${B}/api/nodes/catalog/${encodeURIComponent(OK_PKG)}`, {
     method: 'DELETE', headers: H(admin),
   }, `撤销 ${OK_PKG}`);
-  requireCheck(`撤销 ${OK_PKG}`,
+  check(`撤销 ${OK_PKG}`,
     revokedOk.response.status === 200 && revokedOk.body.ok === true,
     `HTTP ${revokedOk.response.status}`);
   const inventoryAfterRevoke = await fetchJson(
@@ -1187,7 +1270,7 @@ async function main() {
     { headers: { cookie: admin.cookie } },
     '撤销后读取节点台账',
   );
-  requireCheck('撤销后读取节点台账', inventoryAfterRevoke.response.status === 200,
+  check('撤销后读取节点台账', inventoryAfterRevoke.response.status === 200,
     `HTTP ${inventoryAfterRevoke.response.status}`);
   const inv2 = inventoryAfterRevoke.body;
   check('撤销批准后台账把已装的那个标为未批准（发现清单与实际的漂移）',
@@ -1199,7 +1282,7 @@ async function main() {
   const revokedUrlDep = await fetchJson(`${B}/api/nodes/catalog/${encodeURIComponent(URLDEP_PKG)}`, {
     method: 'DELETE', headers: H(admin),
   }, `撤销 ${URLDEP_PKG}`);
-  requireCheck(`撤销 ${URLDEP_PKG}`,
+  check(`撤销 ${URLDEP_PKG}`,
     revokedUrlDep.response.status === 200 && revokedUrlDep.body.ok === true,
     `HTTP ${revokedUrlDep.response.status}`);
 
@@ -1215,7 +1298,7 @@ async function main() {
     JSON.stringify(applied.results?.[0] ?? null));
 
   await sleep(3000);
-  requireCheck('收紧策略下发后实例重新就绪', await ready());
+  check('收紧策略下发后实例重新就绪', await ready());
   const settings2 = await catInContainer(ID, '/data/settings.js');
   check('撤销两个普通批准后白名单精确保留固定 Edge 与仍批准的回源包',
     settings2.includes(`allowList: ${JSON.stringify([
@@ -1240,7 +1323,7 @@ async function main() {
     JSON.stringify(opened.results?.[0] ?? null));
 
   await sleep(3000);
-  requireCheck('open 策略下发后实例重新就绪', await ready());
+  check('open 策略下发后实例重新就绪', await ready());
   const openSettings = await catInContainer(ID, '/data/settings.js');
   check('open settings 放开安装并保留上传和更新禁用',
     openSettings.includes('allowList: ["*"]')
