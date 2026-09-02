@@ -465,6 +465,21 @@ function assertNpmOwners(modules: readonly InstalledModule[]): InstalledModule {
   } catch {
     throw controlled('verification', 'platform module runtime node-set health is invalid');
   }
+  const expectedFiles = PLATFORM_NODE_TYPES.map((type) => (
+    `/data/node_modules/${PLATFORM_NODE_PACKAGE.name}/${type}.js`
+  )).sort();
+  const nodeSetFiles = platform.nodeSets.flatMap((set) => set.file ? [set.file] : []).sort();
+  if (
+    (platform.observedFiles.length > 0 || nodeSetFiles.length > 0)
+    && (
+      JSON.stringify(platform.observedFiles) !== JSON.stringify(expectedFiles)
+      || JSON.stringify(nodeSetFiles) !== JSON.stringify(expectedFiles)
+      || platform.nodeSets.some((set) => (
+        set.types.length !== 1
+        || set.file !== `/data/node_modules/${PLATFORM_NODE_PACKAGE.name}/${set.types[0]}.js`
+      ))
+    )
+  ) throw controlled('verification', 'platform module runtime file paths are not canonical');
   return platform;
 }
 
@@ -1211,6 +1226,19 @@ function sameArtifactFacts(
 ): boolean {
   return left.length === right.length
     && left.every((fact, index) => sameArtifact(fact, right[index]!));
+}
+
+function exactEqualPrecleanedKeys(
+  artifacts: readonly StoppedEvidenceAuthority['artifacts'][number][],
+): Set<string> {
+  return new Set(artifacts.filter((artifact) => (
+    artifact.postStart.comparison === 'exact'
+    && sameArtifact(artifact.prior, artifact.desired)
+  )).map((artifact) => artifact.key));
+}
+
+function sameStringSet(left: ReadonlySet<string>, right: ReadonlySet<string>): boolean {
+  return left.size === right.size && [...left].every((entry) => right.has(entry));
 }
 
 async function matchesPostStartExpectation(
@@ -2247,6 +2275,8 @@ export class PlatformMigrationService {
     instanceId: string,
     txId: string,
     allowCommittedCleanupResidue = false,
+    precleanedKeys?: ReadonlySet<string>,
+    requireRawDesiredLive = false,
   ): Promise<StoppedEvidenceAuthority['artifacts']> {
     const liveRoot = join(this.o.instanceDataRoot, instanceId);
     const journal = this.o.repo.nodeMigration(instanceId);
@@ -2264,6 +2294,13 @@ export class PlatformMigrationService {
       }
       throw error;
     }
+    const expectedPrecleaned = exactEqualPrecleanedKeys(authority.artifacts);
+    const effectivePrecleaned = precleanedKeys
+      ?? (allowCommittedCleanupResidue ? expectedPrecleaned : new Set<string>());
+    if (
+      !requireRawDesiredLive
+      && !sameStringSet(effectivePrecleaned, expectedPrecleaned)
+    ) throw new Error('stopped precleaned evidence key set mismatch');
     for (const artifact of authority.artifacts) {
       const { key, desired: requiredDesired, prior: expectedPrior } = artifact;
       const target = join(liveRoot, key);
@@ -2276,8 +2313,17 @@ export class PlatformMigrationService {
       const backupFact = await artifactFact(dirname(backup), basename(backup));
       const desiredMarker = await readArtifactManifest(manifest, key);
       const priorMarker = await readArtifactManifest(backupManifest, key);
-      if (!await matchesPostStartExpectation(liveRoot, key, artifact.postStart)) {
+      const liveValid = requireRawDesiredLive
+        ? sameArtifact(await artifactFact(liveRoot, key), requiredDesired)
+        : await matchesPostStartExpectation(liveRoot, key, artifact.postStart);
+      if (!liveValid) {
         throw new Error(`stopped live differs from Manager authority ${key}`);
+      }
+      if (effectivePrecleaned.has(key)) {
+        if (desiredMarker || partialFact.exists || backupFact.exists || priorMarker) {
+          throw new Error(`stopped precleaned evidence remains ${key}`);
+        }
+        continue;
       }
       if (!allowCommittedCleanupResidue && !desiredMarker) {
         throw new Error(`stopped desired manifest missing ${key}`);
@@ -2383,7 +2429,7 @@ export class PlatformMigrationService {
     }
   }
 
-  private async cleanupEqualStoppedEvidenceBeforeCommit(
+  private async cleanupEqualStoppedEvidenceBeforeStart(
     execution: MigrationExecutionSession,
     artifacts: readonly StoppedEvidenceAuthority['artifacts'][number][],
     startSequence: number,
@@ -2396,10 +2442,25 @@ export class PlatformMigrationService {
       if (postStart.comparison !== 'exact' || !sameArtifact(prior, desired)) continue;
       const target = join(liveRoot, desired.key);
       const partial = stoppedSidecar(target, execution.txId, 'partial');
-      const partialFact = await artifactFact(dirname(partial), basename(partial));
-      if (!partialFact.exists) continue;
-      // Strict verification proved a retained partial is an equal/no-op artifact.
       const manifest = stoppedSidecar(target, execution.txId, 'manifest');
+      const backup = stoppedSidecar(target, execution.txId, 'backup');
+      const backupManifest = stoppedSidecar(target, execution.txId, 'backup-manifest');
+      await trustedArtifactParent(liveRoot, desired.key, false);
+      const partialFact = await artifactFact(dirname(partial), basename(partial));
+      const marker = await readArtifactManifest(manifest, desired.key);
+      if (
+        !sameArtifact(await artifactFact(liveRoot, desired.key), desired)
+        || !marker
+        || !sameArtifact(marker, desired)
+        || (desired.exists && (
+          !partialFact.exists
+          || !sameArtifact({ ...partialFact, key: desired.key } as StoppedArtifactFact, desired)
+        ))
+        || (!desired.exists && partialFact.exists)
+        || (await artifactFact(dirname(backup), basename(backup))).exists
+        || await readArtifactManifest(backupManifest, desired.key)
+      ) throw new Error(`stopped exact-equal evidence is invalid ${desired.key}`);
+      execution.renew(['verifying']);
       await rm(manifest, { force: false });
       await syncDirectory(dirname(target));
       await this.barrierOwned(execution, {
@@ -2407,13 +2468,31 @@ export class PlatformMigrationService {
         sequence: sequence++, artifact: this.artifactBarrierKey(desired.key),
         boundary: 'after-live-backup',
       });
-      await rm(partial, { recursive: true, force: false });
-      await syncDirectory(dirname(target));
-      await this.barrierOwned(execution, {
-        instanceId: execution.instanceId, txId: execution.txId, phase: 'verifying',
-        sequence: sequence++, artifact: this.artifactBarrierKey(desired.key),
-        boundary: 'after-live-rename',
-      });
+      const partialAfterMarker = await artifactFact(dirname(partial), basename(partial));
+      if (
+        !sameArtifact(await artifactFact(liveRoot, desired.key), desired)
+        || await readArtifactManifest(manifest, desired.key)
+        || (desired.exists && !sameArtifact(
+          { ...partialAfterMarker, key: desired.key } as StoppedArtifactFact,
+          desired,
+        ))
+        || (!desired.exists && partialAfterMarker.exists)
+      ) throw new Error(`stopped exact-equal evidence changed after marker removal ${desired.key}`);
+      if (partialFact.exists) {
+        execution.renew(['verifying']);
+        await rm(partial, { recursive: true, force: false });
+        await syncDirectory(dirname(target));
+        await this.barrierOwned(execution, {
+          instanceId: execution.instanceId, txId: execution.txId, phase: 'verifying',
+          sequence: sequence++, artifact: this.artifactBarrierKey(desired.key),
+          boundary: 'after-live-rename',
+        });
+      }
+      if (
+        !sameArtifact(await artifactFact(liveRoot, desired.key), desired)
+        || await readArtifactManifest(manifest, desired.key)
+        || (await artifactFact(dirname(partial), basename(partial))).exists
+      ) throw new Error(`stopped exact-equal evidence cleanup drifted ${desired.key}`);
       cleanedKeys.add(desired.key);
     }
     return { sequence, cleanedKeys };
@@ -2713,21 +2792,46 @@ export class PlatformMigrationService {
     try {
       await this.reachOwned(execution, 'verifying', 200);
       execution.renew(['verifying']);
-      // Validate the Manager-only authority before the one production start.
-      // Live data and its operational sidecars remain untrusted until the later
-      // strict post-start/precommit comparison.
+      // Validate Manager authority, raw live artifacts, and every operational
+      // sidecar before precleaning exact-equal evidence and starting production.
       await readStoppedAuthority(this.o.instanceDataRoot, {
         instanceId,
         txId: scanned.txId,
         targetIntegrity: scanned.targetIntegrity,
       });
+      const artifacts = await this.verifyStoppedEvidenceOwned(
+        instanceId,
+        scanned.txId,
+        false,
+        new Set<string>(),
+        true,
+      );
+      const equalCleanup = await this.cleanupEqualStoppedEvidenceBeforeStart(
+        execution,
+        artifacts,
+        201,
+      );
+      const expectedPrecleaned = exactEqualPrecleanedKeys(artifacts);
+      if (!sameStringSet(equalCleanup.cleanedKeys, expectedPrecleaned)) {
+        throw controlled('verification', 'stopped prestart cleanup key set mismatch');
+      }
+      await this.verifyStoppedEvidenceOwned(
+        instanceId,
+        scanned.txId,
+        false,
+        equalCleanup.cleanedKeys,
+        true,
+      );
+      execution.renew(['verifying']);
       await this.o.docker.start(instanceId);
       await this.o.adminRuntime.waitReady(instanceId, { timeoutMs: 30_000, intervalMs: 250 });
       await this.verifyCutover(instanceId, this.o.repo.nodeMigration(instanceId)!);
       execution.renew(['verifying']);
-      const artifacts = await this.verifyStoppedEvidenceOwned(instanceId, scanned.txId);
-      const equalCleanup = await this.cleanupEqualStoppedEvidenceBeforeCommit(
-        execution, artifacts, 201,
+      await this.verifyStoppedEvidenceOwned(
+        instanceId,
+        scanned.txId,
+        false,
+        equalCleanup.cleanedKeys,
       );
       const liveRoot = join(this.o.instanceDataRoot, instanceId);
       for (const artifact of artifacts) {

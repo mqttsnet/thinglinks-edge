@@ -426,6 +426,20 @@ function healthyPlatformInventory(): InstalledModule {
   };
 }
 
+function platformInventoryWithFiles(
+  files: readonly string[] = PLATFORM_NODE_TYPES.map((type) => (
+    `/data/node_modules/${PLATFORM_NODE_PACKAGE.name}/${type}.js`
+  )),
+): InstalledModule {
+  const inventory = healthyPlatformInventory();
+  inventory.nodeSets = inventory.nodeSets.map((set, index) => ({
+    ...set,
+    ...(files[index] ? { file: files[index] } : {}),
+  }));
+  inventory.observedFiles = [...files].sort();
+  return inventory;
+}
+
 function stagedPlatformInventory(version = PLATFORM_NODE_PACKAGE.version): InstalledModule {
   const module = PLATFORM_NODE_PACKAGE.name;
   const nodeSets = PLATFORM_NODE_TYPES.map((type) => (
@@ -2735,6 +2749,214 @@ test('C62 reopened recovery preserves exact v1 authority and explicit start succ
   assert.equal(result.phase, 'committed');
   assert.equal(reopened.repo.nodeRuntime('line-a')?.mode, 'npm');
   reopened.db.close();
+});
+
+test('C63 exact-equal package evidence is removed before start while canonical evidence remains', async () => {
+  const f = migrationFixture({ originalRunning: false, preexisting: true });
+  f.admin.beforeModules = [rawPlatformInventory(), capturedNodeRed504StagedPlatformInventory()];
+  f.admin.afterRestart = platformInventoryWithFiles();
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  const sidecar = (key: string, suffix: 'partial' | 'manifest') => {
+    const target = join(f.instanceRoot, key);
+    return join(dirname(target), `.${basename(target)}.tle-tx-01.${suffix}`);
+  };
+  const edgeKey = join('node_modules', ...PLATFORM_NODE_PACKAGE.name.split('/'));
+  const commonKey = join('node_modules', ...PLATFORM_COMMON_PACKAGE.name.split('/'));
+  assert.equal(existsSync(sidecar(edgeKey, 'partial')), true);
+  assert.equal(existsSync(sidecar(commonKey, 'partial')), true);
+  const start = f.docker.start.bind(f.docker);
+  let checkedBeforeStart = false;
+  f.docker.start = async () => {
+    checkedBeforeStart = true;
+    for (const key of [
+      'package.json',
+      'package-lock.json',
+      '.config.modules.json',
+      '.config.modules.json.backup',
+      edgeKey,
+      commonKey,
+    ]) {
+      assert.equal(existsSync(sidecar(key, 'manifest')), false, `${key} marker`);
+      assert.equal(existsSync(sidecar(key, 'partial')), false, `${key} partial`);
+    }
+    assert.equal(existsSync(sidecar('.config.nodes.json', 'manifest')), true);
+    assert.equal(existsSync(sidecar('.config.nodes.json', 'partial')), true);
+    assert.equal(existsSync(sidecar('.config.nodes.json.backup', 'manifest')), true);
+    await start();
+  };
+
+  const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+    f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+
+  assert.equal(checkedBeforeStart, true);
+  assert.equal(result.phase, 'committed');
+  assert.deepEqual(
+    f.admin.afterRestart.observedFiles,
+    PLATFORM_NODE_TYPES.map((type) => (
+      `/data/node_modules/${PLATFORM_NODE_PACKAGE.name}/${type}.js`
+    )).sort(),
+  );
+});
+
+test('C63 hidden transaction partial inventory path is rejected without normalization', async () => {
+  const f = migrationFixture({ originalRunning: false, preexisting: true });
+  f.admin.beforeModules = [rawPlatformInventory(), capturedNodeRed504StagedPlatformInventory()];
+  const hiddenRoot = '/data/node_modules/@mqttsnet/.thinglinks-edge-nodes.tle-tx-01.partial';
+  f.admin.afterRestart = platformInventoryWithFiles(
+    PLATFORM_NODE_TYPES.map((type) => `${hiddenRoot}/${type}.js`),
+  );
+  const before = migrationEvidence(f.instanceRoot);
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+
+  const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+    f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+
+  assert.equal(result.phase, 'rolled_back');
+  assert.equal(f.docker.inspection.running, false);
+  assert.deepEqual(migrationEvidenceDiff(f.instanceRoot, before), []);
+});
+
+for (const artifact of ['edge-module', 'common-module'] as const) {
+  for (const boundary of ['after-live-backup', 'after-live-rename'] as const) {
+    test(`C63 ${artifact} prestart ${boundary} failure rolls back exact without starting`, async () => {
+      const f = migrationFixture({ originalRunning: false, preexisting: true });
+      f.admin.beforeModules = [rawPlatformInventory(), capturedNodeRed504StagedPlatformInventory()];
+      const before = migrationEvidence(f.instanceRoot);
+      assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+      f.controls.barrierFailure = { phase: 'verifying', boundary, artifact };
+      const startsBefore = f.docker.runtimeCalls.filter((call) => call === 'start').length;
+
+      const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+        f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+      ));
+
+      assert.equal(result.phase, 'rolled_back', `${artifact}/${boundary}`);
+      assert.equal(f.docker.inspection.running, false, `${artifact}/${boundary}`);
+      assert.equal(
+        f.docker.runtimeCalls.filter((call) => call === 'start').length,
+        startsBefore,
+        `${artifact}/${boundary}`,
+      );
+      assert.deepEqual(migrationEvidenceDiff(f.instanceRoot, before), [], `${artifact}/${boundary}`);
+    });
+  }
+}
+
+for (const boundary of ['after-live-backup', 'after-live-rename'] as const) {
+  test(`C63 owner loss at Edge prestart ${boundary} is recovered without starting`, async () => {
+    let replaced = false;
+    const f: ReturnType<typeof migrationFixture> = migrationFixture({
+      originalRunning: false,
+      preexisting: true,
+      onBarrier: (event) => {
+        if (
+          !replaced
+          && event.phase === 'verifying'
+          && event.boundary === boundary
+          && event.artifact === 'edge-module'
+        ) {
+          replaced = true;
+          claimReplacementExecution(f, `owner-c63-${boundary}-0000001`, 'verifying');
+        }
+      },
+    });
+    f.admin.beforeModules = [rawPlatformInventory(), capturedNodeRed504StagedPlatformInventory()];
+    const before = migrationEvidence(f.instanceRoot);
+    assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+    const startsBefore = f.docker.runtimeCalls.filter((call) => call === 'start').length;
+
+    const stale = await f.gate.run('line-a', 'start-instance', (lease) => (
+      f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+    ));
+
+    assert.equal(replaced, true, boundary);
+    assert.equal(stale.phase, 'verifying', boundary);
+    assert.equal(f.docker.runtimeCalls.filter((call) => call === 'start').length, startsBefore);
+    f.time.advance(1_000);
+    const reopened = reopenMigrationFixture(f);
+    const recovered = await reopened.service.recoverInterrupted();
+    assert.deepEqual(recovered.map((result) => result.phase), ['rolled_back'], boundary);
+    assert.equal(f.docker.runtimeCalls.filter((call) => call === 'start').length, startsBefore);
+    assert.equal(f.docker.inspection.running, false, boundary);
+    assert.deepEqual(migrationEvidenceDiff(f.instanceRoot, before), [], boundary);
+    reopened.db.close();
+  });
+}
+
+test('C63 canonical node-config evidence remains until committed phase is durable', async () => {
+  let inspectCommittedEvidence = () => undefined;
+  const f = migrationFixture({
+    originalRunning: false,
+    onBarrier: (event) => {
+      if (event.phase === 'committed' && event.boundary === 'after-phase-persist') {
+        inspectCommittedEvidence();
+      }
+    },
+  });
+  const sidecar = (key: string, suffix: 'partial' | 'manifest') => {
+    const target = join(f.instanceRoot, key);
+    return join(dirname(target), `.${basename(target)}.tle-tx-01.${suffix}`);
+  };
+  inspectCommittedEvidence = () => {
+    assert.equal(existsSync(sidecar('.config.nodes.json', 'manifest')), true);
+    assert.equal(existsSync(sidecar('.config.nodes.json', 'partial')), true);
+    assert.equal(existsSync(sidecar('.config.nodes.json.backup', 'manifest')), true);
+  };
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+
+  const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+    f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+
+  assert.equal(result.phase, 'committed');
+  assert.equal(existsSync(stoppedAuthorityPath(f)), false);
+});
+
+test('C63 tampered exact live partial or marker blocks production start', async () => {
+  const cases = [
+    { name: 'live', mutate: (f: ReturnType<typeof migrationFixture>, edgeKey: string) => {
+      writeFileSync(join(f.instanceRoot, edgeKey, 'tampered-live.js'), 'tampered\n', { mode: 0o600 });
+    } },
+    { name: 'partial', mutate: (f: ReturnType<typeof migrationFixture>, edgeKey: string) => {
+      const target = join(f.instanceRoot, edgeKey);
+      const partial = join(dirname(target), `.${basename(target)}.tle-tx-01.partial`);
+      writeFileSync(join(partial, 'tampered-partial.js'), 'tampered\n', { mode: 0o600 });
+    } },
+    { name: 'marker', mutate: (f: ReturnType<typeof migrationFixture>, edgeKey: string) => {
+      const target = join(f.instanceRoot, edgeKey);
+      const marker = join(dirname(target), `.${basename(target)}.tle-tx-01.manifest`);
+      writeFileSync(marker, `${JSON.stringify({
+        key: edgeKey,
+        exists: true,
+        kind: 'directory',
+        mode: 0o755,
+        sha256: 'f'.repeat(64),
+      })}\n`, { mode: 0o600 });
+    } },
+  ] as const;
+
+  for (const item of cases) {
+    const f = migrationFixture({ originalRunning: false, preexisting: true });
+    f.admin.beforeModules = [rawPlatformInventory(), capturedNodeRed504StagedPlatformInventory()];
+    assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+    const edgeKey = join('node_modules', ...PLATFORM_NODE_PACKAGE.name.split('/'));
+    item.mutate(f, edgeKey);
+    const startsBefore = f.docker.runtimeCalls.filter((call) => call === 'start').length;
+
+    const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+      f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+    ));
+
+    assert.equal(result.phase, 'manual_required', item.name);
+    assert.equal(
+      f.docker.runtimeCalls.filter((call) => call === 'start').length,
+      startsBefore,
+      item.name,
+    );
+    assert.equal(f.docker.inspection.running, false, item.name);
+  }
 });
 
 test('C60 ownership loss during quiescence polling writes no authority or sidecars', async () => {
