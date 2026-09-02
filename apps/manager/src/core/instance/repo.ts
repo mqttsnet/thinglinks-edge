@@ -1337,35 +1337,69 @@ export class InstanceRepo {
     });
   }
 
-  /** C37 controlled retry marker for committed stopped-copy evidence cleanup. */
+  /** C37/C45 controlled retry marker for exact clean stopped-copy terminal cleanup. */
   recordStoppedEvidenceCleanupPendingExact(
     instanceId: string,
     txId: string,
+    phase: 'committed' | 'rolled_back',
     actor: string,
   ): void {
     if (!TX_ID.test(txId)) throw new RepoError('停机证据清理事务 id 无效');
+    requireEnum(phase, ['committed', 'rolled_back'] as const, '停机证据清理终态');
     requireSafeText(actor, '操作人', 128);
-    const journal = this.nodeMigration(instanceId);
-    if (!journal || journal.txId !== txId || journal.phase !== 'committed') {
-      throw new RepoError('停机证据清理日志不是 exact committed');
-    }
-    const alreadyRecorded = this.db.prepare(
-      `SELECT 1 FROM audit
-       WHERE action = 'stopped_evidence_cleanup_pending' AND target = ?
-         AND id > COALESCE((
-           SELECT MAX(id) FROM audit
-           WHERE action = 'commit-node-migration' AND target = ?
-         ), 0)
-       LIMIT 1`,
-    ).get(instanceId, instanceId);
-    if (alreadyRecorded) return;
-    recordAudit(this.db, {
-      actor,
-      action: 'stopped_evidence_cleanup_pending',
-      target: instanceId,
-      detail: JSON.stringify({ code: 'stopped_evidence_cleanup_pending' }),
-      result: 'fail',
-    });
+    const audit = phase === 'committed'
+      ? {
+        action: 'stopped_evidence_cleanup_pending',
+        code: 'stopped_evidence_cleanup_pending',
+        terminalAction: 'commit-node-migration',
+        terminalDetail: undefined,
+        runtimeMode: 'npm',
+      } as const
+      : {
+        action: 'stopped_rollback_cleanup_pending',
+        code: 'stopped_rollback_cleanup_pending',
+        terminalAction: 'rollback-node-migration',
+        terminalDetail: JSON.stringify({ phase: 'rolled_back' }),
+        runtimeMode: 'legacy',
+      } as const;
+    this.db.transaction(() => {
+      const current = this.db.prepare(
+        `SELECT 1
+         FROM instance_node_migration m
+         JOIN instance i ON i.id = m.instance_id
+         WHERE m.instance_id = ? AND m.tx_id = ? AND m.operation_kind = 'migration'
+           AND m.phase = ? AND m.error = 'none'
+           AND m.execution_owner = '' AND m.execution_lease_expires_at = 0
+           AND i.node_runtime_mode = ?
+           AND i.node_migration_state = m.phase AND i.node_migration_error = m.error`,
+      ).get(instanceId, txId, phase, audit.runtimeMode);
+      if (!current) throw new RepoError('停机证据清理日志不是 exact clean terminal');
+
+      const terminal = this.db.prepare(
+        `SELECT MAX(id) AS id FROM audit
+         WHERE action = ? AND target = ?
+           AND (? IS NULL OR detail = ?)`,
+      ).get(
+        audit.terminalAction,
+        instanceId,
+        audit.terminalDetail ?? null,
+        audit.terminalDetail ?? null,
+      ) as { id: number | null };
+      if (terminal.id === null) throw new RepoError('停机证据清理终态审计缺失');
+      const alreadyRecorded = this.db.prepare(
+        `SELECT 1 FROM audit
+         WHERE action = ? AND target = ? AND id > ?
+         LIMIT 1`,
+      ).get(audit.action, instanceId, terminal.id);
+      if (alreadyRecorded) return;
+      recordAudit(this.db, {
+        actor,
+        action: audit.action,
+        target: instanceId,
+        detail: JSON.stringify({ code: audit.code }),
+        result: 'fail',
+      });
+    })();
   }
 
   interruptedNodeMigrations(): InstanceNodeMigrationJournal[] {

@@ -1617,12 +1617,19 @@ export class PlatformMigrationService {
           if (sameArtifact(live, desired)) {
             if (!desiredMarker) throw new Error(`applied desired marker missing ${key}`);
             if (live.exists) await rm(target, { recursive: true, force: false });
-          } else if (live.exists) {
+          } else if (live.exists && !sameArtifact(live, prior)) {
             throw new Error(`foreign stopped restore target ${key}`);
           }
           const afterRemoval = await artifactFact(liveRoot, key);
-          if (afterRemoval.exists) throw new Error(`stopped restore target occupied ${key}`);
-          await rename(backup, target);
+          if (afterRemoval.exists) {
+            if (!sameArtifact(afterRemoval, prior)) {
+              throw new Error(`stopped restore target occupied ${key}`);
+            }
+          } else {
+            // Preserve the authoritative backup until rolled_back plus its audit are
+            // durable. A terminal-publication failure must leave retryable evidence.
+            await copyArtifact(backup, target, prior);
+          }
         } else if (sameArtifact(prior, desired)) {
           if (!sameArtifact(live, prior)) throw new Error(`equal live differs from authority ${key}`);
         } else if (!prior.exists) {
@@ -1635,18 +1642,7 @@ export class PlatformMigrationService {
         } else if (!sameArtifact(live, prior)) {
           throw new Error(`changed live lacks authoritative backup ${key}`);
         }
-        await rm(partial, { recursive: true, force: true });
-        await rm(manifest, { force: true });
-        await rm(backupManifest, { force: true });
         await syncExistingDirectory(dirname(target));
-      }
-      for (const parent of [
-        join(liveRoot, 'node_modules', '@mqttsnet'),
-        join(liveRoot, 'node_modules'),
-      ]) {
-        await rmdir(parent).catch((error: NodeJS.ErrnoException) => {
-          if (!['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes(error.code ?? '')) throw error;
-        });
       }
       return;
     }
@@ -1817,6 +1813,56 @@ export class PlatformMigrationService {
     return authority.artifacts.map((artifact) => artifact.desired);
   }
 
+  private async verifyRolledBackStoppedEvidenceOwned(
+    instanceId: string,
+    txId: string,
+    authority: StoppedEvidenceAuthority,
+  ): Promise<void> {
+    const journal = this.o.repo.nodeMigration(instanceId);
+    if (
+      !journal
+      || journal.txId !== txId
+      || journal.originalRunning
+      || !['rolling_back', 'rolled_back'].includes(journal.phase)
+      || authority.instanceId !== instanceId
+      || authority.txId !== txId
+      || authority.targetIntegrity !== journal.targetIntegrity
+    ) throw new Error('rolled-back stopped evidence journal identity mismatch');
+    const liveRoot = join(this.o.instanceDataRoot, instanceId);
+    for (const artifact of authority.artifacts) {
+      const { key, desired, prior } = artifact;
+      if (!sameArtifact(await artifactFact(liveRoot, key), prior)) {
+        throw new Error(`rolled-back stopped live differs from authority ${key}`);
+      }
+      const target = join(liveRoot, key);
+      await trustedArtifactParent(liveRoot, key, false);
+      const partial = stoppedSidecar(target, txId, 'partial');
+      const backup = stoppedSidecar(target, txId, 'backup');
+      const manifest = stoppedSidecar(target, txId, 'manifest');
+      const backupManifest = stoppedSidecar(target, txId, 'backup-manifest');
+      const partialFact = await artifactFact(dirname(partial), basename(partial));
+      const backupFact = await artifactFact(dirname(backup), basename(backup));
+      const desiredMarker = await readArtifactManifest(manifest, key);
+      const priorMarker = await readArtifactManifest(backupManifest, key);
+      if (desiredMarker && !sameArtifact(desiredMarker, desired)) {
+        throw new Error(`rolled-back desired marker differs from authority ${key}`);
+      }
+      if (priorMarker && !sameArtifact(priorMarker, prior)) {
+        throw new Error(`rolled-back prior marker differs from authority ${key}`);
+      }
+      if (partialFact.exists && (
+        !desired.exists
+        || !sameArtifact({ ...partialFact, key } as StoppedArtifactFact, desired)
+        || (!desiredMarker && !sameArtifact(prior, desired))
+      )) throw new Error(`rolled-back stopped partial differs from authority ${key}`);
+      if (backupFact.exists && (
+        !prior.exists
+        || !priorMarker
+        || !sameArtifact({ ...backupFact, key } as StoppedArtifactFact, prior)
+      )) throw new Error(`rolled-back stopped backup differs from authority ${key}`);
+    }
+  }
+
   private async cleanupEqualStoppedEvidenceBeforeCommit(
     execution: MigrationExecutionSession,
     desiredFacts: readonly StoppedArtifactFact[],
@@ -1877,8 +1923,25 @@ export class PlatformMigrationService {
     }
   }
 
-  private async cleanupStoppedEvidence(instanceId: string, txId: string): Promise<void> {
-    await this.verifyStoppedEvidenceOwned(instanceId, txId, true);
+  private async cleanupStoppedEvidence(
+    instanceId: string,
+    txId: string,
+    phase: 'committed' | 'rolled_back' = 'committed',
+  ): Promise<void> {
+    if (phase === 'committed') {
+      await this.verifyStoppedEvidenceOwned(instanceId, txId, true);
+    } else {
+      const journal = this.o.repo.nodeMigration(instanceId);
+      if (!journal || journal.txId !== txId || journal.phase !== 'rolled_back') {
+        throw new Error('rolled-back stopped cleanup journal mismatch');
+      }
+      const authority = await readStoppedAuthority(this.o.instanceDataRoot, {
+        instanceId,
+        txId,
+        targetIntegrity: journal.targetIntegrity,
+      });
+      await this.verifyRolledBackStoppedEvidenceOwned(instanceId, txId, authority);
+    }
     const liveRoot = join(this.o.instanceDataRoot, instanceId);
     for (const key of STOPPED_EXPORT_PATHS) {
       const target = join(liveRoot, key);
@@ -1896,6 +1959,14 @@ export class PlatformMigrationService {
           throw new Error(`stopped evidence cleanup did not remove ${key}`);
         }
       }
+    }
+    for (const parent of [
+      join(liveRoot, 'node_modules', '@mqttsnet'),
+      join(liveRoot, 'node_modules'),
+    ]) {
+      await rmdir(parent).catch((error: NodeJS.ErrnoException) => {
+        if (!['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes(error.code ?? '')) throw error;
+      });
     }
   }
 
@@ -1933,9 +2004,65 @@ export class PlatformMigrationService {
       return true;
     } catch {
       try {
-        this.o.repo.recordStoppedEvidenceCleanupPendingExact(instanceId, txId, actor);
+        this.o.repo.recordStoppedEvidenceCleanupPendingExact(
+          instanceId, txId, 'committed', actor,
+        );
       } catch {
         // The committed journal plus retained sidecars/checkpoint remain recovery authority.
+      }
+      return false;
+    }
+  }
+
+  private async cleanupRolledBackStoppedTransaction(
+    instanceId: string,
+    txId: string,
+    actor: string,
+  ): Promise<boolean> {
+    try {
+      const journal = this.o.repo.nodeMigration(instanceId);
+      if (
+        !journal
+        || journal.txId !== txId
+        || journal.phase !== 'rolled_back'
+        || journal.error !== 'none'
+        || journal.originalRunning
+      ) throw new Error('rolled-back stopped cleanup journal mismatch');
+      let authority: StoppedEvidenceAuthority;
+      try {
+        authority = await readStoppedAuthority(this.o.instanceDataRoot, {
+          instanceId,
+          txId,
+          targetIntegrity: journal.targetIntegrity,
+        });
+      } catch (error) {
+        if (await this.hasStoppedOperationalEvidence(instanceId, txId)) throw error;
+        await cleanupStoppedAuthorityRemainder(this.o.instanceDataRoot, instanceId, txId);
+        if (await stoppedAuthorityRootExists(this.o.instanceDataRoot, instanceId, txId)) {
+          throw new Error('rolled-back stopped authority cleanup remains ambiguous', {
+            cause: error,
+          });
+        }
+        await this.o.checkpoint.cleanupTerminal(instanceId, txId, 'rolled_back');
+        return true;
+      }
+      await this.cleanupStoppedEvidence(instanceId, txId, 'rolled_back');
+      if (await this.hasStoppedOperationalEvidence(instanceId, txId)) {
+        throw new Error('rolled-back stopped sidecar cleanup remains ambiguous');
+      }
+      await cleanupStoppedAuthority(this.o.instanceDataRoot, authority, false);
+      if (await stoppedAuthorityRootExists(this.o.instanceDataRoot, instanceId, txId)) {
+        throw new Error('rolled-back stopped authority cleanup remains ambiguous');
+      }
+      await this.o.checkpoint.cleanupTerminal(instanceId, txId, 'rolled_back');
+      return true;
+    } catch {
+      try {
+        this.o.repo.recordStoppedEvidenceCleanupPendingExact(
+          instanceId, txId, 'rolled_back', actor,
+        );
+      } catch {
+        // The exact rolled_back journal plus remaining evidence/checkpoint stay retryable.
       }
       return false;
     }
@@ -2254,6 +2381,9 @@ export class PlatformMigrationService {
       if (afterRestore.imageId !== journal.imageIdBefore) {
         throw controlled('rollback', 'rollback immutable image identity changed');
       }
+      if (!journal.originalRunning && afterRestore.running) {
+        throw controlled('rollback', 'rollback changed the original stopped runtime state');
+      }
       if (journal.originalRunning) {
         execution.renew(['rolling_back']);
         await this.o.docker.start(instanceId);
@@ -2298,8 +2428,9 @@ export class PlatformMigrationService {
         return this.status(instanceId);
       }
       if (stoppedAuthority) {
-        execution.renew(['rolling_back']);
-        await cleanupStoppedAuthority(this.o.instanceDataRoot, stoppedAuthority, false);
+        await this.verifyRolledBackStoppedEvidenceOwned(
+          instanceId, journal.txId, stoppedAuthority,
+        );
       }
       execution.renew(['rolling_back']);
       this.o.repo.finishNodeMigrationRollbackExact(
@@ -2316,7 +2447,13 @@ export class PlatformMigrationService {
       } catch {
         return this.status(instanceId);
       }
-      await this.cleanupTerminal(instanceId, journal.txId, 'rolled_back', journal.actor);
+      if (journal.originalRunning) {
+        await this.cleanupTerminal(instanceId, journal.txId, 'rolled_back', journal.actor);
+      } else {
+        await this.cleanupRolledBackStoppedTransaction(
+          instanceId, journal.txId, journal.actor,
+        );
+      }
       return this.status(instanceId);
     } catch {
       if (!claimed) return this.status(instanceId);
@@ -2372,6 +2509,13 @@ export class PlatformMigrationService {
         continue;
       }
       if (journal.phase === 'committed' || journal.phase === 'rolled_back') {
+        if (journal.phase === 'rolled_back' && !journal.originalRunning) {
+          await this.cleanupRolledBackStoppedTransaction(
+            journal.instanceId, journal.txId, 'system',
+          );
+          results.push(this.status(journal.instanceId));
+          continue;
+        }
         if (
           journal.phase === 'committed'
           && !journal.originalRunning

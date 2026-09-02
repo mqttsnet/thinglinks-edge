@@ -547,6 +547,207 @@ test('terminal checkpoint cleanup pending audit is controlled and idempotent', (
   );
 });
 
+test('C45 exact stopped cleanup audit accepts committed and rolled_back terminals idempotently', () => {
+  const cases = [
+    {
+      phase: 'committed' as const,
+      action: 'stopped_evidence_cleanup_pending',
+      detail: '{"code":"stopped_evidence_cleanup_pending"}',
+    },
+    {
+      phase: 'rolled_back' as const,
+      action: 'stopped_rollback_cleanup_pending',
+      detail: '{"code":"stopped_rollback_cleanup_pending"}',
+    },
+  ];
+
+  for (const item of cases) {
+    const db = openDb(':memory:');
+    const repo = new InstanceRepo(db, KEY);
+    const txId = `tx-cleanup-${item.phase}`;
+    const owner = `owner-cleanup-${item.phase}-0001`;
+    repo.create(rec(), [], cred());
+    repo.beginNodeMigration(migrationBegin('line-a', txId, {
+      originalRunning: false,
+      executionOwner: owner,
+      executionLeaseExpiresAt: 10_000,
+    }));
+    if (item.phase === 'committed') {
+      repo.transitionNodeMigrationExact(
+        'line-a', txId, owner, 1_000, ['preparing'], 'verifying',
+      );
+      repo.commitNodeMigrationExact(
+        'line-a', txId, owner, 1_000, 'verifying',
+        PLATFORM_NODE_PACKAGE.version, 'admin',
+      );
+    } else {
+      repo.transitionNodeMigrationExact(
+        'line-a', txId, owner, 1_000, ['preparing'], 'rolling_back', 'rollback',
+      );
+      repo.finishNodeMigrationRollbackExact(
+        'line-a', txId, owner, 1_000, 'rolling_back', 'rolled_back', 'admin',
+      );
+    }
+
+    repo.recordStoppedEvidenceCleanupPendingExact('line-a', txId, item.phase, 'system');
+    repo.recordStoppedEvidenceCleanupPendingExact('line-a', txId, item.phase, 'system');
+
+    assert.deepEqual(
+      db.prepare(
+        `SELECT actor, action, target, detail, result FROM audit
+         WHERE action = ? ORDER BY id`,
+      ).all(item.action),
+      [{
+        actor: 'system',
+        action: item.action,
+        target: 'line-a',
+        detail: item.detail,
+        result: 'fail',
+      }],
+      item.phase,
+    );
+    assert.equal(repo.nodeMigration('line-a')?.phase, item.phase);
+    assert.equal(repo.nodeRuntime('line-a')?.migrationState, item.phase);
+    if (item.phase === 'rolled_back') {
+      const nextTxId = 'tx-cleanup-rolled-back-next';
+      const nextOwner = 'owner-cleanup-rolled-back-next';
+      repo.beginNodeMigration(migrationBegin('line-a', nextTxId, {
+        originalRunning: false,
+        executionOwner: nextOwner,
+        executionLeaseExpiresAt: 10_000,
+        replaceRolledBackTxId: txId,
+      }));
+      repo.transitionNodeMigrationExact(
+        'line-a', nextTxId, nextOwner, 1_000, ['preparing'], 'rolling_back', 'rollback',
+      );
+      repo.finishNodeMigrationRollbackExact(
+        'line-a', nextTxId, nextOwner, 1_000, 'rolling_back', 'rolled_back', 'admin',
+      );
+      repo.recordStoppedEvidenceCleanupPendingExact(
+        'line-a', nextTxId, 'rolled_back', 'system',
+      );
+      repo.recordStoppedEvidenceCleanupPendingExact(
+        'line-a', nextTxId, 'rolled_back', 'system',
+      );
+      assert.equal(
+        (db.prepare(
+          "SELECT COUNT(*) AS n FROM audit WHERE action = 'stopped_rollback_cleanup_pending'",
+        ).get() as { n: number }).n,
+        2,
+      );
+    }
+  }
+});
+
+test('C45 exact stopped cleanup audit rejects stale, non-clean, and projection-mismatched state', () => {
+  for (const phase of [
+    'preparing',
+    'pending_start_verification',
+    'rolled_back_dirty',
+    'manual_required',
+  ] as const) {
+    const repo = fresh();
+    const txId = `tx-cleanup-reject-${phase}`;
+    repo.create(rec(), [], cred());
+    repo.beginNodeMigration(migrationBegin('line-a', txId, { originalRunning: false }));
+    repo.updateNodeMigration(
+      'line-a',
+      phase,
+      phase === 'rolled_back_dirty' || phase === 'manual_required' ? 'rollback' : 'none',
+    );
+    assert.throws(
+      () => repo.recordStoppedEvidenceCleanupPendingExact(
+        'line-a', txId, 'committed', 'system',
+      ),
+      /exact|clean|terminal|终态|日志|状态|投影/i,
+      phase,
+    );
+  }
+
+  const stale = fresh();
+  stale.create(rec(), [], cred());
+  stale.beginNodeMigration(migrationBegin('line-a', 'tx-cleanup-current', {
+    originalRunning: false,
+  }));
+  stale.updateNodeMigration('line-a', 'rolled_back');
+  assert.throws(
+    () => stale.recordStoppedEvidenceCleanupPendingExact(
+      'line-a', 'tx-cleanup-stale', 'rolled_back', 'system',
+    ),
+    /exact|tx|日志|状态/i,
+  );
+  assert.throws(
+    () => stale.recordStoppedEvidenceCleanupPendingExact(
+      'line-a', 'tx-cleanup-current', 'committed', 'system',
+    ),
+    /exact|phase|终态|日志|状态/i,
+  );
+
+  const db = openDb(':memory:');
+  const projection = new InstanceRepo(db, KEY);
+  projection.create(rec(), [], cred());
+  projection.beginNodeMigration(migrationBegin('line-a', 'tx-cleanup-projection', {
+    originalRunning: false,
+  }));
+  projection.updateNodeMigration('line-a', 'rolled_back');
+  db.prepare(
+    "UPDATE instance SET node_migration_state = 'manual_required', node_migration_error = 'rollback' WHERE id = ?",
+  ).run('line-a');
+  assert.throws(
+    () => projection.recordStoppedEvidenceCleanupPendingExact(
+      'line-a', 'tx-cleanup-projection', 'rolled_back', 'system',
+    ),
+    /exact|projection|投影|日志|状态/i,
+  );
+  assert.equal(
+    (db.prepare(
+      "SELECT COUNT(*) AS n FROM audit WHERE action LIKE 'stopped_%_cleanup_pending'",
+    ).get() as { n: number }).n,
+    0,
+  );
+});
+
+test('C45 stopped cleanup audit insertion failure leaves the exact rolled_back terminal unchanged', () => {
+  const db = openDb(':memory:');
+  const repo = new InstanceRepo(db, KEY);
+  const txId = 'tx-cleanup-audit-failure';
+  const owner = 'owner-cleanup-audit-failure';
+  repo.create(rec(), [], cred());
+  repo.beginNodeMigration(migrationBegin('line-a', txId, {
+    originalRunning: false,
+    executionOwner: owner,
+    executionLeaseExpiresAt: 10_000,
+  }));
+  repo.transitionNodeMigrationExact(
+    'line-a', txId, owner, 1_000, ['preparing'], 'rolling_back', 'rollback',
+  );
+  repo.finishNodeMigrationRollbackExact(
+    'line-a', txId, owner, 1_000, 'rolling_back', 'rolled_back', 'admin',
+  );
+  db.exec(`CREATE TRIGGER reject_stopped_rollback_cleanup_audit
+    BEFORE INSERT ON audit
+    WHEN NEW.action = 'stopped_rollback_cleanup_pending'
+    BEGIN SELECT RAISE(ABORT, 'C45 cleanup audit rejected'); END;`);
+
+  assert.throws(
+    () => repo.recordStoppedEvidenceCleanupPendingExact(
+      'line-a', txId, 'rolled_back', 'system',
+    ),
+    /C45 cleanup audit rejected/,
+  );
+  assert.equal(repo.nodeMigration('line-a')?.phase, 'rolled_back');
+  assert.equal(repo.nodeMigration('line-a')?.error, 'none');
+  assert.deepEqual(repo.nodeRuntime('line-a'), {
+    mode: 'legacy', platformVersion: '', migrationState: 'rolled_back', migrationError: 'none',
+  });
+  assert.equal(
+    (db.prepare(
+      "SELECT COUNT(*) AS n FROM audit WHERE action = 'stopped_rollback_cleanup_pending'",
+    ).get() as { n: number }).n,
+    0,
+  );
+});
+
 test('exact tx phase CAS refuses a stale replacement and leaves the new journal untouched', () => {
   const repo = fresh();
   repo.create(rec(), [], cred());

@@ -1532,6 +1532,196 @@ test('C37 tampered stopped backup blocks commit and retains evidence for manual 
   assert.equal(existsSync(stoppedAuthorityPath(f)), true);
 });
 
+test('C44 rollback terminal audit failure retains stopped authority, sidecars, and checkpoint', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  const settingsBefore = sha256(readFileSync(join(f.instanceRoot, 'settings.js')));
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  const unhealthy = healthyPlatformInventory();
+  unhealthy.enabled = false;
+  unhealthy.health = 'failed';
+  unhealthy.errors = ['load_failed'];
+  unhealthy.nodeSets[0] = {
+    ...unhealthy.nodeSets[0]!, enabled: false, err: 'load_failed',
+  };
+  f.admin.afterRestart = unhealthy;
+  f.db.exec(`CREATE TRIGGER reject_c44_rollback_terminal_audit
+    BEFORE INSERT ON audit
+    WHEN NEW.action = 'rollback-node-migration'
+    BEGIN SELECT RAISE(ABORT, 'C44 rollback terminal audit rejected'); END;`);
+
+  const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+    f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+
+  assert.equal(result.phase, 'manual_required');
+  assert.notEqual(result.phase, 'rolled_back_dirty');
+  assert.equal(result.runtimeMode, 'legacy');
+  assert.equal(f.docker.inspection.running, false);
+  assert.equal(sha256(readFileSync(join(f.instanceRoot, 'settings.js'))), settingsBefore);
+  assert.equal(existsSync(join(stoppedAuthorityPath(f), 'manifest.json')), true);
+  assert.ok(txSidecars(f.instanceRoot, 'tx-01').length > 0);
+  assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), true);
+  assert.equal(
+    (f.db.prepare(
+      "SELECT COUNT(*) AS n FROM audit WHERE action = 'stopped_rollback_cleanup_pending'",
+    ).get() as { n: number }).n,
+    0,
+  );
+});
+
+test('C44 authority cleanup failure after manifest unlink stays rolled_back and fresh recovery finishes', async () => {
+  const f = migrationFixture({
+    originalRunning: false,
+    onBarrier: (event) => {
+      if (event.phase === 'rolled_back' && event.boundary === 'after-phase-persist') {
+        writeFileSync(join(stoppedAuthorityPath(f), 'cleanup-blocker'), 'retry later\n', {
+          mode: 0o600,
+        });
+      }
+    },
+  });
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  const unhealthy = healthyPlatformInventory();
+  unhealthy.enabled = false;
+  unhealthy.health = 'failed';
+  unhealthy.errors = ['load_failed'];
+  unhealthy.nodeSets[0] = {
+    ...unhealthy.nodeSets[0]!, enabled: false, err: 'load_failed',
+  };
+  f.admin.afterRestart = unhealthy;
+
+  const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+    f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+
+  const authorityRoot = stoppedAuthorityPath(f);
+  assert.equal(result.phase, 'rolled_back');
+  assert.equal(f.repo.nodeMigration('line-a')?.error, 'none');
+  assert.deepEqual(txSidecars(f.instanceRoot, 'tx-01'), []);
+  assert.equal(existsSync(authorityRoot), true);
+  assert.equal(existsSync(join(authorityRoot, 'manifest.json')), false);
+  assert.equal(existsSync(join(authorityRoot, 'cleanup-blocker')), true);
+  assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), true);
+  assert.deepEqual(
+    f.db.prepare(
+      `SELECT action, detail, result FROM audit
+       WHERE action = 'stopped_rollback_cleanup_pending'`,
+    ).all(),
+    [{
+      action: 'stopped_rollback_cleanup_pending',
+      detail: '{"code":"stopped_rollback_cleanup_pending"}',
+      result: 'fail',
+    }],
+  );
+
+  rmSync(join(authorityRoot, 'cleanup-blocker'));
+  const reopened = reopenMigrationFixture(f);
+  assert.deepEqual(
+    (await reopened.service.recoverInterrupted()).map((entry) => entry.phase),
+    ['rolled_back'],
+  );
+  await reopened.service.recoverInterrupted();
+  assert.equal(existsSync(authorityRoot), false);
+  assert.deepEqual(txSidecars(f.instanceRoot, 'tx-01'), []);
+  assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), false);
+  reopened.db.close();
+});
+
+test('C44 stopped terminal cleanup gates authority and checkpoint behind sidecar success', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  const cleanupPort = f.service as unknown as {
+    cleanupStoppedEvidence(
+      instanceId: string,
+      txId: string,
+      phase?: 'committed' | 'rolled_back',
+    ): Promise<void>;
+  };
+  const cleanupStoppedEvidence = cleanupPort.cleanupStoppedEvidence.bind(f.service);
+  let failSidecars = true;
+  cleanupPort.cleanupStoppedEvidence = async (instanceId, txId, phase) => {
+    assert.equal(f.repo.nodeMigration(instanceId)?.phase, 'rolled_back');
+    assert.equal(phase, 'rolled_back');
+    if (failSidecars) {
+      failSidecars = false;
+      throw new Error('token=sidecar-cleanup-secret');
+    }
+    await cleanupStoppedEvidence(instanceId, txId, phase);
+  };
+  const unhealthy = healthyPlatformInventory();
+  unhealthy.enabled = false;
+  unhealthy.health = 'failed';
+  unhealthy.errors = ['load_failed'];
+  unhealthy.nodeSets[0] = {
+    ...unhealthy.nodeSets[0]!, enabled: false, err: 'load_failed',
+  };
+  f.admin.afterRestart = unhealthy;
+
+  const rolledBack = await f.gate.run('line-a', 'start-instance', (lease) => (
+    f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+
+  const authorityRoot = stoppedAuthorityPath(f);
+  assert.equal(rolledBack.phase, 'rolled_back');
+  assert.ok(txSidecars(f.instanceRoot, 'tx-01').length > 0);
+  assert.equal(existsSync(join(authorityRoot, 'manifest.json')), true);
+  assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), true);
+  assert.equal(
+    (f.db.prepare(
+      "SELECT COUNT(*) AS n FROM audit WHERE action = 'checkpoint_cleanup_pending'",
+    ).get() as { n: number }).n,
+    0,
+  );
+
+  writeFileSync(join(authorityRoot, 'cleanup-blocker'), 'retry later\n', { mode: 0o600 });
+  const freshGate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(f.repo));
+  const freshService = f.createService(f.repo, freshGate, 'tx-c44-fresh');
+  await freshService.recoverInterrupted();
+  assert.deepEqual(txSidecars(f.instanceRoot, 'tx-01'), []);
+  assert.equal(existsSync(authorityRoot), true);
+  assert.equal(existsSync(join(authorityRoot, 'manifest.json')), false);
+  assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), true);
+  assert.equal(
+    (f.db.prepare(
+      "SELECT COUNT(*) AS n FROM audit WHERE action = 'stopped_rollback_cleanup_pending'",
+    ).get() as { n: number }).n,
+    1,
+  );
+
+  rmSync(join(authorityRoot, 'cleanup-blocker'));
+  f.controls.cleanupFailure = true;
+  await freshService.recoverInterrupted();
+  assert.deepEqual(txSidecars(f.instanceRoot, 'tx-01'), []);
+  assert.equal(existsSync(authorityRoot), false);
+  assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), true);
+  assert.equal(
+    (f.db.prepare(
+      "SELECT COUNT(*) AS n FROM audit WHERE action = 'checkpoint_cleanup_pending'",
+    ).get() as { n: number }).n,
+    0,
+  );
+  assert.doesNotMatch(
+    JSON.stringify(f.db.prepare(
+      "SELECT detail FROM audit WHERE action = 'stopped_rollback_cleanup_pending'",
+    ).all()),
+    /sidecar-cleanup-secret|token=/i,
+  );
+
+  f.controls.cleanupFailure = false;
+  await freshService.recoverInterrupted();
+  await freshService.recoverInterrupted();
+  assert.equal(f.repo.nodeMigration('line-a')?.phase, 'rolled_back');
+  assert.deepEqual(txSidecars(f.instanceRoot, 'tx-01'), []);
+  assert.equal(existsSync(authorityRoot), false);
+  assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), false);
+  assert.equal(
+    (f.db.prepare(
+      "SELECT COUNT(*) AS n FROM audit WHERE action = 'stopped_rollback_cleanup_pending'",
+    ).get() as { n: number }).n,
+    1,
+  );
+});
+
 test('stopped live apply covers all four file/directory states without overwriting nonempty targets', async () => {
   const f = migrationFixture({ originalRunning: false, preexisting: true });
   writeFileSync(join(f.instanceRoot, '.config.modules.json.backup'), 'delete-on-cutover', { mode: 0o640 });
