@@ -347,22 +347,29 @@ function assertStagedEvidence(module: InstalledModule): void {
   ) {
     throw controlled('preflight', 'preexisting platform package identity is not exact');
   }
-  const seen = new Set<string>();
+  const duplicateErrors = new Map<string, string>();
   for (const set of module.nodeSets) {
     if (
       set.module !== PLATFORM_NODE_PACKAGE.name
       || set.version !== PLATFORM_NODE_PACKAGE.version
       || set.types.length !== 1
-      || !TARGET_TYPES.has(set.types[0]!)
-      || seen.has(set.types[0]!)
-      || set.err !== 'type_already_registered'
     ) {
       throw controlled('preflight', 'preexisting platform package staging evidence is incomplete');
     }
-    seen.add(set.types[0]!);
+    const type = set.types[0]!;
+    if (!TARGET_TYPES.has(type) || duplicateErrors.has(type)) {
+      throw controlled('preflight', 'preexisting platform package staging evidence is incomplete');
+    }
+    duplicateErrors.set(type, set.err);
   }
-  if (seen.size !== PLATFORM_NODE_TYPES.length) {
+  if (duplicateErrors.size !== PLATFORM_NODE_TYPES.length) {
     throw controlled('preflight', 'preexisting platform package node sets are incomplete');
+  }
+  for (const type of PLATFORM_NODE_TYPES) {
+    const error = duplicateErrors.get(type);
+    if (error !== 'type_already_registered' && error !== `${type} already registered`) {
+      throw controlled('preflight', 'preexisting platform package staging evidence is incomplete');
+    }
   }
 }
 

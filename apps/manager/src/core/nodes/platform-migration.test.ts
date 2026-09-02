@@ -297,6 +297,34 @@ function stagedPlatformInventory(version = PLATFORM_NODE_PACKAGE.version): Insta
   };
 }
 
+function capturedNodeRed504StagedPlatformInventory(): InstalledModule {
+  const module = PLATFORM_NODE_PACKAGE.name;
+  const version = PLATFORM_NODE_PACKAGE.version;
+  const nodeSets = PLATFORM_NODE_TYPES.map((type) => ({
+    id: `${module}/${type}`,
+    name: type,
+    module,
+    version,
+    types: [type],
+    enabled: true,
+    err: `${type} already registered`,
+    local: true,
+  }));
+  return {
+    module,
+    version,
+    observedVersions: [version],
+    local: true,
+    types: [...PLATFORM_NODE_TYPES],
+    enabled: true,
+    errors: nodeSets.map((set) => set.err),
+    nodeSets,
+    observedFiles: [],
+    source: 'npm',
+    health: 'failed',
+  };
+}
+
 function writeJson(path: string, value: unknown): void {
   mkdirSync(join(path, '..'), { recursive: true });
   writeFileSync(path, `${JSON.stringify(value)}\n`, { mode: 0o600 });
@@ -2371,6 +2399,107 @@ test('exact preexisting staged package skips install and still completes strict 
     ), 'utf8').includes(PLATFORM_NODE_PACKAGE.version),
     true,
   );
+});
+
+test('C48 accepts the exact per-type duplicate text captured from Node-RED 5.0.4 staging', async () => {
+  const f = migrationFixture();
+  f.admin.stagePlatformModule = async () => {
+    f.admin.installCalls += 1;
+    writeInstalledPackage(f.instanceRoot);
+    f.state.staged = true;
+    const staged = capturedNodeRed504StagedPlatformInventory();
+    f.admin.beforeModules = [rawPlatformInventory(), staged];
+    return staged;
+  };
+
+  const result = await f.service.migrate('line-a', 'admin');
+
+  assert.equal(result.phase, 'committed');
+  assert.equal(f.admin.installCalls, 1);
+  assert.equal(f.admin.uninstallCalls, 0);
+  assert.equal(f.docker.settingsWrites.length, 1);
+});
+
+test('C48 rejects near-miss duplicate staging text and non-exact type-set evidence', async () => {
+  const cases: Array<{
+    name: string;
+    mutate: (inventory: InstalledModule) => void;
+  }> = [
+    { name: 'empty error', mutate: (inventory) => {
+      inventory.nodeSets[0]!.err = '';
+    } },
+    { name: 'wrong type association', mutate: (inventory) => {
+      inventory.nodeSets[0]!.err = 'tl-tag already registered';
+    } },
+    { name: 'wrong type', mutate: (inventory) => {
+      inventory.nodeSets[0]!.types = ['tl-other'];
+      inventory.nodeSets[0]!.err = 'tl-other already registered';
+    } },
+    { name: 'multiple types', mutate: (inventory) => {
+      inventory.nodeSets[0]!.types = ['tl-device', 'tl-tag'];
+    } },
+    { name: 'case variation', mutate: (inventory) => {
+      inventory.nodeSets[0]!.err = 'TL-DEVICE already registered';
+    } },
+    { name: 'leading whitespace', mutate: (inventory) => {
+      inventory.nodeSets[0]!.err = ' tl-device already registered';
+    } },
+    { name: 'trailing whitespace', mutate: (inventory) => {
+      inventory.nodeSets[0]!.err = 'tl-device already registered ';
+    } },
+    { name: 'prefix variation', mutate: (inventory) => {
+      inventory.nodeSets[0]!.err = 'error: tl-device already registered';
+    } },
+    { name: 'suffix variation', mutate: (inventory) => {
+      inventory.nodeSets[0]!.err = 'tl-device already registered now';
+    } },
+    { name: 'other error', mutate: (inventory) => {
+      inventory.nodeSets[0]!.err = 'load_failed';
+    } },
+    { name: 'missing set', mutate: (inventory) => {
+      inventory.nodeSets.pop();
+    } },
+    { name: 'extra set', mutate: (inventory) => {
+      inventory.nodeSets.push({
+        ...inventory.nodeSets[0]!,
+        id: `${PLATFORM_NODE_PACKAGE.name}/tl-other`,
+        name: 'tl-other',
+        types: ['tl-other'],
+        err: 'tl-other already registered',
+      });
+    } },
+    { name: 'duplicate set', mutate: (inventory) => {
+      inventory.nodeSets[2] = {
+        ...inventory.nodeSets[0]!,
+        types: [...inventory.nodeSets[0]!.types],
+      };
+    } },
+    { name: 'mixed versions', mutate: (inventory) => {
+      inventory.nodeSets[0]!.version = '0.0.2';
+      inventory.version = '';
+      inventory.observedVersions = [PLATFORM_NODE_PACKAGE.version, '0.0.2'];
+    } },
+  ];
+
+  for (const item of cases) {
+    const f = migrationFixture();
+    const invalid = capturedNodeRed504StagedPlatformInventory();
+    item.mutate(invalid);
+    invalid.errors = invalid.nodeSets.map((set) => set.err).filter(Boolean);
+    f.admin.stagePlatformModule = async () => {
+      f.admin.installCalls += 1;
+      writeInstalledPackage(f.instanceRoot);
+      f.state.staged = true;
+      f.admin.beforeModules = [rawPlatformInventory(), invalid];
+      return invalid;
+    };
+
+    const result = await f.service.migrate('line-a', 'admin');
+
+    assert.equal(result.phase, 'rolled_back', item.name);
+    assert.equal(f.admin.uninstallCalls, 1, item.name);
+    assert.equal(f.docker.settingsWrites.length, 0, item.name);
+  }
 });
 
 test('preexisting partial or integrity-mismatched package fails before cutover', async () => {
