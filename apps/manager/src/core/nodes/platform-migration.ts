@@ -217,6 +217,8 @@ export interface PlatformMigrationServiceOptions {
   txId?: (() => string) | undefined;
   /** Internal deterministic time/heartbeat port; production uses the bounded defaults below. */
   executionRuntime?: PlatformMigrationExecutionRuntime | undefined;
+  /** Internal object-only probe quiescence port; never populated from HTTP or environment input. */
+  probeSettleRuntime?: PlatformMigrationProbeSettleRuntime | undefined;
 }
 
 export interface PlatformMigrationExecutionRuntime {
@@ -225,6 +227,20 @@ export interface PlatformMigrationExecutionRuntime {
   startHeartbeat(intervalMs: number, task: () => void): () => void;
   executionOwner(): string;
   leaseDurationMs: number;
+}
+
+export interface PlatformMigrationProbeSettleRuntime {
+  sleep(ms: number): Promise<void>;
+  pollIntervalMs?: number | undefined;
+  quietSamples?: number | undefined;
+  maxSamples?: number | undefined;
+}
+
+interface ResolvedPlatformMigrationProbeSettleRuntime {
+  sleep(ms: number): Promise<void>;
+  pollIntervalMs: number;
+  quietSamples: number;
+  maxSamples: number;
 }
 
 interface PreflightFacts {
@@ -243,6 +259,10 @@ const RECOVERABLE_PHASES = [
 const OWNED_PHASES = [...RECOVERABLE_PHASES, 'pending_start_verification'] as const;
 const DEFAULT_EXECUTION_LEASE_MS = 15_000;
 const MAX_EXECUTION_LEASE_MS = 59_000;
+const DEFAULT_PROBE_SETTLE_POLL_INTERVAL_MS = 500;
+const DEFAULT_PROBE_SETTLE_QUIET_SAMPLES = 5;
+const DEFAULT_PROBE_SETTLE_MAX_SAMPLES = 20;
+const MAX_PROBE_SETTLE_POLL_INTERVAL_MS = 1_000;
 
 const DEFAULT_EXECUTION_RUNTIME: PlatformMigrationExecutionRuntime = {
   now: () => Date.now(),
@@ -254,6 +274,13 @@ const DEFAULT_EXECUTION_RUNTIME: PlatformMigrationExecutionRuntime = {
   },
   executionOwner: () => `owner-${randomUUID()}`,
   leaseDurationMs: DEFAULT_EXECUTION_LEASE_MS,
+};
+
+const DEFAULT_PROBE_SETTLE_RUNTIME: ResolvedPlatformMigrationProbeSettleRuntime = {
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  pollIntervalMs: DEFAULT_PROBE_SETTLE_POLL_INTERVAL_MS,
+  quietSamples: DEFAULT_PROBE_SETTLE_QUIET_SAMPLES,
+  maxSamples: DEFAULT_PROBE_SETTLE_MAX_SAMPLES,
 };
 
 interface MigrationExecutionSession {
@@ -999,15 +1026,36 @@ async function readArtifactManifest(
 export class PlatformMigrationService {
   private readonly o: PlatformMigrationServiceOptions;
   private readonly executionRuntime: PlatformMigrationExecutionRuntime;
+  private readonly probeSettleRuntime: ResolvedPlatformMigrationProbeSettleRuntime;
 
   constructor(options: PlatformMigrationServiceOptions) {
     this.o = options;
     this.executionRuntime = options.executionRuntime ?? DEFAULT_EXECUTION_RUNTIME;
+    this.probeSettleRuntime = {
+      sleep: options.probeSettleRuntime?.sleep ?? DEFAULT_PROBE_SETTLE_RUNTIME.sleep,
+      pollIntervalMs: options.probeSettleRuntime?.pollIntervalMs
+        ?? DEFAULT_PROBE_SETTLE_RUNTIME.pollIntervalMs,
+      quietSamples: options.probeSettleRuntime?.quietSamples
+        ?? DEFAULT_PROBE_SETTLE_RUNTIME.quietSamples,
+      maxSamples: options.probeSettleRuntime?.maxSamples
+        ?? DEFAULT_PROBE_SETTLE_RUNTIME.maxSamples,
+    };
     if (
       !Number.isSafeInteger(this.executionRuntime.leaseDurationMs)
       || this.executionRuntime.leaseDurationMs <= 0
       || this.executionRuntime.leaseDurationMs > MAX_EXECUTION_LEASE_MS
     ) throw new Error('platform migration execution lease must be 1..59000 ms');
+    if (
+      typeof this.probeSettleRuntime.sleep !== 'function'
+      || !Number.isSafeInteger(this.probeSettleRuntime.pollIntervalMs)
+      || this.probeSettleRuntime.pollIntervalMs <= 0
+      || this.probeSettleRuntime.pollIntervalMs > MAX_PROBE_SETTLE_POLL_INTERVAL_MS
+      || !Number.isSafeInteger(this.probeSettleRuntime.quietSamples)
+      || this.probeSettleRuntime.quietSamples <= 0
+      || !Number.isSafeInteger(this.probeSettleRuntime.maxSamples)
+      || this.probeSettleRuntime.maxSamples < this.probeSettleRuntime.quietSamples
+      || this.probeSettleRuntime.maxSamples > DEFAULT_PROBE_SETTLE_MAX_SAMPLES
+    ) throw new Error('platform migration probe settle runtime bounds are invalid');
   }
 
   status(instanceId: string): PlatformMigrationResult {
@@ -1412,13 +1460,10 @@ export class PlatformMigrationService {
     return facts;
   }
 
-  private async verifyAndExportStoppedProbe(
-    execution: MigrationExecutionSession,
+  private async verifyStoppedProbeRuntime(
     handle: MigrationProbeHandle,
     target: AdminTarget,
-  ): Promise<StoppedArtifactFact[]> {
-    await this.o.admin.waitReadyAt(target);
-    execution.renew(['staged']);
+  ): Promise<void> {
     assertNpmOwners(await this.o.admin.installedModulesAt(target));
     await this.verifyProbePackageFiles(handle.dataRoot);
     const expectedFlows = await this.probeFlowIds(handle.dataRoot);
@@ -1426,9 +1471,41 @@ export class PlatformMigrationService {
     if (!observedFlows || JSON.stringify(observedFlows) !== JSON.stringify(expectedFlows)) {
       throw controlled('verification', 'probe Admin flow identity mismatch');
     }
-    const exported = await this.exportStoppedProbe(handle.dataRoot);
+  }
+
+  private async settleAndVerifyStoppedProbe(
+    execution: MigrationExecutionSession,
+    handle: MigrationProbeHandle,
+    target: AdminTarget,
+  ): Promise<StoppedArtifactFact[]> {
+    await this.o.admin.waitReadyAt(target);
     execution.renew(['staged']);
-    return exported;
+    await this.verifyStoppedProbeRuntime(handle, target);
+    let settled = await this.exportStoppedProbe(handle.dataRoot);
+    execution.renew(['staged']);
+    let quiet = 0;
+    for (let sample = 0; sample < this.probeSettleRuntime.maxSamples; sample += 1) {
+      await this.probeSettleRuntime.sleep(this.probeSettleRuntime.pollIntervalMs);
+      const current = await this.exportStoppedProbe(handle.dataRoot);
+      execution.renew(['staged']);
+      if (sameArtifactFacts(settled, current)) {
+        quiet += 1;
+        if (quiet >= this.probeSettleRuntime.quietSamples) break;
+      } else {
+        settled = current;
+        quiet = 0;
+      }
+    }
+    if (quiet < this.probeSettleRuntime.quietSamples) {
+      throw controlled('verification', 'probe runtime artifacts did not become quiet');
+    }
+    await this.verifyStoppedProbeRuntime(handle, target);
+    const final = await this.exportStoppedProbe(handle.dataRoot);
+    execution.renew(['staged']);
+    if (!sameArtifactFacts(settled, final)) {
+      throw controlled('verification', 'probe runtime artifacts changed after quiet verification');
+    }
+    return final;
   }
 
   private async persistStoppedAuthority(
@@ -2166,12 +2243,12 @@ export class PlatformMigrationService {
         boundary: 'after-settings-write',
       });
       await this.o.docker.restartMigrationProbe(handle);
-      let previous = await this.verifyAndExportStoppedProbe(execution, handle, target);
+      let previous = await this.settleAndVerifyStoppedProbe(execution, handle, target);
       let exported: StoppedArtifactFact[] | undefined;
       for (let confirmation = 0; confirmation < 2; confirmation += 1) {
         execution.renew(['staged']);
         await this.o.docker.restartMigrationProbe(handle);
-        const current = await this.verifyAndExportStoppedProbe(execution, handle, target);
+        const current = await this.settleAndVerifyStoppedProbe(execution, handle, target);
         if (sameArtifactFacts(previous, current)) {
           exported = current;
           break;

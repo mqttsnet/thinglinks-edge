@@ -104,6 +104,26 @@ class ManualMigrationTime {
   }
 }
 
+interface TestProbeSettleRuntime {
+  pollIntervalMs: number;
+  quietSamples: number;
+  maxSamples: number;
+  sleep(ms: number): Promise<void>;
+}
+
+class FakeProbeSettleRuntime implements TestProbeSettleRuntime {
+  pollIntervalMs = 500;
+  quietSamples = 5;
+  maxSamples = 20;
+  readonly sleeps: number[] = [];
+  onSleep: ((sample: number) => Promise<void> | void) | undefined;
+
+  sleep = async (ms: number): Promise<void> => {
+    this.sleeps.push(ms);
+    await this.onSleep?.(this.sleeps.length);
+  };
+}
+
 after(() => {
   for (const root of roots) rmSync(root, { recursive: true, force: true });
 });
@@ -847,6 +867,7 @@ function migrationFixture(options: FixtureOptions = {}) {
   }
   const packages = new FakePackageVerifier();
   const time = new ManualMigrationTime();
+  const probeSettle = new FakeProbeSettleRuntime();
   const proxySessions = new ProxySessionRegistry();
   const events: string[] = [];
   const barrierEvents: Parameters<PlatformNodeOperationBarrier['reach']>[0][] = [];
@@ -912,57 +933,62 @@ function migrationFixture(options: FixtureOptions = {}) {
     selectedGate: InstanceOperationGate,
     txId: string | (() => string),
     executionOwner = `owner-${typeof txId === 'string' ? txId : 'generated'}-0000000000000000`,
-  ) => new PlatformMigrationService({
-    repo: selectedRepo,
-    gate: selectedGate,
-    proxySessions,
-    docker,
-    adminRuntime,
-    admin,
-    platformPackages: packages,
-    checkpoint,
-    settings: new FakeSettings(selectedGate),
-    ...(options.enableRepair ? {
-      repair: {
-        recreateSameImageUnderLease: async (
-          instanceId: string,
-          lease: InstanceOperationLease,
-        ) => {
-          selectedGate.assertLease(lease, instanceId, ['platform-migration']);
-          events.push('same-image-rebuild');
-          docker.runtimeCalls.push('same-image-rebuild');
-          if (options.repairFailure) throw new Error('TLE_INGEST_TOKEN=must-not-escape');
-          docker.inspection = {
-            ...docker.inspection,
-            environment: [
-              `TLE_INSTANCE_ID=${instanceId}`,
-              `TLE_MANAGER_URL=${docker.expected.managerUrl}`,
-              `TLE_INGEST_TOKEN=${token}`,
-              `NPM_CONFIG_REGISTRY=${docker.expected.npmRegistry}`,
-            ],
-          };
+    selectedProbeSettle?: TestProbeSettleRuntime,
+  ) => {
+    const serviceOptions = {
+      repo: selectedRepo,
+      gate: selectedGate,
+      proxySessions,
+      docker,
+      adminRuntime,
+      admin,
+      platformPackages: packages,
+      checkpoint,
+      settings: new FakeSettings(selectedGate),
+      ...(options.enableRepair ? {
+        repair: {
+          recreateSameImageUnderLease: async (
+            instanceId: string,
+            lease: InstanceOperationLease,
+          ) => {
+            selectedGate.assertLease(lease, instanceId, ['platform-migration']);
+            events.push('same-image-rebuild');
+            docker.runtimeCalls.push('same-image-rebuild');
+            if (options.repairFailure) throw new Error('TLE_INGEST_TOKEN=must-not-escape');
+            docker.inspection = {
+              ...docker.inspection,
+              environment: [
+                `TLE_INSTANCE_ID=${instanceId}`,
+                `TLE_MANAGER_URL=${docker.expected.managerUrl}`,
+                `TLE_INGEST_TOKEN=${token}`,
+                `NPM_CONFIG_REGISTRY=${docker.expected.npmRegistry}`,
+              ],
+            };
+          },
         },
-      },
-    } : {}),
-    ...(options.onBootstrapRecovery ? {
-      bootstrapRecovery: {
-        recoverInterruptedBootstraps: async () => {
-          events.push('bootstrap-recovery');
-          await options.onBootstrapRecovery?.();
+      } : {}),
+      ...(options.onBootstrapRecovery ? {
+        bootstrapRecovery: {
+          recoverInterruptedBootstraps: async () => {
+            events.push('bootstrap-recovery');
+            await options.onBootstrapRecovery?.();
+          },
         },
+      } : {}),
+      barrier,
+      instanceDataRoot: root,
+      txId: typeof txId === 'string' ? () => txId : txId,
+      executionRuntime: {
+        now: time.now,
+        sleep: time.sleep,
+        startHeartbeat: time.startHeartbeat,
+        executionOwner: () => executionOwner,
+        leaseDurationMs: 1_000,
       },
-    } : {}),
-    barrier,
-    instanceDataRoot: root,
-    txId: typeof txId === 'string' ? () => txId : txId,
-    executionRuntime: {
-      now: time.now,
-      sleep: time.sleep,
-      startHeartbeat: time.startHeartbeat,
-      executionOwner: () => executionOwner,
-      leaseDurationMs: 1_000,
-    },
-  });
+      probeSettleRuntime: selectedProbeSettle ?? { sleep: probeSettle.sleep },
+    };
+    return new PlatformMigrationService(serviceOptions);
+  };
   const service = createService(repo, gate, 'tx-01');
   return {
     root,
@@ -976,6 +1002,7 @@ function migrationFixture(options: FixtureOptions = {}) {
     admin,
     packages,
     time,
+    probeSettle,
     checkpoint: realCheckpoint,
     proxySessions,
     events,
@@ -1656,8 +1683,8 @@ test('C58 stopped probe exports only after one-generation node config rotation c
   assert.equal(restart, 3);
   assert.equal(f.docker.runtimeCalls.filter((call) => call === 'probe-restart').length, 3);
   assert.equal(f.admin.waitReadyAtCalls, 4);
-  assert.equal(f.admin.probeInstalledModulesCalls, 3);
-  assert.equal(f.admin.probeCurrentFlowsCalls, 3);
+  assert.equal(f.admin.probeInstalledModulesCalls, 6);
+  assert.equal(f.admin.probeCurrentFlowsCalls, 6);
   assert.deepEqual(JSON.parse(readFileSync(join(f.instanceRoot, '.config.nodes.json'), 'utf8')), {
     generation: 'C',
   });
@@ -1692,8 +1719,8 @@ test('C58 stable stopped probe needs exactly one confirmation restart', async ()
   assert.equal(result.phase, 'pending_start_verification');
   assert.equal(f.docker.runtimeCalls.filter((call) => call === 'probe-restart').length, 2);
   assert.equal(f.admin.waitReadyAtCalls, 3);
-  assert.equal(f.admin.probeInstalledModulesCalls, 2);
-  assert.equal(f.admin.probeCurrentFlowsCalls, 2);
+  assert.equal(f.admin.probeInstalledModulesCalls, 4);
+  assert.equal(f.admin.probeCurrentFlowsCalls, 4);
 });
 
 test('C58 oscillating stopped probe rolls back before applying any live artifact', async () => {
@@ -1712,8 +1739,8 @@ test('C58 oscillating stopped probe rolls back before applying any live artifact
   assert.equal(result.error, 'none');
   assert.equal(restart, 3);
   assert.equal(f.admin.waitReadyAtCalls, 4);
-  assert.equal(f.admin.probeInstalledModulesCalls, 3);
-  assert.equal(f.admin.probeCurrentFlowsCalls, 3);
+  assert.equal(f.admin.probeInstalledModulesCalls, 6);
+  assert.equal(f.admin.probeCurrentFlowsCalls, 6);
   assert.equal(f.docker.runtimeCalls.includes('start'), false);
   assert.equal(f.docker.runtimeCalls.includes('write-settings'), false);
   assert.equal(f.barrierEvents.some((event) => (
@@ -1763,8 +1790,8 @@ test('C58 every confirmation pass revalidates Edge common manifests and lock SRI
 
     assert.equal(result.phase, 'rolled_back', item.name);
     assert.equal(restart, 2, item.name);
-    assert.equal(f.admin.probeInstalledModulesCalls, 2, item.name);
-    assert.equal(f.admin.probeCurrentFlowsCalls, 1, item.name);
+    assert.equal(f.admin.probeInstalledModulesCalls, 3, item.name);
+    assert.equal(f.admin.probeCurrentFlowsCalls, 2, item.name);
     assert.equal(existsSync(stoppedAuthorityPath(f)), false, item.name);
     assert.equal(f.barrierEvents.some((event) => (
       event.boundary === 'after-live-backup' || event.boundary === 'after-live-rename'
@@ -1772,7 +1799,7 @@ test('C58 every confirmation pass revalidates Edge common manifests and lock SRI
   }
 });
 
-test('C58 every confirmation pass rejects Admin flow identity drift before export', async () => {
+test('C60 post-quiet full revalidation rejects Admin flow identity drift before export', async () => {
   const f = migrationFixture({ originalRunning: false });
   const currentFlowsAt = f.admin.currentFlowsAt.bind(f.admin);
   f.admin.currentFlowsAt = async (target) => {
@@ -1786,7 +1813,7 @@ test('C58 every confirmation pass rejects Admin flow identity drift before expor
   const result = await f.service.migrate('line-a', 'admin');
 
   assert.equal(result.phase, 'rolled_back');
-  assert.equal(f.docker.runtimeCalls.filter((call) => call === 'probe-restart').length, 2);
+  assert.equal(f.docker.runtimeCalls.filter((call) => call === 'probe-restart').length, 1);
   assert.equal(f.admin.probeInstalledModulesCalls, 2);
   assert.equal(f.admin.probeCurrentFlowsCalls, 2);
   assert.equal(existsSync(stoppedAuthorityPath(f)), false);
@@ -1877,7 +1904,7 @@ for (const mutation of ['existence', 'mode', 'hash'] as const) {
   });
 }
 
-test('C58 ownership loss during final export read writes no authority or sidecars and recovers once', async () => {
+test('C60 ownership loss during a polled export writes no authority or sidecars and recovers once', async () => {
   const f = migrationFixture({ originalRunning: false });
   const before = migrationEvidence(f.instanceRoot);
   let exportReads = 0;
@@ -1922,6 +1949,239 @@ test('C58 ownership loss during final export read writes no authority or sidecar
   );
   assert.equal(f.docker.runtimeCalls.includes('start'), false);
   reopened.db.close();
+});
+
+test('C60 delayed Node-RED state write settles before restart convergence and production commit', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  let restarts = 0;
+  let firstRestartPolls = 0;
+  f.docker.afterProbeRestart = (probeRoot) => {
+    restarts += 1;
+    if (restarts === 1) {
+      writeJson(join(probeRoot, '.config.nodes.json'), { generation: 'A' });
+      writeJson(join(probeRoot, '.config.nodes.json.backup'), { generation: 'B' });
+    }
+  };
+  f.probeSettle.onSleep = () => {
+    if (restarts !== 1 || !f.state.probeRoot) return;
+    firstRestartPolls += 1;
+    if (firstRestartPolls === 4) {
+      writeJson(join(f.state.probeRoot, '.config.nodes.json'), { generation: 'C' });
+      writeJson(join(f.state.probeRoot, '.config.nodes.json.backup'), { generation: 'A' });
+    }
+  };
+
+  const pending = await f.service.migrate('line-a', 'admin');
+
+  assert.equal(pending.phase, 'pending_start_verification');
+  assert.equal(restarts, 2);
+  assert.equal(firstRestartPolls, 9);
+  assert.equal(f.probeSettle.sleeps.length, 14);
+  assert.ok(f.probeSettle.sleeps.every((ms) => ms === 500));
+  assert.deepEqual(JSON.parse(readFileSync(join(f.instanceRoot, '.config.nodes.json'), 'utf8')), {
+    generation: 'C',
+  });
+  assert.deepEqual(
+    JSON.parse(readFileSync(join(f.instanceRoot, '.config.nodes.json.backup'), 'utf8')),
+    { generation: 'A' },
+  );
+
+  const committed = await f.gate.run('line-a', 'start-instance', (lease) => (
+    f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+  assert.equal(committed.phase, 'committed');
+  assert.equal(f.docker.runtimeCalls.filter((call) => call === 'start').length, 1);
+});
+
+test('C60 artifact change just before the quiet threshold resets the full counter', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  let restarts = 0;
+  let firstRestartPolls = 0;
+  f.docker.afterProbeRestart = (probeRoot) => {
+    restarts += 1;
+    if (restarts === 1) {
+      writeJson(join(probeRoot, '.config.nodes.json'), { generation: 'A' });
+    }
+  };
+  f.probeSettle.onSleep = () => {
+    if (restarts !== 1 || !f.state.probeRoot) return;
+    firstRestartPolls += 1;
+    if (firstRestartPolls === 5) {
+      writeJson(join(f.state.probeRoot, '.config.nodes.json'), { generation: 'C' });
+    }
+  };
+
+  const result = await f.service.migrate('line-a', 'admin');
+
+  assert.equal(result.phase, 'pending_start_verification');
+  assert.equal(restarts, 2);
+  assert.equal(firstRestartPolls, 10);
+  assert.equal(f.probeSettle.sleeps.length, 15);
+  assert.ok(f.probeSettle.sleeps.every((ms) => ms === 500));
+});
+
+test('C60 perpetual delayed churn times out at twenty samples before authority or live apply', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  let sample = 0;
+  f.probeSettle.onSleep = () => {
+    sample += 1;
+    assert.ok(f.state.probeRoot);
+    writeJson(join(f.state.probeRoot, '.config.nodes.json'), { generation: sample });
+    writeJson(join(f.state.probeRoot, '.config.nodes.json.backup'), { generation: sample - 1 });
+  };
+
+  const result = await f.service.migrate('line-a', 'admin');
+
+  assert.equal(result.phase, 'rolled_back');
+  assert.equal(sample, 20);
+  assert.equal(f.probeSettle.sleeps.length, 20);
+  assert.ok(f.probeSettle.sleeps.every((ms) => ms === 500));
+  assert.equal(f.docker.runtimeCalls.filter((call) => call === 'probe-restart').length, 1);
+  assert.equal(existsSync(stoppedAuthorityPath(f)), false);
+  assert.deepEqual(txSidecars(f.instanceRoot, 'tx-01'), []);
+  assert.equal(f.barrierEvents.some((event) => (
+    event.boundary === 'after-live-backup' || event.boundary === 'after-live-rename'
+  )), false);
+});
+
+test('C60 post-quiet full revalidation rejects package drift before authority', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  const installedModulesAt = f.admin.installedModulesAt.bind(f.admin);
+  f.admin.installedModulesAt = async (target) => {
+    const modules = await installedModulesAt(target);
+    if (f.admin.probeInstalledModulesCalls === 2) {
+      assert.ok(f.state.probeRoot);
+      mutateJson(join(f.state.probeRoot, 'package-lock.json'), (lock) => {
+        const packages = lock['packages'] as Record<string, Record<string, unknown>>;
+        const edgePath = join('node_modules', ...PLATFORM_NODE_PACKAGE.name.split('/'));
+        packages[edgePath]!['integrity'] = 'sha512-post-quiet-drift';
+      });
+    }
+    return modules;
+  };
+
+  const result = await f.service.migrate('line-a', 'admin');
+
+  assert.equal(result.phase, 'rolled_back');
+  assert.equal(f.probeSettle.sleeps.length, 5);
+  assert.equal(f.admin.probeInstalledModulesCalls, 2);
+  assert.equal(f.admin.probeCurrentFlowsCalls, 1);
+  assert.equal(existsSync(stoppedAuthorityPath(f)), false);
+  assert.deepEqual(txSidecars(f.instanceRoot, 'tx-01'), []);
+});
+
+test('C60 final export must still equal the quiet artifact sample', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  const currentFlowsAt = f.admin.currentFlowsAt.bind(f.admin);
+  f.admin.currentFlowsAt = async (target) => {
+    const observed = await currentFlowsAt(target);
+    if (f.admin.probeCurrentFlowsCalls === 2) {
+      assert.ok(f.state.probeRoot);
+      writeJson(join(f.state.probeRoot, '.config.modules.json'), {
+        changedDuringFinalValidation: true,
+      });
+    }
+    return observed;
+  };
+
+  const result = await f.service.migrate('line-a', 'admin');
+
+  assert.equal(result.phase, 'rolled_back');
+  assert.equal(f.probeSettle.sleeps.length, 5);
+  assert.equal(f.admin.probeInstalledModulesCalls, 2);
+  assert.equal(f.admin.probeCurrentFlowsCalls, 2);
+  assert.equal(existsSync(stoppedAuthorityPath(f)), false);
+  assert.deepEqual(txSidecars(f.instanceRoot, 'tx-01'), []);
+});
+
+test('C60 ownership loss during quiescence polling writes no authority or sidecars', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  let replaced = false;
+  f.probeSettle.onSleep = () => {
+    if (replaced) return;
+    replaced = true;
+    claimReplacementExecution(f, 'owner-probe-poll-reader-0001', 'staged');
+  };
+
+  const result = await f.service.migrate('line-a', 'admin');
+
+  assert.equal(replaced, true);
+  assert.equal(result.phase, 'staged');
+  assert.equal(f.probeSettle.sleeps.length, 1);
+  assert.equal(existsSync(stoppedAuthorityPath(f)), false);
+  assert.deepEqual(txSidecars(f.instanceRoot, 'tx-01'), []);
+  assert.equal(f.barrierEvents.some((event) => (
+    event.boundary === 'after-live-backup' || event.boundary === 'after-live-rename'
+  )), false);
+});
+
+test('C60 ownership loss during final post-quiet validation writes no authority or sidecars', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  const installedModulesAt = f.admin.installedModulesAt.bind(f.admin);
+  let replaced = false;
+  f.admin.installedModulesAt = async (target) => {
+    const modules = await installedModulesAt(target);
+    if (!replaced && f.admin.probeInstalledModulesCalls === 2) {
+      replaced = true;
+      claimReplacementExecution(f, 'owner-probe-final-validator-01', 'staged');
+    }
+    return modules;
+  };
+
+  const result = await f.service.migrate('line-a', 'admin');
+
+  assert.equal(replaced, true);
+  assert.equal(result.phase, 'staged');
+  assert.equal(f.probeSettle.sleeps.length, 5);
+  assert.equal(existsSync(stoppedAuthorityPath(f)), false);
+  assert.deepEqual(txSidecars(f.instanceRoot, 'tx-01'), []);
+  assert.equal(f.barrierEvents.some((event) => (
+    event.boundary === 'after-live-backup' || event.boundary === 'after-live-rename'
+  )), false);
+});
+
+test('C60 internal probe settle runtime rejects unsafe timing and sample bounds', () => {
+  const f = migrationFixture({ originalRunning: false });
+  const cases: Array<{ name: string; runtime: TestProbeSettleRuntime }> = [
+    {
+      name: 'zero interval',
+      runtime: { ...f.probeSettle, pollIntervalMs: 0, sleep: f.probeSettle.sleep },
+    },
+    {
+      name: 'oversized interval',
+      runtime: { ...f.probeSettle, pollIntervalMs: 1_001, sleep: f.probeSettle.sleep },
+    },
+    {
+      name: 'zero quiet samples',
+      runtime: { ...f.probeSettle, quietSamples: 0, sleep: f.probeSettle.sleep },
+    },
+    {
+      name: 'quiet exceeds maximum',
+      runtime: { ...f.probeSettle, quietSamples: 6, maxSamples: 5, sleep: f.probeSettle.sleep },
+    },
+    {
+      name: 'oversized maximum',
+      runtime: { ...f.probeSettle, maxSamples: 21, sleep: f.probeSettle.sleep },
+    },
+    {
+      name: 'fractional sample count',
+      runtime: { ...f.probeSettle, quietSamples: 2.5, sleep: f.probeSettle.sleep },
+    },
+  ];
+
+  for (const item of cases) {
+    assert.throws(
+      () => f.createService(
+        f.repo,
+        f.gate,
+        `tx-invalid-${item.name.replaceAll(' ', '-')}`,
+        'owner-invalid-probe-settle-0001',
+        item.runtime,
+      ),
+      /probe settle runtime/i,
+      item.name,
+    );
+  }
 });
 
 test('C49 stopped probe accepts exact and canonical tilde root selectors', async () => {
