@@ -187,6 +187,25 @@ function txSidecars(root: string, txId: string): string[] {
   return found.sort();
 }
 
+function stoppedAuthorityPath(
+  f: ReturnType<typeof migrationFixture>,
+  txId = 'tx-01',
+): string {
+  return join(f.root, '.thinglinks-stopped-evidence', 'line-a', txId);
+}
+
+function writeForgedDesiredSidecar(
+  instanceRoot: string,
+  txId: string,
+  key: string,
+): void {
+  const target = join(instanceRoot, key);
+  writeTestManifest(
+    join(dirname(target), `.${basename(target)}.tle-${txId}.manifest`),
+    testArtifactFact(instanceRoot, key),
+  );
+}
+
 function nodeSet(
   module: string,
   type: string,
@@ -922,12 +941,30 @@ function installPhaseRealisticRunningEffects(
   }
 }
 
+function writePriorCommonModule(f: ReturnType<typeof migrationFixture>): void {
+  const commonKey = join('node_modules', ...PLATFORM_COMMON_PACKAGE.name.split('/'));
+  const common = join(f.instanceRoot, commonKey);
+  mkdirSync(join(common, 'lib'), { recursive: true, mode: 0o750 });
+  chmodSync(common, 0o750);
+  writeFileSync(join(common, 'package.json'), '{"name":"prior-common"}\n', { mode: 0o640 });
+  writeFileSync(join(common, 'lib', 'prior.js'), 'module.exports = 0;\n', { mode: 0o600 });
+}
+
 function installPhaseRealisticStoppedEffects(
   f: ReturnType<typeof migrationFixture>,
   txId: string,
   phase: NodeMigrationState,
 ): void {
   if (!['cutover', 'verifying', 'rolling_back'].includes(phase)) return;
+  const priorFacts = new Map(
+    [
+      'settings.js', 'package.json', 'package-lock.json',
+      '.config.nodes.json', '.config.nodes.json.backup',
+      '.config.modules.json', '.config.modules.json.backup',
+      join('node_modules', ...PLATFORM_NODE_PACKAGE.name.split('/')),
+      join('node_modules', ...PLATFORM_COMMON_PACKAGE.name.split('/')),
+    ].map((key) => [key, testArtifactFact(f.instanceRoot, key)]),
+  );
   const sidecar = (target: string, suffix: string) => (
     join(dirname(target), `.${basename(target)}.tle-${txId}.${suffix}`)
   );
@@ -977,6 +1014,24 @@ function installPhaseRealisticStoppedEffects(
     writeTestManifest(sidecar(target, 'manifest'), desired);
     if (desired.exists) cpSync(target, sidecar(target, 'partial'));
   }
+  const authorityRoot = join(
+    f.root, '.thinglinks-stopped-evidence', 'line-a', txId,
+  );
+  mkdirSync(authorityRoot, { recursive: true, mode: 0o700 });
+  chmodSync(join(f.root, '.thinglinks-stopped-evidence'), 0o700);
+  chmodSync(join(f.root, '.thinglinks-stopped-evidence', 'line-a'), 0o700);
+  chmodSync(authorityRoot, 0o700);
+  writeFileSync(join(authorityRoot, 'manifest.json'), `${JSON.stringify({
+    version: 1,
+    instanceId: 'line-a',
+    txId,
+    targetIntegrity: f.repo.nodeMigration('line-a')!.targetIntegrity,
+    artifacts: [...priorFacts.entries()].map(([key, prior]) => ({
+      key,
+      desired: testArtifactFact(f.instanceRoot, key),
+      prior,
+    })),
+  })}\n`, { mode: 0o600 });
 }
 
 function claimReplacementExecution(
@@ -1197,6 +1252,7 @@ test('a source change after revalidation but before checkpoint publish is reject
   assert.equal(result.phase, 'rolled_back');
   assert.equal(f.admin.installCalls, 0);
   assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), false);
+  assert.equal(existsSync(stoppedAuthorityPath(f)), false);
 });
 
 test('fresh staging is journaled before the POST barrier and an interrupted-before-POST rollback is clean', async () => {
@@ -1304,6 +1360,7 @@ test('stopped migration verifies an isolated probe, applies allowlisted state, a
   assert.equal(existsSync(join(f.instanceRoot, 'node_modules', '@mqttsnet', 'thinglinks-edge-nodes')), true);
   assert.equal(existsSync(join(f.root, '.thinglinks-probes', 'line-a', 'tx-01')), false);
   assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), true);
+  assert.equal(existsSync(stoppedAuthorityPath(f)), true);
 });
 
 test('explicit pending start claims once, starts once, verifies, commits, and removes rollback evidence', async () => {
@@ -1323,6 +1380,7 @@ test('explicit pending start claims once, starts once, verifies, commits, and re
   );
   assert.equal(f.repo.nodeMigration('line-a')?.executionOwner, '');
   assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), false);
+  assert.equal(existsSync(stoppedAuthorityPath(f)), false);
   assert.equal(
     readdirSync(f.instanceRoot).some((name) => name.includes('.tle-tx-01.')),
     false,
@@ -1440,6 +1498,7 @@ test('C37 committed recovery retries stopped evidence cleanup before checkpoint 
   ));
   assert.equal(committed.phase, 'committed');
   assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), true);
+  assert.equal(existsSync(stoppedAuthorityPath(f)), true);
   assert.ok(readdirSync(f.instanceRoot).some((entry) => entry.includes('.tle-tx-01.')));
   assert.equal(
     (f.db.prepare(
@@ -1453,6 +1512,7 @@ test('C37 committed recovery retries stopped evidence cleanup before checkpoint 
   await freshService.recoverInterrupted();
   assert.equal(readdirSync(f.instanceRoot).some((entry) => entry.includes('.tle-tx-01.')), false);
   assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), false);
+  assert.equal(existsSync(stoppedAuthorityPath(f)), false);
 });
 
 test('C37 tampered stopped backup blocks commit and retains evidence for manual recovery', async () => {
@@ -1469,6 +1529,7 @@ test('C37 tampered stopped backup blocks commit and retains evidence for manual 
   assert.equal(f.docker.inspection.running, false);
   assert.equal(readFileSync(backup, 'utf8'), 'foreign-backup');
   assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), true);
+  assert.equal(existsSync(stoppedAuthorityPath(f)), true);
 });
 
 test('stopped live apply covers all four file/directory states without overwriting nonempty targets', async () => {
@@ -1650,6 +1711,202 @@ test('C41 first post-commit cleanup never uses permissive retry rules for a miss
   assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), true);
   reopened.db.close();
 });
+
+test('C42 forged settings and config plus matching in-bind desired facts cannot commit', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  f.docker.afterProbeRestart = (probeRoot) => {
+    writeFileSync(join(probeRoot, '.config.nodes.json'), '{"probe":"desired"}\n', { mode: 0o600 });
+  };
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  const settingsBackup = join(f.instanceRoot, '.settings.js.tle-tx-01.backup');
+  const configBackup = join(f.instanceRoot, '..config.nodes.json.tle-tx-01.backup');
+  const settingsBefore = sha256(readFileSync(settingsBackup));
+  const configBefore = sha256(readFileSync(configBackup));
+  f.docker.afterStart = () => {
+    writeFileSync(
+      join(f.instanceRoot, 'settings.js'),
+      'module.exports={flowOwned:true};\n',
+      { mode: 0o600 },
+    );
+    writeFileSync(
+      join(f.instanceRoot, '.config.nodes.json'),
+      '{"flow":"forged"}\n', { mode: 0o600 },
+    );
+    writeForgedDesiredSidecar(f.instanceRoot, 'tx-01', 'settings.js');
+    writeForgedDesiredSidecar(f.instanceRoot, 'tx-01', '.config.nodes.json');
+  };
+
+  const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+    f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+
+  assert.equal(result.phase, 'manual_required');
+  assert.equal(f.docker.inspection.running, false);
+  assert.equal(sha256(readFileSync(settingsBackup)), settingsBefore);
+  assert.equal(sha256(readFileSync(configBackup)), configBefore);
+  assert.equal(existsSync(stoppedAuthorityPath(f)), true);
+});
+
+test('C42 forged Edge and common trees plus matching in-bind desired facts cannot commit', async () => {
+  const f = migrationFixture({ originalRunning: false, preexisting: true });
+  const edgeKey = join('node_modules', ...PLATFORM_NODE_PACKAGE.name.split('/'));
+  const commonKey = join('node_modules', ...PLATFORM_COMMON_PACKAGE.name.split('/'));
+  f.docker.afterProbeRestart = (probeRoot) => {
+    writeFileSync(join(probeRoot, edgeKey, 'probe-desired.js'), 'probe edge\n', { mode: 0o600 });
+    writeFileSync(join(probeRoot, commonKey, 'probe-desired.js'), 'probe common\n', { mode: 0o600 });
+  };
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  const edgeTarget = join(f.instanceRoot, edgeKey);
+  const commonTarget = join(f.instanceRoot, commonKey);
+  const edgeBackup = join(dirname(edgeTarget), '.thinglinks-edge-nodes.tle-tx-01.backup');
+  const commonBackup = join(dirname(commonTarget), '.thinglinks-node-red-common.tle-tx-01.backup');
+  const edgeBefore = testArtifactFact(dirname(edgeBackup), basename(edgeBackup));
+  const commonBefore = testArtifactFact(dirname(commonBackup), basename(commonBackup));
+  f.docker.afterStart = () => {
+    writeFileSync(join(edgeTarget, 'flow-forged.js'), 'flow edge\n', { mode: 0o600 });
+    writeFileSync(join(commonTarget, 'flow-forged.js'), 'flow common\n', { mode: 0o600 });
+    writeForgedDesiredSidecar(f.instanceRoot, 'tx-01', edgeKey);
+    writeForgedDesiredSidecar(f.instanceRoot, 'tx-01', commonKey);
+  };
+
+  const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+    f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+
+  assert.equal(result.phase, 'manual_required');
+  assert.equal(f.docker.inspection.running, false);
+  assert.deepEqual(testArtifactFact(dirname(edgeBackup), basename(edgeBackup)), edgeBefore);
+  assert.deepEqual(testArtifactFact(dirname(commonBackup), basename(commonBackup)), commonBefore);
+  assert.equal(existsSync(stoppedAuthorityPath(f)), true);
+});
+
+test('C42 Manager-only authority is complete, tx-bound, and permission restricted', async () => {
+  const f = migrationFixture({ originalRunning: false });
+
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+
+  const authorityRoot = stoppedAuthorityPath(f);
+  const evidenceRoot = dirname(dirname(authorityRoot));
+  const instanceEvidenceRoot = dirname(authorityRoot);
+  const manifestPath = join(authorityRoot, 'manifest.json');
+  assert.equal(lstatSync(evidenceRoot).mode & 0o777, 0o700);
+  assert.equal(lstatSync(instanceEvidenceRoot).mode & 0o777, 0o700);
+  assert.equal(lstatSync(authorityRoot).mode & 0o777, 0o700);
+  assert.equal(lstatSync(manifestPath).isFile(), true);
+  assert.equal(lstatSync(manifestPath).isSymbolicLink(), false);
+  assert.equal(lstatSync(manifestPath).mode & 0o777, 0o600);
+  const authority = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
+    version: number;
+    instanceId: string;
+    txId: string;
+    targetIntegrity: string;
+    artifacts: Array<{ key: string; desired: TestArtifactFact; prior: TestArtifactFact }>;
+  };
+  assert.deepEqual(
+    {
+      version: authority.version,
+      instanceId: authority.instanceId,
+      txId: authority.txId,
+      targetIntegrity: authority.targetIntegrity,
+    },
+    {
+      version: 1,
+      instanceId: 'line-a',
+      txId: 'tx-01',
+      targetIntegrity: PLATFORM_NODE_PACKAGE.integrity,
+    },
+  );
+  assert.deepEqual(authority.artifacts.map((artifact) => artifact.key), [
+    'settings.js',
+    'package.json',
+    'package-lock.json',
+    '.config.nodes.json',
+    '.config.nodes.json.backup',
+    '.config.modules.json',
+    '.config.modules.json.backup',
+    join('node_modules', ...PLATFORM_NODE_PACKAGE.name.split('/')),
+    join('node_modules', ...PLATFORM_COMMON_PACKAGE.name.split('/')),
+  ]);
+  for (const artifact of authority.artifacts) {
+    assert.equal(artifact.desired.key, artifact.key);
+    assert.equal(artifact.prior.key, artifact.key);
+  }
+});
+
+test('C42 fresh startup marks tampered pending authority manual without destructive cleanup', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  const authorityRoot = stoppedAuthorityPath(f);
+  const authority = join(authorityRoot, 'manifest.json');
+  const backup = join(f.instanceRoot, '.settings.js.tle-tx-01.backup');
+  const backupBefore = sha256(readFileSync(backup));
+  const runtimeBeforeRecovery = [...f.docker.runtimeCalls];
+  writeFileSync(authority, '{"tampered":true}\n', { mode: 0o600 });
+
+  const reopened = reopenMigrationFixture(f);
+  const recovered = await reopened.service.recoverInterrupted();
+
+  assert.deepEqual(recovered.map((entry) => entry.phase), ['manual_required']);
+  assert.equal(reopened.repo.nodeMigration('line-a')?.executionOwner, '');
+  assert.equal(f.docker.inspection.running, false);
+  assert.deepEqual(f.docker.runtimeCalls, runtimeBeforeRecovery);
+  assert.equal(sha256(readFileSync(backup)), backupBefore);
+  assert.equal(existsSync(authorityRoot), true);
+  assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), true);
+  reopened.db.close();
+});
+
+for (const fault of [
+  'missing',
+  'tampered',
+  'schema',
+  'manifest-mode',
+  'directory-mode',
+  'manifest-symlink',
+  'directory-symlink',
+] as const) {
+  test(`C42 ${fault} Manager-only authority blocks start and preserves rollback evidence`, async () => {
+    const f = migrationFixture({ originalRunning: false });
+    assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+    const authorityRoot = stoppedAuthorityPath(f);
+    const authority = join(authorityRoot, 'manifest.json');
+    assert.equal(existsSync(authority), true);
+    if (fault === 'missing') rmSync(authorityRoot, { recursive: true, force: true });
+    if (fault === 'tampered') writeFileSync(authority, '{"tampered":true}\n', { mode: 0o600 });
+    if (fault === 'schema') {
+      const value = JSON.parse(readFileSync(authority, 'utf8')) as Record<string, unknown>;
+      value['unexpected'] = true;
+      writeFileSync(authority, `${JSON.stringify(value)}\n`, { mode: 0o600 });
+    }
+    if (fault === 'manifest-mode') chmodSync(authority, 0o644);
+    if (fault === 'directory-mode') chmodSync(authorityRoot, 0o755);
+    if (fault === 'manifest-symlink') {
+      rmSync(authority);
+      symlinkSync(join(f.instanceRoot, 'settings.js'), authority);
+    }
+    let outsideAuthority: string | undefined;
+    if (fault === 'directory-symlink') {
+      outsideAuthority = join(f.root, 'outside-authority');
+      mkdirSync(outsideAuthority, { mode: 0o700 });
+      rmSync(authorityRoot, { recursive: true, force: true });
+      symlinkSync(outsideAuthority, authorityRoot);
+    }
+    const backup = join(f.instanceRoot, '.settings.js.tle-tx-01.backup');
+    const before = sha256(readFileSync(backup));
+    const runtimeBeforeStart = [...f.docker.runtimeCalls];
+
+    const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+      f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+    ));
+
+    assert.equal(result.phase, 'manual_required', fault);
+    assert.equal(f.docker.inspection.running, false, fault);
+    assert.deepEqual(f.docker.runtimeCalls, runtimeBeforeStart, fault);
+    assert.equal(sha256(readFileSync(backup)), before, fault);
+    assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), true, fault);
+    if (outsideAuthority) assert.deepEqual(readdirSync(outsideAuthority), [], fault);
+  });
+}
 
 test('stopped export ignores settings/package/lock backup variants exactly', async () => {
   const f = migrationFixture({ originalRunning: false });
@@ -2199,6 +2456,9 @@ test('startup recovery restores every stopped phase from the immutable checkpoin
   ] as const) {
     const f = migrationFixture({ originalRunning: false });
     const txId = `tx-stopped-recover-${phase}`;
+    if (['cutover', 'verifying', 'rolling_back'].includes(phase)) {
+      writePriorCommonModule(f);
+    }
     const before = {
       settings: sha256(readFileSync(join(f.instanceRoot, 'settings.js'))),
       flows: sha256(readFileSync(join(f.instanceRoot, 'flows.json'))),
@@ -2207,6 +2467,7 @@ test('startup recovery restores every stopped phase from the immutable checkpoin
       lock: sha256(readFileSync(join(f.instanceRoot, 'package-lock.json'))),
     };
     await interruptedMigration(f, txId, phase, undefined, false);
+    installPhaseRealisticStoppedEffects(f, txId, phase);
 
     const result = await f.service.recoverInterrupted();
 
@@ -2231,7 +2492,9 @@ test('C34 stopped staged cutover and verifying recovery never calls unreachable 
   for (const phase of ['staged', 'cutover', 'verifying'] as const) {
     const f = migrationFixture({ originalRunning: false });
     const txId = `tx-stopped-no-admin-${phase}`;
+    if (['cutover', 'verifying'].includes(phase)) writePriorCommonModule(f);
     await interruptedMigration(f, txId, phase, undefined, false);
+    installPhaseRealisticStoppedEffects(f, txId, phase);
     let adminCalls = 0;
     const unreachable = async () => {
       adminCalls += 1;
@@ -2260,11 +2523,7 @@ test('C40 fresh file-backed service recovers every running and stopped phase wit
       const edgeKey = join('node_modules', ...PLATFORM_NODE_PACKAGE.name.split('/'));
       const commonKey = join('node_modules', ...PLATFORM_COMMON_PACKAGE.name.split('/'));
       if (!originalRunning && ['cutover', 'verifying', 'rolling_back'].includes(phase)) {
-        const common = join(f.instanceRoot, commonKey);
-        mkdirSync(join(common, 'lib'), { recursive: true, mode: 0o750 });
-        chmodSync(common, 0o750);
-        writeFileSync(join(common, 'package.json'), '{"name":"prior-common"}\n', { mode: 0o640 });
-        writeFileSync(join(common, 'lib', 'prior.js'), 'module.exports = 0;\n', { mode: 0o600 });
+        writePriorCommonModule(f);
       }
       const before = {
         settings: sha256(readFileSync(join(f.instanceRoot, 'settings.js'))),
@@ -2330,6 +2589,11 @@ test('C40 fresh file-backed service recovers every running and stopped phase wit
         common: testArtifactFact(f.instanceRoot, commonKey),
       }, before, `${originalRunning}/${phase}`);
       assert.deepEqual(txSidecars(f.instanceRoot, txId), [], `${originalRunning}/${phase}`);
+      assert.equal(
+        existsSync(stoppedAuthorityPath(f, txId)),
+        false,
+        `${originalRunning}/${phase}`,
+      );
       reopened.db.close();
     }
   }

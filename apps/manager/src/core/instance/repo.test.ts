@@ -862,6 +862,133 @@ test('C31 pending start claim leaves the ownerless journal unchanged when SQLite
   assert.equal(repo.nodeMigration('line-a')?.executionLeaseExpiresAt, 0);
 });
 
+test('C43 ownerless pending manual finalizer is exact and clears both journal and projection atomically', () => {
+  const repo = fresh();
+  repo.create(rec(), [], cred());
+  const txId = 'tx-ownerless-pending-manual';
+  const owner = 'owner-before-pending-manual';
+  repo.beginNodeMigration(migrationBegin('line-a', txId, {
+    executionOwner: owner,
+    executionLeaseExpiresAt: 10_000,
+  }));
+  repo.parkNodeMigrationPendingStartExact(
+    'line-a', txId, owner, 1_000, 'preparing',
+  );
+
+  repo.finishOwnerlessPendingManualExact('line-a', txId, 'rollback', 'system');
+
+  assert.equal(repo.nodeMigration('line-a')?.phase, 'manual_required');
+  assert.equal(repo.nodeMigration('line-a')?.error, 'rollback');
+  assert.equal(repo.nodeMigration('line-a')?.executionOwner, '');
+  assert.equal(repo.nodeMigration('line-a')?.executionLeaseExpiresAt, 0);
+  assert.deepEqual(repo.nodeRuntime('line-a'), {
+    mode: 'legacy', platformVersion: '',
+    migrationState: 'manual_required', migrationError: 'rollback',
+  });
+});
+
+test('C43 ownerless pending manual finalizer rejects stale tx, owner, phase, and error', () => {
+  const makePending = (txId: string) => {
+    const db = openDb(':memory:');
+    const repo = new InstanceRepo(db, KEY);
+    repo.create(rec(), [], cred());
+    const owner = `owner-${txId}-before-pending`;
+    repo.beginNodeMigration(migrationBegin('line-a', txId, {
+      executionOwner: owner,
+      executionLeaseExpiresAt: 10_000,
+    }));
+    repo.parkNodeMigrationPendingStartExact('line-a', txId, owner, 1_000, 'preparing');
+    return { db, repo };
+  };
+
+  const { repo: stale } = makePending('tx-c43-stale');
+  assert.throws(
+    () => stale.finishOwnerlessPendingManualExact(
+      'line-a', 'tx-c43-replacement', 'rollback', 'system',
+    ),
+    /pending|CAS|变化|事务/i,
+  );
+  assert.equal(stale.nodeMigration('line-a')?.phase, 'pending_start_verification');
+
+  const { repo: owned } = makePending('tx-c43-owned');
+  owned.claimPendingStartExecutionExact(
+    'line-a', 'tx-c43-owned', 'owner-c43-start-0001', 2_000, 1_000,
+  );
+  assert.throws(
+    () => owned.finishOwnerlessPendingManualExact(
+      'line-a', 'tx-c43-owned', 'rollback', 'system',
+    ),
+    /pending|CAS|变化|事务/i,
+  );
+  assert.equal(owned.nodeMigration('line-a')?.phase, 'pending_start_verification');
+  assert.equal(owned.nodeMigration('line-a')?.executionOwner, 'owner-c43-start-0001');
+
+  const { repo: verifying } = makePending('tx-c43-verifying');
+  verifying.claimPendingStartVerifyingExact(
+    'line-a', 'tx-c43-verifying', 'owner-c43-verifying-01', 2_000, 1_000,
+  );
+  assert.throws(
+    () => verifying.finishOwnerlessPendingManualExact(
+      'line-a', 'tx-c43-verifying', 'rollback', 'system',
+    ),
+    /pending|CAS|变化|事务/i,
+  );
+  assert.equal(verifying.nodeMigration('line-a')?.phase, 'verifying');
+
+  const { db: erroredDb, repo: errored } = makePending('tx-c43-error');
+  erroredDb.prepare(
+    "UPDATE instance_node_migration SET error = 'rollback' WHERE instance_id = 'line-a'",
+  ).run();
+  erroredDb.prepare(
+    "UPDATE instance SET node_migration_error = 'rollback' WHERE id = 'line-a'",
+  ).run();
+  assert.throws(
+    () => errored.finishOwnerlessPendingManualExact(
+      'line-a', 'tx-c43-error', 'rollback', 'system',
+    ),
+    /pending|CAS|变化|事务/i,
+  );
+  assert.equal(errored.nodeMigration('line-a')?.phase, 'pending_start_verification');
+
+  const { repo: requestedError } = makePending('tx-c43-requested-error');
+  assert.throws(
+    () => requestedError.finishOwnerlessPendingManualExact(
+      'line-a', 'tx-c43-requested-error', 'compensation' as 'rollback', 'system',
+    ),
+    /错误码|rollback/i,
+  );
+  assert.equal(requestedError.nodeMigration('line-a')?.error, 'none');
+});
+
+test('C43 ownerless pending manual finalizer rolls journal and projection back when audit insert fails', () => {
+  const db = openDb(':memory:');
+  const repo = new InstanceRepo(db, KEY);
+  const txId = 'tx-c43-audit-rollback';
+  const owner = 'owner-c43-before-pending';
+  repo.create(rec(), [], cred());
+  repo.beginNodeMigration(migrationBegin('line-a', txId, {
+    executionOwner: owner,
+    executionLeaseExpiresAt: 10_000,
+  }));
+  repo.parkNodeMigrationPendingStartExact('line-a', txId, owner, 1_000, 'preparing');
+  db.exec(`CREATE TRIGGER reject_c43_manual_audit
+    BEFORE INSERT ON audit
+    WHEN NEW.action = 'manual-node-migration'
+    BEGIN SELECT RAISE(ABORT, 'C43 audit rejected'); END;`);
+
+  assert.throws(
+    () => repo.finishOwnerlessPendingManualExact(
+      'line-a', txId, 'rollback', 'system',
+    ),
+    /C43 audit rejected/,
+  );
+  assert.equal(repo.nodeMigration('line-a')?.phase, 'pending_start_verification');
+  assert.equal(repo.nodeMigration('line-a')?.error, 'none');
+  assert.equal(repo.nodeMigration('line-a')?.executionOwner, '');
+  assert.equal(repo.nodeRuntime('line-a')?.migrationState, 'pending_start_verification');
+  assert.equal(repo.nodeRuntime('line-a')?.migrationError, 'none');
+});
+
 test('same-image compensation manual fence is atomic and never replaces a migration journal', () => {
   const db = openDb(':memory:');
   const repo = new InstanceRepo(db, KEY);

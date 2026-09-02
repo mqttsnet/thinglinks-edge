@@ -844,6 +844,54 @@ export class InstanceRepo {
     return this.nodeMigration(instanceId);
   }
 
+  /** C43 startup fence for a clean ownerless pending tx whose Manager evidence is invalid. */
+  finishOwnerlessPendingManualExact(
+    instanceId: string,
+    txId: string,
+    error: 'rollback',
+    actor: string,
+  ): void {
+    if (!TX_ID.test(txId)) throw new RepoError('待启动人工处理事务参数无效');
+    if (error !== 'rollback') throw new RepoError('待启动人工处理错误码必须为 rollback');
+    requireSafeText(actor, '操作人', 128);
+    this.db.transaction(() => {
+      const journal = this.db.prepare(
+        `UPDATE instance_node_migration
+         SET phase = 'manual_required', error = ?,
+             execution_owner = '', execution_lease_expires_at = 0,
+             updated_at = datetime('now')
+         WHERE instance_id = ? AND tx_id = ? AND operation_kind = 'migration'
+           AND phase = 'pending_start_verification' AND error = 'none'
+           AND execution_owner = '' AND execution_lease_expires_at = 0
+           AND EXISTS (
+             SELECT 1 FROM instance i
+             WHERE i.id = instance_node_migration.instance_id
+               AND i.node_migration_state = 'pending_start_verification'
+               AND i.node_migration_error = 'none'
+           )`,
+      ).run(error, instanceId, txId);
+      if (journal.changes !== 1) {
+        throw new RepoError('待启动人工处理事务 CAS 未命中');
+      }
+      const projection = this.db.prepare(
+        `UPDATE instance
+         SET node_migration_state = 'manual_required', node_migration_error = ?
+         WHERE id = ? AND node_migration_state = 'pending_start_verification'
+           AND node_migration_error = 'none'`,
+      ).run(error, instanceId);
+      if (projection.changes !== 1) {
+        throw new RepoError('待启动人工处理投影 CAS 未命中');
+      }
+      recordAudit(this.db, {
+        actor,
+        action: 'manual-node-migration',
+        target: instanceId,
+        detail: JSON.stringify({ code: error }),
+        result: 'fail',
+      });
+    })();
+  }
+
   /** C35: claim the exact pending tx and publish verifying in one SQLite transaction. */
   claimPendingStartVerifyingExact(
     instanceId: string,

@@ -1,8 +1,9 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
+import { constants as FS_CONSTANTS } from 'node:fs';
 import {
   chmod, cp, lstat, mkdir, open, readFile, readdir, rename, rm, rmdir,
 } from 'node:fs/promises';
-import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import {
   getFlows,
   getInstalledModules,
@@ -12,6 +13,7 @@ import {
   type InstalledModule,
 } from '../flows/admin-client.ts';
 import type { InstanceAdminRuntime } from '../instance/admin-runtime.ts';
+import { assertValidId } from '../instance/container-spec.ts';
 import type {
   CreateMigrationProbeInput,
   MigrationProbeHandle,
@@ -36,7 +38,6 @@ import { verifyInstalledPlatformFiles } from './installed-files.ts';
 import { assertHealthyPlatformModule } from './inventory.ts';
 import type {
   MigrationCheckpointManifest,
-  MigrationCheckpointFilePath,
 } from './migration-checkpoint.ts';
 import type { PlatformNodeOperationBarrier } from './platform-operation-barrier.ts';
 import {
@@ -494,6 +495,302 @@ const STOPPED_EXPORT_PATHS = Object.freeze([
 type StoppedArtifactFact =
   | { key: string; exists: false }
   | { key: string; exists: true; kind: 'file' | 'directory'; mode: number; sha256: string };
+
+interface StoppedEvidenceAuthority {
+  version: 1;
+  instanceId: string;
+  txId: string;
+  targetIntegrity: string;
+  artifacts: Array<{
+    key: string;
+    desired: StoppedArtifactFact;
+    prior: StoppedArtifactFact;
+  }>;
+}
+
+const STOPPED_EVIDENCE_TX = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const AUTHORITY_MANIFEST = 'manifest.json';
+
+function exactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const wanted = [...expected].sort();
+  return actual.length === wanted.length && actual.every((key, index) => key === wanted[index]);
+}
+
+function exactAuthorityFact(value: unknown, expectedKey: string): StoppedArtifactFact {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('stopped authority fact must be an object');
+  }
+  const record = value as Record<string, unknown>;
+  if (record['key'] !== expectedKey || typeof record['exists'] !== 'boolean') {
+    throw new Error('stopped authority fact identity mismatch');
+  }
+  if (!record['exists']) {
+    if (!exactKeys(record, ['key', 'exists'])) throw new Error('absent authority fact has extra fields');
+    return { key: expectedKey, exists: false };
+  }
+  if (!exactKeys(record, ['key', 'exists', 'kind', 'mode', 'sha256'])) {
+    throw new Error('present authority fact field set mismatch');
+  }
+  if (
+    (record['kind'] !== 'file' && record['kind'] !== 'directory')
+    || !Number.isInteger(record['mode'])
+    || (record['mode'] as number) < 0
+    || (record['mode'] as number) > 0o777
+    || typeof record['sha256'] !== 'string'
+    || !/^[a-f0-9]{64}$/.test(record['sha256'])
+  ) throw new Error('present authority fact is invalid');
+  return {
+    key: expectedKey,
+    exists: true,
+    kind: record['kind'],
+    mode: record['mode'] as number,
+    sha256: record['sha256'],
+  };
+}
+
+function stoppedAuthorityPaths(instanceDataRoot: string, instanceId: string, txId: string) {
+  assertValidId(instanceId);
+  if (!STOPPED_EVIDENCE_TX.test(txId)) throw new Error('stopped authority tx id invalid');
+  const managerRoot = resolve(instanceDataRoot);
+  const evidenceRoot = resolve(managerRoot, '.thinglinks-stopped-evidence');
+  const instanceRoot = resolve(evidenceRoot, instanceId);
+  const txRoot = resolve(instanceRoot, txId);
+  const manifest = resolve(txRoot, AUTHORITY_MANIFEST);
+  for (const [parent, child] of [
+    [managerRoot, evidenceRoot],
+    [evidenceRoot, instanceRoot],
+    [instanceRoot, txRoot],
+    [txRoot, manifest],
+  ] as const) {
+    const path = relative(parent, child);
+    if (path.startsWith('..') || isAbsolute(path)) throw new Error('stopped authority path escapes root');
+  }
+  return { managerRoot, evidenceRoot, instanceRoot, txRoot, manifest };
+}
+
+async function requireAuthorityDirectory(path: string, mode?: number): Promise<void> {
+  const stat = await lstat(path);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('stopped authority directory untrusted');
+  if (mode !== undefined && (stat.mode & 0o777) !== mode) {
+    throw new Error('stopped authority directory mode mismatch');
+  }
+}
+
+async function ensureAuthorityDirectory(path: string, parent: string): Promise<void> {
+  let created = false;
+  try {
+    await mkdir(path, { mode: 0o700 });
+    created = true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+  }
+  await requireAuthorityDirectory(path);
+  await chmod(path, 0o700);
+  await requireAuthorityDirectory(path, 0o700);
+  await syncDirectory(path);
+  if (created) await syncDirectory(parent);
+}
+
+function exactStoppedAuthority(
+  value: unknown,
+  expected: { instanceId: string; txId: string; targetIntegrity: string },
+): StoppedEvidenceAuthority {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('stopped authority must be an object');
+  }
+  const record = value as Record<string, unknown>;
+  if (!exactKeys(record, ['version', 'instanceId', 'txId', 'targetIntegrity', 'artifacts'])) {
+    throw new Error('stopped authority field set mismatch');
+  }
+  if (
+    record['version'] !== 1
+    || record['instanceId'] !== expected.instanceId
+    || record['txId'] !== expected.txId
+    || record['targetIntegrity'] !== expected.targetIntegrity
+    || !Array.isArray(record['artifacts'])
+    || record['artifacts'].length !== STOPPED_EXPORT_PATHS.length
+  ) throw new Error('stopped authority identity mismatch');
+  const artifacts = record['artifacts'].map((value, index) => {
+    const key = STOPPED_EXPORT_PATHS[index]!;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error('stopped authority artifact invalid');
+    }
+    const artifact = value as Record<string, unknown>;
+    if (!exactKeys(artifact, ['key', 'desired', 'prior']) || artifact['key'] !== key) {
+      throw new Error('stopped authority artifact order mismatch');
+    }
+    return {
+      key,
+      desired: exactAuthorityFact(artifact['desired'], key),
+      prior: exactAuthorityFact(artifact['prior'], key),
+    };
+  });
+  return {
+    version: 1,
+    instanceId: expected.instanceId,
+    txId: expected.txId,
+    targetIntegrity: expected.targetIntegrity,
+    artifacts,
+  };
+}
+
+async function readStoppedAuthority(
+  instanceDataRoot: string,
+  expected: { instanceId: string; txId: string; targetIntegrity: string },
+): Promise<StoppedEvidenceAuthority> {
+  const paths = stoppedAuthorityPaths(instanceDataRoot, expected.instanceId, expected.txId);
+  await requireAuthorityDirectory(paths.managerRoot);
+  await requireAuthorityDirectory(paths.evidenceRoot, 0o700);
+  await requireAuthorityDirectory(paths.instanceRoot, 0o700);
+  await requireAuthorityDirectory(paths.txRoot, 0o700);
+  const handle = await open(
+    paths.manifest,
+    FS_CONSTANTS.O_RDONLY | FS_CONSTANTS.O_NOFOLLOW,
+  );
+  try {
+    const before = await handle.stat();
+    if (!before.isFile() || (before.mode & 0o777) !== 0o600) {
+      throw new Error('stopped authority manifest untrusted');
+    }
+    const serialized = await handle.readFile('utf8');
+    const after = await handle.stat();
+    if (
+      !after.isFile()
+      || after.dev !== before.dev || after.ino !== before.ino
+      || after.size !== before.size || after.mtimeMs !== before.mtimeMs
+      || (after.mode & 0o777) !== 0o600
+    ) throw new Error('stopped authority manifest changed while reading');
+    return exactStoppedAuthority(JSON.parse(serialized), expected);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function createStoppedAuthority(
+  instanceDataRoot: string,
+  authority: StoppedEvidenceAuthority,
+): Promise<void> {
+  const paths = stoppedAuthorityPaths(instanceDataRoot, authority.instanceId, authority.txId);
+  await requireAuthorityDirectory(paths.managerRoot);
+  await ensureAuthorityDirectory(paths.evidenceRoot, paths.managerRoot);
+  await ensureAuthorityDirectory(paths.instanceRoot, paths.evidenceRoot);
+  try {
+    await mkdir(paths.txRoot, { mode: 0o700 });
+    await chmod(paths.txRoot, 0o700);
+    await syncDirectory(paths.instanceRoot);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    const existing = await readStoppedAuthority(instanceDataRoot, authority);
+    if (JSON.stringify(existing) !== JSON.stringify(authority)) {
+      throw new Error('existing stopped authority differs', { cause: error });
+    }
+    return;
+  }
+  await requireAuthorityDirectory(paths.txRoot, 0o700);
+  const handle = await open(
+    paths.manifest,
+    FS_CONSTANTS.O_WRONLY | FS_CONSTANTS.O_CREAT | FS_CONSTANTS.O_EXCL
+      | FS_CONSTANTS.O_NOFOLLOW,
+    0o600,
+  );
+  try {
+    await handle.writeFile(`${JSON.stringify(authority)}\n`, 'utf8');
+    await handle.chmod(0o600);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await syncDirectory(paths.txRoot);
+  await syncDirectory(paths.instanceRoot);
+}
+
+async function stoppedAuthorityRootExists(
+  instanceDataRoot: string,
+  instanceId: string,
+  txId: string,
+): Promise<boolean> {
+  const { txRoot } = stoppedAuthorityPaths(instanceDataRoot, instanceId, txId);
+  try {
+    await lstat(txRoot);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+async function cleanupStoppedAuthority(
+  instanceDataRoot: string,
+  expected: StoppedEvidenceAuthority,
+  allowCompletedManifestRemoval: boolean,
+): Promise<void> {
+  const paths = stoppedAuthorityPaths(instanceDataRoot, expected.instanceId, expected.txId);
+  let manifestPresent = true;
+  try {
+    const current = await readStoppedAuthority(instanceDataRoot, expected);
+    if (JSON.stringify(current) !== JSON.stringify(expected)) {
+      throw new Error('stopped authority cleanup identity mismatch');
+    }
+  } catch (error) {
+    if (!allowCompletedManifestRemoval) throw error;
+    try {
+      await requireAuthorityDirectory(paths.txRoot, 0o700);
+      const entries = await readdir(paths.txRoot);
+      if (entries.length !== 0) throw error;
+      manifestPresent = false;
+    } catch (directoryError) {
+      if ((directoryError as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw error;
+    }
+  }
+  if (manifestPresent) {
+    await rm(paths.manifest, { force: false });
+    await syncDirectory(paths.txRoot);
+  }
+  await rmdir(paths.txRoot);
+  await syncDirectory(paths.instanceRoot);
+  if (await stoppedAuthorityRootExists(instanceDataRoot, expected.instanceId, expected.txId)) {
+    throw new Error('stopped authority cleanup did not remove tx root');
+  }
+  for (const [path, parent] of [
+    [paths.instanceRoot, paths.evidenceRoot],
+    [paths.evidenceRoot, paths.managerRoot],
+  ] as const) {
+    await rmdir(path).then(() => syncDirectory(parent)).catch((error: NodeJS.ErrnoException) => {
+      if (!['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes(error.code ?? '')) throw error;
+    });
+  }
+}
+
+async function cleanupStoppedAuthorityRemainder(
+  instanceDataRoot: string,
+  instanceId: string,
+  txId: string,
+): Promise<void> {
+  const paths = stoppedAuthorityPaths(instanceDataRoot, instanceId, txId);
+  try {
+    await requireAuthorityDirectory(paths.evidenceRoot, 0o700);
+    await requireAuthorityDirectory(paths.instanceRoot, 0o700);
+    await requireAuthorityDirectory(paths.txRoot, 0o700);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  if ((await readdir(paths.txRoot)).length !== 0) {
+    throw new Error('stopped authority remainder is not empty');
+  }
+  await rmdir(paths.txRoot);
+  await syncDirectory(paths.instanceRoot);
+  for (const [path, parent] of [
+    [paths.instanceRoot, paths.evidenceRoot],
+    [paths.evidenceRoot, paths.managerRoot],
+  ] as const) {
+    await rmdir(path).then(() => syncDirectory(parent)).catch((error: NodeJS.ErrnoException) => {
+      if (!['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes(error.code ?? '')) throw error;
+    });
+  }
+}
 
 async function artifactFact(root: string, key: string): Promise<StoppedArtifactFact> {
   const absolute = join(root, key);
@@ -1084,6 +1381,34 @@ export class PlatformMigrationService {
     return facts;
   }
 
+  private async persistStoppedAuthority(
+    journal: InstanceNodeMigrationJournal,
+    desiredFacts: readonly StoppedArtifactFact[],
+  ): Promise<StoppedEvidenceAuthority> {
+    if (desiredFacts.length !== STOPPED_EXPORT_PATHS.length) {
+      throw controlled('cutover', 'stopped desired authority set is incomplete');
+    }
+    const liveRoot = join(this.o.instanceDataRoot, journal.instanceId);
+    const artifacts = [] as StoppedEvidenceAuthority['artifacts'];
+    for (let index = 0; index < STOPPED_EXPORT_PATHS.length; index += 1) {
+      const key = STOPPED_EXPORT_PATHS[index]!;
+      const desired = desiredFacts[index];
+      if (!desired || desired.key !== key) {
+        throw controlled('cutover', 'stopped desired authority order mismatch');
+      }
+      artifacts.push({ key, desired, prior: await artifactFact(liveRoot, key) });
+    }
+    const authority: StoppedEvidenceAuthority = {
+      version: 1,
+      instanceId: journal.instanceId,
+      txId: journal.txId,
+      targetIntegrity: journal.targetIntegrity,
+      artifacts,
+    };
+    await createStoppedAuthority(this.o.instanceDataRoot, authority);
+    return readStoppedAuthority(this.o.instanceDataRoot, authority);
+  }
+
   private artifactBarrierKey(key: string): NonNullable<
     Parameters<PlatformNodeOperationBarrier['reach']>[0]['artifact']
   > {
@@ -1134,20 +1459,32 @@ export class PlatformMigrationService {
 
   private async applyStoppedArtifacts(
     execution: MigrationExecutionSession,
-    facts: readonly StoppedArtifactFact[],
+    authority: StoppedEvidenceAuthority,
     startSequence: number,
   ): Promise<number> {
     const liveRoot = join(this.o.instanceDataRoot, execution.instanceId);
     let sequence = startSequence;
+    const persistedAuthority = await readStoppedAuthority(this.o.instanceDataRoot, {
+      instanceId: execution.instanceId,
+      txId: execution.txId,
+      targetIntegrity: authority.targetIntegrity,
+    });
+    if (JSON.stringify(persistedAuthority) !== JSON.stringify(authority)) {
+      throw controlled('cutover', 'stopped authority changed before live apply');
+    }
     // C36 closing pass: recursively flush and revalidate every complete partial
     // immediately before the first live rename. No live mutation may precede this loop.
-    for (const fact of facts) {
+    for (const artifact of authority.artifacts) {
+      const fact = artifact.desired;
       const target = join(liveRoot, fact.key);
       await trustedArtifactParent(liveRoot, fact.key, false);
       const partial = stoppedSidecar(target, execution.txId, 'partial');
       const manifest = stoppedSidecar(target, execution.txId, 'manifest');
       const observed = await artifactFact(dirname(partial), basename(partial));
       const marker = await readArtifactManifest(manifest, fact.key);
+      if (!sameArtifact(await artifactFact(liveRoot, fact.key), artifact.prior)) {
+        throw controlled('cutover', `stopped prior drifted before live apply ${fact.key}`);
+      }
       if (!marker || !sameArtifact(marker, fact)) {
         throw controlled('cutover', `prepared stopped desired manifest is incomplete ${fact.key}`);
       }
@@ -1169,7 +1506,8 @@ export class PlatformMigrationService {
       }
       await syncDirectory(dirname(partial));
     }
-    for (const fact of facts) {
+    for (const artifact of authority.artifacts) {
+      const fact = artifact.desired;
       execution.renew(['cutover']);
       const target = join(liveRoot, fact.key);
       await trustedArtifactParent(liveRoot, fact.key, false);
@@ -1177,6 +1515,9 @@ export class PlatformMigrationService {
       const backup = stoppedSidecar(target, execution.txId, 'backup');
       const backupManifest = stoppedSidecar(target, execution.txId, 'backup-manifest');
       const live = await artifactFact(liveRoot, fact.key);
+      if (!sameArtifact(live, artifact.prior)) {
+        throw controlled('cutover', `stopped prior changed before artifact mutation ${fact.key}`);
+      }
       const backupFact = await artifactFact(dirname(backup), basename(backup));
       if (backupFact.exists) throw controlled('cutover', `stopped backup already exists ${fact.key}`);
 
@@ -1221,16 +1562,94 @@ export class PlatformMigrationService {
         boundary: 'after-live-rename',
       });
     }
-    for (const fact of facts) {
-      if (!sameArtifact(await artifactFact(liveRoot, fact.key), fact)) {
-        throw controlled('verification', `stopped live artifact mismatch ${fact.key}`);
+    for (const artifact of authority.artifacts) {
+      if (!sameArtifact(await artifactFact(liveRoot, artifact.key), artifact.desired)) {
+        throw controlled('verification', `stopped live artifact mismatch ${artifact.key}`);
       }
     }
     return sequence;
   }
 
-  private async restoreStoppedArtifacts(journal: InstanceNodeMigrationJournal): Promise<void> {
+  private async restoreStoppedArtifacts(
+    journal: InstanceNodeMigrationJournal,
+    authority?: StoppedEvidenceAuthority,
+  ): Promise<void> {
     const liveRoot = join(this.o.instanceDataRoot, journal.instanceId);
+    if (authority) {
+      for (const artifact of [...authority.artifacts].reverse()) {
+        const { key, desired, prior } = artifact;
+        const target = join(liveRoot, key);
+        await trustedArtifactParent(liveRoot, key, false);
+        const partial = stoppedSidecar(target, journal.txId, 'partial');
+        const backup = stoppedSidecar(target, journal.txId, 'backup');
+        const manifest = stoppedSidecar(target, journal.txId, 'manifest');
+        const backupManifest = stoppedSidecar(target, journal.txId, 'backup-manifest');
+        const live = await artifactFact(liveRoot, key);
+        const partialFact = await artifactFact(dirname(partial), basename(partial));
+        const backupFact = await artifactFact(dirname(backup), basename(backup));
+        const desiredMarker = await readArtifactManifest(manifest, key);
+        const priorMarker = await readArtifactManifest(backupManifest, key);
+        if (desiredMarker && !sameArtifact(desiredMarker, desired)) {
+          throw new Error(`stopped desired marker differs from authority ${key}`);
+        }
+        if (priorMarker && !sameArtifact(priorMarker, prior)) {
+          throw new Error(`stopped prior marker differs from authority ${key}`);
+        }
+        if (partialFact.exists && !sameArtifact(
+          { ...partialFact, key } as StoppedArtifactFact,
+          desired,
+        )) throw new Error(`stopped partial differs from authority ${key}`);
+        if (
+          desired.exists
+          && desiredMarker
+          && !partialFact.exists
+          && !backupFact.exists
+          && !sameArtifact(prior, desired)
+          && sameArtifact(live, prior)
+        ) {
+          throw new Error(`stopped prepared partial disappeared before mutation ${key}`);
+        }
+        if (backupFact.exists) {
+          if (
+            !prior.exists || !priorMarker
+            || !sameArtifact({ ...backupFact, key } as StoppedArtifactFact, prior)
+          ) throw new Error(`stopped backup differs from authority ${key}`);
+          if (sameArtifact(live, desired)) {
+            if (!desiredMarker) throw new Error(`applied desired marker missing ${key}`);
+            if (live.exists) await rm(target, { recursive: true, force: false });
+          } else if (live.exists) {
+            throw new Error(`foreign stopped restore target ${key}`);
+          }
+          const afterRemoval = await artifactFact(liveRoot, key);
+          if (afterRemoval.exists) throw new Error(`stopped restore target occupied ${key}`);
+          await rename(backup, target);
+        } else if (sameArtifact(prior, desired)) {
+          if (!sameArtifact(live, prior)) throw new Error(`equal live differs from authority ${key}`);
+        } else if (!prior.exists) {
+          if (sameArtifact(live, desired)) {
+            if (!desiredMarker) throw new Error(`created desired marker missing ${key}`);
+            if (live.exists) await rm(target, { recursive: true, force: false });
+          } else if (!sameArtifact(live, prior)) {
+            throw new Error(`created live differs from authority ${key}`);
+          }
+        } else if (!sameArtifact(live, prior)) {
+          throw new Error(`changed live lacks authoritative backup ${key}`);
+        }
+        await rm(partial, { recursive: true, force: true });
+        await rm(manifest, { force: true });
+        await rm(backupManifest, { force: true });
+        await syncExistingDirectory(dirname(target));
+      }
+      for (const parent of [
+        join(liveRoot, 'node_modules', '@mqttsnet'),
+        join(liveRoot, 'node_modules'),
+      ]) {
+        await rmdir(parent).catch((error: NodeJS.ErrnoException) => {
+          if (!['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes(error.code ?? '')) throw error;
+        });
+      }
+      return;
+    }
     for (const key of [...STOPPED_EXPORT_PATHS].reverse()) {
       const target = join(liveRoot, key);
       await trustedArtifactParent(liveRoot, key, false);
@@ -1291,22 +1710,45 @@ export class PlatformMigrationService {
     }
   }
 
+  private async hasStoppedOperationalEvidence(instanceId: string, txId: string): Promise<boolean> {
+    const liveRoot = join(this.o.instanceDataRoot, instanceId);
+    for (const key of STOPPED_EXPORT_PATHS) {
+      const target = join(liveRoot, key);
+      for (const suffix of ['partial', 'backup', 'manifest', 'backup-manifest'] as const) {
+        try {
+          await lstat(stoppedSidecar(target, txId, suffix));
+          return true;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        }
+      }
+    }
+    return false;
+  }
+
   private async verifyStoppedEvidenceOwned(
     instanceId: string,
     txId: string,
     allowCommittedCleanupResidue = false,
   ): Promise<StoppedArtifactFact[]> {
     const liveRoot = join(this.o.instanceDataRoot, instanceId);
-    const desiredFacts: StoppedArtifactFact[] = [];
     const journal = this.o.repo.nodeMigration(instanceId);
-    if (!allowCommittedCleanupResidue && (!journal || journal.txId !== txId)) {
-      throw new Error('strict stopped evidence journal identity mismatch');
+    if (!journal || journal.txId !== txId) throw new Error('stopped evidence journal identity mismatch');
+    let authority: StoppedEvidenceAuthority;
+    try {
+      authority = await readStoppedAuthority(this.o.instanceDataRoot, {
+        instanceId,
+        txId,
+        targetIntegrity: journal.targetIntegrity,
+      });
+    } catch (error) {
+      if (allowCommittedCleanupResidue && !await this.hasStoppedOperationalEvidence(instanceId, txId)) {
+        return [];
+      }
+      throw error;
     }
-    const checkpoint = !allowCommittedCleanupResidue
-      ? await this.o.checkpoint.verify(instanceId, txId)
-      : undefined;
-    const checkpointFacts = new Map(checkpoint?.files.map((fact) => [fact.path, fact]) ?? []);
-    for (const key of STOPPED_EXPORT_PATHS) {
+    for (const artifact of authority.artifacts) {
+      const { key, desired: requiredDesired, prior: expectedPrior } = artifact;
       const target = join(liveRoot, key);
       await trustedArtifactParent(liveRoot, key, false);
       const partial = stoppedSidecar(target, txId, 'partial');
@@ -1316,49 +1758,26 @@ export class PlatformMigrationService {
       const partialFact = await artifactFact(dirname(partial), basename(partial));
       const backupFact = await artifactFact(dirname(backup), basename(backup));
       const live = await artifactFact(liveRoot, key);
-      const desired = await readArtifactManifest(manifest, key);
-      const prior = await readArtifactManifest(backupManifest, key);
-      if (!allowCommittedCleanupResidue && !desired) {
+      const desiredMarker = await readArtifactManifest(manifest, key);
+      const priorMarker = await readArtifactManifest(backupManifest, key);
+      if (!sameArtifact(live, requiredDesired)) {
+        throw new Error(`stopped live differs from Manager authority ${key}`);
+      }
+      if (!allowCommittedCleanupResidue && !desiredMarker) {
         throw new Error(`stopped desired manifest missing ${key}`);
       }
-      if (desired) {
-        desiredFacts.push(desired);
-        if (!sameArtifact(live, desired)) {
-          throw new Error(`stopped live desired owner mismatch ${key}`);
-        }
+      if (desiredMarker && !sameArtifact(desiredMarker, requiredDesired)) {
+        throw new Error(`stopped desired marker differs from Manager authority ${key}`);
       }
       if (!allowCommittedCleanupResidue) {
-        const requiredDesired = desired!;
-        let expectedPrior: StoppedArtifactFact;
-        if (key.startsWith(`node_modules${sep}`)) {
-          if (!journal!.stagedBefore) {
-            expectedPrior = { key, exists: false };
-          } else if (backupFact.exists) {
-            if (!prior) throw new Error(`stopped prior manifest missing ${key}`);
-            expectedPrior = prior;
-          } else {
-            // A preexisting module without backup is unambiguous only while the
-            // retained equal/no-op partial proves prior === desired.
-            if (!partialFact.exists || !requiredDesired.exists || prior) {
-              throw new Error(`stopped preexisting module matrix is ambiguous ${key}`);
-            }
-            expectedPrior = requiredDesired;
-          }
-        } else {
-          const fact = checkpointFacts.get(key as MigrationCheckpointFilePath);
-          if (!fact) throw new Error(`checkpoint prior fact missing ${key}`);
-          expectedPrior = fact.exists
-            ? { key, exists: true, kind: 'file', mode: fact.mode, sha256: fact.sha256 }
-            : { key, exists: false };
-        }
         const changed = !sameArtifact(expectedPrior, requiredDesired);
         if (changed && expectedPrior.exists) {
           if (
-            !backupFact.exists || !prior
+            !backupFact.exists || !priorMarker
             || !sameArtifact({ ...backupFact, key } as StoppedArtifactFact, expectedPrior)
-            || !sameArtifact(prior, expectedPrior)
+            || !sameArtifact(priorMarker, expectedPrior)
           ) throw new Error(`stopped changed prior evidence missing ${key}`);
-        } else if (backupFact.exists || prior) {
+        } else if (backupFact.exists || priorMarker) {
           throw new Error(`stopped unchanged/created artifact has prior evidence ${key}`);
         }
         if (changed) {
@@ -1374,27 +1793,28 @@ export class PlatformMigrationService {
         continue;
       }
       if (partialFact.exists) {
-        if (!desired || !sameArtifact(
+        if (!desiredMarker || !sameArtifact(
           { ...partialFact, key } as StoppedArtifactFact,
-          desired,
+          requiredDesired,
         )) {
           throw new Error(`stopped partial owner mismatch ${key}`);
         }
-      } else if (desired && !sameArtifact(live, desired)) {
-        throw new Error(`stopped live desired owner mismatch ${key}`);
       }
       if (backupFact.exists) {
-        if (!desired || !prior || !sameArtifact(
+        if (!desiredMarker || !priorMarker || !expectedPrior.exists || !sameArtifact(
           { ...backupFact, key } as StoppedArtifactFact,
-          prior,
+          expectedPrior,
+        ) || !sameArtifact(
+          priorMarker,
+          expectedPrior,
         )) {
           throw new Error(`stopped backup owner mismatch ${key}`);
         }
-      } else if (prior && !allowCommittedCleanupResidue) {
-        throw new Error(`orphan stopped backup manifest ${key}`);
+      } else if (priorMarker && !sameArtifact(priorMarker, expectedPrior)) {
+        throw new Error(`orphan stopped backup marker mismatch ${key}`);
       }
     }
-    return desiredFacts;
+    return authority.artifacts.map((artifact) => artifact.desired);
   }
 
   private async cleanupEqualStoppedEvidenceBeforeCommit(
@@ -1489,12 +1909,27 @@ export class PlatformMigrationService {
     },
   ): Promise<boolean> {
     try {
+      const journal = this.o.repo.nodeMigration(instanceId);
+      if (!journal || journal.txId !== txId) throw new Error('committed cleanup journal mismatch');
+      let authority: StoppedEvidenceAuthority;
+      try {
+        authority = await readStoppedAuthority(this.o.instanceDataRoot, {
+          instanceId,
+          txId,
+          targetIntegrity: journal.targetIntegrity,
+        });
+      } catch (error) {
+        if (initial || await this.hasStoppedOperationalEvidence(instanceId, txId)) throw error;
+        await cleanupStoppedAuthorityRemainder(this.o.instanceDataRoot, instanceId, txId);
+        return true;
+      }
       if (initial) {
         await this.verifyInitialCommittedCleanup(
           instanceId, txId, initial.desiredFacts, initial.precleanedKeys,
         );
       }
       await this.cleanupStoppedEvidence(instanceId, txId);
+      await cleanupStoppedAuthority(this.o.instanceDataRoot, authority, false);
       return true;
     } catch {
       try {
@@ -1563,6 +1998,7 @@ export class PlatformMigrationService {
         throw controlled('verification', 'probe Admin flow identity mismatch');
       }
       const exported = await this.exportStoppedProbe(handle.dataRoot);
+      const authority = await this.persistStoppedAuthority(journal, exported);
       await this.prepareStoppedPartials(instanceId, txId, handle.dataRoot, exported);
       const cleanup = await this.o.docker.cleanupMigrationProbe(handle);
       handle = undefined;
@@ -1574,7 +2010,7 @@ export class PlatformMigrationService {
         ['staged'], 'cutover',
       );
       await this.reachOwned(execution, 'cutover', 5);
-      const nextSequence = await this.applyStoppedArtifacts(execution, exported, 6);
+      const nextSequence = await this.applyStoppedArtifacts(execution, authority, 6);
       this.o.repo.parkNodeMigrationPendingStartExact(
         instanceId, txId, execution.owner, this.executionRuntime.now(), 'cutover',
       );
@@ -1619,6 +2055,14 @@ export class PlatformMigrationService {
     try {
       await this.reachOwned(execution, 'verifying', 200);
       execution.renew(['verifying']);
+      // Validate the Manager-only authority before the one production start.
+      // Live data and its operational sidecars remain untrusted until the later
+      // strict post-start/precommit comparison.
+      await readStoppedAuthority(this.o.instanceDataRoot, {
+        instanceId,
+        txId: scanned.txId,
+        targetIntegrity: scanned.targetIntegrity,
+      });
       await this.o.docker.start(instanceId);
       await this.o.adminRuntime.waitReady(instanceId, { timeoutMs: 30_000, intervalMs: 250 });
       await this.verifyCutover(instanceId, this.o.repo.nodeMigration(instanceId)!);
@@ -1737,7 +2181,42 @@ export class PlatformMigrationService {
     const { instanceId } = journal;
     let cleanupDirty = false;
     let claimed = false;
+    let stoppedAuthority: StoppedEvidenceAuthority | undefined;
     try {
+      if (!journal.originalRunning) {
+        const requiresAuthority = ['cutover', 'verifying'].includes(journal.phase)
+          || await stoppedAuthorityRootExists(this.o.instanceDataRoot, instanceId, journal.txId)
+          || await this.hasStoppedOperationalEvidence(instanceId, journal.txId);
+        if (requiresAuthority) {
+          try {
+            stoppedAuthority = await readStoppedAuthority(this.o.instanceDataRoot, {
+              instanceId,
+              txId: journal.txId,
+              targetIntegrity: journal.targetIntegrity,
+            });
+          } catch {
+            const inspection = await this.o.docker.inspectMigrationRuntime(instanceId)
+              .catch(() => undefined);
+            if (inspection?.running) await this.o.docker.stop(instanceId).catch(() => undefined);
+            try {
+              this.o.repo.finishNodeMigrationManualExact(
+                instanceId,
+                journal.txId,
+                execution.owner,
+                this.executionRuntime.now(),
+                [journal.phase],
+                'rollback',
+                journal.actor,
+              );
+              await this.reach(instanceId, journal.txId, 'manual_required', 99)
+                .catch(() => undefined);
+            } catch {
+              // Exact owner loss leaves the replacement journal authoritative.
+            }
+            return this.status(instanceId);
+          }
+        }
+      }
       this.o.repo.transitionNodeMigrationExact(
         instanceId,
         journal.txId,
@@ -1759,7 +2238,7 @@ export class PlatformMigrationService {
         execution.renew(['rolling_back']);
         const current = await this.o.docker.inspectMigrationRuntime(instanceId);
         if (current.running) await this.o.docker.stop(instanceId);
-        await this.restoreStoppedArtifacts(journal);
+        await this.restoreStoppedArtifacts(journal, stoppedAuthority);
       }
       if (installedByTx && !journal.stagedBefore) {
         cleanupDirty = await this.cleanupAttemptedInstall(instanceId, execution);
@@ -1818,6 +2297,10 @@ export class PlatformMigrationService {
           .catch(() => undefined);
         return this.status(instanceId);
       }
+      if (stoppedAuthority) {
+        execution.renew(['rolling_back']);
+        await cleanupStoppedAuthority(this.o.instanceDataRoot, stoppedAuthority, false);
+      }
       execution.renew(['rolling_back']);
       this.o.repo.finishNodeMigrationRollbackExact(
         instanceId,
@@ -1864,6 +2347,30 @@ export class PlatformMigrationService {
     const results: PlatformMigrationResult[] = [];
     for (const journal of this.o.repo.nodeMigrations()) {
       if (journal.operationKind !== 'migration') continue;
+      if (journal.phase === 'pending_start_verification' && !journal.originalRunning) {
+        try {
+          await readStoppedAuthority(this.o.instanceDataRoot, {
+            instanceId: journal.instanceId,
+            txId: journal.txId,
+            targetIntegrity: journal.targetIntegrity,
+          });
+        } catch {
+          try {
+            const inspection = await this.o.docker.inspectMigrationRuntime(journal.instanceId);
+            if (!inspection.running) {
+              this.o.repo.finishOwnerlessPendingManualExact(
+                journal.instanceId, journal.txId, 'rollback', 'system',
+              );
+              await this.reach(journal.instanceId, journal.txId, 'manual_required', 102)
+                .catch(() => undefined);
+            }
+          } catch {
+            // A running/unknown instance or changed pending journal must not be touched here.
+          }
+        }
+        results.push(this.status(journal.instanceId));
+        continue;
+      }
       if (journal.phase === 'committed' || journal.phase === 'rolled_back') {
         if (
           journal.phase === 'committed'
