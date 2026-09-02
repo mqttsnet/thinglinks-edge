@@ -127,6 +127,16 @@ type TestArtifactFact =
   | { key: string; exists: false }
   | { key: string; exists: true; kind: 'file' | 'directory'; mode: number; sha256: string };
 
+const ROLLBACK_EVIDENCE_PATHS = [
+  'settings.js', 'settings.js.backup', 'flows.json', 'flows.json.backup',
+  'flows_cred.json', 'flows_cred.json.backup', 'package.json', 'package.json.backup',
+  'package-lock.json', 'package-lock.json.backup', '.config.nodes.json',
+  '.config.nodes.json.backup', '.config.modules.json', '.config.modules.json.backup',
+  'nodes',
+  join('node_modules', ...PLATFORM_NODE_PACKAGE.name.split('/')),
+  join('node_modules', ...PLATFORM_COMMON_PACKAGE.name.split('/')),
+] as const;
+
 function testArtifactFact(root: string, key: string): TestArtifactFact {
   const absolute = join(root, key);
   if (!existsSync(absolute)) return { key, exists: false };
@@ -167,6 +177,19 @@ function testArtifactFact(root: string, key: string): TestArtifactFact {
   };
   walk(absolute, '');
   return { key, exists: true, kind: 'directory', mode, sha256: sha256(JSON.stringify(entries)) };
+}
+
+function migrationEvidence(root: string): Map<string, TestArtifactFact> {
+  return new Map(ROLLBACK_EVIDENCE_PATHS.map((path) => [path, testArtifactFact(root, path)]));
+}
+
+function migrationEvidenceDiff(
+  root: string,
+  before: ReadonlyMap<string, TestArtifactFact>,
+): string[] {
+  return ROLLBACK_EVIDENCE_PATHS.filter((path) => (
+    JSON.stringify(testArtifactFact(root, path)) !== JSON.stringify(before.get(path))
+  ));
 }
 
 function writeTestManifest(path: string, fact: TestArtifactFact): void {
@@ -537,6 +560,8 @@ class FakeAdminRuntime implements InstanceAdminRuntime {
 
 class FakeAdminActions implements PlatformMigrationAdminActions {
   installCalls = 0;
+  liveInstallCalls = 0;
+  probeInstallCalls = 0;
   uninstallCalls = 0;
   failAt = '';
   flowValue: unknown = [{ id: 'flow-a', type: 'inject' }];
@@ -563,6 +588,7 @@ class FakeAdminActions implements PlatformMigrationAdminActions {
 
   async stagePlatformModule(): Promise<InstalledModule> {
     this.installCalls += 1;
+    this.liveInstallCalls += 1;
     if (this.failAt === 'install') throw new Error('password=install-secret');
     writeInstalledPackage(this.instanceRoot);
     this.state.staged = true;
@@ -608,6 +634,7 @@ class FakeAdminActions implements PlatformMigrationAdminActions {
 
   async stagePlatformModuleAt(_target: AdminTarget): Promise<InstalledModule> {
     this.installCalls += 1;
+    this.probeInstallCalls += 1;
     if (!this.state.probeRoot) throw new Error('probe root missing');
     writeInstalledPackage(this.state.probeRoot);
     this.state.staged = true;
@@ -2543,24 +2570,6 @@ test('post-start flow rewrites are reverified during rollback and require manual
   assert.equal(result.error, 'rollback');
 });
 
-test('exact preexisting staged package skips install and still completes strict running verification', async () => {
-  const f = migrationFixture({ preexisting: true });
-  const result = await f.service.migrate('line-a', 'admin');
-  assert.equal(result.phase, 'committed');
-  assert.equal(f.admin.installCalls, 0);
-  assert.equal(f.packages.calls, 2);
-  assert.equal(f.repo.nodeMigration('line-a')?.stagedBefore, true);
-  assert.equal(
-    readFileSync(join(
-      f.instanceRoot,
-      'node_modules',
-      ...PLATFORM_NODE_PACKAGE.name.split('/'),
-      'package.json',
-    ), 'utf8').includes(PLATFORM_NODE_PACKAGE.version),
-    true,
-  );
-});
-
 test('C48 accepts the exact per-type duplicate text captured from Node-RED 5.0.4 staging', async () => {
   const f = migrationFixture();
   f.admin.stagePlatformModule = async () => {
@@ -2895,25 +2904,133 @@ test('every running failure boundary restores checkpoint bytes, legacy ownership
   }
 });
 
-test('rollback preserves an exact preexisting package and dirty cleanup never deletes it', async () => {
+test('running stagedBefore is rejected read-only before gate drain journal checkpoint or runtime effects', async () => {
   const f = migrationFixture({ preexisting: true });
-  const preservedPaths = [
-    'package.json',
-    'package-lock.json',
-    join('node_modules', ...PLATFORM_NODE_PACKAGE.name.split('/'), 'package.json'),
-    join('node_modules', ...PLATFORM_COMMON_PACKAGE.name.split('/'), 'package.json'),
-  ];
-  const preserved = new Map(preservedPaths.map((path) => [
-    path,
-    readFileSync(join(f.instanceRoot, path)),
-  ]));
-  f.docker.failAt = 'settings';
-  const result = await f.service.migrate('line-a', 'admin');
-  assert.equal(result.phase, 'rolled_back');
+  f.admin.beforeModules = [rawPlatformInventory(), capturedNodeRed504StagedPlatformInventory()];
+  const before = migrationEvidence(f.instanceRoot);
+
+  await f.gate.run('line-a', 'flow-write', async () => {
+    await assert.rejects(
+      () => f.service.migrate('line-a', 'admin'),
+      (error: unknown) => {
+        assert.ok(error instanceof PlatformMigrationError);
+        assert.equal(error.code, 'preflight');
+        assert.match(error.message, /stop the instance.*retry/i);
+        return true;
+      },
+    );
+    assert.equal(f.gate.current('line-a'), 'flow-write');
+  });
+
+  assert.deepEqual(migrationEvidenceDiff(f.instanceRoot, before), []);
+  assert.equal(f.repo.nodeMigration('line-a'), undefined);
+  assert.deepEqual(f.events, []);
+  assert.deepEqual(f.docker.runtimeCalls, []);
+  assert.equal(f.docker.inspection.running, true);
+  assert.equal(f.admin.liveInstallCalls, 0);
+  assert.equal(f.admin.probeInstallCalls, 0);
   assert.equal(f.admin.uninstallCalls, 0);
-  assert.equal(f.repo.nodeMigration('line-a')?.stagedBefore, true);
-  for (const [path, bytes] of preserved) {
-    assert.deepEqual(readFileSync(join(f.instanceRoot, path)), bytes, path);
+});
+
+test('running stagedBefore rejects before same-image environment repair', async () => {
+  const f = migrationFixture({ preexisting: true, enableRepair: true });
+  f.admin.beforeModules = [rawPlatformInventory(), capturedNodeRed504StagedPlatformInventory()];
+  f.docker.inspection = {
+    ...f.docker.inspection,
+    environment: f.docker.inspection.environment.map((entry) => (
+      entry.startsWith('NPM_CONFIG_REGISTRY=')
+        ? 'NPM_CONFIG_REGISTRY=http://wrong.invalid/npm/'
+        : entry
+    )),
+  };
+  const before = migrationEvidence(f.instanceRoot);
+
+  await assert.rejects(
+    () => f.service.migrate('line-a', 'admin'),
+    (error: unknown) => {
+      assert.ok(error instanceof PlatformMigrationError);
+      assert.equal(error.code, 'preflight');
+      assert.match(error.message, /stop the instance.*retry/i);
+      return true;
+    },
+  );
+
+  assert.deepEqual(migrationEvidenceDiff(f.instanceRoot, before), []);
+  assert.equal(f.repo.nodeMigration('line-a'), undefined);
+  assert.deepEqual(f.events, []);
+  assert.deepEqual(f.docker.runtimeCalls, []);
+  assert.equal(f.docker.inspection.running, true);
+  assert.equal(f.admin.liveInstallCalls, 0);
+  assert.equal(f.admin.probeInstallCalls, 0);
+  assert.equal(f.admin.uninstallCalls, 0);
+});
+
+test('stopped stagedBefore uses the isolated probe and commits only on explicit start', async () => {
+  const f = migrationFixture({ originalRunning: false, preexisting: true });
+  f.admin.beforeModules = [rawPlatformInventory(), capturedNodeRed504StagedPlatformInventory()];
+  const protectedPaths = [
+    'flows.json',
+    'flows_cred.json',
+    join('node_modules', ...PLATFORM_NODE_PACKAGE.name.split('/')),
+    join('node_modules', ...PLATFORM_COMMON_PACKAGE.name.split('/')),
+  ];
+  const protectedBefore = new Map(protectedPaths.map((path) => [
+    path,
+    testArtifactFact(f.instanceRoot, path),
+  ]));
+
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  assert.equal(f.admin.liveInstallCalls, 0);
+  assert.equal(f.admin.probeInstallCalls, 1);
+  assert.equal(f.admin.uninstallCalls, 0);
+  assert.ok(f.docker.runtimeCalls.includes('probe-create'));
+  assert.ok(f.docker.runtimeCalls.includes('probe-restart'));
+  assert.equal(f.docker.runtimeCalls.includes('start'), false);
+
+  const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+    f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+  assert.equal(result.phase, 'committed');
+  assert.equal(f.docker.inspection.running, true);
+  assert.equal(f.admin.uninstallCalls, 0);
+  for (const [path, fact] of protectedBefore) {
+    assert.deepEqual(testArtifactFact(f.instanceRoot, path), fact, path);
+  }
+});
+
+test('stopped stagedBefore rollback preserves exact evidence without uninstall and can retry', async () => {
+  const f = migrationFixture({
+    originalRunning: false,
+    preexisting: true,
+    barrierFailure: { phase: 'cutover', boundary: 'after-live-rename', artifact: 'settings' },
+  });
+  f.admin.beforeModules = [rawPlatformInventory(), capturedNodeRed504StagedPlatformInventory()];
+  const before = migrationEvidence(f.instanceRoot);
+
+  const rolledBack = await f.service.migrate('line-a', 'admin');
+  assert.equal(rolledBack.phase, 'rolled_back');
+  assert.equal(f.docker.inspection.running, false);
+  assert.equal(f.admin.liveInstallCalls, 0);
+  assert.equal(f.admin.probeInstallCalls, 1);
+  assert.equal(f.admin.uninstallCalls, 0);
+  assert.deepEqual(migrationEvidenceDiff(f.instanceRoot, before), []);
+
+  f.controls.barrierFailure = undefined;
+  const retryGate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(f.repo));
+  const retry = f.createService(f.repo, retryGate, 'tx-staged-retry');
+  assert.equal((await retry.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  const committed = await retryGate.run('line-a', 'start-instance', (lease) => (
+    retry.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+  assert.equal(committed.phase, 'committed');
+  assert.equal(f.admin.uninstallCalls, 0);
+  for (const path of [
+    'flows.json',
+    'flows_cred.json',
+    join('node_modules', ...PLATFORM_NODE_PACKAGE.name.split('/')),
+    join('node_modules', ...PLATFORM_COMMON_PACKAGE.name.split('/')),
+  ]) {
+    assert.deepEqual(testArtifactFact(f.instanceRoot, path), before.get(path), path);
   }
 });
 

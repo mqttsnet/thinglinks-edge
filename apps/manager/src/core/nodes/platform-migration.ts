@@ -2811,6 +2811,13 @@ export class PlatformMigrationService {
       legacyManifestSha256: hash(legacyManifest),
       nodeInventorySha256,
     };
+    if (inspection.running && stagedBefore) {
+      throw controlled(
+        'preflight',
+        'running legacy instance already has the platform package staged; '
+          + 'stop the instance before retrying migration',
+      );
+    }
     return {
       inspection, snapshot, stagedBefore,
       flowIdentity: preflightFlowIdentity,
