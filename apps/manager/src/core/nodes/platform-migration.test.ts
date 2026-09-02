@@ -1,7 +1,7 @@
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import {
+import fs, {
   existsSync,
   chmodSync,
   cpSync,
@@ -15,8 +15,9 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDb } from '../db.ts';
 import { deriveKey } from '../auth/crypto.ts';
@@ -192,6 +193,38 @@ function migrationEvidenceDiff(
   ));
 }
 
+async function withReadEvidence<T>(
+  root: string,
+  reads: string[],
+  action: () => Promise<T>,
+): Promise<T> {
+  const trustedRoot = resolve(root);
+  const originalReadFile = fs.promises.readFile;
+  const observedPath = (path: unknown): string => {
+    if (typeof path === 'string') return resolve(path);
+    if (path instanceof URL) return fileURLToPath(path);
+    if (Buffer.isBuffer(path)) return resolve(path.toString());
+    return '';
+  };
+  fs.promises.readFile = (async (path: unknown, ...args: unknown[]) => {
+    const absolute = observedPath(path);
+    if (absolute) {
+      const candidate = relative(trustedRoot, absolute);
+      if (candidate && candidate !== '..' && !candidate.startsWith(`..${sep}`) && !isAbsolute(candidate)) {
+        reads.push(candidate);
+      }
+    }
+    return Reflect.apply(originalReadFile, fs.promises, [path, ...args]);
+  }) as typeof originalReadFile;
+  syncBuiltinESMExports();
+  try {
+    return await action();
+  } finally {
+    fs.promises.readFile = originalReadFile;
+    syncBuiltinESMExports();
+  }
+}
+
 function writeTestManifest(path: string, fact: TestArtifactFact): void {
   writeFileSync(path, `${JSON.stringify(fact)}\n`, { mode: 0o600 });
 }
@@ -351,6 +384,15 @@ function capturedNodeRed504StagedPlatformInventory(): InstalledModule {
 function writeJson(path: string, value: unknown): void {
   mkdirSync(join(path, '..'), { recursive: true });
   writeFileSync(path, `${JSON.stringify(value)}\n`, { mode: 0o600 });
+}
+
+function mutateJson(
+  path: string,
+  mutate: (value: Record<string, unknown>) => void,
+): void {
+  const value = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+  mutate(value);
+  writeJson(path, value);
 }
 
 function writeInstalledPackage(
@@ -559,6 +601,8 @@ class FakeAdminRuntime implements InstanceAdminRuntime {
 }
 
 class FakeAdminActions implements PlatformMigrationAdminActions {
+  installedModulesCalls = 0;
+  currentFlowsCalls = 0;
   installCalls = 0;
   liveInstallCalls = 0;
   probeInstallCalls = 0;
@@ -579,6 +623,7 @@ class FakeAdminActions implements PlatformMigrationAdminActions {
   }
 
   async installedModules(): Promise<InstalledModule[]> {
+    this.installedModulesCalls += 1;
     if (this.failAt === 'inventory') throw new Error('token=inventory-secret');
     if (this.state.cutover) {
       return this.state.staged ? [builtinInventory(), this.afterRestart] : [builtinInventory()];
@@ -619,6 +664,10 @@ class FakeAdminActions implements PlatformMigrationAdminActions {
   }
 
   async currentFlows(): Promise<unknown> {
+    this.currentFlowsCalls += 1;
+    if (this.failAt === 'preflight-flows') {
+      throw new Error('credentials=preflight-flow-secret');
+    }
     if (this.failAt === 'flows' && this.state.cutover) {
       throw new Error('credentials=flow-secret');
     }
@@ -2904,14 +2953,61 @@ test('every running failure boundary restores checkpoint bytes, legacy ownership
   }
 });
 
-test('running stagedBefore is rejected read-only before gate drain journal checkpoint or runtime effects', async () => {
+function completedRunningStagedDirectReads(): string[] {
+  // The installed-file verifier's captured callback is proven separately by corrupting
+  // its Edge manifest, lock entry, and SRI. This list pins every surrounding direct read.
+  return [
+    ...Object.keys(LEGACY_PLATFORM_FILES).map((path) => join('nodes', path)),
+    'flows.json',
+    'settings.js', 'flows.json', 'flows_cred.json', 'package.json', 'package-lock.json',
+  ].sort();
+}
+
+async function assertRunningStagedPreflightFailure(
+  f: ReturnType<typeof migrationFixture>,
+  expectedMessage: RegExp,
+  options: { stopRetry?: boolean; reads?: string[] } = {},
+): Promise<void> {
+  const before = migrationEvidence(f.instanceRoot);
+  const migrate = () => f.service.migrate('line-a', 'admin');
+  await assert.rejects(
+    () => options.reads
+      ? withReadEvidence(f.instanceRoot, options.reads, migrate)
+      : migrate(),
+    (error: unknown) => {
+      assert.ok(error instanceof PlatformMigrationError);
+      assert.equal(error.code, 'preflight');
+      assert.match(error.message, expectedMessage);
+      if (options.stopRetry !== true) {
+        assert.doesNotMatch(error.message, /stop the instance|retry/i);
+      }
+      assert.doesNotMatch(error.message, /secret|token|password|credential/i);
+      return true;
+    },
+  );
+  assert.deepEqual(migrationEvidenceDiff(f.instanceRoot, before), []);
+  assert.equal(f.repo.nodeMigration('line-a'), undefined);
+  assert.deepEqual(f.events, []);
+  assert.deepEqual(f.docker.runtimeCalls, []);
+  assert.equal(f.docker.inspection.running, true);
+  assert.equal(f.admin.liveInstallCalls, 0);
+  assert.equal(f.admin.probeInstallCalls, 0);
+  assert.equal(f.admin.uninstallCalls, 0);
+}
+
+test('running stagedBefore stop retry follows every complete read-only preflight check', async () => {
   const f = migrationFixture({ preexisting: true });
   f.admin.beforeModules = [rawPlatformInventory(), capturedNodeRed504StagedPlatformInventory()];
   const before = migrationEvidence(f.instanceRoot);
+  const reads: string[] = [];
 
   await f.gate.run('line-a', 'flow-write', async () => {
     await assert.rejects(
-      () => f.service.migrate('line-a', 'admin'),
+      () => withReadEvidence(
+        f.instanceRoot,
+        reads,
+        () => f.service.migrate('line-a', 'admin'),
+      ),
       (error: unknown) => {
         assert.ok(error instanceof PlatformMigrationError);
         assert.equal(error.code, 'preflight');
@@ -2930,6 +3026,10 @@ test('running stagedBefore is rejected read-only before gate drain journal check
   assert.equal(f.admin.liveInstallCalls, 0);
   assert.equal(f.admin.probeInstallCalls, 0);
   assert.equal(f.admin.uninstallCalls, 0);
+  assert.equal(f.packages.calls, 1);
+  assert.equal(f.admin.installedModulesCalls, 1);
+  assert.equal(f.admin.currentFlowsCalls, 1);
+  assert.deepEqual(reads.sort(), completedRunningStagedDirectReads());
 });
 
 test('running stagedBefore rejects before same-image environment repair', async () => {
@@ -2944,9 +3044,14 @@ test('running stagedBefore rejects before same-image environment repair', async 
     )),
   };
   const before = migrationEvidence(f.instanceRoot);
+  const reads: string[] = [];
 
   await assert.rejects(
-    () => f.service.migrate('line-a', 'admin'),
+    () => withReadEvidence(
+      f.instanceRoot,
+      reads,
+      () => f.service.migrate('line-a', 'admin'),
+    ),
     (error: unknown) => {
       assert.ok(error instanceof PlatformMigrationError);
       assert.equal(error.code, 'preflight');
@@ -2963,6 +3068,115 @@ test('running stagedBefore rejects before same-image environment repair', async 
   assert.equal(f.admin.liveInstallCalls, 0);
   assert.equal(f.admin.probeInstallCalls, 0);
   assert.equal(f.admin.uninstallCalls, 0);
+  assert.equal(f.packages.calls, 1);
+  assert.equal(f.admin.installedModulesCalls, 1);
+  assert.equal(f.admin.currentFlowsCalls, 1);
+  assert.deepEqual(reads.sort(), completedRunningStagedDirectReads());
+});
+
+test('running stagedBefore package manifest lock and SRI corruption win before stop retry', async () => {
+  const edgeRelative = join('node_modules', ...PLATFORM_NODE_PACKAGE.name.split('/'));
+  const commonRelative = join('node_modules', ...PLATFORM_COMMON_PACKAGE.name.split('/'));
+  const cases: Array<{
+    name: string;
+    mutate: (f: ReturnType<typeof migrationFixture>) => void;
+  }> = [
+    {
+      name: 'package manifest',
+      mutate: (f) => mutateJson(join(f.instanceRoot, edgeRelative, 'package.json'), (manifest) => {
+        manifest['version'] = '0.0.2';
+      }),
+    },
+    {
+      name: 'lock entry',
+      mutate: (f) => mutateJson(join(f.instanceRoot, 'package-lock.json'), (lock) => {
+        const packages = lock['packages'] as Record<string, Record<string, unknown>>;
+        delete packages[commonRelative];
+      }),
+    },
+    {
+      name: 'SRI',
+      mutate: (f) => mutateJson(join(f.instanceRoot, 'package-lock.json'), (lock) => {
+        const packages = lock['packages'] as Record<string, Record<string, unknown>>;
+        packages[edgeRelative]!['integrity'] = 'sha512-invalid';
+      }),
+    },
+  ];
+
+  for (const item of cases) {
+    const f = migrationFixture({ preexisting: true });
+    f.admin.beforeModules = [rawPlatformInventory(), capturedNodeRed504StagedPlatformInventory()];
+    item.mutate(f);
+    const reads: string[] = [];
+    await assertRunningStagedPreflightFailure(
+      f,
+      /preexisting platform package integrity is invalid/,
+      { reads },
+    );
+
+    assert.equal(f.packages.calls, 1, item.name);
+    assert.equal(f.admin.installedModulesCalls, 1, item.name);
+    assert.equal(f.admin.currentFlowsCalls, 1, item.name);
+  }
+});
+
+test('running stagedBefore invalid inventory keeps its identity or staging error before stop retry', async () => {
+  const cases: Array<{ name: string; staged: InstalledModule; expected: RegExp }> = [
+    {
+      name: 'identity',
+      staged: stagedPlatformInventory('0.0.2'),
+      expected: /preexisting platform package identity is not exact/,
+    },
+    {
+      name: 'staging evidence',
+      staged: healthyPlatformInventory(),
+      expected: /preexisting platform package staging evidence is incomplete/,
+    },
+  ];
+
+  for (const item of cases) {
+    const f = migrationFixture({ preexisting: true });
+    f.admin.beforeModules = [rawPlatformInventory(), item.staged];
+
+    await assertRunningStagedPreflightFailure(f, item.expected);
+
+    assert.equal(f.packages.calls, 1, item.name);
+    assert.equal(f.admin.installedModulesCalls, 1, item.name);
+    assert.equal(f.admin.currentFlowsCalls, 0, item.name);
+  }
+});
+
+test('running stagedBefore flow mismatch and read failure win before package integrity and stop retry', async () => {
+  const cases: Array<{
+    name: string;
+    expected: RegExp;
+    mutate: (f: ReturnType<typeof migrationFixture>) => void;
+  }> = [
+    {
+      name: 'identity mismatch',
+      expected: /Admin flow ids do not match flows.json/,
+      mutate: (f) => { f.admin.flowValue = [{ id: 'different-flow', type: 'debug' }]; },
+    },
+    {
+      name: 'read failure',
+      expected: /existing flow preflight failed/,
+      mutate: (f) => { f.admin.failAt = 'preflight-flows'; },
+    },
+  ];
+
+  for (const item of cases) {
+    const f = migrationFixture({ preexisting: true });
+    f.admin.beforeModules = [rawPlatformInventory(), capturedNodeRed504StagedPlatformInventory()];
+    item.mutate(f);
+    const reads: string[] = [];
+
+    await assertRunningStagedPreflightFailure(f, item.expected, { reads });
+
+    assert.equal(f.packages.calls, 1, item.name);
+    assert.equal(f.admin.installedModulesCalls, 1, item.name);
+    assert.equal(f.admin.currentFlowsCalls, 1, item.name);
+    assert.equal(reads.some((path) => path.startsWith(`node_modules${sep}`)), false, item.name);
+  }
 });
 
 test('stopped stagedBefore uses the isolated probe and commits only on explicit start', async () => {
