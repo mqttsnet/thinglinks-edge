@@ -148,6 +148,21 @@ type TestArtifactFact =
   | { key: string; exists: false }
   | { key: string; exists: true; kind: 'file' | 'directory'; mode: number; sha256: string };
 
+interface TestAuthorityArtifact {
+  key: string;
+  desired: TestArtifactFact;
+  prior: TestArtifactFact;
+  postStart?: Record<string, unknown>;
+}
+
+interface TestStoppedAuthority {
+  version: number;
+  instanceId: string;
+  txId: string;
+  targetIntegrity: string;
+  artifacts: TestAuthorityArtifact[];
+}
+
 const ROLLBACK_EVIDENCE_PATHS = [
   'settings.js', 'settings.js.backup', 'flows.json', 'flows.json.backup',
   'flows_cred.json', 'flows_cred.json.backup', 'package.json', 'package.json.backup',
@@ -322,6 +337,32 @@ function stoppedAuthorityPath(
   return join(f.root, '.thinglinks-stopped-evidence', 'line-a', txId);
 }
 
+function readTestStoppedAuthority(f: ReturnType<typeof migrationFixture>): TestStoppedAuthority {
+  return JSON.parse(
+    readFileSync(join(stoppedAuthorityPath(f), 'manifest.json'), 'utf8'),
+  ) as TestStoppedAuthority;
+}
+
+function writeTestStoppedAuthority(
+  f: ReturnType<typeof migrationFixture>,
+  authority: TestStoppedAuthority,
+): void {
+  writeFileSync(
+    join(stoppedAuthorityPath(f), 'manifest.json'),
+    `${JSON.stringify(authority)}\n`,
+    { mode: 0o600 },
+  );
+}
+
+function testAuthorityArtifact(
+  authority: TestStoppedAuthority,
+  key: string,
+): TestAuthorityArtifact {
+  const artifact = authority.artifacts.find((candidate) => candidate.key === key);
+  assert.ok(artifact, key);
+  return artifact;
+}
+
 function downgradeStoppedAuthorityToV1(f: ReturnType<typeof migrationFixture>): void {
   const manifest = join(stoppedAuthorityPath(f), 'manifest.json');
   const v2 = JSON.parse(readFileSync(manifest, 'utf8')) as {
@@ -340,6 +381,30 @@ function downgradeStoppedAuthorityToV1(f: ReturnType<typeof migrationFixture>): 
     txId: v2.txId,
     targetIntegrity: v2.targetIntegrity,
     artifacts: v2.artifacts.map(({ key, desired, prior }) => ({ key, desired, prior })),
+  })}\n`, { mode: 0o600 });
+}
+
+function downgradeStoppedAuthorityToV2(f: ReturnType<typeof migrationFixture>): void {
+  const manifest = join(stoppedAuthorityPath(f), 'manifest.json');
+  const v3 = readTestStoppedAuthority(f);
+  const main = v3.artifacts.find((artifact) => artifact.key === '.config.nodes.json');
+  assert.equal(main?.postStart?.['comparison'], 'canonical-json');
+  writeFileSync(manifest, `${JSON.stringify({
+    version: 2,
+    instanceId: v3.instanceId,
+    txId: v3.txId,
+    targetIntegrity: v3.targetIntegrity,
+    artifacts: v3.artifacts.map((artifact) => ({
+      key: artifact.key,
+      desired: artifact.desired,
+      prior: artifact.prior,
+      postStart: (
+        artifact.key === '.config.nodes.json'
+        || artifact.key === '.config.nodes.json.backup'
+      )
+        ? main!.postStart
+        : artifact.postStart,
+    })),
   })}\n`, { mode: 0o600 });
 }
 
@@ -948,6 +1013,7 @@ function migrationFixture(options: FixtureOptions = {}) {
   writeJson(join(instanceRoot, 'package.json'), { name: 'line-a-runtime', dependencies: {} });
   writeJson(join(instanceRoot, 'package-lock.json'), { packages: { '': { dependencies: {} } } });
   writeJson(join(instanceRoot, '.config.nodes.json'), {});
+  writeJson(join(instanceRoot, '.config.nodes.json.backup'), {});
   writeJson(join(instanceRoot, '.config.modules.json'), {});
 
   const db = openDb(join(root, 'manager.db'));
@@ -2306,7 +2372,7 @@ test('C61 ownership loss on the second settle final export is fenced before auth
   )), false);
 });
 
-test('C62 staged explicit start accepts semantic node-config serialization and backup rotation', async () => {
+test('C64 v3 authority accepts semantic main A with rotated backup A', async () => {
   const f = migrationFixture({ originalRunning: false, preexisting: true });
   f.admin.beforeModules = [rawPlatformInventory(), capturedNodeRed504StagedPlatformInventory()];
   configureProbeNodeConfig(f);
@@ -2321,13 +2387,18 @@ test('C62 staged explicit start accepts semantic node-config serialization and b
       postStart: Record<string, unknown>;
     }>;
   };
-  assert.equal(authority.version, 2);
+  assert.equal(authority.version, 3);
   const nodePost = authority.artifacts.filter((artifact) => (
     artifact.key === '.config.nodes.json' || artifact.key === '.config.nodes.json.backup'
   ));
   assert.equal(nodePost.length, 2);
   assert.equal(nodePost[0]?.postStart['comparison'], 'canonical-json');
-  assert.deepEqual(nodePost[0]?.postStart, nodePost[1]?.postStart);
+  assert.equal(nodePost[1]?.postStart['comparison'], 'canonical-json-one-of');
+  assert.deepEqual(nodePost[1]?.postStart['canonicalSha256s'], [
+    nodePost[0]?.postStart['canonicalSha256'],
+    (nodePost[1]?.postStart['canonicalSha256s'] as string[])[1],
+  ]);
+  assert.equal((nodePost[1]?.postStart['canonicalSha256s'] as string[]).length, 2);
   assert.notEqual(nodePost[0]?.desired.sha256, nodePost[1]?.desired.sha256);
 
   f.docker.afterStart = () => {
@@ -2351,6 +2422,334 @@ test('C62 staged explicit start accepts semantic node-config serialization and b
   assert.equal(f.repo.nodeRuntime('line-a')?.mode, 'npm');
   assert.equal(f.docker.runtimeCalls.filter((call) => call === 'start').length, 1);
   assert.equal(f.admin.uninstallCalls, 0);
+});
+
+test('C64 v3 authority accepts stable probe backup B when Node-RED does not rotate it', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  configureProbeNodeConfig(f);
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  const authority = readTestStoppedAuthority(f);
+  const main = testAuthorityArtifact(authority, '.config.nodes.json').postStart!;
+  const backup = testAuthorityArtifact(authority, '.config.nodes.json.backup').postStart!;
+  const hashes = backup['canonicalSha256s'] as string[];
+  assert.equal(authority.version, 3);
+  assert.equal(main['comparison'], 'canonical-json');
+  assert.equal(backup['comparison'], 'canonical-json-one-of');
+  assert.equal(hashes.length, 2);
+  assert.equal(hashes[0], main['canonicalSha256']);
+  assert.notEqual(hashes[1], hashes[0]);
+  f.docker.afterStart = () => {
+    writeFileSync(
+      join(f.instanceRoot, '.config.nodes.json'),
+      `${JSON.stringify(reorderedPlatformNodeConfig(), null, 2)}\n`,
+      { mode: 0o600 },
+    );
+    writeJson(join(f.instanceRoot, '.config.nodes.json.backup'), { previous: 'probe-main' });
+  };
+
+  const committed = await f.gate.run('line-a', 'start-instance', (lease) => (
+    f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+
+  assert.equal(committed.phase, 'committed');
+  assert.equal(f.repo.nodeRuntime('line-a')?.mode, 'npm');
+});
+
+test('C64 v3 authority de-duplicates equal A and B canonical hashes', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  const authority = readTestStoppedAuthority(f);
+  const main = testAuthorityArtifact(authority, '.config.nodes.json').postStart!;
+  const backup = testAuthorityArtifact(authority, '.config.nodes.json.backup').postStart!;
+
+  assert.equal(authority.version, 3);
+  assert.deepEqual(backup['canonicalSha256s'], [main['canonicalSha256']]);
+  assert.equal((await f.gate.run('line-a', 'start-instance', (lease) => (
+    f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ))).phase, 'committed');
+});
+
+test('C64 v3 authority rejects unauthorized live main or backup state', async () => {
+  const cases: Array<{ name: string; mutate(root: string): void }> = [
+    { name: 'main becomes B', mutate: (root) => {
+      writeJson(join(root, '.config.nodes.json'), { previous: 'probe-main' });
+      writeJson(join(root, '.config.nodes.json.backup'), { previous: 'probe-main' });
+    } },
+    { name: 'backup becomes C', mutate: (root) => {
+      writeJson(join(root, '.config.nodes.json.backup'), { generation: 'C' });
+    } },
+    { name: 'backup is missing', mutate: (root) => {
+      rmSync(join(root, '.config.nodes.json.backup'), { force: true });
+    } },
+    { name: 'backup mode differs', mutate: (root) => {
+      writeJson(join(root, '.config.nodes.json.backup'), { previous: 'probe-main' });
+      chmodSync(join(root, '.config.nodes.json.backup'), 0o640);
+    } },
+    { name: 'backup has duplicate decoded key', mutate: (root) => {
+      writeFileSync(
+        join(root, '.config.nodes.json.backup'),
+        '{"a":1,"\\u0061":1}\n',
+        { mode: 0o600 },
+      );
+    } },
+    { name: 'backup has invalid UTF-8', mutate: (root) => {
+      writeFileSync(join(root, '.config.nodes.json.backup'), Buffer.from([0xff]));
+    } },
+    { name: 'backup has unsafe integer', mutate: (root) => {
+      writeFileSync(
+        join(root, '.config.nodes.json.backup'),
+        '{"n":9007199254740992}\n',
+        { mode: 0o600 },
+      );
+    } },
+  ];
+
+  for (const item of cases) {
+    const f = migrationFixture({ originalRunning: false });
+    configureProbeNodeConfig(f);
+    assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+    f.docker.afterStart = () => item.mutate(f.instanceRoot);
+
+    const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+      f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+    ));
+
+    assert.ok(
+      result.phase === 'rolled_back' || result.phase === 'manual_required',
+      `${item.name}: ${result.phase}`,
+    );
+    assert.equal(f.docker.inspection.running, false, item.name);
+    assert.notEqual(f.repo.nodeRuntime('line-a')?.mode, 'npm', item.name);
+  }
+});
+
+test('C64 v3 schema rejects malformed canonical closure before start or live mutation', async () => {
+  const cases: Array<{
+    name: string;
+    mutate(authority: TestStoppedAuthority): void;
+  }> = [
+    { name: 'empty closure', mutate: (authority) => {
+      testAuthorityArtifact(authority, '.config.nodes.json.backup').postStart![
+        'canonicalSha256s'
+      ] = [];
+    } },
+    { name: 'three hashes', mutate: (authority) => {
+      const backup = testAuthorityArtifact(authority, '.config.nodes.json.backup').postStart!;
+      const hashes = backup['canonicalSha256s'] as string[];
+      backup['canonicalSha256s'] = [hashes[0], hashes[1], 'c'.repeat(64)];
+    } },
+    { name: 'duplicate hashes', mutate: (authority) => {
+      const backup = testAuthorityArtifact(authority, '.config.nodes.json.backup').postStart!;
+      const hashes = backup['canonicalSha256s'] as string[];
+      backup['canonicalSha256s'] = [hashes[0], hashes[0]];
+    } },
+    { name: 'reversed hashes', mutate: (authority) => {
+      const backup = testAuthorityArtifact(authority, '.config.nodes.json.backup').postStart!;
+      const hashes = backup['canonicalSha256s'] as string[];
+      backup['canonicalSha256s'] = [...hashes].reverse();
+    } },
+    { name: 'missing A', mutate: (authority) => {
+      const backup = testAuthorityArtifact(authority, '.config.nodes.json.backup').postStart!;
+      const hashes = backup['canonicalSha256s'] as string[];
+      backup['canonicalSha256s'] = [hashes[1]];
+    } },
+    { name: 'extra field', mutate: (authority) => {
+      testAuthorityArtifact(authority, '.config.nodes.json.backup').postStart![
+        'unexpected'
+      ] = true;
+    } },
+    { name: 'bad hash', mutate: (authority) => {
+      testAuthorityArtifact(authority, '.config.nodes.json.backup').postStart![
+        'canonicalSha256s'
+      ] = ['not-a-hash'];
+    } },
+    { name: 'main claims B', mutate: (authority) => {
+      const main = testAuthorityArtifact(authority, '.config.nodes.json').postStart!;
+      const backup = testAuthorityArtifact(authority, '.config.nodes.json.backup').postStart!;
+      main['canonicalSha256'] = (backup['canonicalSha256s'] as string[])[1];
+    } },
+    { name: 'v1 carries postStart', mutate: (authority) => {
+      authority.version = 1;
+    } },
+    { name: 'v2 carries v3 closure', mutate: (authority) => {
+      authority.version = 2;
+    } },
+    { name: 'v3 backup carries v2 scalar', mutate: (authority) => {
+      const main = testAuthorityArtifact(authority, '.config.nodes.json').postStart!;
+      testAuthorityArtifact(authority, '.config.nodes.json.backup').postStart = { ...main };
+    } },
+    { name: 'v3 main carries backup closure', mutate: (authority) => {
+      const backup = testAuthorityArtifact(authority, '.config.nodes.json.backup').postStart!;
+      testAuthorityArtifact(authority, '.config.nodes.json').postStart = { ...backup };
+    } },
+  ];
+
+  for (const item of cases) {
+    const f = migrationFixture({ originalRunning: false });
+    configureProbeNodeConfig(f);
+    assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+    const liveBefore = migrationEvidence(f.instanceRoot);
+    const sidecarsBefore = txSidecars(f.instanceRoot, 'tx-01');
+    const startsBefore = f.docker.runtimeCalls.filter((call) => call === 'start').length;
+    const mutationsBefore = f.barrierEvents.filter((event) => (
+      event.boundary === 'after-live-backup' || event.boundary === 'after-live-rename'
+    )).length;
+    const authority = readTestStoppedAuthority(f);
+    item.mutate(authority);
+    writeTestStoppedAuthority(f, authority);
+
+    const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+      f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+    ));
+
+    assert.equal(result.phase, 'manual_required', item.name);
+    assert.equal(
+      f.docker.runtimeCalls.filter((call) => call === 'start').length,
+      startsBefore,
+      item.name,
+    );
+    assert.deepEqual(migrationEvidenceDiff(f.instanceRoot, liveBefore), [], item.name);
+    assert.deepEqual(txSidecars(f.instanceRoot, 'tx-01'), sidecarsBefore, item.name);
+    assert.equal(f.barrierEvents.filter((event) => (
+      event.boundary === 'after-live-backup' || event.boundary === 'after-live-rename'
+    )).length, mutationsBefore, item.name);
+  }
+});
+
+test('C64 legacy v1 and v2 authorities retain their original post-start semantics', async () => {
+  for (const version of [1, 2] as const) {
+    const f = migrationFixture({ originalRunning: false });
+    if (version === 2) configureProbeNodeConfig(f);
+    assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+    if (version === 1) downgradeStoppedAuthorityToV1(f);
+    else downgradeStoppedAuthorityToV2(f);
+
+    const reopened = reopenMigrationFixture(f);
+    assert.deepEqual(
+      (await reopened.service.recoverInterrupted()).map((result) => result.phase),
+      ['pending_start_verification'],
+      `v${version}`,
+    );
+    assert.equal((await reopened.gate.run('line-a', 'start-instance', (lease) => (
+      reopened.service.completePendingStartUnderLease('line-a', lease, 'admin')
+    ))).phase, 'committed', `v${version}`);
+    reopened.db.close();
+  }
+});
+
+test('C64 legacy v2 does not inherit the v3 backup B allowance', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  configureProbeNodeConfig(f);
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  downgradeStoppedAuthorityToV2(f);
+  f.docker.afterStart = () => {
+    writeJson(join(f.instanceRoot, '.config.nodes.json.backup'), { previous: 'probe-main' });
+  };
+
+  const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+    f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+
+  assert.notEqual(result.phase, 'committed');
+  assert.notEqual(f.repo.nodeRuntime('line-a')?.mode, 'npm');
+  assert.equal(f.docker.inspection.running, false);
+});
+
+test('C64 authorized A/B post-start state still rolls back to byte-exact prior artifacts', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  const before = migrationEvidence(f.instanceRoot);
+  configureProbeNodeConfig(f);
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  const unhealthy = healthyPlatformInventory();
+  unhealthy.nodeSets[0] = { ...unhealthy.nodeSets[0]!, enabled: false, err: 'load_failed' };
+  unhealthy.enabled = false;
+  unhealthy.errors = ['load_failed'];
+  unhealthy.health = 'failed';
+  f.admin.afterRestart = unhealthy;
+  f.docker.afterStart = () => {
+    writeJson(join(f.instanceRoot, '.config.nodes.json'), reorderedPlatformNodeConfig());
+    writeJson(join(f.instanceRoot, '.config.nodes.json.backup'), { previous: 'probe-main' });
+  };
+
+  const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+    f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+
+  assert.equal(result.phase, 'rolled_back');
+  assert.equal(f.docker.inspection.running, false);
+  assert.deepEqual(migrationEvidenceDiff(f.instanceRoot, before), []);
+  assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), false);
+});
+
+test('C64 unauthorized backup C retains authority and raw rollback evidence', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  configureProbeNodeConfig(f);
+  assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+  const nodeConfigSidecarsBefore = txSidecars(f.instanceRoot, 'tx-01').filter((path) => (
+    basename(path).startsWith('..config.nodes.json')
+  ));
+  f.docker.afterStart = () => {
+    writeJson(join(f.instanceRoot, '.config.nodes.json.backup'), { generation: 'C' });
+  };
+
+  const result = await f.gate.run('line-a', 'start-instance', (lease) => (
+    f.service.completePendingStartUnderLease('line-a', lease, 'admin')
+  ));
+
+  assert.equal(result.phase, 'manual_required');
+  assert.equal(f.docker.inspection.running, false);
+  assert.deepEqual(
+    JSON.parse(readFileSync(join(f.instanceRoot, '.config.nodes.json.backup'), 'utf8')),
+    { generation: 'C' },
+  );
+  assert.equal(existsSync(stoppedAuthorityPath(f)), true);
+  assert.deepEqual(
+    txSidecars(f.instanceRoot, 'tx-01').filter((path) => (
+      basename(path).startsWith('..config.nodes.json')
+    )),
+    nodeConfigSidecarsBefore,
+  );
+  assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), true);
+});
+
+test('C64 probe backup must be a same-mode strictly parsed ordinary JSON file', async () => {
+  const cases: Array<{ name: string; mutate(path: string): void }> = [
+    { name: 'missing', mutate: (path) => rmSync(path, { force: true }) },
+    { name: 'directory', mutate: (path) => {
+      rmSync(path, { force: true });
+      mkdirSync(path, { mode: 0o700 });
+    } },
+    { name: 'wrong mode', mutate: (path) => chmodSync(path, 0o640) },
+    { name: 'invalid UTF-8', mutate: (path) => writeFileSync(path, Buffer.from([0xff])) },
+    { name: 'duplicate decoded key', mutate: (path) => {
+      writeFileSync(path, '{"a":1,"\\u0061":1}\n', { mode: 0o600 });
+    } },
+    { name: 'unsafe integer', mutate: (path) => {
+      writeFileSync(path, '{"n":9007199254740992}\n', { mode: 0o600 });
+    } },
+    { name: 'leading BOM', mutate: (path) => {
+      writeFileSync(path, Buffer.from([0xef, 0xbb, 0xbf, 0x7b, 0x7d]));
+    } },
+  ];
+
+  for (const item of cases) {
+    const f = migrationFixture({ originalRunning: false });
+    const before = migrationEvidence(f.instanceRoot);
+    f.docker.afterProbeRestart = (probeRoot) => {
+      writeJson(join(probeRoot, '.config.nodes.json'), platformNodeConfig());
+      const backup = join(probeRoot, '.config.nodes.json.backup');
+      writeJson(backup, { previous: 'probe-main' });
+      item.mutate(backup);
+    };
+
+    const result = await f.service.migrate('line-a', 'admin');
+
+    assert.equal(result.phase, 'rolled_back', item.name);
+    assert.equal(f.docker.runtimeCalls.filter((call) => call === 'start').length, 0, item.name);
+    assert.equal(existsSync(stoppedAuthorityPath(f)), false, item.name);
+    assert.deepEqual(txSidecars(f.instanceRoot, 'tx-01'), [], item.name);
+    assert.deepEqual(migrationEvidenceDiff(f.instanceRoot, before), [], item.name);
+  }
 });
 
 test('C62 node-config semantic authority rejects every non-serialization drift', async () => {
@@ -2733,9 +3132,6 @@ test('C62 reopened recovery preserves exact v1 authority and explicit start succ
   const f = migrationFixture({ originalRunning: false });
   assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
   downgradeStoppedAuthorityToV1(f);
-  f.docker.afterStart = () => {
-    rmSync(join(f.instanceRoot, '.config.nodes.json.backup'), { force: true });
-  };
 
   const reopened = reopenMigrationFixture(f);
   assert.deepEqual(
@@ -3563,10 +3959,13 @@ test('C44 stopped terminal cleanup gates authority and checkpoint behind sidecar
 
 test('stopped live apply covers all four file/directory states without overwriting nonempty targets', async () => {
   const f = migrationFixture({ originalRunning: false, preexisting: true });
-  writeFileSync(join(f.instanceRoot, '.config.modules.json.backup'), 'delete-on-cutover', { mode: 0o640 });
   f.docker.afterProbeRestart = (probeRoot) => {
-    rmSync(join(probeRoot, '.config.modules.json.backup'), { force: true });
-    writeFileSync(join(probeRoot, '.config.nodes.json.backup'), 'create-on-cutover', { mode: 0o600 });
+    rmSync(join(probeRoot, '.config.modules.json'), { force: true });
+    writeFileSync(
+      join(probeRoot, '.config.modules.json.backup'),
+      'create-on-cutover',
+      { mode: 0o600 },
+    );
     writeFileSync(join(
       probeRoot, 'node_modules', '@mqttsnet', 'thinglinks-edge-nodes', 'probe-only.txt',
     ), 'directory-swap', { mode: 0o600 });
@@ -3575,8 +3974,11 @@ test('stopped live apply covers all four file/directory states without overwriti
   const result = await f.service.migrate('line-a', 'admin');
 
   assert.equal(result.phase, 'pending_start_verification', JSON.stringify({ result, events: f.events, runtime: f.docker.runtimeCalls }));
-  assert.equal(readFileSync(join(f.instanceRoot, '.config.nodes.json.backup'), 'utf8'), 'create-on-cutover');
-  assert.equal(existsSync(join(f.instanceRoot, '.config.modules.json.backup')), false);
+  assert.equal(
+    readFileSync(join(f.instanceRoot, '.config.modules.json.backup'), 'utf8'),
+    'create-on-cutover',
+  );
+  assert.equal(existsSync(join(f.instanceRoot, '.config.modules.json')), false);
   assert.equal(readFileSync(join(
     f.instanceRoot, 'node_modules', '@mqttsnet', 'thinglinks-edge-nodes', 'probe-only.txt',
   ), 'utf8'), 'directory-swap');
@@ -3632,15 +4034,10 @@ for (const fault of ['missing', 'tampered'] as const) {
   for (const matrix of ['settings', 'creation', 'deletion', 'replacement', 'equal-common'] as const) {
     test(`C41 ${fault} desired manifest rejects ${matrix} before commit`, async () => {
       const f = migrationFixture({ originalRunning: false, preexisting: true });
-      writeFileSync(
-        join(f.instanceRoot, '.config.modules.json.backup'),
-        'delete-on-cutover',
-        { mode: 0o640 },
-      );
       f.docker.afterProbeRestart = (probeRoot) => {
-        rmSync(join(probeRoot, '.config.modules.json.backup'), { force: true });
+        rmSync(join(probeRoot, '.config.modules.json'), { force: true });
         writeFileSync(
-          join(probeRoot, '.config.nodes.json.backup'),
+          join(probeRoot, '.config.modules.json.backup'),
           'create-on-cutover',
           { mode: 0o600 },
         );
@@ -3651,8 +4048,8 @@ for (const fault of ['missing', 'tampered'] as const) {
       assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
       const manifests = {
         settings: join(f.instanceRoot, '.settings.js.tle-tx-01.manifest'),
-        creation: join(f.instanceRoot, '..config.nodes.json.backup.tle-tx-01.manifest'),
-        deletion: join(f.instanceRoot, '..config.modules.json.backup.tle-tx-01.manifest'),
+        creation: join(f.instanceRoot, '..config.modules.json.backup.tle-tx-01.manifest'),
+        deletion: join(f.instanceRoot, '..config.modules.json.tle-tx-01.manifest'),
         replacement: join(
           f.instanceRoot, 'node_modules', '@mqttsnet',
           '.thinglinks-edge-nodes.tle-tx-01.manifest',
@@ -3844,7 +4241,7 @@ test('C42 Manager-only authority is complete, tx-bound, and permission restricte
       targetIntegrity: authority.targetIntegrity,
     },
     {
-      version: 2,
+      version: 3,
       instanceId: 'line-a',
       txId: 'tx-01',
       targetIntegrity: PLATFORM_NODE_PACKAGE.integrity,
@@ -3864,12 +4261,22 @@ test('C42 Manager-only authority is complete, tx-bound, and permission restricte
   for (const artifact of authority.artifacts) {
     assert.equal(artifact.desired.key, artifact.key);
     assert.equal(artifact.prior.key, artifact.key);
-    if (artifact.key === '.config.nodes.json' || artifact.key === '.config.nodes.json.backup') {
+    if (artifact.key === '.config.nodes.json') {
       assert.deepEqual(Object.keys(artifact.postStart).sort(), [
         'canonicalSha256', 'comparison', 'exists', 'kind', 'mode',
       ]);
       assert.equal(artifact.postStart['comparison'], 'canonical-json');
       assert.match(String(artifact.postStart['canonicalSha256']), /^[a-f0-9]{64}$/);
+    } else if (artifact.key === '.config.nodes.json.backup') {
+      assert.deepEqual(Object.keys(artifact.postStart).sort(), [
+        'canonicalSha256s', 'comparison', 'exists', 'kind', 'mode',
+      ]);
+      assert.equal(artifact.postStart['comparison'], 'canonical-json-one-of');
+      assert.deepEqual(artifact.postStart['canonicalSha256s'], [
+        authority.artifacts.find((candidate) => (
+          candidate.key === '.config.nodes.json'
+        ))?.postStart['canonicalSha256'],
+      ]);
     } else {
       assert.deepEqual(artifact.postStart, { comparison: 'exact', fact: artifact.desired });
     }
@@ -3932,14 +4339,14 @@ test('C62 recovery strictly parses authority without normalizing duplicate or un
     {
       name: 'fractional version normalization',
       mutate: (valid) => Buffer.from(valid.toString('utf8').replace(
-        '"version":2',
-        '"version":2.0',
+        '"version":3',
+        '"version":3.0',
       )),
     },
     {
       name: 'unsafe integer',
       mutate: (valid) => Buffer.from(valid.toString('utf8').replace(
-        '"version":2',
+        '"version":3',
         '"version":9007199254740992',
       )),
     },

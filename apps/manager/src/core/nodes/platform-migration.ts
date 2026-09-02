@@ -556,10 +556,17 @@ type StoppedPostStartExpectation =
     kind: 'file';
     mode: number;
     canonicalSha256: string;
+  }
+  | {
+    comparison: 'canonical-json-one-of';
+    exists: true;
+    kind: 'file';
+    mode: number;
+    canonicalSha256s: [string] | [string, string];
   };
 
 interface StoppedEvidenceAuthority {
-  version: 1 | 2;
+  version: 1 | 2 | 3;
   instanceId: string;
   txId: string;
   targetIntegrity: string;
@@ -622,6 +629,7 @@ function exactPostStartExpectation(
   value: unknown,
   key: string,
   desired: StoppedArtifactFact,
+  version: 2 | 3,
 ): StoppedPostStartExpectation {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('stopped post-start expectation must be an object');
@@ -636,6 +644,32 @@ function exactPostStartExpectation(
       throw new Error('exact post-start expectation differs from desired');
     }
     return { comparison: 'exact', fact };
+  }
+  if (record['comparison'] === 'canonical-json-one-of') {
+    const hashes = record['canonicalSha256s'];
+    if (
+      version !== 3
+      || key !== NODE_CONFIG_BACKUP_PATH
+      || !exactKeys(record, [
+        'comparison', 'exists', 'kind', 'mode', 'canonicalSha256s',
+      ])
+      || record['exists'] !== true
+      || record['kind'] !== 'file'
+      || !Number.isInteger(record['mode'])
+      || (record['mode'] as number) < 0
+      || (record['mode'] as number) > 0o777
+      || !Array.isArray(hashes)
+      || (hashes.length !== 1 && hashes.length !== 2)
+      || hashes.some((entry) => typeof entry !== 'string' || !/^[a-f0-9]{64}$/.test(entry))
+      || new Set(hashes).size !== hashes.length
+    ) throw new Error('canonical one-of post-start expectation is invalid');
+    return {
+      comparison: 'canonical-json-one-of',
+      exists: true,
+      kind: 'file',
+      mode: record['mode'] as number,
+      canonicalSha256s: hashes as [string] | [string, string],
+    };
   }
   if (
     record['comparison'] !== 'canonical-json'
@@ -716,7 +750,7 @@ function exactStoppedAuthority(
   }
   const version = record['version'];
   if (
-    (version !== 1 && version !== 2)
+    (version !== 1 && version !== 2 && version !== 3)
     || record['instanceId'] !== expected.instanceId
     || record['txId'] !== expected.txId
     || record['targetIntegrity'] !== expected.targetIntegrity
@@ -738,7 +772,7 @@ function exactStoppedAuthority(
     const desired = exactAuthorityFact(artifact['desired'], key);
     const postStart = version === 1
       ? { comparison: 'exact' as const, fact: desired }
-      : exactPostStartExpectation(artifact['postStart'], key, desired);
+      : exactPostStartExpectation(artifact['postStart'], key, desired, version);
     return {
       key,
       desired,
@@ -761,6 +795,28 @@ function exactStoppedAuthority(
       || nodePost[0]!.postStart.canonicalSha256 !== nodePost[1]!.postStart.canonicalSha256
       || nodePost[0]!.postStart.mode !== nodePost[1]!.postStart.mode
       || nodePost[0]!.postStart.mode !== main.desired.mode
+      || artifacts.some((artifact) => (
+        artifact.key !== NODE_CONFIG_PATH
+        && artifact.key !== NODE_CONFIG_BACKUP_PATH
+        && artifact.postStart.comparison !== 'exact'
+      ))
+    ) throw new Error('stopped authority post-start policy mismatch');
+  }
+  if (version === 3) {
+    const main = nodePost.find((artifact) => artifact.key === NODE_CONFIG_PATH);
+    const backup = nodePost.find((artifact) => artifact.key === NODE_CONFIG_BACKUP_PATH);
+    if (
+      nodePost.length !== 2
+      || !main?.desired.exists
+      || main.desired.kind !== 'file'
+      || !backup?.desired.exists
+      || backup.desired.kind !== 'file'
+      || main.desired.mode !== backup.desired.mode
+      || main.postStart.comparison !== 'canonical-json'
+      || backup.postStart.comparison !== 'canonical-json-one-of'
+      || main.postStart.mode !== main.desired.mode
+      || backup.postStart.mode !== backup.desired.mode
+      || backup.postStart.canonicalSha256s[0] !== main.postStart.canonicalSha256
       || artifacts.some((artifact) => (
         artifact.key !== NODE_CONFIG_PATH
         && artifact.key !== NODE_CONFIG_BACKUP_PATH
@@ -1250,8 +1306,12 @@ async function matchesPostStartExpectation(
     return sameArtifact(await artifactFact(root, key), expected.fact);
   }
   try {
-    return JSON.stringify(await canonicalNodeConfigExpectation(root, key))
-      === JSON.stringify(expected);
+    const observed = await canonicalNodeConfigExpectation(root, key);
+    if (expected.comparison === 'canonical-json') {
+      return JSON.stringify(observed) === JSON.stringify(expected);
+    }
+    return observed.mode === expected.mode
+      && expected.canonicalSha256s.includes(observed.canonicalSha256);
   } catch {
     return false;
   }
@@ -1895,10 +1955,17 @@ export class PlatformMigrationService {
     }
     const liveRoot = join(this.o.instanceDataRoot, journal.instanceId);
     const nodeConfigDesired = desiredFacts.find((fact) => fact.key === NODE_CONFIG_PATH);
-    if (!nodeConfigDesired) {
+    const nodeConfigBackupDesired = desiredFacts.find((fact) => (
+      fact.key === NODE_CONFIG_BACKUP_PATH
+    ));
+    if (!nodeConfigDesired || !nodeConfigBackupDesired) {
       throw controlled('cutover', 'stopped node config authority is missing');
     }
     let nodeConfigPostStart: Extract<
+      StoppedPostStartExpectation,
+      { comparison: 'canonical-json' }
+    >;
+    let nodeConfigBackupPostStart: Extract<
       StoppedPostStartExpectation,
       { comparison: 'canonical-json' }
     >;
@@ -1908,9 +1975,25 @@ export class PlatformMigrationService {
         NODE_CONFIG_PATH,
         nodeConfigDesired,
       );
+      nodeConfigBackupPostStart = await canonicalNodeConfigExpectation(
+        probeRoot,
+        NODE_CONFIG_BACKUP_PATH,
+        nodeConfigBackupDesired,
+      );
+      if (nodeConfigBackupPostStart.mode !== nodeConfigPostStart.mode) {
+        throw new Error('probe node config modes differ');
+      }
     } catch {
       throw controlled('cutover', 'stopped node config semantic authority is invalid');
     }
+    const backupCanonicalSha256s: [string] | [string, string] = (
+      nodeConfigBackupPostStart.canonicalSha256 === nodeConfigPostStart.canonicalSha256
+    )
+      ? [nodeConfigPostStart.canonicalSha256]
+      : [
+        nodeConfigPostStart.canonicalSha256,
+        nodeConfigBackupPostStart.canonicalSha256,
+      ];
     const artifacts = [] as StoppedEvidenceAuthority['artifacts'];
     for (let index = 0; index < STOPPED_EXPORT_PATHS.length; index += 1) {
       const key = STOPPED_EXPORT_PATHS[index]!;
@@ -1918,11 +2001,20 @@ export class PlatformMigrationService {
       if (!desired || desired.key !== key) {
         throw controlled('cutover', 'stopped desired authority order mismatch');
       }
-      const postStart: StoppedPostStartExpectation = (
-        key === NODE_CONFIG_PATH || key === NODE_CONFIG_BACKUP_PATH
-      )
-        ? { ...nodeConfigPostStart }
-        : { comparison: 'exact', fact: desired };
+      let postStart: StoppedPostStartExpectation;
+      if (key === NODE_CONFIG_PATH) {
+        postStart = { ...nodeConfigPostStart };
+      } else if (key === NODE_CONFIG_BACKUP_PATH) {
+        postStart = {
+          comparison: 'canonical-json-one-of',
+          exists: true,
+          kind: 'file',
+          mode: nodeConfigBackupPostStart.mode,
+          canonicalSha256s: backupCanonicalSha256s,
+        };
+      } else {
+        postStart = { comparison: 'exact', fact: desired };
+      }
       artifacts.push({
         key,
         desired,
@@ -1931,7 +2023,7 @@ export class PlatformMigrationService {
       });
     }
     const authority: StoppedEvidenceAuthority = {
-      version: 2,
+      version: 3,
       instanceId: journal.instanceId,
       txId: journal.txId,
       targetIntegrity: journal.targetIntegrity,
