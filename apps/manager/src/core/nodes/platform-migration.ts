@@ -1426,7 +1426,9 @@ export class PlatformMigrationService {
     if (!observedFlows || JSON.stringify(observedFlows) !== JSON.stringify(expectedFlows)) {
       throw controlled('verification', 'probe Admin flow identity mismatch');
     }
-    return this.exportStoppedProbe(handle.dataRoot);
+    const exported = await this.exportStoppedProbe(handle.dataRoot);
+    execution.renew(['staged']);
+    return exported;
   }
 
   private async persistStoppedAuthority(
@@ -2179,7 +2181,9 @@ export class PlatformMigrationService {
       if (!exported) {
         throw controlled('verification', 'probe runtime artifact facts did not converge');
       }
+      execution.renew(['staged']);
       const authority = await this.persistStoppedAuthority(journal, exported);
+      execution.renew(['staged']);
       await this.prepareStoppedPartials(instanceId, txId, handle.dataRoot, exported);
       const cleanup = await this.o.docker.cleanupMigrationProbe(handle);
       handle = undefined;

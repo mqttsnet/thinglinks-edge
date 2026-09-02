@@ -225,6 +225,32 @@ async function withReadEvidence<T>(
   }
 }
 
+async function withReadCompletionHook<T>(
+  onRead: (absolute: string) => void,
+  action: () => Promise<T>,
+): Promise<T> {
+  const originalReadFile = fs.promises.readFile;
+  fs.promises.readFile = (async (path: unknown, ...args: unknown[]) => {
+    const result = await Reflect.apply(originalReadFile, fs.promises, [path, ...args]);
+    const absolute = typeof path === 'string'
+      ? resolve(path)
+      : path instanceof URL
+        ? fileURLToPath(path)
+        : Buffer.isBuffer(path)
+          ? resolve(path.toString())
+          : '';
+    if (absolute) onRead(absolute);
+    return result;
+  }) as typeof originalReadFile;
+  syncBuiltinESMExports();
+  try {
+    return await action();
+  } finally {
+    fs.promises.readFile = originalReadFile;
+    syncBuiltinESMExports();
+  }
+}
+
 function writeTestManifest(path: string, fact: TestArtifactFact): void {
   writeFileSync(path, `${JSON.stringify(fact)}\n`, { mode: 0o600 });
 }
@@ -1695,6 +1721,207 @@ test('C58 oscillating stopped probe rolls back before applying any live artifact
   )), false);
   assert.equal(existsSync(join(f.root, '.thinglinks-probes', 'line-a', 'tx-01')), false);
   assert.deepEqual(migrationEvidenceDiff(f.instanceRoot, before), []);
+});
+
+test('C58 every confirmation pass revalidates Edge common manifests and lock SRI', async () => {
+  const edgePath = join('node_modules', ...PLATFORM_NODE_PACKAGE.name.split('/'));
+  const commonPath = join('node_modules', ...PLATFORM_COMMON_PACKAGE.name.split('/'));
+  const cases = [
+    { name: 'Edge manifest', mutate: (root: string) => {
+      mutateJson(join(root, edgePath, 'package.json'), (manifest) => {
+        manifest['version'] = '0.0.2';
+      });
+    } },
+    { name: 'common manifest', mutate: (root: string) => {
+      mutateJson(join(root, commonPath, 'package.json'), (manifest) => {
+        manifest['name'] = '@mqttsnet/untrusted-common';
+      });
+    } },
+    { name: 'Edge SRI', mutate: (root: string) => {
+      mutateJson(join(root, 'package-lock.json'), (lock) => {
+        const packages = lock['packages'] as Record<string, Record<string, unknown>>;
+        packages[edgePath]!['integrity'] = 'sha512-untrusted';
+      });
+    } },
+    { name: 'common SRI', mutate: (root: string) => {
+      mutateJson(join(root, 'package-lock.json'), (lock) => {
+        const packages = lock['packages'] as Record<string, Record<string, unknown>>;
+        packages[commonPath]!['integrity'] = 'sha512-untrusted';
+      });
+    } },
+  ] as const;
+
+  for (const item of cases) {
+    const f = migrationFixture({ originalRunning: false });
+    let restart = 0;
+    f.docker.afterProbeRestart = (probeRoot) => {
+      restart += 1;
+      if (restart === 2) item.mutate(probeRoot);
+    };
+
+    const result = await f.service.migrate('line-a', 'admin');
+
+    assert.equal(result.phase, 'rolled_back', item.name);
+    assert.equal(restart, 2, item.name);
+    assert.equal(f.admin.probeInstalledModulesCalls, 2, item.name);
+    assert.equal(f.admin.probeCurrentFlowsCalls, 1, item.name);
+    assert.equal(existsSync(stoppedAuthorityPath(f)), false, item.name);
+    assert.equal(f.barrierEvents.some((event) => (
+      event.boundary === 'after-live-backup' || event.boundary === 'after-live-rename'
+    )), false, item.name);
+  }
+});
+
+test('C58 every confirmation pass rejects Admin flow identity drift before export', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  const currentFlowsAt = f.admin.currentFlowsAt.bind(f.admin);
+  f.admin.currentFlowsAt = async (target) => {
+    const observed = await currentFlowsAt(target);
+    if (f.admin.probeCurrentFlowsCalls === 2) {
+      return [{ id: 'confirmation-only-flow', type: 'debug' }];
+    }
+    return observed;
+  };
+
+  const result = await f.service.migrate('line-a', 'admin');
+
+  assert.equal(result.phase, 'rolled_back');
+  assert.equal(f.docker.runtimeCalls.filter((call) => call === 'probe-restart').length, 2);
+  assert.equal(f.admin.probeInstalledModulesCalls, 2);
+  assert.equal(f.admin.probeCurrentFlowsCalls, 2);
+  assert.equal(existsSync(stoppedAuthorityPath(f)), false);
+  assert.equal(f.barrierEvents.some((event) => (
+    event.boundary === 'after-live-backup' || event.boundary === 'after-live-rename'
+  )), false);
+});
+
+test('C58 every ordered stopped export fact participates in each convergence pass', async () => {
+  const exportedPaths = [
+    'settings.js',
+    'package.json',
+    'package-lock.json',
+    '.config.nodes.json',
+    '.config.nodes.json.backup',
+    '.config.modules.json',
+    '.config.modules.json.backup',
+    join('node_modules', ...PLATFORM_NODE_PACKAGE.name.split('/')),
+    join('node_modules', ...PLATFORM_COMMON_PACKAGE.name.split('/')),
+  ] as const;
+
+  for (const key of exportedPaths) {
+    const f = migrationFixture({ originalRunning: false });
+    let restart = 0;
+    let original: TestArtifactFact | undefined;
+    f.docker.afterProbeRestart = (probeRoot) => {
+      restart += 1;
+      const target = join(probeRoot, key);
+      if (restart === 1) original = testArtifactFact(probeRoot, key);
+      assert.ok(original);
+      if (restart === 2) {
+        if (original.exists) {
+          chmodSync(target, original.mode === 0o700 ? 0o750 : 0o700);
+        } else {
+          writeFileSync(target, 'confirmation-only\n', { mode: 0o600 });
+        }
+      }
+      if (restart === 3) {
+        if (original.exists) chmodSync(target, original.mode);
+        else rmSync(target, { force: true });
+      }
+    };
+
+    const result = await f.service.migrate('line-a', 'admin');
+
+    assert.equal(result.phase, 'rolled_back', key);
+    assert.equal(restart, 3, key);
+    assert.equal(existsSync(stoppedAuthorityPath(f)), false, key);
+    assert.equal(f.barrierEvents.some((event) => (
+      event.boundary === 'after-live-backup' || event.boundary === 'after-live-rename'
+    )), false, key);
+  }
+});
+
+for (const mutation of ['existence', 'mode', 'hash'] as const) {
+  test(`C58 non-config export ${mutation} drift cannot converge`, async () => {
+    const f = migrationFixture({ originalRunning: false });
+    let restart = 0;
+    let originalBytes: Buffer | undefined;
+    let originalMode = 0;
+    f.docker.afterProbeRestart = (probeRoot) => {
+      restart += 1;
+      const settings = join(probeRoot, 'settings.js');
+      if (restart === 1) {
+        originalBytes = readFileSync(settings);
+        originalMode = lstatSync(settings).mode & 0o777;
+      }
+      assert.ok(originalBytes);
+      if (restart === 2) {
+        if (mutation === 'existence') rmSync(settings);
+        if (mutation === 'mode') chmodSync(settings, originalMode === 0o700 ? 0o750 : 0o700);
+        if (mutation === 'hash') writeFileSync(settings, 'confirmation-two\n', { mode: originalMode });
+      }
+      if (restart === 3) {
+        if (mutation === 'existence') {
+          writeFileSync(settings, originalBytes, { mode: originalMode });
+        }
+        if (mutation === 'mode') chmodSync(settings, originalMode);
+        if (mutation === 'hash') writeFileSync(settings, 'confirmation-three\n', { mode: originalMode });
+      }
+    };
+
+    const result = await f.service.migrate('line-a', 'admin');
+
+    assert.equal(result.phase, 'rolled_back');
+    assert.equal(restart, 3);
+    assert.equal(existsSync(stoppedAuthorityPath(f)), false);
+  });
+}
+
+test('C58 ownership loss during final export read writes no authority or sidecars and recovers once', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  const before = migrationEvidence(f.instanceRoot);
+  let exportReads = 0;
+  let replaced = false;
+
+  const result = await withReadCompletionHook((absolute) => {
+    if (
+      !replaced
+      && f.state.probeRoot
+      && absolute === resolve(f.state.probeRoot, '.config.modules.json')
+    ) {
+      exportReads += 1;
+      if (exportReads === 2) {
+        replaced = true;
+        claimReplacementExecution(f, 'owner-final-export-reader-0001', 'staged');
+      }
+    }
+  }, () => f.service.migrate('line-a', 'admin'));
+
+  assert.equal(replaced, true);
+  assert.equal(result.phase, 'staged');
+  assert.equal(existsSync(stoppedAuthorityPath(f)), false);
+  assert.deepEqual(txSidecars(f.instanceRoot, 'tx-01'), []);
+  assert.deepEqual(migrationEvidenceDiff(f.instanceRoot, before), []);
+  assert.equal(f.barrierEvents.some((event) => (
+    event.boundary === 'after-live-backup' || event.boundary === 'after-live-rename'
+  )), false);
+
+  f.time.advance(1_000);
+  const reopened = reopenMigrationFixture(f);
+  await reopened.service.recoverInterrupted();
+  await reopened.service.recoverInterrupted();
+  assert.equal(reopened.repo.nodeMigration('line-a')?.phase, 'rolled_back');
+  assert.equal(existsSync(stoppedAuthorityPath(f)), false);
+  assert.deepEqual(txSidecars(f.instanceRoot, 'tx-01'), []);
+  assert.deepEqual(migrationEvidenceDiff(f.instanceRoot, before), []);
+  assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), false);
+  assert.equal(f.events.filter((event) => event === 'checkpoint:restore').length, 1);
+  assert.equal(
+    f.docker.runtimeCalls.filter((call) => call === 'probe-recovery-cleanup').length,
+    1,
+  );
+  assert.equal(f.docker.runtimeCalls.includes('start'), false);
+  reopened.db.close();
 });
 
 test('C49 stopped probe accepts exact and canonical tilde root selectors', async () => {
