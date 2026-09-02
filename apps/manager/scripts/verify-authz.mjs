@@ -8,26 +8,48 @@
  * 这样它能在几秒内跑完，值得在每次改路由后都跑一遍。
  */
 import { createServer } from 'node:http';
-import { mkdtempSync } from 'node:fs';
+import assert from 'node:assert/strict';
+import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import net from 'node:net';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 
 import { openDb } from '../dist/core/db.js';
 import { deriveKey } from '../dist/core/auth/crypto.js';
 import { AuthService } from '../dist/core/auth/service.js';
 import { InstanceRepo } from '../dist/core/instance/repo.js';
-import { UserRepo } from '../dist/core/auth/user-repo.js';
 import { InstanceService } from '../dist/core/instance/service.js';
+import {
+  InstanceOperationGate,
+  InstanceRepositoryOperationPolicy,
+} from '../dist/core/instance/operation-gate.js';
+import { ProxySessionRegistry } from '../dist/core/instance/proxy-session-registry.js';
+import { NodeStore } from '../dist/core/nodes/store.js';
+import { NodeCatalog } from '../dist/core/nodes/catalog.js';
+import { PlatformPackageService } from '../dist/core/nodes/platform-package.js';
+import { MigrationCheckpointStore } from '../dist/core/nodes/migration-checkpoint.js';
+import {
+  NodeRedPlatformMigrationAdminActions,
+  PlatformMigrationService,
+} from '../dist/core/nodes/platform-migration.js';
+import {
+  assembleInstanceAdminRuntime,
+  assemblePlatformOperationBarrier,
+} from '../dist/index.js';
 import { MetricsHistory } from '../dist/core/health/metrics-history.js';
 import { FieldRegistry } from '../dist/core/edge/registry.js';
 import { buildServer } from '../dist/http/app.js';
 import WebSocket from 'ws';
 
-const PORT = 13260;
-const B = `http://127.0.0.1:${PORT}`;
+let PORT;
+let B;
 const ADMIN_PW = 'initial-password-123';
 
 const results = [];
+let authzApp;
+let authzDb;
+let authzRoot;
+let upstreamServer;
 const check = (name, ok, detail = '') => {
   results.push({ name, ok });
   console.log(`  ${ok ? '✓' : '✗'} ${name}${detail ? '  — ' + detail : ''}`);
@@ -42,6 +64,91 @@ const fakeDocker = {
   containerRef() { return { async inspect() { return { State: { Status: 'running', Running: true } }; },
                             async stats() { return {}; } }; },
 };
+
+async function freePort() {
+  const server = net.createServer();
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  const port = address.port;
+  await new Promise((resolve) => server.close(resolve));
+  return port;
+}
+
+function assembleRuntime({ db, repo, docker, dataRoot, upstreamFor }) {
+  const operationGate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repo));
+  const proxySessions = new ProxySessionRegistry();
+  const instanceAdmin = assembleInstanceAdminRuntime({ repo, upstreamFor });
+  const platformOperation = assemblePlatformOperationBarrier();
+  // Authz never installs a node package. Keep the real trust service fail-closed
+  // instead of fabricating a verifier-only trusted package response.
+  const platformPackages = new PlatformPackageService({
+    store: new NodeStore(join(dataRoot, 'npm')),
+    catalog: new NodeCatalog(db),
+  });
+  let migrationService;
+  const pendingStartCompletion = {
+    completePendingStartUnderLease(instanceId, lease, actor) {
+      if (!migrationService) throw new Error('migration service is not assembled');
+      return migrationService.completePendingStartUnderLease(instanceId, lease, actor);
+    },
+  };
+  const service = new InstanceService({
+    ...instanceAdmin.instanceServiceDeps,
+    ...platformOperation.instanceServiceDeps,
+    db, repo, docker, gate: operationGate, instanceDataRoot: dataRoot,
+    platformPackages, pendingStartCompletion,
+    basePath: '', portRange: { min: 30000, max: 30999 },
+    allowedImageTags: ['5.0.4-24-minimal'], probeHostPorts: false,
+    upstreamFor,
+  });
+  migrationService = new PlatformMigrationService({
+    repo, gate: operationGate, proxySessions, docker,
+    adminRuntime: instanceAdmin.adminRuntime,
+    admin: new NodeRedPlatformMigrationAdminActions(instanceAdmin.adminRuntime),
+    platformPackages,
+    checkpoint: new MigrationCheckpointStore(dataRoot),
+    settings: service, repair: service, bootstrapRecovery: service,
+    ...platformOperation.migrationServiceDeps,
+    instanceDataRoot: dataRoot,
+  });
+  return {
+    service, operationGate, proxySessions, migrationService, platformPackages,
+    adminRuntime: instanceAdmin.adminRuntime,
+  };
+}
+
+async function cleanup() {
+  const errors = [];
+  const attempt = async (label, task) => {
+    try { await task(); } catch (error) { errors.push(`${label}: ${error.message}`); }
+  };
+  await attempt('Manager close', async () => {
+    if (authzApp) await authzApp.close();
+    authzApp = undefined;
+  });
+  await attempt('upstream close', () => new Promise((resolve, reject) => {
+    if (!upstreamServer?.listening) return resolve();
+    upstreamServer.close((error) => error ? reject(error) : resolve());
+  }));
+  upstreamServer = undefined;
+  await attempt('database close', async () => {
+    if (authzDb?.open) authzDb.close();
+    authzDb = undefined;
+  });
+  await attempt('data cleanup', async () => {
+    if (!authzRoot) return;
+    const realTmp = realpathSync(tmpdir());
+    assert.equal(dirname(authzRoot), realTmp);
+    assert.ok(basename(authzRoot).startsWith('tle-authz-'));
+    rmSync(authzRoot, { recursive: true, force: false });
+    authzRoot = undefined;
+  });
+  if (errors.length > 0) throw new Error(`verifier cleanup failed: ${errors.join('; ')}`);
+}
 
 async function login(username, password) {
   const res = await fetch(`${B}/api/login`, {
@@ -60,15 +167,18 @@ const status = async (path, sess, init = {}) =>
 async function main() {
   console.log('\n──── 越权用例 · 全拒验证 ────\n');
 
-  const db = openDb(join(mkdtempSync(join(tmpdir(), 'tle-authz-')), 'edge.db'));
+  PORT = await freePort();
+  B = `http://127.0.0.1:${PORT}`;
+  const dataRoot = realpathSync(mkdtempSync(join(tmpdir(), 'tle-authz-')));
+  authzRoot = dataRoot;
+  const db = openDb(join(dataRoot, 'edge.db'));
+  authzDb = db;
   const auth = new AuthService(db);
   auth.ensureInitialUser('admin', ADMIN_PW);
   const repo = new InstanceRepo(db, deriveKey('authz', 'salt'));
-  const users = new UserRepo(db);
-  const service = new InstanceService({
-    db, repo, docker: fakeDocker, basePath: '', portRange: { min: 30000, max: 30999 },
-    allowedImageTags: ['5.0.4-24-minimal'],
-  });
+  let upstreamUrl = 'http://127.0.0.1:1';
+  const upstreamFor = () => upstreamUrl;
+  const runtime = assembleRuntime({ db, repo, docker: fakeDocker, dataRoot, upstreamFor });
 
   // 两台实例直接落库，绕开 Docker
   for (const id of ['line-a', 'line-b']) {
@@ -99,7 +209,14 @@ async function main() {
   // 假上游：反代若放行就会打到它；被拒时它一次都不会被访问到
   let upstreamHits = 0;
   const upstream = createServer((_q, s) => { upstreamHits += 1; s.end('UPSTREAM'); });
-  await new Promise((r) => upstream.listen(13261, '127.0.0.1', r));
+  upstreamServer = upstream;
+  await new Promise((resolve, reject) => {
+    upstream.once('error', reject);
+    upstream.listen(0, '127.0.0.1', resolve);
+  });
+  const upstreamAddress = upstream.address();
+  assert.ok(upstreamAddress && typeof upstreamAddress !== 'string');
+  upstreamUrl = `http://127.0.0.1:${upstreamAddress.port}`;
 
   const app = buildServer({
     config: {
@@ -107,48 +224,67 @@ async function main() {
       listenAddr: '127.0.0.1', listenPort: PORT, dataDir: '/tmp',
       dataRoot: '/tmp', instanceDataRoot: '/tmp', portRange: { min: 30000, max: 30999 },
     },
-    db, auth, repo, service, metrics,
-    upstreamFor: () => 'http://127.0.0.1:13261',
+    db, auth, repo, metrics,
+    service: runtime.service,
+    operationGate: runtime.operationGate,
+    migrationService: runtime.migrationService,
+    proxySessions: runtime.proxySessions,
+    adminRuntime: runtime.adminRuntime,
+    platformPackages: runtime.platformPackages,
+    upstreamFor,
   });
+  authzApp = app;
   await app.listen({ host: '127.0.0.1', port: PORT });
 
   // ── 准备账号 ──
   const admin = await login('admin', ADMIN_PW);
-  await fetch(`${B}/api/change-password`, {
+  assert.ok(admin, 'initial admin login failed');
+  const initialChange = await fetch(`${B}/api/change-password`, {
     method: 'POST', headers: admin.headers,
     body: JSON.stringify({ oldPassword: ADMIN_PW, newPassword: 'admin-pass-1234' }),
   });
+  assert.equal(initialChange.status, 204, 'initial admin password change failed');
   const root = await login('admin', 'admin-pass-1234');
   check('管理员登录并完成首次改密', Boolean(root));
+  assert.ok(root, 'admin relogin failed');
 
   const mk = async (username, role) => {
     const res = await fetch(`${B}/api/users`, {
       method: 'POST', headers: root.headers, body: JSON.stringify({ username, role }),
     });
-    return (await res.json()).password;
+    assert.ok(res.ok, `create user ${username} failed with HTTP ${res.status}`);
+    const body = await res.json();
+    assert.equal(typeof body.password, 'string', `create user ${username} returned no password`);
+    return body.password;
   };
   const opPw = await mk('lineop', 'operator');
   const viPw = await mk('watcher', 'viewer');
   check('管理员可新建用户并拿到一次性口令', typeof opPw === 'string' && opPw.length >= 20);
 
   // 只授权 line-a
-  await fetch(`${B}/api/users/lineop/grants`, {
+  const opGrant = await fetch(`${B}/api/users/lineop/grants`, {
     method: 'POST', headers: root.headers,
     body: JSON.stringify({ instanceId: 'line-a', level: 'operate' }),
   });
-  await fetch(`${B}/api/users/watcher/grants`, {
+  assert.equal(opGrant.status, 204, 'operator grant failed');
+  const viewerGrant = await fetch(`${B}/api/users/watcher/grants`, {
     method: 'POST', headers: root.headers,
     body: JSON.stringify({ instanceId: 'line-a', level: 'view' }),
   });
+  assert.equal(viewerGrant.status, 204, 'viewer grant failed');
 
   // 新用户首次登录要改密，改完再用
   const useAs = async (username, initial, next) => {
     const s0 = await login(username, initial);
-    await fetch(`${B}/api/change-password`, {
+    assert.ok(s0, `${username} initial login failed`);
+    const changed = await fetch(`${B}/api/change-password`, {
       method: 'POST', headers: s0.headers,
       body: JSON.stringify({ oldPassword: initial, newPassword: next }),
     });
-    return login(username, next);
+    assert.equal(changed.status, 204, `${username} password change failed`);
+    const session = await login(username, next);
+    assert.ok(session, `${username} relogin failed`);
+    return session;
   };
   const op = await useAs('lineop', opPw, 'operator-pass-1234');
   const vi = await useAs('watcher', viPw, 'viewer-pass-12345');
@@ -356,12 +492,17 @@ async function main() {
   check('未登录访问实例被拒', await status('/api/instances') === 401);
   check('未登录访问反代被拒', await status('/red/line-a/') === 401);
 
-  await app.close();
-  upstream.close();
+  await cleanup();
 
   const pass = results.filter((r) => r.ok).length;
   console.log(`\n  ${pass}/${results.length} 通过\n`);
   if (pass !== results.length) process.exit(1);
 }
 
-main().catch((e) => { console.error('\n  验证异常：', e.message); process.exit(1); });
+main().catch(async (e) => {
+  let cleanupError;
+  try { await cleanup(); } catch (error) { cleanupError = error; }
+  console.error('\n  验证异常：', e.message,
+    cleanupError ? `；清理失败：${cleanupError.message}` : '');
+  process.exit(1);
+});

@@ -11,12 +11,14 @@
  * C 段起真容器 —— 「透传给实例容器」这件事只有 docker inspect 能证明。
  */
 import { createServer } from 'node:http';
+import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
 import { networkInterfaces } from 'node:os';
 import { execFile } from 'node:child_process';
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { access, chmod, lstat, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import Docker from 'dockerode';
+import bcrypt from 'bcryptjs';
 
 import { openDb } from '../dist/core/db.js';
 import { deriveKey } from '../dist/core/auth/crypto.js';
@@ -24,17 +26,42 @@ import { InstanceRepo } from '../dist/core/instance/repo.js';
 import { InstanceService } from '../dist/core/instance/service.js';
 import { DockerClient } from '../dist/core/instance/docker-client.js';
 import { containerName } from '../dist/core/instance/container-spec.js';
+import { renderSettings } from '../dist/core/instance/settings-template.js';
+import {
+  InstanceOperationGate,
+  InstanceRepositoryOperationPolicy,
+} from '../dist/core/instance/operation-gate.js';
+import { ProxySessionRegistry } from '../dist/core/instance/proxy-session-registry.js';
+import { NodeStore } from '../dist/core/nodes/store.js';
+import { NodeCatalog } from '../dist/core/nodes/catalog.js';
+import { PlatformPackageService } from '../dist/core/nodes/platform-package.js';
+import { MigrationCheckpointStore } from '../dist/core/nodes/migration-checkpoint.js';
+import {
+  NodeRedPlatformMigrationAdminActions,
+  PlatformMigrationService,
+} from '../dist/core/nodes/platform-migration.js';
+import {
+  assembleInstanceAdminRuntime,
+  assemblePlatformOperationBarrier,
+} from '../dist/index.js';
 import { runPreflight } from '../dist/core/preflight/run.js';
 import { proxyEnvFor } from '../dist/core/proxy.js';
-import { TEST_DATA_ROOT, ensureRoot, resetDataDir } from './_data-root.mjs';
+import { TEST_DATA_ROOT, ensureRoot } from './_data-root.mjs';
 
-const ID = 'proxy-a';
-const NET = 'tle-proxy-net';
-const PROXY_NET = 'tle-proxy-verify-net';
-const PROXY_BOX = 'tle-proxy-fake';
+const RUN_LABEL = 'com.mqttsnet.thinglinks-edge.verifier-run';
+const ROLE_LABEL = 'com.mqttsnet.thinglinks-edge.verifier-role';
+const MANAGED_LABEL = 'com.mqttsnet.thinglinks-edge.managed';
+const INSTANCE_LABEL = 'com.mqttsnet.thinglinks-edge.instance';
+const RUN_ID = `egress-${randomBytes(5).toString('hex')}`;
+const ID = `e${randomBytes(5).toString('hex')}`;
+const NET = `${RUN_ID}-net`;
+const INSTANCE_NET = `${NET}-${ID}`;
+const PROXY_NET = `${RUN_ID}-proxy-net`;
+const PROXY_BOX = `${RUN_ID}-proxy`;
+const OUTBOUND_BOX = `${RUN_ID}-outbound`;
+const RUN_DATA_ROOT = `${TEST_DATA_ROOT}/${RUN_ID}`;
+const DATA_OWNER = `${RUN_DATA_ROOT}/.verifier-owner`;
 const TAG = '5.0.4-24-minimal';
-const REPO_ROOT = resolve(import.meta.dirname, '..');
-
 /*
  * 假代理源码。**必须实现 CONNECT** ——
  * Node 的内置代理（undici ProxyAgent）即使目标是 http:// 也走 CONNECT 隧道，
@@ -59,7 +86,7 @@ srv.on('connect', (q, sock) => {
   sock.write('HTTP/1.1 200 Connection Established\\r\\n\\r\\n');
   sock.once('data', () => respond(sock));
 });
-srv.listen(8080, '0.0.0.0');
+srv.listen(8080, '0.0.0.0', () => console.log('READY'));
 `;
 
 const results = [];
@@ -69,6 +96,11 @@ const check = (name, ok, detail = '') => {
 };
 
 const raw = new Docker();
+let protectedBefore;
+let hostProxy;
+let runtimeDb;
+const ownedContainerIds = new Map();
+const ownedNetworkIds = new Map();
 
 /** 跑一条命令并返回 stdout+stderr；失败即抛，避免「静默没跑」被当成通过 */
 function sh(cmd, args) {
@@ -80,16 +112,186 @@ function sh(cmd, args) {
   });
 }
 
+async function protectedSnapshot() {
+  const snapshots = [];
+  for (const name of ['thinglinks-edge-manager', 'tle-nr-line-1']) {
+    const info = await raw.getContainer(name).inspect().catch((error) => {
+      if (error?.statusCode === 404) return undefined;
+      throw error;
+    });
+    if (!info) continue;
+    snapshots.push({
+      id: info.Id, name: info.Name, image: info.Image,
+      state: info.State?.Status, health: info.State?.Health?.Status ?? 'none',
+      startedAt: info.State?.StartedAt, restartCount: info.RestartCount,
+      networks: Object.values(info.NetworkSettings?.Networks ?? {})
+        .map((network) => network.NetworkID).sort(),
+    });
+  }
+  return snapshots;
+}
+
+async function removeExactContainer(name, verifyOwnership) {
+  const expectedId = ownedContainerIds.get(name);
+  const named = await raw.getContainer(expectedId ?? name).inspect().catch((error) => {
+    if (error?.statusCode === 404) return undefined;
+    throw error;
+  });
+  if (!named) {
+    ownedContainerIds.delete(name);
+    return;
+  }
+  if (expectedId) assert.equal(named.Id, expectedId, `container id changed for ${name}`);
+  assert.equal(named.Name, `/${name}`, `refuse unexpected container name for ${name}`);
+  verifyOwnership(named);
+  const id = named.Id;
+  const exact = await raw.getContainer(id).inspect();
+  assert.equal(exact.Id, id);
+  verifyOwnership(exact);
+  await raw.getContainer(id).remove({ force: true });
+  assert.equal(await raw.getContainer(id).inspect().then(() => true).catch(() => false), false);
+  ownedContainerIds.delete(name);
+}
+
+async function removeExactNetwork(name, verifyOwnership) {
+  const expectedId = ownedNetworkIds.get(name);
+  const named = await raw.getNetwork(expectedId ?? name).inspect().catch((error) => {
+    if (error?.statusCode === 404) return undefined;
+    throw error;
+  });
+  if (!named) {
+    ownedNetworkIds.delete(name);
+    return;
+  }
+  if (expectedId) assert.equal(named.Id, expectedId, `network id changed for ${name}`);
+  assert.equal(named.Name, name, `refuse unexpected network name for ${name}`);
+  verifyOwnership(named);
+  const id = named.Id;
+  const exact = await raw.getNetwork(id).inspect();
+  assert.equal(exact.Id, id);
+  verifyOwnership(exact);
+  await raw.getNetwork(id).remove();
+  assert.equal(await raw.getNetwork(id).inspect().then(() => true).catch(() => false), false);
+  ownedNetworkIds.delete(name);
+}
+
+function assertRunDataRoot() {
+  const base = resolve(TEST_DATA_ROOT);
+  assert.ok(base.startsWith('/private/tmp/') || base.startsWith('/tmp/'),
+    `refuse non-temporary verifier data root: ${base}`);
+  assert.equal(resolve(RUN_DATA_ROOT), join(base, RUN_ID));
+}
+
+async function reserveRunDataRoot() {
+  assertRunDataRoot();
+  await mkdir(RUN_DATA_ROOT, { mode: 0o700 });
+  await writeFile(DATA_OWNER, RUN_ID, { flag: 'wx', mode: 0o600 });
+  // The official Node-RED image runs as uid 1000; this is an isolated verifier root.
+  await chmod(RUN_DATA_ROOT, 0o777);
+}
+
+async function removeRunDataRoot() {
+  assertRunDataRoot();
+  const stat = await lstat(RUN_DATA_ROOT).catch((error) => {
+    if (error?.code === 'ENOENT') return undefined;
+    throw error;
+  });
+  if (!stat) return;
+  assert.ok(stat.isDirectory() && !stat.isSymbolicLink(), 'refuse untrusted verifier data root');
+  assert.equal(await readFile(DATA_OWNER, 'utf8'), RUN_ID, 'refuse foreign verifier data root');
+  await rm(RUN_DATA_ROOT, { recursive: true, force: false });
+  assert.equal(await access(RUN_DATA_ROOT).then(() => true).catch(() => false), false);
+}
+
+function assembleRuntime({ db, repo, docker, dataRoot, upstreamFor }) {
+  const operationGate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repo));
+  const proxySessions = new ProxySessionRegistry();
+  const instanceAdmin = assembleInstanceAdminRuntime({ repo, upstreamFor });
+  const platformOperation = assemblePlatformOperationBarrier();
+  // This proxy propagation scenario uses a pre-seeded legacy fixture. Keep the
+  // actual package service fail-closed instead of fabricating trusted tarballs.
+  const platformPackages = new PlatformPackageService({
+    store: new NodeStore(join(dataRoot, 'npm')),
+    catalog: new NodeCatalog(db),
+  });
+  let migrationService;
+  const pendingStartCompletion = {
+    completePendingStartUnderLease(instanceId, lease, actor) {
+      if (!migrationService) throw new Error('migration service is not assembled');
+      return migrationService.completePendingStartUnderLease(instanceId, lease, actor);
+    },
+  };
+  const service = new InstanceService({
+    ...instanceAdmin.instanceServiceDeps,
+    ...platformOperation.instanceServiceDeps,
+    db, repo, docker, gate: operationGate,
+    instanceDataRoot: RUN_DATA_ROOT,
+    platformPackages, pendingStartCompletion,
+    basePath: '', portRange: { min: 30000, max: 30999 },
+    allowedImageTags: [TAG], probeHostPorts: false,
+    upstreamFor,
+  });
+  migrationService = new PlatformMigrationService({
+    repo, gate: operationGate, proxySessions, docker,
+    adminRuntime: instanceAdmin.adminRuntime,
+    admin: new NodeRedPlatformMigrationAdminActions(instanceAdmin.adminRuntime),
+    platformPackages,
+    checkpoint: new MigrationCheckpointStore(RUN_DATA_ROOT),
+    settings: service, repair: service, bootstrapRecovery: service,
+    ...platformOperation.migrationServiceDeps,
+    instanceDataRoot: RUN_DATA_ROOT,
+  });
+  return {
+    service, operationGate, proxySessions, migrationService, platformPackages,
+    adminRuntime: instanceAdmin.adminRuntime,
+  };
+}
+
 async function cleanup() {
-  await raw.getContainer(PROXY_BOX).remove({ force: true }).catch(() => {});
-  await raw.getNetwork(PROXY_NET).remove().catch(() => {});
-  await raw.getContainer(containerName(ID)).remove({ force: true }).catch(() => {});
-  await resetDataDir(ID);
-  const nets = await raw.listNetworks({
-    filters: { label: ['com.mqttsnet.thinglinks-edge.managed=true'] },
-  }).catch(() => []);
-  for (const n of nets) await raw.getNetwork(n.Id).remove().catch(() => {});
-  await raw.getNetwork(NET).remove().catch(() => {});
+  const errors = [];
+  const attempt = async (label, task) => {
+    try { await task(); } catch (error) { errors.push(`${label}: ${error.message}`); }
+  };
+  await attempt('host proxy close', () => new Promise((resolve, reject) => {
+    if (!hostProxy?.listening) return resolve();
+    const server = hostProxy;
+    server.close((error) => error ? reject(error) : resolve());
+    for (const socket of server.verifierSockets ?? []) socket.destroy();
+  }));
+  hostProxy = undefined;
+  await attempt('database close', async () => {
+    if (runtimeDb?.open) runtimeDb.close();
+    runtimeDb = undefined;
+  });
+  for (const [name, role] of [[OUTBOUND_BOX, 'outbound'], [PROXY_BOX, 'proxy']]) {
+    await attempt(`${role} cleanup`, () => removeExactContainer(name, (info) => {
+      assert.equal(info.Config?.Labels?.[RUN_LABEL], RUN_ID);
+      assert.equal(info.Config?.Labels?.[ROLE_LABEL], role);
+    }));
+  }
+  await attempt('instance cleanup', () => removeExactContainer(containerName(ID), (info) => {
+    assert.equal(info.Config?.Labels?.[MANAGED_LABEL], 'true');
+    assert.equal(info.Config?.Labels?.[INSTANCE_LABEL], ID);
+  }));
+  await attempt('instance network cleanup', () => removeExactNetwork(INSTANCE_NET, (info) => {
+    assert.equal(info.Labels?.[MANAGED_LABEL], 'true');
+    assert.equal(info.Labels?.[INSTANCE_LABEL], ID);
+    assert.equal(info.Labels?.[RUN_LABEL], RUN_ID);
+    assert.equal(info.Labels?.[ROLE_LABEL], 'instance-network');
+  }));
+  await attempt('proxy network cleanup', () => removeExactNetwork(PROXY_NET, (info) => {
+    assert.equal(info.Labels?.[RUN_LABEL], RUN_ID);
+    assert.equal(info.Labels?.[ROLE_LABEL], 'proxy-network');
+  }));
+  await attempt('data cleanup', removeRunDataRoot);
+  await attempt('resource ledger', async () => {
+    assert.equal(ownedContainerIds.size, 0, 'owned container ids remain');
+    assert.equal(ownedNetworkIds.size, 0, 'owned network ids remain');
+  });
+  await attempt('protected baseline', async () => {
+    if (protectedBefore) assert.deepEqual(await protectedSnapshot(), protectedBefore);
+  });
+  if (errors.length > 0) throw new Error(`verifier cleanup failed: ${errors.join('; ')}`);
 }
 
 /** 假代理：只记录「谁来找过我、要去哪」，不真的转发 */
@@ -109,17 +311,27 @@ function fakeProxy() {
       'HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n'
       + `content-length: ${Buffer.byteLength(body)}\r\nconnection: close\r\n\r\n${body}`));
   });
+  const sockets = new Set();
+  srv.on('connection', (socket) => {
+    sockets.add(socket);
+    socket.once('close', () => sockets.delete(socket));
+  });
+  srv.verifierSockets = sockets;
   return { srv, seen };
 }
 
-const internal = { managerContainer: 'tle-proxy-mgr', instancePrefix: 'tle-nr-', network: NET };
+const internal = {
+  managerContainer: `${RUN_ID}-manager`, instancePrefix: 'tle-nr-', network: NET,
+};
 
 async function main() {
   console.log('\n──── 企业 HTTP 代理出网 · 验证 ────\n');
+  protectedBefore = await protectedSnapshot();
   await ensureRoot();
-  await cleanup();
+  await reserveRunDataRoot();
 
-  const { srv, seen } = fakeProxy();
+  const { srv } = fakeProxy();
+  hostProxy = srv;
   /*
    * 监听全部网卡而不是只回环：C 段要让**容器**回连这个假代理，
    * 而容器走的是 host-gateway 那个地址，只绑 127.0.0.1 的话它连不进来
@@ -191,35 +403,58 @@ async function main() {
   if (!hasImage) {
     check(`本机没有 ${image}，镜像内验证无法进行`, false,
           '先 docker compose -f docker-compose.yml -f docker-compose.build.yml build');
+    throw new Error(`required Manager image is missing: ${image}`);
   } else {
+    assert.match(hasImage.Id, /^sha256:[a-f0-9]{64}$/);
+    const imageId = hasImage.Id;
     const imgEnv = hasImage.Config?.Env ?? [];
     check('镜像里默认打开了 NODE_USE_ENV_PROXY（没开则代理配了也不生效）',
           imgEnv.includes('NODE_USE_ENV_PROXY=1'),
           imgEnv.filter((e) => e.startsWith('NODE_')).join(' ') || '(无)');
 
-    await sh('docker', ['network', 'create', PROXY_NET]).catch(() => {});
+    const proxyNetwork = await raw.createNetwork({
+      Name: PROXY_NET, Internal: true,
+      Labels: { [RUN_LABEL]: RUN_ID, [ROLE_LABEL]: 'proxy-network' },
+    });
+    const proxyNetworkInfo = await proxyNetwork.inspect();
+    assert.equal(proxyNetworkInfo.Labels?.[RUN_LABEL], RUN_ID);
+    ownedNetworkIds.set(PROXY_NET, proxyNetworkInfo.Id);
     await sh('docker', [
       'run', '-d', '--name', PROXY_BOX, '--network', PROXY_NET,
+      '--label', `${RUN_LABEL}=${RUN_ID}`, '--label', `${ROLE_LABEL}=proxy`,
+      '--user', '1000:1000', '--read-only', '--cap-drop', 'ALL',
+      '--security-opt', 'no-new-privileges:true', '--tmpfs', '/tmp:rw,noexec,nosuid,size=8m',
       '--entrypoint', 'node', 'node:24.19.0-alpine', '-e', FAKE_PROXY_SRC,
     ]);
+    const proxyInfo = await raw.getContainer(PROXY_BOX).inspect();
+    assert.equal(proxyInfo.Config?.Labels?.[RUN_LABEL], RUN_ID);
+    ownedContainerIds.set(PROXY_BOX, proxyInfo.Id);
     // 等它把端口听起来，否则第一次请求会连接被拒
-    for (let i = 0; i < 20; i += 1) {
+    let proxyReady = false;
+    for (let i = 0; i < 40; i += 1) {
       const logs = await sh('docker', ['logs', PROXY_BOX]).catch(() => '');
-      if (!logs.includes('Error')) break;
+      if (logs.includes('READY')) { proxyReady = true; break; }
       await new Promise((r) => setTimeout(r, 200));
     }
+    assert.equal(proxyReady, true, 'container proxy did not become ready');
 
     const out = await sh('docker', [
-      'run', '--rm', '--network', PROXY_NET,
+      'run', '--name', OUTBOUND_BOX, '--network', PROXY_NET,
+      '--label', `${RUN_LABEL}=${RUN_ID}`, '--label', `${ROLE_LABEL}=outbound`,
+      '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true',
+      '--tmpfs', '/tmp:rw,noexec,nosuid,size=8m',
       '-e', `HTTP_PROXY=http://${PROXY_BOX}:8080`,
-      '--entrypoint', 'node', image, '-e',
+      '--entrypoint', 'node', imageId, '-e',
       "fetch('http://update.invalid/latest', { signal: AbortSignal.timeout(8000) })"
       + '.then((r) => r.text()).then((t) => console.log(t))'
       + ".catch((e) => console.log('ERR', e.name, e.cause?.code ?? ''))"
       // 显式退出：fetch 用的连接池会保持 keep-alive 套接字，
       // 不退的话容器会一直挂着，表现成「验证卡住」而不是「请求失败」
       + '.finally(() => process.exit(0));',
-    ]).catch((e) => `ERR ${e.message}`);
+    ]);
+    const outboundInfo = await raw.getContainer(OUTBOUND_BOX).inspect();
+    assert.equal(outboundInfo.Config?.Labels?.[RUN_LABEL], RUN_ID);
+    ownedContainerIds.set(OUTBOUND_BOX, outboundInfo.Id);
 
     const proxyLog = await sh('docker', ['logs', PROXY_BOX]).catch(() => '');
     check('镜像里的对外请求确实打到了代理，而不是绕过去直连',
@@ -232,21 +467,57 @@ async function main() {
   }
 
   // ── C. 实例容器拿到代理变量 ────────────────────────────
-  const db = openDb(join(mkdtempSync(join(tmpdir(), 'tle-proxy-')), 'edge.db'));
+  const runtimeRoot = join(RUN_DATA_ROOT, 'manager');
+  await mkdir(runtimeRoot, { mode: 0o700 });
+  const db = openDb(join(runtimeRoot, 'edge.db'));
+  runtimeDb = db;
   const repo = new InstanceRepo(db, deriveKey('proxy', 'salt'));
   const proxyEnv = proxyEnvFor({ httpProxy: proxyUrl, httpsProxy: '', noProxy: '10.0.0.0/8' }, internal);
+  const instanceNetwork = await raw.createNetwork({
+    Name: INSTANCE_NET, Driver: 'bridge', Internal: true,
+    Labels: {
+      [MANAGED_LABEL]: 'true', [INSTANCE_LABEL]: ID,
+      [RUN_LABEL]: RUN_ID, [ROLE_LABEL]: 'instance-network',
+    },
+  });
+  const instanceNetworkInfo = await instanceNetwork.inspect();
+  assert.equal(instanceNetworkInfo.Id, instanceNetwork.id);
+  assert.equal(instanceNetworkInfo.Internal, true);
+  assert.equal(instanceNetworkInfo.Labels?.[RUN_LABEL], RUN_ID);
+  ownedNetworkIds.set(INSTANCE_NET, instanceNetworkInfo.Id);
   const docker = new DockerClient({
     network: NET, imageRepo: 'nodered/node-red',
-    portRange: { min: 30000, max: 30999 }, instanceDataRoot: TEST_DATA_ROOT,
+    portRange: { min: 30000, max: 30999 }, instanceDataRoot: RUN_DATA_ROOT,
     timezone: 'Asia/Shanghai', proxyEnv,
   });
-  const service = new InstanceService({
-    db, repo, docker, basePath: '', portRange: { min: 30000, max: 30999 },
-    allowedImageTags: [TAG],
+  const upstreamFor = (instanceId) => `http://${containerName(instanceId)}:1880`;
+  const runtime = assembleRuntime({
+    db, repo, docker, dataRoot: runtimeRoot, upstreamFor,
   });
-  await service.create({
-    id: ID, name: '代理验证', imageTag: TAG, memoryMb: 256, cpus: 0.5, ports: [], actor: 'verify',
-  });
+  repo.create(
+    {
+      id: ID, name: '代理验证', imageTag: TAG, memLimit: 256, cpuLimit: 0.5,
+      adminRoot: `/red/${ID}/`, credSecret: 'proxy-credential-secret', notes: '',
+      nodeRuntimeMode: 'legacy',
+    },
+    [],
+    [{ username: 'admin', password: 'proxy-node-red-password', permissions: '*' }],
+  );
+  await docker.createInstance({
+    id: ID, imageTag: TAG, memoryMb: 256, cpus: 0.5, ports: [],
+    adminRoot: `/red/${ID}/`,
+  }, renderSettings({
+    instanceId: ID, nodeRuntimeMode: 'legacy', adminRoot: `/red/${ID}/`,
+    credentialSecret: 'proxy-credential-secret',
+    credentials: [{
+      username: 'admin', passwordHash: bcrypt.hashSync('proxy-node-red-password', 8), permissions: '*',
+    }],
+  }), 'legacy');
+  const instanceInfo = await raw.getContainer(containerName(ID)).inspect();
+  assert.equal(instanceInfo.Config?.Labels?.[MANAGED_LABEL], 'true');
+  assert.equal(instanceInfo.Config?.Labels?.[INSTANCE_LABEL], ID);
+  ownedContainerIds.set(containerName(ID), instanceInfo.Id);
+  await runtime.service.start(ID, 'verify');
 
   const info = await raw.getContainer(containerName(ID)).inspect();
   const env = Object.fromEntries(
@@ -262,8 +533,8 @@ async function main() {
         ['localhost', '127.0.0.1', internal.managerContainer, 'tle-nr-', NET]
           .every((v) => noProxy.includes(v)),
         env['NO_PROXY']);
+  await runtime.service.stop(ID, 'verify');
 
-  srv.close();
   await cleanup();
 
   const pass = results.filter((r) => r.ok).length;
@@ -272,7 +543,9 @@ async function main() {
 }
 
 main().catch(async (e) => {
-  console.error('\n验证失败：', e.message);
-  await cleanup();
+  let cleanupError;
+  try { await cleanup(); } catch (error) { cleanupError = error; }
+  console.error('\n验证失败：', e.message,
+    cleanupError ? `；清理失败：${cleanupError.message}` : '');
   process.exit(1);
 });
