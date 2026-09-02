@@ -107,6 +107,25 @@ test('PAX 多字节最终分量按 UTF-8 字节完整往返', () => {
   assert.equal(untar(tarFile(name, 'pax 中文'))[0]?.name, name);
 });
 
+test('PAX path 开头的 U+FEFF 保留为文件名内容，字节不被 BOM 语义吞掉', () => {
+  const name = `\uFEFF${'b'.repeat(101)}`;
+  const archive = tarFile(name, 'bom-path');
+  const restored = untar(archive)[0]?.name;
+  assert.equal(restored, name);
+  assert.deepEqual(Buffer.from(restored ?? '', 'utf8'), Buffer.from(name, 'utf8'));
+  assert.equal(roundTrip(name, 'bom-path'), 'bom-path');
+});
+
+test('写端拒绝孤立 UTF-16 代理项，合法补充平面字符走 PAX 精确往返', () => {
+  for (const invalid of [
+    `high-\uD800`, `low-\uDC00`, `high-high-\uD800\uD800`, `low-high-\uDC00\uD800`,
+  ]) assert.throws(() => tarFile(invalid, 'x'), /UTF-16/);
+
+  const supplementary = `prefix/${'😀'.repeat(30)}`;
+  assert.equal(roundTrip(supplementary, 'emoji'), 'emoji');
+  assert.equal(untar(tarFile(supplementary, 'emoji'))[0]?.name, supplementary);
+});
+
 test('PAX 路径上限 4096 字节，超过一字节即拒绝', () => {
   const max = 'm'.repeat(4096);
   assert.equal(untar(tarFile(max, 'max'))[0]?.name, max);
@@ -256,6 +275,15 @@ test('PAX record 对非十进制、零长度、截断、重复 path、NUL 与超
     paxRecord('path', 'bad\0name'),
     '9000 path=a\n',
   ]) assert.throws(() => untar(archiveFor(pax)), /PAX/);
+});
+
+test('外部 PAX key 的 U+FEFF 不得被剥离后误解释成 path', () => {
+  const archive = Buffer.concat([
+    member('PaxHeader/bom-key', paxRecord('\uFEFFpath', 'forged-name'), 'x'),
+    member('placeholder', 'x'),
+    Buffer.alloc(1024, 0),
+  ]);
+  assert.throws(() => untar(archive), /PAX record key 非法/);
 });
 
 test('PAX header 必须恰好绑定下一普通文件，悬空或插入其它类型均拒绝', () => {

@@ -19,6 +19,21 @@ const PAX_PATH_BYTES = 4096;
 const PAX_HEADER_BYTES = 8192;
 const PAX_KEY_BYTES = 128;
 
+function assertWellFormedUtf16(value: string, label: string): void {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) {
+        throw new Error(`${label} 含孤立 UTF-16 高代理项`);
+      }
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      throw new Error(`${label} 含孤立 UTF-16 低代理项`);
+    }
+  }
+}
+
 function writeField(buf: Buffer, offset: number, len: number, value: string): void {
   buf.write(value.slice(0, len - 1), offset, 'utf8');
 }
@@ -31,6 +46,7 @@ function writeTextField(
   value: string,
   label: string,
 ): void {
+  assertWellFormedUtf16(value, label);
   const bytes = Buffer.from(value, 'utf8');
   if (bytes.length > len) throw new Error(`${label} 超过 USTAR 字段上限 ${len} 字节`);
   bytes.copy(buf, offset);
@@ -63,6 +79,8 @@ function readTextField(header: Buffer, offset: number, len: number): string {
 }
 
 function paxRecord(key: string, value: string): Buffer {
+  assertWellFormedUtf16(key, 'PAX key');
+  assertWellFormedUtf16(value, 'PAX value');
   const keyBytes = Buffer.from(key, 'utf8');
   const valueBytes = Buffer.from(value, 'utf8');
   if (
@@ -146,6 +164,7 @@ function ustarMember(
 /** 单个逻辑文件；超出 USTAR 时先写本地 PAX path，再写安全占位普通头。 */
 function tarMember(name: string, content: string | Buffer, opts: TarOwner = {}): Buffer {
   const data = Buffer.isBuffer(content) ? content : Buffer.from(content, 'utf8');
+  assertWellFormedUtf16(name, '文件名');
   const nameBytes = Buffer.from(name, 'utf8');
   if (nameBytes.length === 0 || nameBytes.length > PAX_PATH_BYTES || nameBytes.includes(0)) {
     throw new Error(`文件名过长或非法（PAX 路径上限 ${PAX_PATH_BYTES} 字节）：${name}`);
@@ -180,7 +199,8 @@ export function tarArchive(entries: TarEntry[]): Buffer {
   ]);
 }
 
-const utf8 = new TextDecoder('utf-8', { fatal: true });
+// `ignoreBOM: true` means U+FEFF is ordinary path/key content and is not stripped.
+const utf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
 function decodePaxText(bytes: Buffer, label: string): string {
   try {
