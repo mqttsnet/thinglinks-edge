@@ -3677,6 +3677,96 @@ test('C42 fresh startup marks tampered pending authority manual without destruct
   reopened.db.close();
 });
 
+test('C62 recovery strictly parses authority without normalizing duplicate or unsafe input', async () => {
+  const cases: Array<{
+    name: string;
+    mutate(valid: Buffer): Buffer;
+  }> = [
+    {
+      name: 'escape-equivalent top-level duplicate',
+      mutate: (valid) => Buffer.from(
+        valid.toString('utf8').replace(/^\{/, '{"\\u0076ersion":2,'),
+      ),
+    },
+    {
+      name: 'escape-equivalent artifact duplicate',
+      mutate: (valid) => Buffer.from(valid.toString('utf8').replace(
+        '"key":"settings.js"',
+        '"key":"settings.js","\\u006bey":"settings.js"',
+      )),
+    },
+    {
+      name: 'nested canonicalSha256 duplicate',
+      mutate: (valid) => {
+        const serialized = valid.toString('utf8');
+        const match = serialized.match(/"canonicalSha256":"([a-f0-9]{64})"/);
+        assert.ok(match);
+        return Buffer.from(serialized.replace(
+          match[0],
+          `${match[0]},"\\u0063anonicalSha256":"${match[1]}"`,
+        ));
+      },
+    },
+    {
+      name: 'fractional version normalization',
+      mutate: (valid) => Buffer.from(valid.toString('utf8').replace(
+        '"version":2',
+        '"version":2.0',
+      )),
+    },
+    {
+      name: 'unsafe integer',
+      mutate: (valid) => Buffer.from(valid.toString('utf8').replace(
+        '"version":2',
+        '"version":9007199254740992',
+      )),
+    },
+    {
+      name: 'invalid UTF-8',
+      mutate: () => Buffer.from([0xff]),
+    },
+    {
+      name: 'leading BOM',
+      mutate: (valid) => Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), valid]),
+    },
+    {
+      name: 'oversize trailing whitespace',
+      mutate: (valid) => Buffer.concat([
+        valid,
+        Buffer.alloc(1024 * 1024 + 1 - valid.length, 0x20),
+      ]),
+    },
+  ];
+
+  for (const item of cases) {
+    const f = migrationFixture({ originalRunning: false });
+    assert.equal((await f.service.migrate('line-a', 'admin')).phase, 'pending_start_verification');
+    const authority = join(stoppedAuthorityPath(f), 'manifest.json');
+    const tampered = item.mutate(readFileSync(authority));
+    writeFileSync(authority, tampered, { mode: 0o600 });
+    const liveBefore = migrationEvidence(f.instanceRoot);
+    const sidecarsBefore = txSidecars(f.instanceRoot, 'tx-01');
+    const runtimeBefore = [...f.docker.runtimeCalls];
+    const liveBarriersBefore = f.barrierEvents.filter((event) => (
+      event.boundary === 'after-live-backup' || event.boundary === 'after-live-rename'
+    )).length;
+
+    const reopened = reopenMigrationFixture(f);
+    const recovered = await reopened.service.recoverInterrupted();
+
+    assert.deepEqual(recovered.map((result) => result.phase), ['manual_required'], item.name);
+    assert.deepEqual(f.docker.runtimeCalls, runtimeBefore, item.name);
+    assert.deepEqual(migrationEvidenceDiff(f.instanceRoot, liveBefore), [], item.name);
+    assert.deepEqual(txSidecars(f.instanceRoot, 'tx-01'), sidecarsBefore, item.name);
+    assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), true, item.name);
+    assert.deepEqual(readFileSync(authority), tampered, item.name);
+    assert.equal(f.barrierEvents.filter((event) => (
+      event.boundary === 'after-live-backup' || event.boundary === 'after-live-rename'
+    )).length, liveBarriersBefore, item.name);
+    reopened.db.close();
+  }
+});
+
 for (const fault of [
   'missing',
   'tampered',

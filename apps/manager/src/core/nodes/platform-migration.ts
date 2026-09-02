@@ -561,6 +561,7 @@ const AUTHORITY_MANIFEST = 'manifest.json';
 const NODE_CONFIG_PATH = '.config.nodes.json';
 const NODE_CONFIG_BACKUP_PATH = '.config.nodes.json.backup';
 const MAX_NODE_CONFIG_JSON_BYTES = 1024 * 1024;
+const MAX_STOPPED_AUTHORITY_BYTES = 1024 * 1024;
 const MAX_CANONICAL_JSON_DEPTH = 64;
 const MAX_CANONICAL_JSON_VALUES = 100_000;
 
@@ -776,18 +777,26 @@ async function readStoppedAuthority(
   );
   try {
     const before = await handle.stat();
-    if (!before.isFile() || (before.mode & 0o777) !== 0o600) {
+    if (
+      !before.isFile()
+      || (before.mode & 0o777) !== 0o600
+      || before.size <= 0
+      || before.size > MAX_STOPPED_AUTHORITY_BYTES
+    ) {
       throw new Error('stopped authority manifest untrusted');
     }
-    const serialized = await handle.readFile('utf8');
+    const serialized = await handle.readFile();
     const after = await handle.stat();
     if (
       !after.isFile()
       || after.dev !== before.dev || after.ino !== before.ino
       || after.size !== before.size || after.mtimeMs !== before.mtimeMs
+      || serialized.length !== before.size
       || (after.mode & 0o777) !== 0o600
     ) throw new Error('stopped authority manifest changed while reading');
-    return exactStoppedAuthority(JSON.parse(serialized), expected);
+    const decoded = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(serialized);
+    const canonical = canonicalJsonObject(decoded);
+    return exactStoppedAuthority(JSON.parse(canonical), expected);
   } finally {
     await handle.close();
   }
