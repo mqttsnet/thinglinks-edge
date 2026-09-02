@@ -479,13 +479,13 @@ export class PlatformMigrationService {
         facts.snapshot,
       );
 
-      this.o.repo.updateNodeMigration(instanceId, 'checkpointed');
+      this.o.repo.transitionNodeMigrationExact(instanceId, txId, ['preparing'], 'checkpointed');
       await this.reach(instanceId, txId, 'checkpointed', 2);
 
       failureCode = 'install';
       if (!facts.stagedBefore) {
         // A POST can mutate and then fail/lose its response. Persist ownership before it.
-        this.o.repo.updateNodeMigration(instanceId, 'staged');
+        this.o.repo.transitionNodeMigrationExact(instanceId, txId, ['checkpointed'], 'staged');
         await this.reach(instanceId, txId, 'staged', 3);
         installedByTx = true;
         this.o.platformPackages.verifyForInstall();
@@ -504,12 +504,12 @@ export class PlatformMigrationService {
         throw controlled('install', 'installed platform package filesystem evidence is invalid');
       });
       if (facts.stagedBefore) {
-        this.o.repo.updateNodeMigration(instanceId, 'staged');
+        this.o.repo.transitionNodeMigrationExact(instanceId, txId, ['checkpointed'], 'staged');
         await this.reach(instanceId, txId, 'staged', 3);
       }
 
       failureCode = 'cutover';
-      this.o.repo.updateNodeMigration(instanceId, 'cutover');
+      this.o.repo.transitionNodeMigrationExact(instanceId, txId, ['staged'], 'cutover');
       await this.reach(instanceId, txId, 'cutover', 4);
       const settings = this.o.settings.renderNodeSettingsUnderLease(instanceId, lease, 'npm');
       await this.o.docker.writeSettings(instanceId, settings);
@@ -525,7 +525,7 @@ export class PlatformMigrationService {
       await this.o.adminRuntime.waitReady(instanceId, { timeoutMs: 30_000, intervalMs: 250 });
 
       failureCode = 'verification';
-      this.o.repo.updateNodeMigration(instanceId, 'verifying');
+      this.o.repo.transitionNodeMigrationExact(instanceId, txId, ['cutover'], 'verifying');
       await this.reach(instanceId, txId, 'verifying', 6);
       await this.verifyCutover(
         instanceId,
@@ -553,21 +553,21 @@ export class PlatformMigrationService {
   }
 
   async rollback(instanceId: string, cause: unknown): Promise<PlatformMigrationResult> {
-    const existing = this.o.repo.nodeMigration(instanceId);
-    if (!existing) return this.status(instanceId);
-    if (['committed', 'rolled_back', 'rolled_back_dirty', 'manual_required'].includes(existing.phase)) {
-      return this.status(instanceId);
-    }
     const controlledCause = cause instanceof PlatformMigrationError
       ? cause
       : controlled('rollback', 'rollback requested after a controlled migration failure');
-    // The durable gate correctly fences interrupted rows, so recovery must use the
-    // exact journal rather than attempting an ordinary new migration lease.
-    return this.rollbackExactJournal(
-      instanceId,
-      controlledCause,
-      !existing.stagedBefore && !['preparing', 'checkpointed'].includes(existing.phase),
-    );
+    return this.o.gate.run(instanceId, 'platform-recovery', async (lease) => {
+      this.o.gate.assertLease(lease, instanceId, ['platform-recovery']);
+      const existing = this.o.repo.nodeMigration(instanceId);
+      if (!existing || ['committed', 'rolled_back', 'rolled_back_dirty', 'manual_required'].includes(existing.phase)) {
+        return this.status(instanceId);
+      }
+      return this.rollbackExactJournal(
+        instanceId,
+        controlledCause,
+        !existing.stagedBefore && !['preparing', 'checkpointed'].includes(existing.phase),
+      );
+    });
   }
 
   private async rollbackUnderLease(
@@ -590,7 +590,13 @@ export class PlatformMigrationService {
     if (!journal) return this.status(instanceId);
     let cleanupDirty = false;
     try {
-      this.o.repo.updateNodeMigration(instanceId, 'rolling_back', cause.code);
+      this.o.repo.transitionNodeMigrationExact(
+        instanceId,
+        journal.txId,
+        [journal.phase],
+        'rolling_back',
+        cause.code,
+      );
       await this.reach(instanceId, journal.txId, 'rolling_back', 100);
       if (installedByTx && !journal.stagedBefore) {
         cleanupDirty = await this.cleanupAttemptedInstall(instanceId);
@@ -661,50 +667,65 @@ export class PlatformMigrationService {
     const results: PlatformMigrationResult[] = [];
     for (const journal of this.o.repo.nodeMigrations()) {
       if (journal.operationKind !== 'migration') continue;
+      if (journal.phase === 'committed' || journal.phase === 'rolled_back') {
+        await this.cleanupTerminal(journal.instanceId, journal.txId, journal.phase, 'system');
+        results.push(this.status(journal.instanceId));
+        continue;
+      }
+      if (!['preparing', 'checkpointed', 'staged', 'cutover', 'verifying', 'rolling_back']
+        .includes(journal.phase)) {
+        results.push(this.status(journal.instanceId));
+        continue;
+      }
+      try {
+        results.push(await this.o.gate.run(journal.instanceId, 'platform-recovery', async (lease) => {
+          this.o.gate.assertLease(lease, journal.instanceId, ['platform-recovery']);
+          const current = this.o.repo.nodeMigration(journal.instanceId);
+          if (!current || current.txId !== journal.txId || current.phase !== journal.phase) {
+            return this.status(journal.instanceId);
+          }
+          return this.recoverExactJournal(current);
+        }));
+      } catch {
+        results.push(this.status(journal.instanceId));
+      }
+    }
+    return results;
+  }
+
+  private async recoverExactJournal(journal: InstanceNodeMigrationJournal): Promise<PlatformMigrationResult> {
       if (journal.phase === 'preparing') {
         let ready: boolean;
         try {
           ready = await this.o.checkpoint.readyExists(journal.instanceId, journal.txId);
         } catch {
           this.o.repo.finishNodeMigrationManual(journal.instanceId, 'checkpoint', journal.actor);
-          results.push(this.status(journal.instanceId));
-          continue;
+          return this.status(journal.instanceId);
         }
         if (!ready) {
           try {
             await this.o.checkpoint.cleanupPartial(journal.instanceId, journal.txId);
-            this.o.repo.updateNodeMigration(journal.instanceId, 'rolling_back', 'checkpoint');
+            this.o.repo.transitionNodeMigrationExact(
+              journal.instanceId,
+              journal.txId,
+              ['preparing'],
+              'rolling_back',
+              'checkpoint',
+            );
             await this.reach(journal.instanceId, journal.txId, 'rolling_back', 100);
             this.o.repo.finishNodeMigrationRollback(journal.instanceId, 'rolled_back', journal.actor);
             await this.cleanupTerminal(journal.instanceId, journal.txId, 'rolled_back', journal.actor);
           } catch {
             this.o.repo.finishNodeMigrationManual(journal.instanceId, 'rollback', journal.actor);
           }
-          results.push(this.status(journal.instanceId));
-          continue;
+          return this.status(journal.instanceId);
         }
       }
-      if (journal.phase === 'committed' || journal.phase === 'rolled_back') {
-        await this.cleanupTerminal(
-          journal.instanceId,
-          journal.txId,
-          journal.phase,
-          'system',
-        );
-      } else if (
-        ['preparing', 'checkpointed', 'staged', 'cutover', 'verifying', 'rolling_back']
-          .includes(journal.phase)
-      ) {
-        results.push(await this.rollbackExactJournal(
+      return this.rollbackExactJournal(
           journal.instanceId,
           controlled('rollback', 'interrupted migration recovery requested'),
           !journal.stagedBefore && !['preparing', 'checkpointed'].includes(journal.phase),
-        ));
-        continue;
-      }
-      results.push(this.status(journal.instanceId));
-    }
-    return results;
+      );
   }
 
   private async cleanupTerminal(

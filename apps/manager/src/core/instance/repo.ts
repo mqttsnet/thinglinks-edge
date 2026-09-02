@@ -601,6 +601,37 @@ export class InstanceRepo {
     })();
   }
 
+  /** Task-8 CAS transition: stale recovery/worker rows must never advance a replacement tx. */
+  transitionNodeMigrationExact(
+    instanceId: string,
+    txId: string,
+    expected: readonly NodeMigrationPhase[],
+    phase: NodeMigrationPhase,
+    error: NodeMigrationErrorCode = 'none',
+  ): void {
+    if (!TX_ID.test(txId) || expected.length === 0) throw new RepoError('迁移事务 CAS 参数无效');
+    requireEnum(phase, NODE_MIGRATION_PHASES, '迁移阶段');
+    requireEnum(error, NODE_MIGRATION_ERROR_CODES, '迁移错误码');
+    for (const item of expected) requireEnum(item, NODE_MIGRATION_PHASES, '预期迁移阶段');
+    const marks = expected.map(() => '?').join(', ');
+    this.db.transaction(() => {
+      const current = this.db.prepare(
+        `SELECT phase, error FROM instance_node_migration WHERE instance_id = ? AND tx_id = ?`,
+      ).get(instanceId, txId) as { phase: NodeMigrationPhase; error: NodeMigrationErrorCode } | undefined;
+      if (!current || !expected.includes(current.phase)) throw new RepoError('迁移事务所有权已变化');
+      const journal = this.db.prepare(
+        `UPDATE instance_node_migration SET phase = ?, error = ?, updated_at = datetime('now')
+         WHERE instance_id = ? AND tx_id = ? AND phase IN (${marks})`,
+      ).run(phase, error, instanceId, txId, ...expected);
+      if (journal.changes !== 1) throw new RepoError('迁移事务 CAS 未命中');
+      const projection = this.db.prepare(
+        `UPDATE instance SET node_migration_state = ?, node_migration_error = ?
+         WHERE id = ? AND node_migration_state = ? AND node_migration_error = ?`,
+      ).run(phase, error, instanceId, current.phase, current.error);
+      if (projection.changes !== 1) throw new RepoError('迁移投影 CAS 未命中');
+    })();
+  }
+
   commitNodeMigration(instanceId: string, platformVersion: string, actor: string): void {
     requireSafeText(platformVersion, '平台节点版本', 128);
     requireSafeText(actor, '操作人', 128);

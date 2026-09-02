@@ -542,3 +542,19 @@ test('terminal checkpoint cleanup pending audit is controlled and idempotent', (
     [['line-a', 'rolled_back']],
   );
 });
+
+test('exact tx phase CAS refuses a stale replacement and leaves the new journal untouched', () => {
+  const repo = fresh();
+  repo.create(rec(), [], cred());
+  repo.beginNodeMigration(migrationBegin('line-a', 'tx-old'));
+  repo.updateNodeMigration('line-a', 'rolled_back');
+  repo.beginNodeMigration(migrationBegin('line-a', 'tx-new', { replaceRolledBackTxId: 'tx-old' }));
+
+  assert.throws(
+    () => repo.transitionNodeMigrationExact('line-a', 'tx-old', ['preparing'], 'checkpointed'),
+    /所有权|CAS|变化/i,
+  );
+  assert.equal(repo.nodeMigration('line-a')?.txId, 'tx-new');
+  repo.transitionNodeMigrationExact('line-a', 'tx-new', ['preparing'], 'checkpointed');
+  assert.equal(repo.nodeMigration('line-a')?.phase, 'checkpointed');
+});

@@ -12,7 +12,8 @@ export type InstanceOperation =
   | 'install-node'
   | 'flow-write'
   | 'proxy-write'
-  | 'platform-migration';
+  | 'platform-migration'
+  | 'platform-recovery';
 
 const LEASE_BRAND: unique symbol = Symbol('instance-operation-lease');
 
@@ -99,6 +100,17 @@ export class InstanceRepositoryOperationPolicy implements RepositoryOperationPol
           + `，journal ${journal.phase}/${journal.error}`,
       );
     }
+    if (
+      operation === 'platform-recovery'
+      && journal
+      && journal.operationKind === 'migration'
+      && runtime.migrationState === journal.phase
+      && runtime.migrationError === journal.error
+      && ['preparing', 'checkpointed', 'staged', 'cutover', 'verifying', 'rolling_back']
+        .includes(journal.phase)
+      && ['none', 'checkpoint', 'install', 'cutover', 'verification', 'rollback']
+        .includes(journal.error)
+    ) return;
     if (
       runtime.migrationError === 'none'
       && ORDINARY_SAFE_STATES.has(runtime.migrationState)

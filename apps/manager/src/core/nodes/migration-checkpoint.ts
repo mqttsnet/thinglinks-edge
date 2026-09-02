@@ -349,6 +349,27 @@ export class MigrationCheckpointStore {
     } finally {
       await manifestHandle.close();
     }
+    // Closing pass: no earlier copied file may be published if any allowlisted
+    // source changed, appeared, disappeared, or changed metadata mid-capture.
+    try {
+      for (const fact of checkpointManifest.files) {
+        const current = await readStableRegularFile(join(paths.live, fact.path), fact.path);
+        if (!fact.exists) {
+          if (current) throw new MigrationCheckpointError(`${fact.path} appeared during checkpoint capture`);
+          continue;
+        }
+        if (!current
+          || current.mode !== fact.mode
+          || current.size !== fact.size
+          || current.sha256 !== fact.sha256) {
+          throw new MigrationCheckpointError(`${fact.path} changed during checkpoint capture`);
+        }
+      }
+    } catch (error) {
+      await rm(paths.partial, { recursive: true, force: true }).catch(() => undefined);
+      if (error instanceof MigrationCheckpointError) throw error;
+      throw new MigrationCheckpointError('checkpoint closing pass failed');
+    }
     await syncPath(filesRoot);
     await syncPath(paths.partial);
     await rename(paths.partial, paths.ready);
