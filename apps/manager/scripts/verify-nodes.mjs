@@ -131,8 +131,18 @@ const check = (name, ok, detail = '') => {
     throw new Error(`前置条件失败：${name}${detail ? `（${detail}）` : ''}`);
   }
 };
-const isExactPlatformCatalogueEntry = (entry) => {
+const normalizeExactKeywords = (keywords) => {
+  if (
+    !Array.isArray(keywords)
+    || !keywords.every((keyword) => typeof keyword === 'string' && keyword.length > 0)
+  ) return undefined;
+  const normalized = [...keywords].sort();
+  return new Set(normalized).size === normalized.length ? normalized : undefined;
+};
+const isExactPlatformCatalogueEntry = (entry, expectedKeywords) => {
   const expectedKeys = ['description', 'id', 'keywords', 'types', 'updated_at', 'version'];
+  const actualKeywords = normalizeExactKeywords(entry?.keywords);
+  const normalizedExpectedKeywords = normalizeExactKeywords(expectedKeywords);
   return entry !== null
     && typeof entry === 'object'
     && JSON.stringify(Object.keys(entry).sort()) === JSON.stringify(expectedKeys)
@@ -143,10 +153,10 @@ const isExactPlatformCatalogueEntry = (entry) => {
     && entry.description.length > 0
     && typeof entry.updated_at === 'string'
     && entry.updated_at.length > 0
-    && Array.isArray(entry.keywords)
-    && entry.keywords.every((keyword) => typeof keyword === 'string' && keyword.length > 0)
-    && entry.keywords.includes('node-red')
-    && entry.keywords.includes('thinglinks')
+    && actualKeywords !== undefined
+    && normalizedExpectedKeywords !== undefined
+    // catalogue 不承诺关键词顺序；排序副本后精确比较，缺失/重复/额外项均拒绝。
+    && JSON.stringify(actualKeywords) === JSON.stringify(normalizedExpectedKeywords)
     && Array.isArray(entry.types)
     && JSON.stringify([...entry.types].sort()) === JSON.stringify([...PLATFORM_NODE_TYPES].sort());
 };
@@ -733,6 +743,7 @@ async function main() {
   const catalog = new NodeCatalog(db);
   const platformNodeServices = assemblePlatformNodeServices({ store, catalog });
   const trusted = platformNodeServices.platformPackages.verifyForInstall();
+  const trustedPlatformCatalogueKeywords = Object.freeze([...trusted.meta.keywords]);
   const trustedCommon = platformNodeServices.platformPackages.snapshotForRegistry(
     PLATFORM_COMMON_PACKAGE.name,
     PLATFORM_COMMON_PACKAGE.version,
@@ -971,7 +982,10 @@ async function main() {
     `实际 ${JSON.stringify(catIds)}`);
   check('固定 Edge catalogue 条目契约精确',
     edgeCatalogueEntries.length === 1
-      && isExactPlatformCatalogueEntry(edgeCatalogueEntries[0]),
+      && isExactPlatformCatalogueEntry(
+        edgeCatalogueEntries[0],
+        trustedPlatformCatalogueKeywords,
+      ),
     JSON.stringify(edgeCatalogueEntries[0] ?? null).slice(0, 240));
 
   // ── 3. 起实例（settings 由当前批准清单生成）─────────
