@@ -59,6 +59,7 @@ test('checkpoint is atomically published outside the live bind with restrictive 
   assert.equal(ready, join(f.root, '.thinglinks-migration', 'line-a', 'tx-01'));
   assert.equal(ready.startsWith(`${f.live}/`), false);
   assert.equal(statSync(ready).mode & 0o777, 0o700);
+  assert.equal(statSync(join(ready, 'manifest.json')).mode & 0o777, 0o600);
   assert.equal(existsSync(`${ready}.partial`), false);
 
   const saved = manifest(f.root);
@@ -145,6 +146,15 @@ test('only clean terminal phases remove and verify the ready checkpoint', async 
 });
 
 test('checkpoint rejects symlinked Manager root, live root, files root, and manifest', async () => {
+  {
+    const f = fixture();
+    const outside = mkdtempSync(join(tmpdir(), 'tle-migration-checkpoint-source-outside-'));
+    roots.push(outside);
+    const source = join(f.live, 'settings.js');
+    rmSync(source);
+    symlinkSync(join(outside, 'settings.js'), source);
+    await assert.rejects(() => f.store.create('line-a', 'tx-01'), /settings\.js.*untrusted|safely/i);
+  }
   {
     const f = fixture();
     const outside = mkdtempSync(join(tmpdir(), 'tle-migration-checkpoint-outside-'));

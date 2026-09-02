@@ -205,6 +205,8 @@ function writeInstalledPackage(instanceRoot: string): void {
 
 function removeInstalledPackage(instanceRoot: string): void {
   rmSync(join(instanceRoot, 'node_modules', '@mqttsnet'), { recursive: true, force: true });
+  writeJson(join(instanceRoot, 'package.json'), { name: 'line-a-runtime', dependencies: {} });
+  writeJson(join(instanceRoot, 'package-lock.json'), { packages: { '': { dependencies: {} } } });
 }
 
 interface RuntimeState {
@@ -221,7 +223,9 @@ class FakeDocker implements PlatformMigrationDocker {
     npmRegistry: 'http://tle-mgr:19100/nodered/npm/',
   };
   failAt = '';
+  inspectCalls = 0;
   afterRestart: (() => void) | undefined;
+  afterStart: (() => void) | undefined;
   private readonly instanceRoot: string;
   private readonly state: RuntimeState;
 
@@ -234,7 +238,7 @@ class FakeDocker implements PlatformMigrationDocker {
     this.state = state;
     this.inspection = {
       running: true,
-      imageId: 'sha256:immutable-image-a',
+      imageId: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
       environment: [
         'TLE_INSTANCE_ID=line-a',
         'TLE_MANAGER_URL=http://tle-mgr:19100/nodered',
@@ -247,6 +251,7 @@ class FakeDocker implements PlatformMigrationDocker {
   expectedMigrationEnvironment() { return { ...this.expected }; }
 
   async inspectMigrationRuntime(): Promise<PlatformMigrationContainerInspection> {
+    this.inspectCalls += 1;
     if (this.failAt === 'inspect') throw new Error('token=external-secret inspect failed');
     return { ...this.inspection, environment: [...this.inspection.environment] };
   }
@@ -270,6 +275,7 @@ class FakeDocker implements PlatformMigrationDocker {
     this.runtimeCalls.push('stop');
     if (this.failAt === 'stop') throw new Error('stop external failure');
     this.inspection = { ...this.inspection, running: false };
+    this.state.cutover = false;
   }
 
   async start(): Promise<void> {
@@ -278,6 +284,7 @@ class FakeDocker implements PlatformMigrationDocker {
     this.inspection = { ...this.inspection, running: true };
     const settings = readFileSync(join(this.instanceRoot, 'settings.js'), 'utf8');
     this.state.cutover = LEGACY_RUNTIME_EXCLUDES.every((file) => settings.includes(file));
+    this.afterStart?.();
   }
 }
 
@@ -323,7 +330,9 @@ class FakeAdminActions implements PlatformMigrationAdminActions {
 
   async installedModules(): Promise<InstalledModule[]> {
     if (this.failAt === 'inventory') throw new Error('token=inventory-secret');
-    if (this.state.cutover) return [builtinInventory(), this.afterRestart];
+    if (this.state.cutover) {
+      return this.state.staged ? [builtinInventory(), this.afterRestart] : [builtinInventory()];
+    }
     return [...this.beforeModules];
   }
 
@@ -334,12 +343,25 @@ class FakeAdminActions implements PlatformMigrationAdminActions {
     this.state.staged = true;
     const staged = stagedPlatformInventory();
     this.beforeModules = [rawPlatformInventory(), staged];
+    if (this.failAt === 'install-after-mutation') {
+      throw new Error('password=install-after-mutation-secret');
+    }
     return staged;
   }
 
   async uninstallPlatformModule(): Promise<void> {
     this.uninstallCalls += 1;
     if (this.failAt === 'uninstall') throw new Error('token=uninstall-secret');
+    if (this.failAt === 'uninstall-partial') {
+      rmSync(join(this.instanceRoot, 'node_modules', '@mqttsnet', 'thinglinks-edge-nodes'), {
+        recursive: true,
+        force: true,
+      });
+      writeJson(join(this.instanceRoot, 'package.json'), { name: 'line-a-runtime', dependencies: {} });
+      writeJson(join(this.instanceRoot, 'package-lock.json'), { packages: { '': { dependencies: {} } } });
+      this.beforeModules = [rawPlatformInventory()];
+      return;
+    }
     removeInstalledPackage(this.instanceRoot);
     this.state.staged = false;
     this.beforeModules = [rawPlatformInventory()];
@@ -426,6 +448,7 @@ interface FixtureOptions {
     phase: NodeMigrationState;
     boundary: string;
   }) => void) | undefined;
+  onProxyClose?: (() => void) | undefined;
 }
 
 function migrationFixture(options: FixtureOptions = {}) {
@@ -475,6 +498,7 @@ function migrationFixture(options: FixtureOptions = {}) {
   unregister = proxySessions.register('line-a', {
     close(code) {
       events.push(`proxy-close:${code}`);
+      options.onProxyClose?.();
       unregister();
     },
   });
@@ -545,6 +569,41 @@ function migrationFixture(options: FixtureOptions = {}) {
   };
 }
 
+async function interruptedMigration(
+  f: ReturnType<typeof migrationFixture>,
+  txId: string,
+  phase: Exclude<NodeMigrationState, 'idle' | 'committed' | 'rolled_back' | 'rolled_back_dirty' | 'manual_required'>,
+): Promise<void> {
+  f.repo.beginNodeMigration({
+    instanceId: 'line-a',
+    txId,
+    operationKind: 'migration',
+    phase: 'preparing',
+    originalRunning: true,
+    stagedBefore: false,
+    modeBefore: 'legacy',
+    imageIdBefore: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    targetIntegrity: PLATFORM_NODE_PACKAGE.integrity,
+    checkpointDir: `.thinglinks-migration/line-a/${txId}`,
+    snapshot: {
+      version: 1,
+      kind: 'migration',
+      settings: { exists: true, sha256: sha256(readFileSync(join(f.instanceRoot, 'settings.js'))) },
+      flows: { exists: true, sha256: sha256(readFileSync(join(f.instanceRoot, 'flows.json'))) },
+      credentials: { exists: true, sha256: sha256(readFileSync(join(f.instanceRoot, 'flows_cred.json'))) },
+      packageManifest: { exists: true, sha256: sha256(readFileSync(join(f.instanceRoot, 'package.json'))) },
+      lock: { exists: true, sha256: sha256(readFileSync(join(f.instanceRoot, 'package-lock.json'))) },
+      legacyManifestSha256: 'a'.repeat(64),
+      nodeInventorySha256: 'b'.repeat(64),
+    },
+    actor: 'admin',
+  });
+  if (phase !== 'preparing') {
+    await f.checkpoint.create('line-a', txId);
+    f.repo.updateNodeMigration('line-a', phase);
+  }
+}
+
 test('preflight rejects modified, missing, and extra legacy files with no Docker runtime side effects', async () => {
   const cases = [
     { name: 'modified', mutate: (f: ReturnType<typeof migrationFixture>) => {
@@ -573,7 +632,40 @@ test('preflight rejects modified, missing, and extra legacy files with no Docker
     assert.equal(f.admin.installCalls, 0);
     assert.equal(f.repo.nodeRuntime('line-a')?.mode, 'legacy');
     assert.equal(f.repo.nodeMigration('line-a'), undefined);
+    assert.equal(f.proxySessions.count('line-a'), 1, item.name);
   }
+});
+
+test('revalidates mutable preflight facts after drain and rejects the between-pass change before a journal', async () => {
+  const f = migrationFixture({
+    onProxyClose: () => {
+      writeFileSync(join(f.instanceRoot, 'nodes', 'tl-device.js'), 'changed-after-readonly-preflight');
+    },
+  });
+
+  await assert.rejects(
+    () => f.service.migrate('line-a', 'admin'),
+    (error: unknown) => error instanceof PlatformMigrationError && error.code === 'preflight',
+  );
+
+  assert.equal(f.docker.inspectCalls, 2);
+  assert.equal(f.repo.nodeMigration('line-a'), undefined);
+  assert.equal(f.admin.installCalls, 0);
+  assert.deepEqual(f.docker.runtimeCalls, []);
+});
+
+test('rejects mutable image tags during read-only preflight without draining editors', async () => {
+  const f = migrationFixture();
+  f.docker.inspection = { ...f.docker.inspection, imageId: 'node-red:5.0.4' };
+
+  await assert.rejects(
+    () => f.service.migrate('line-a', 'admin'),
+    (error: unknown) => error instanceof PlatformMigrationError && error.code === 'preflight',
+  );
+
+  assert.equal(f.proxySessions.count('line-a'), 1);
+  assert.equal(f.docker.inspectCalls, 1);
+  assert.equal(f.repo.nodeMigration('line-a'), undefined);
 });
 
 test('environment identity, running state, token digest, third-party ownership, and staged identity fail closed', async () => {
@@ -651,6 +743,35 @@ test('lease and proxy drain precede durable checkpoint and checkpointed barrier 
   assert.ok(f.events.indexOf('checkpoint:create:preparing') < f.events.indexOf('barrier:checkpointed:after-phase-persist'));
 });
 
+test('a source change after revalidation but before checkpoint publish is rejected from its ready manifest', async () => {
+  const f = migrationFixture({
+    onBarrier: (event) => {
+      if (event.phase === 'preparing' && event.boundary === 'after-phase-persist') {
+        writeFileSync(join(f.instanceRoot, 'settings.js'), 'changed-after-revalidation');
+      }
+    },
+  });
+
+  const result = await f.service.migrate('line-a', 'admin');
+
+  assert.equal(result.phase, 'rolled_back');
+  assert.equal(f.admin.installCalls, 0);
+  assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), false);
+});
+
+test('fresh staging is journaled before the POST barrier and an interrupted-before-POST rollback is clean', async () => {
+  const f = migrationFixture({
+    barrierFailure: { phase: 'staged', boundary: 'after-phase-persist' },
+  });
+
+  const result = await f.service.migrate('line-a', 'admin');
+
+  assert.equal(result.phase, 'rolled_back');
+  assert.equal(f.admin.installCalls, 0);
+  assert.equal(f.admin.uninstallCalls, 0);
+  assert.equal(f.repo.nodeMigration('line-a')?.stagedBefore, false);
+});
+
 test('preflight and journal projections never persist inspected secrets or external error text', async () => {
   const f = migrationFixture({
     barrierFailure: { phase: 'checkpointed', boundary: 'after-phase-persist' },
@@ -693,7 +814,7 @@ test('running migration checkpoints, stages once, cuts over, verifies, and commi
   assert.equal(f.repo.nodeRuntime('line-a')?.mode, 'npm');
   assert.equal(f.repo.nodeRuntime('line-a')?.platformVersion, PLATFORM_NODE_PACKAGE.version);
   assert.equal(f.admin.installCalls, 1);
-  assert.equal(f.packages.calls, 2);
+  assert.equal(f.packages.calls, 3);
   assert.deepEqual(f.docker.runtimeCalls, ['write-settings', 'restart']);
   assert.deepEqual(
     f.docker.settingsWrites.at(-1)?.nodesExcludes.filter((path) => path.startsWith('tl-')),
@@ -720,12 +841,44 @@ test('running migration checkpoints, stages once, cuts over, verifies, and commi
   );
 });
 
+test('cutover requires the Admin flow identity to remain exactly the preflight identity, including empty flows', async () => {
+  const changed = migrationFixture();
+  changed.docker.afterRestart = () => {
+    changed.admin.flowValue = [{ id: 'unrelated-flow', type: 'debug' }];
+  };
+  assert.equal((await changed.service.migrate('line-a', 'admin')).phase, 'rolled_back');
+
+  const empty = migrationFixture();
+  empty.admin.flowValue = [];
+  assert.equal((await empty.service.migrate('line-a', 'admin')).phase, 'committed');
+});
+
+test('post-start flow rewrites are reverified during rollback and require manual recovery', async () => {
+  const f = migrationFixture();
+  const unhealthy = healthyPlatformInventory();
+  unhealthy.nodeSets[0] = { ...unhealthy.nodeSets[0]!, enabled: false, err: 'load_failed' };
+  unhealthy.enabled = false;
+  unhealthy.errors = ['load_failed'];
+  unhealthy.health = 'failed';
+  f.admin.afterRestart = unhealthy;
+  f.docker.afterRestart = () => undefined;
+  f.docker.afterStart = () => writeFileSync(
+    join(f.instanceRoot, 'flows.json'),
+    JSON.stringify([{ id: 'rewritten-after-rollback-start' }]),
+  );
+
+  const result = await f.service.migrate('line-a', 'admin');
+
+  assert.equal(result.phase, 'manual_required');
+  assert.equal(result.error, 'rollback');
+});
+
 test('exact preexisting staged package skips install and still completes strict running verification', async () => {
   const f = migrationFixture({ preexisting: true });
   const result = await f.service.migrate('line-a', 'admin');
   assert.equal(result.phase, 'committed');
   assert.equal(f.admin.installCalls, 0);
-  assert.equal(f.packages.calls, 1);
+  assert.equal(f.packages.calls, 2);
   assert.equal(f.repo.nodeMigration('line-a')?.stagedBefore, true);
   assert.equal(
     readFileSync(join(
@@ -795,6 +948,40 @@ test('unexpected duplicate-type staging evidence still uninstalls the newly stag
   );
 });
 
+test('an install that mutates then throws is durably owned and removed before rollback restore', async () => {
+  const f = migrationFixture();
+  f.admin.failAt = 'install-after-mutation';
+
+  const result = await f.service.migrate('line-a', 'admin');
+
+  assert.equal(result.phase, 'rolled_back');
+  assert.equal(f.admin.installCalls, 1);
+  assert.equal(f.admin.uninstallCalls, 1);
+  assert.equal(existsSync(join(
+    f.instanceRoot,
+    'node_modules',
+    ...PLATFORM_NODE_PACKAGE.name.split('/'),
+    'package.json',
+  )), false);
+});
+
+test('partial uninstall residual is rolled_back_dirty before checkpoint restoration', async () => {
+  const f = migrationFixture();
+  f.admin.failAt = 'uninstall-partial';
+  const unhealthy = healthyPlatformInventory();
+  unhealthy.nodeSets[0] = { ...unhealthy.nodeSets[0]!, enabled: false, err: 'load_failed' };
+  unhealthy.enabled = false;
+  unhealthy.errors = ['load_failed'];
+  unhealthy.health = 'failed';
+  f.admin.afterRestart = unhealthy;
+
+  const result = await f.service.migrate('line-a', 'admin');
+
+  assert.equal(result.phase, 'rolled_back_dirty');
+  assert.equal(f.admin.uninstallCalls, 1);
+  assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), true);
+});
+
 test('every running failure boundary restores checkpoint bytes, legacy ownership, image, and running state', async () => {
   const cases: Array<{
     name: string;
@@ -862,7 +1049,11 @@ test('every running failure boundary restores checkpoint bytes, legacy ownership
       credentialsBefore,
       item.name,
     );
-    assert.equal(f.docker.inspection.imageId, 'sha256:immutable-image-a', item.name);
+    assert.equal(
+      f.docker.inspection.imageId,
+      'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      item.name,
+    );
     assert.equal(f.docker.inspection.running, true, item.name);
     assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), false, item.name);
     assert.equal(
@@ -998,6 +1189,23 @@ test('terminal cleanup failure records controlled audit and recoverInterrupted r
   }
 });
 
+test('recovery and public rollback finalize exact interrupted journals without reacquiring the durable gate', async () => {
+  for (const phase of ['preparing', 'checkpointed', 'staged', 'cutover', 'verifying', 'rolling_back'] as const) {
+    const f = migrationFixture();
+    await interruptedMigration(f, `tx-recover-${phase}`, phase);
+
+    const result = await f.service.recoverInterrupted();
+
+    assert.deepEqual(result.map((entry) => entry.phase), ['rolled_back'], phase);
+    assert.equal(f.repo.nodeMigration('line-a')?.phase, 'rolled_back', phase);
+    assert.equal(await f.checkpoint.readyExists('line-a', `tx-recover-${phase}`), false, phase);
+  }
+
+  const f = migrationFixture();
+  await interruptedMigration(f, 'tx-public-rollback', 'checkpointed');
+  assert.equal((await f.service.rollback('line-a', new Error('operator requested'))).phase, 'rolled_back');
+});
+
 test('two service objects over one SQLite file race one first migration and one clean rollback retry', async () => {
   {
     const f = migrationFixture();
@@ -1057,7 +1265,7 @@ test('active, pending, committed, dirty, and manual journals return existing sta
       originalRunning: true,
       stagedBefore: false,
       modeBefore: 'legacy',
-      imageIdBefore: 'sha256:immutable-image-a',
+      imageIdBefore: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
       targetIntegrity: PLATFORM_NODE_PACKAGE.integrity,
       checkpointDir: `.thinglinks-migration/line-a/tx-existing-${phase}`,
       snapshot: {

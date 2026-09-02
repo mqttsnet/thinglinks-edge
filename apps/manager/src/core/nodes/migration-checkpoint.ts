@@ -1,10 +1,10 @@
 import { createHash } from 'node:crypto';
+import { constants } from 'node:fs';
 import {
   chmod,
   lstat,
   mkdir,
   open,
-  readFile,
   rename,
   rm,
   unlink,
@@ -102,6 +102,56 @@ async function exists(path: string): Promise<boolean> {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
     throw error;
+  }
+}
+
+interface StableFile {
+  bytes: Buffer;
+  mode: number;
+  size: number;
+  sha256: string;
+}
+
+function sameFileIdentity(
+  before: Awaited<ReturnType<Awaited<ReturnType<typeof open>>['stat']>>,
+  after: Awaited<ReturnType<Awaited<ReturnType<typeof open>>['stat']>>,
+): boolean {
+  return before.dev === after.dev
+    && before.ino === after.ino
+    && before.size === after.size
+    && before.mode === after.mode
+    && before.mtimeMs === after.mtimeMs
+    && before.ctimeMs === after.ctimeMs;
+}
+
+/** Read through a no-follow descriptor and reject a source changed during capture. */
+async function readStableRegularFile(path: string, label: string): Promise<StableFile | undefined> {
+  let handle;
+  try {
+    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw new MigrationCheckpointError(`${label} is untrusted or could not be opened safely`);
+  }
+  try {
+    const before = await handle.stat();
+    if (!before.isFile()) throw new MigrationCheckpointError(`${label} must be a regular file`);
+    const bytes = await handle.readFile();
+    const after = await handle.stat();
+    if (!sameFileIdentity(before, after)) {
+      throw new MigrationCheckpointError(`${label} changed during checkpoint capture`);
+    }
+    return {
+      bytes,
+      mode: before.mode & 0o777,
+      size: bytes.length,
+      sha256: sha256(bytes),
+    };
+  } catch (error) {
+    if (error instanceof MigrationCheckpointError) throw error;
+    throw new MigrationCheckpointError(`${label} could not be read safely`);
+  } finally {
+    await handle.close();
   }
 }
 
@@ -261,33 +311,27 @@ export class MigrationCheckpointStore {
     const files: MigrationCheckpointFile[] = [];
     for (const path of CHECKPOINT_FILE_PATHS) {
       const source = join(paths.live, path);
-      let sourceStat;
-      try {
-        sourceStat = await lstat(source);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-          files.push({ path, exists: false });
-          continue;
-        }
-        throw new MigrationCheckpointError(`${path} could not be inspected`);
+      const sourceFile = await readStableRegularFile(source, path);
+      if (!sourceFile) {
+        files.push({ path, exists: false });
+        continue;
       }
-      if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) {
-        throw new MigrationCheckpointError(`${path} must be a regular file`);
-      }
-      const bytes = await readFile(source).catch(() => {
-        throw new MigrationCheckpointError(`${path} could not be read`);
-      });
-      const mode = sourceStat.mode & 0o777;
       const destination = join(filesRoot, path);
-      const handle = await open(destination, 'wx', mode);
+      const handle = await open(destination, 'wx', sourceFile.mode);
       try {
-        await handle.writeFile(bytes);
+        await handle.writeFile(sourceFile.bytes);
+        await chmod(destination, sourceFile.mode);
         await handle.sync();
       } finally {
         await handle.close();
       }
-      await chmod(destination, mode);
-      files.push({ path, exists: true, mode, size: bytes.length, sha256: sha256(bytes) });
+      files.push({
+        path,
+        exists: true,
+        mode: sourceFile.mode,
+        size: sourceFile.size,
+        sha256: sourceFile.sha256,
+      });
     }
 
     const checkpointManifest: MigrationCheckpointManifest = {
@@ -300,11 +344,11 @@ export class MigrationCheckpointStore {
     const manifestHandle = await open(manifestPath, 'wx', 0o600);
     try {
       await manifestHandle.writeFile(`${JSON.stringify(checkpointManifest)}\n`, 'utf8');
+      await chmod(manifestPath, 0o600);
       await manifestHandle.sync();
     } finally {
       await manifestHandle.close();
     }
-    await chmod(manifestPath, 0o600);
     await syncPath(filesRoot);
     await syncPath(paths.partial);
     await rename(paths.partial, paths.ready);
@@ -348,21 +392,10 @@ export class MigrationCheckpointStore {
   private async readManifest(instanceId: string, txId: string): Promise<MigrationCheckpointManifest> {
     const { ready } = this.paths(instanceId, txId);
     const manifestPath = join(ready, 'manifest.json');
-    let manifestStat;
-    try {
-      manifestStat = await lstat(manifestPath);
-    } catch {
-      throw new MigrationCheckpointError('checkpoint manifest is missing');
-    }
-    if (!manifestStat.isFile() || manifestStat.isSymbolicLink()) {
-      throw new MigrationCheckpointError('checkpoint manifest is not trusted');
-    }
-    let raw: string;
-    try {
-      raw = await readFile(manifestPath, 'utf8');
-    } catch {
-      throw new MigrationCheckpointError('checkpoint manifest is missing');
-    }
+    const manifest = await readStableRegularFile(manifestPath, 'checkpoint manifest');
+    if (!manifest) throw new MigrationCheckpointError('checkpoint manifest is missing');
+    if (manifest.mode !== 0o600) throw new MigrationCheckpointError('checkpoint manifest permissions are untrusted');
+    const raw = manifest.bytes.toString('utf8');
     try {
       return exactManifest(JSON.parse(raw), instanceId, txId);
     } catch (error) {
@@ -402,20 +435,12 @@ export class MigrationCheckpointStore {
         }
         continue;
       }
-      let stat;
-      try {
-        stat = await lstat(checkpointFile);
-      } catch {
-        throw new MigrationCheckpointError(`${fact.path} checkpoint file is missing`);
-      }
-      if (!stat.isFile() || stat.isSymbolicLink()) {
-        throw new MigrationCheckpointError(`${fact.path} checkpoint file is untrusted`);
-      }
-      const bytes = await readFile(checkpointFile);
-      if (bytes.length !== fact.size || sha256(bytes) !== fact.sha256) {
+      const file = await readStableRegularFile(checkpointFile, `${fact.path} checkpoint file`);
+      if (!file) throw new MigrationCheckpointError(`${fact.path} checkpoint file is missing`);
+      if (file.size !== fact.size || file.sha256 !== fact.sha256) {
         throw new MigrationCheckpointError(`${fact.path} checkpoint hash mismatch`);
       }
-      if ((stat.mode & 0o777) !== fact.mode) {
+      if (file.mode !== fact.mode) {
         throw new MigrationCheckpointError(`${fact.path} checkpoint mode mismatch`);
       }
     }
@@ -445,18 +470,24 @@ export class MigrationCheckpointStore {
         if (destinationStat) await unlink(destination);
         continue;
       }
-      const source = join(paths.ready, 'files', fact.path);
-      const bytes = await readFile(source);
+      const source = await readStableRegularFile(
+        join(paths.ready, 'files', fact.path),
+        `${fact.path} checkpoint restore file`,
+      );
+      if (!source) throw new MigrationCheckpointError(`${fact.path} checkpoint restore file is missing`);
+      if (source.size !== fact.size || source.sha256 !== fact.sha256 || source.mode !== fact.mode) {
+        throw new MigrationCheckpointError(`${fact.path} checkpoint restore fact mismatch`);
+      }
       const partial = `${destination}.thinglinks-restore-${txId}.partial`;
       await rm(partial, { force: true });
       const handle = await open(partial, 'wx', fact.mode);
       try {
-        await handle.writeFile(bytes);
+        await handle.writeFile(source.bytes);
+        await chmod(partial, fact.mode);
         await handle.sync();
       } finally {
         await handle.close();
       }
-      await chmod(partial, fact.mode);
       await rename(partial, destination);
     }
     await syncPath(paths.live);
@@ -472,20 +503,12 @@ export class MigrationCheckpointStore {
         if (await exists(path)) throw new MigrationCheckpointError(`${fact.path} live existence mismatch`);
         continue;
       }
-      let stat;
-      try {
-        stat = await lstat(path);
-      } catch {
-        throw new MigrationCheckpointError(`${fact.path} live file is missing`);
-      }
-      if (!stat.isFile() || stat.isSymbolicLink()) {
-        throw new MigrationCheckpointError(`${fact.path} live path is untrusted`);
-      }
-      const bytes = await readFile(path);
-      if (bytes.length !== fact.size || sha256(bytes) !== fact.sha256) {
+      const file = await readStableRegularFile(path, `${fact.path} live file`);
+      if (!file) throw new MigrationCheckpointError(`${fact.path} live file is missing`);
+      if (file.size !== fact.size || file.sha256 !== fact.sha256) {
         throw new MigrationCheckpointError(`${fact.path} live hash mismatch`);
       }
-      if ((stat.mode & 0o777) !== fact.mode) {
+      if (file.mode !== fact.mode) {
         throw new MigrationCheckpointError(`${fact.path} live mode mismatch`);
       }
     }

@@ -156,10 +156,11 @@ interface PreflightFacts {
   inspection: PlatformMigrationContainerInspection;
   snapshot: MigrationNodeMigrationSnapshot;
   stagedBefore: boolean;
+  flowIdentity: string;
 }
 
 const TARGET_TYPES = new Set<string>(PLATFORM_NODE_TYPES);
-const IMAGE_ID = /^[A-Za-z0-9][A-Za-z0-9:._+-]{0,255}$/;
+const IMAGE_ID = /^sha256:[a-fA-F0-9]{64}$/;
 
 function hash(value: Buffer | string): string {
   return createHash('sha256').update(value).digest('hex');
@@ -336,6 +337,44 @@ function flowEvidenceHealthy(value: unknown): boolean {
   return !!value && typeof value === 'object' && Array.isArray((value as { flows?: unknown }).flows);
 }
 
+function flowIdentity(value: unknown): string | undefined {
+  if (!flowEvidenceHealthy(value)) return undefined;
+  const serialized = JSON.stringify(value);
+  if (typeof serialized !== 'string') return undefined;
+  return hash(serialized);
+}
+
+function samePreflightFacts(left: PreflightFacts, right: PreflightFacts): boolean {
+  return left.stagedBefore === right.stagedBefore
+    && left.flowIdentity === right.flowIdentity
+    && JSON.stringify(left.inspection) === JSON.stringify(right.inspection)
+    && JSON.stringify(left.snapshot) === JSON.stringify(right.snapshot);
+}
+
+function assertCheckpointMatchesPreflight(
+  manifest: MigrationCheckpointManifest,
+  snapshot: MigrationNodeMigrationSnapshot,
+): void {
+  const paths: Array<[keyof Pick<MigrationNodeMigrationSnapshot,
+    'settings' | 'flows' | 'credentials' | 'packageManifest' | 'lock'>, string]> = [
+    ['settings', 'settings.js'],
+    ['flows', 'flows.json'],
+    ['credentials', 'flows_cred.json'],
+    ['packageManifest', 'package.json'],
+    ['lock', 'package-lock.json'],
+  ];
+  for (const [snapshotKey, path] of paths) {
+    const expected = snapshot[snapshotKey];
+    const actual = manifest.files.find((file) => file.path === path);
+    if (!actual || actual.exists !== expected.exists) {
+      throw controlled('checkpoint', `${path} checkpoint fact changed after preflight`);
+    }
+    if (actual.exists && expected.exists && actual.sha256 !== expected.sha256) {
+      throw controlled('checkpoint', `${path} checkpoint hash changed after preflight`);
+    }
+  }
+}
+
 export class PlatformMigrationService {
   private readonly o: PlatformMigrationServiceOptions;
 
@@ -371,11 +410,20 @@ export class PlatformMigrationService {
       replaceRolledBackTxId = existing.txId;
     }
 
+    // This pass must remain read-only: a rejected migration must not evict editors.
+    const initialFacts = await this.preflight(instanceId);
+
     return this.o.gate.runOrCurrent(
       instanceId,
       'platform-migration',
       () => this.status(instanceId),
-      async (lease) => this.migrateUnderLease(instanceId, actor, lease, replaceRolledBackTxId),
+      async (lease) => this.migrateUnderLease(
+        instanceId,
+        actor,
+        lease,
+        initialFacts,
+        replaceRolledBackTxId,
+      ),
     );
   }
 
@@ -383,12 +431,18 @@ export class PlatformMigrationService {
     instanceId: string,
     actor: string,
     lease: InstanceOperationLease,
+    initialFacts: PreflightFacts,
     replaceRolledBackTxId?: string,
   ): Promise<PlatformMigrationResult> {
     this.o.gate.assertLease(lease, instanceId, ['platform-migration']);
     await this.o.proxySessions.closeAndDrain(instanceId, { code: 1012, timeoutMs: 5_000 });
 
+    // Proxy drain is the only mutation between the two passes. Re-read every mutable
+    // fact immediately before the durable journal and reject any drift.
     const facts = await this.preflight(instanceId);
+    if (!samePreflightFacts(initialFacts, facts)) {
+      throw controlled('preflight', 'migration facts changed while editor sessions drained');
+    }
     const txId = this.o.txId?.() ?? `migration-${randomUUID()}`;
     const checkpointDir = `.thinglinks-migration/${instanceId}/${txId}`;
     let journalOwned = false;
@@ -420,16 +474,22 @@ export class PlatformMigrationService {
       }
       await this.reach(instanceId, txId, 'preparing', 1);
       await this.o.checkpoint.create(instanceId, txId);
+      assertCheckpointMatchesPreflight(
+        await this.o.checkpoint.verify(instanceId, txId),
+        facts.snapshot,
+      );
 
       this.o.repo.updateNodeMigration(instanceId, 'checkpointed');
       await this.reach(instanceId, txId, 'checkpointed', 2);
 
       failureCode = 'install';
       if (!facts.stagedBefore) {
+        // A POST can mutate and then fail/lose its response. Persist ownership before it.
+        this.o.repo.updateNodeMigration(instanceId, 'staged');
+        await this.reach(instanceId, txId, 'staged', 3);
+        installedByTx = true;
         this.o.platformPackages.verifyForInstall();
         const staged = await this.o.admin.stagePlatformModule(instanceId);
-        // POST /nodes has already mutated package/module state even if its node-set evidence is bad.
-        installedByTx = true;
         try {
           assertStagedEvidence(staged);
         } catch {
@@ -443,8 +503,10 @@ export class PlatformMigrationService {
       }).catch(() => {
         throw controlled('install', 'installed platform package filesystem evidence is invalid');
       });
-      this.o.repo.updateNodeMigration(instanceId, 'staged');
-      await this.reach(instanceId, txId, 'staged', 3);
+      if (facts.stagedBefore) {
+        this.o.repo.updateNodeMigration(instanceId, 'staged');
+        await this.reach(instanceId, txId, 'staged', 3);
+      }
 
       failureCode = 'cutover';
       this.o.repo.updateNodeMigration(instanceId, 'cutover');
@@ -465,7 +527,11 @@ export class PlatformMigrationService {
       failureCode = 'verification';
       this.o.repo.updateNodeMigration(instanceId, 'verifying');
       await this.reach(instanceId, txId, 'verifying', 6);
-      await this.verifyCutover(instanceId, this.o.repo.nodeMigration(instanceId)!);
+      await this.verifyCutover(
+        instanceId,
+        this.o.repo.nodeMigration(instanceId)!,
+        facts.flowIdentity,
+      );
       this.o.repo.commitNodeMigration(instanceId, PLATFORM_NODE_PACKAGE.version, actor);
       await this.reach(instanceId, txId, 'committed', 7);
       await this.cleanupTerminal(instanceId, txId, 'committed', actor);
@@ -495,16 +561,12 @@ export class PlatformMigrationService {
     const controlledCause = cause instanceof PlatformMigrationError
       ? cause
       : controlled('rollback', 'rollback requested after a controlled migration failure');
-    return this.o.gate.runOrCurrent(
+    // The durable gate correctly fences interrupted rows, so recovery must use the
+    // exact journal rather than attempting an ordinary new migration lease.
+    return this.rollbackExactJournal(
       instanceId,
-      'platform-migration',
-      () => this.status(instanceId),
-      (lease) => this.rollbackUnderLease(
-        instanceId,
-        controlledCause,
-        lease,
-        !existing.stagedBefore && ['staged', 'cutover', 'verifying'].includes(existing.phase),
-      ),
+      controlledCause,
+      !existing.stagedBefore && !['preparing', 'checkpointed'].includes(existing.phase),
     );
   }
 
@@ -515,6 +577,15 @@ export class PlatformMigrationService {
     installedByTx: boolean,
   ): Promise<PlatformMigrationResult> {
     this.o.gate.assertLease(lease, instanceId, ['platform-migration']);
+    return this.rollbackExactJournal(instanceId, cause, installedByTx);
+  }
+
+  /** Recovery path: operate only on the durable exact journal, never reacquire its blocked gate. */
+  private async rollbackExactJournal(
+    instanceId: string,
+    cause: PlatformMigrationError,
+    installedByTx: boolean,
+  ): Promise<PlatformMigrationResult> {
     const journal = this.o.repo.nodeMigration(instanceId);
     if (!journal) return this.status(instanceId);
     let cleanupDirty = false;
@@ -522,11 +593,7 @@ export class PlatformMigrationService {
       this.o.repo.updateNodeMigration(instanceId, 'rolling_back', cause.code);
       await this.reach(instanceId, journal.txId, 'rolling_back', 100);
       if (installedByTx && !journal.stagedBefore) {
-        try {
-          await this.o.admin.uninstallPlatformModule(instanceId);
-        } catch {
-          cleanupDirty = true;
-        }
+        cleanupDirty = await this.cleanupAttemptedInstall(instanceId);
       }
       if (journal.originalRunning) await this.o.docker.stop(instanceId);
       await this.o.checkpoint.restore(instanceId, journal.txId);
@@ -538,8 +605,24 @@ export class PlatformMigrationService {
       if (journal.originalRunning) {
         await this.o.docker.start(instanceId);
         await this.o.adminRuntime.waitReady(instanceId, { timeoutMs: 30_000, intervalMs: 250 });
+        // Node-RED can rewrite /data while starting; the post-start bytes are authoritative.
+        await this.o.checkpoint.verifyLive(instanceId, journal.txId);
         const modules = await this.o.admin.installedModules(instanceId);
         assertRawOwners(modules);
+        if (journal.stagedBefore) {
+          const staged = modules.filter((module) => module.module === PLATFORM_NODE_PACKAGE.name);
+          if (staged.length !== 1) {
+            throw controlled('rollback', 'preexisting platform package disappeared during rollback');
+          }
+          assertStagedEvidence(staged[0]!);
+          await verifyInstalledPlatformFiles({
+            instanceDataRoot: this.o.instanceDataRoot,
+            instanceId,
+            readFile,
+          }).catch(() => {
+            throw controlled('rollback', 'preexisting platform package integrity changed during rollback');
+          });
+        }
         if (!flowEvidenceHealthy(await this.o.admin.currentFlows(instanceId))) {
           throw controlled('rollback', 'legacy flow health could not be restored');
         }
@@ -579,7 +662,27 @@ export class PlatformMigrationService {
     for (const journal of this.o.repo.nodeMigrations()) {
       if (journal.operationKind !== 'migration') continue;
       if (journal.phase === 'preparing') {
-        await this.o.checkpoint.cleanupPartial(journal.instanceId, journal.txId).catch(() => undefined);
+        let ready: boolean;
+        try {
+          ready = await this.o.checkpoint.readyExists(journal.instanceId, journal.txId);
+        } catch {
+          this.o.repo.finishNodeMigrationManual(journal.instanceId, 'checkpoint', journal.actor);
+          results.push(this.status(journal.instanceId));
+          continue;
+        }
+        if (!ready) {
+          try {
+            await this.o.checkpoint.cleanupPartial(journal.instanceId, journal.txId);
+            this.o.repo.updateNodeMigration(journal.instanceId, 'rolling_back', 'checkpoint');
+            await this.reach(journal.instanceId, journal.txId, 'rolling_back', 100);
+            this.o.repo.finishNodeMigrationRollback(journal.instanceId, 'rolled_back', journal.actor);
+            await this.cleanupTerminal(journal.instanceId, journal.txId, 'rolled_back', journal.actor);
+          } catch {
+            this.o.repo.finishNodeMigrationManual(journal.instanceId, 'rollback', journal.actor);
+          }
+          results.push(this.status(journal.instanceId));
+          continue;
+        }
       }
       if (journal.phase === 'committed' || journal.phase === 'rolled_back') {
         await this.cleanupTerminal(
@@ -588,6 +691,16 @@ export class PlatformMigrationService {
           journal.phase,
           'system',
         );
+      } else if (
+        ['preparing', 'checkpointed', 'staged', 'cutover', 'verifying', 'rolling_back']
+          .includes(journal.phase)
+      ) {
+        results.push(await this.rollbackExactJournal(
+          journal.instanceId,
+          controlled('rollback', 'interrupted migration recovery requested'),
+          !journal.stagedBefore && !['preparing', 'checkpointed'].includes(journal.phase),
+        ));
+        continue;
       }
       results.push(this.status(journal.instanceId));
     }
@@ -688,6 +801,14 @@ export class PlatformMigrationService {
       throw controlled('preflight', 'partial platform package files exist without Admin inventory');
     }
 
+    let preflightFlowIdentity: string;
+    try {
+      preflightFlowIdentity = flowIdentity(await this.o.admin.currentFlows(instanceId)) ?? '';
+      if (!preflightFlowIdentity) throw controlled('preflight', 'existing flow preflight is unhealthy');
+    } catch (error) {
+      if (error instanceof PlatformMigrationError) throw error;
+      throw controlled('preflight', 'existing flow preflight failed');
+    }
     const snapshot: MigrationNodeMigrationSnapshot = {
       version: 1,
       kind: 'migration',
@@ -699,7 +820,7 @@ export class PlatformMigrationService {
       legacyManifestSha256: hash(legacyManifest),
       nodeInventorySha256: hash(stableInventory(modules)),
     };
-    return { inspection, snapshot, stagedBefore };
+    return { inspection, snapshot, stagedBefore, flowIdentity: preflightFlowIdentity };
   }
 
   private async verifyLegacyFiles(instanceId: string): Promise<string> {
@@ -772,9 +893,40 @@ export class PlatformMigrationService {
     return false;
   }
 
+  /** A POST may have changed disk or Admin state even when it rejects; clean both facts first. */
+  private async cleanupAttemptedInstall(instanceId: string): Promise<boolean> {
+    let modules: InstalledModule[];
+    let footprint: boolean;
+    try {
+      [modules, footprint] = await Promise.all([
+        this.o.admin.installedModules(instanceId),
+        this.platformFootprint(instanceId),
+      ]);
+    } catch {
+      return true;
+    }
+    const adminFootprint = modules.some((module) => module.module === PLATFORM_NODE_PACKAGE.name);
+    if (!adminFootprint && !footprint) return false;
+    try {
+      await this.o.admin.uninstallPlatformModule(instanceId);
+    } catch {
+      return true;
+    }
+    try {
+      const [afterModules, afterFootprint] = await Promise.all([
+        this.o.admin.installedModules(instanceId),
+        this.platformFootprint(instanceId),
+      ]);
+      return afterFootprint || afterModules.some((module) => module.module === PLATFORM_NODE_PACKAGE.name);
+    } catch {
+      return true;
+    }
+  }
+
   private async verifyCutover(
     instanceId: string,
     journal: InstanceNodeMigrationJournal,
+    expectedFlowIdentity: string,
   ): Promise<void> {
     const inspection = await this.o.docker.inspectMigrationRuntime(instanceId).catch(() => {
       throw controlled('verification', 'post-cutover container inspection failed');
@@ -802,7 +954,8 @@ export class PlatformMigrationService {
       JSON.stringify(flows) !== JSON.stringify(journal.snapshot.flows)
       || JSON.stringify(credentials) !== JSON.stringify(journal.snapshot.credentials)
     ) throw controlled('verification', 'existing flow or credential hash changed');
-    if (!flowEvidenceHealthy(await this.o.admin.currentFlows(instanceId).catch(() => undefined))) {
+    const flow = await this.o.admin.currentFlows(instanceId).catch(() => undefined);
+    if (!flowEvidenceHealthy(flow) || flowIdentity(flow) !== expectedFlowIdentity) {
       throw controlled('verification', 'existing flow health check failed');
     }
   }
