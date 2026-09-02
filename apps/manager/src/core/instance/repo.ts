@@ -640,11 +640,95 @@ export class InstanceRepo {
     })();
   }
 
+  /** Atomically publish a verified rollback terminal and its controlled audit. */
+  finishNodeMigrationRollback(
+    instanceId: string,
+    phase: 'rolled_back' | 'rolled_back_dirty',
+    actor: string,
+  ): void {
+    requireSafeText(actor, '操作人', 128);
+    const error: NodeMigrationErrorCode = phase === 'rolled_back' ? 'none' : 'rollback';
+    this.db.transaction(() => {
+      const current = this.db.prepare(
+        `SELECT m.phase, i.node_runtime_mode
+         FROM instance_node_migration m
+         JOIN instance i ON i.id = m.instance_id
+         WHERE m.instance_id = ?`,
+      ).get(instanceId) as { phase: NodeMigrationPhase; node_runtime_mode: NodeRuntimeMode } | undefined;
+      if (!current || current.phase !== 'rolling_back' || current.node_runtime_mode !== 'legacy') {
+        throw new RepoError(`实例 ${instanceId} 不是可结束的 legacy rolling_back 状态`);
+      }
+      this.updateNodeMigration(instanceId, phase, error);
+      recordAudit(this.db, {
+        actor,
+        action: 'rollback-node-migration',
+        target: instanceId,
+        detail: JSON.stringify({ phase }),
+        result: phase === 'rolled_back' ? 'ok' : 'fail',
+      });
+    })();
+  }
+
+  /** Fail closed with one audit; callers provide only a closed code, never external text. */
+  finishNodeMigrationManual(
+    instanceId: string,
+    error: Exclude<NodeMigrationErrorCode, 'none'>,
+    actor: string,
+  ): void {
+    requireEnum(error, NODE_MIGRATION_ERROR_CODES.filter((code) => code !== 'none'), '迁移错误码');
+    requireSafeText(actor, '操作人', 128);
+    this.db.transaction(() => {
+      this.updateNodeMigration(instanceId, 'manual_required', error);
+      recordAudit(this.db, {
+        actor,
+        action: 'manual-node-migration',
+        target: instanceId,
+        detail: JSON.stringify({ code: error }),
+        result: 'fail',
+      });
+    })();
+  }
+
   nodeMigration(instanceId: string): InstanceNodeMigrationJournal | undefined {
     const row = this.db.prepare(
       'SELECT * FROM instance_node_migration WHERE instance_id = ?',
     ).get(instanceId) as Record<string, unknown> | undefined;
     return row ? this.mapNodeMigration(row) : undefined;
+  }
+
+  /** All durable journals, including clean terminals that may still need checkpoint cleanup. */
+  nodeMigrations(): InstanceNodeMigrationJournal[] {
+    const rows = this.db.prepare(
+      'SELECT * FROM instance_node_migration ORDER BY started_at, instance_id',
+    ).all() as Array<Record<string, unknown>>;
+    return rows.map((row) => this.mapNodeMigration(row));
+  }
+
+  /** Persist only the controlled cleanup condition; filesystem/external text never enters audit. */
+  recordCheckpointCleanupPending(instanceId: string, actor: string): void {
+    requireSafeText(actor, '操作人', 128);
+    if (!this.nodeMigration(instanceId)) throw new RepoError(`实例 ${instanceId} 没有迁移日志`);
+    const alreadyRecorded = this.db.prepare(
+      `SELECT 1
+       FROM audit pending
+       WHERE pending.action = 'checkpoint_cleanup_pending'
+         AND pending.target = ?
+         AND pending.id > COALESCE((
+           SELECT MAX(terminal.id)
+           FROM audit terminal
+           WHERE terminal.target = ?
+             AND terminal.action IN ('commit-node-migration', 'rollback-node-migration')
+         ), 0)
+       LIMIT 1`,
+    ).get(instanceId, instanceId);
+    if (alreadyRecorded) return;
+    recordAudit(this.db, {
+      actor,
+      action: 'checkpoint_cleanup_pending',
+      target: instanceId,
+      detail: JSON.stringify({ code: 'checkpoint_cleanup_pending' }),
+      result: 'fail',
+    });
   }
 
   interruptedNodeMigrations(): InstanceNodeMigrationJournal[] {

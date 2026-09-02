@@ -516,3 +516,29 @@ test('interrupted migrations exclude clean terminal phases', () => {
   repo.updateNodeMigration('line-b', 'rolled_back');
   assert.deepEqual(repo.interruptedNodeMigrations().map((j) => j.instanceId), ['line-a']);
 });
+
+test('terminal checkpoint cleanup pending audit is controlled and idempotent', () => {
+  const db = openDb(':memory:');
+  const repo = new InstanceRepo(db, KEY);
+  repo.create(rec(), [], cred());
+  repo.beginNodeMigration(migrationBegin('line-a', 'tx-cleanup'));
+  repo.updateNodeMigration('line-a', 'rolled_back');
+
+  repo.recordCheckpointCleanupPending('line-a', 'system');
+  repo.recordCheckpointCleanupPending('line-a', 'system');
+
+  assert.deepEqual(
+    db.prepare(
+      "SELECT action, detail, result FROM audit WHERE action = 'checkpoint_cleanup_pending'",
+    ).all(),
+    [{
+      action: 'checkpoint_cleanup_pending',
+      detail: '{"code":"checkpoint_cleanup_pending"}',
+      result: 'fail',
+    }],
+  );
+  assert.deepEqual(
+    repo.nodeMigrations().map((journal) => [journal.instanceId, journal.phase]),
+    [['line-a', 'rolled_back']],
+  );
+});

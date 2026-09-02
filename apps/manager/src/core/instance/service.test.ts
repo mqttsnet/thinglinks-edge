@@ -182,6 +182,22 @@ test('a platform migration blocks every public service mutator before side effec
   }
 });
 
+test('platform migration lease renders npm settings without recursively acquiring a public gate', async () => {
+  const f = fixture();
+  await f.gate.run('line-a', 'platform-migration', async (lease) => {
+    const settings = f.service.renderNodeSettingsUnderLease('line-a', lease, 'npm');
+    const match = settings.match(/nodesExcludes:\s*(\[[^\n]+\])/);
+    assert.ok(match);
+    const excludes = JSON.parse(match[1]!) as string[];
+    assert.deepEqual(
+      excludes.filter((path) => path.startsWith('tl-')),
+      ['tl-device.js', 'tl-tag.js', 'tl-uplink.js'],
+    );
+    assert.equal(f.gate.current('line-a'), 'platform-migration');
+  });
+  assert.deepEqual(f.calls, []);
+});
+
 test('public start acquires one start lease and its under-lease primitive reuses it', async () => {
   const f = fixture();
   await f.service.start('line-a', 'admin');

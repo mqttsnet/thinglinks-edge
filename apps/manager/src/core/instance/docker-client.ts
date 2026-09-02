@@ -114,6 +114,35 @@ export class DockerClient {
     this.docker = new Docker(opts.connection ?? {});
   }
 
+  /** Non-secret deployment identity expected in every migratable instance container. */
+  expectedMigrationEnvironment(): { managerUrl: string; npmRegistry: string } {
+    return {
+      managerUrl: this.opts.managerUrl ?? '',
+      npmRegistry: this.opts.npmRegistry ?? '',
+    };
+  }
+
+  /** Strict read-only migration inspection; raw environment remains in-memory only. */
+  async inspectMigrationRuntime(instanceId: string): Promise<{
+    running: boolean;
+    imageId: string;
+    environment: string[];
+  }> {
+    assertValidId(instanceId);
+    const info = await this.docker.getContainer(containerName(instanceId)).inspect();
+    const labels = info.Config.Labels ?? {};
+    if (labels[MANAGED_LABEL] !== 'true' || labels[INSTANCE_LABEL] !== instanceId) {
+      throw new Error(`容器 ${containerName(instanceId)} 归属不匹配，拒绝迁移检查`);
+    }
+    return {
+      running: info.State.Running === true,
+      imageId: info.Image,
+      environment: (info.Config.Env ?? []).filter(
+        (entry): entry is string => typeof entry === 'string',
+      ),
+    };
+  }
+
   private requireBootstrapTxId(txId: string): void {
     if (!BOOTSTRAP_TX_ID.test(txId)) throw new Error('bootstrap tx id 无效');
   }

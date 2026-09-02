@@ -70,6 +70,59 @@ function ownedLabels(instanceId: string, txId: string): Record<string, string> {
   };
 }
 
+test('migration inspection returns immutable running and environment evidence only for exact managed owner', async () => {
+  const f = fixture({
+    managerUrl: 'http://tle-mgr:19100/nodered',
+    npmRegistry: 'http://tle-mgr:19100/nodered/npm/',
+  });
+  const raw = rawOf(f.docker);
+  raw.getContainer = () => ({
+    inspect: async () => ({
+      Image: 'sha256:immutable-image-a',
+      State: { Running: true },
+      Config: {
+        Labels: {
+          [MANAGED_LABEL]: 'true',
+          [instanceLabel]: 'line-a',
+        },
+        Env: [
+          'TLE_INSTANCE_ID=line-a',
+          'TLE_MANAGER_URL=http://tle-mgr:19100/nodered',
+          'TLE_INGEST_TOKEN=opaque-token',
+          'NPM_CONFIG_REGISTRY=http://tle-mgr:19100/nodered/npm/',
+        ],
+      },
+    }),
+  });
+
+  assert.deepEqual(f.docker.expectedMigrationEnvironment(), {
+    managerUrl: 'http://tle-mgr:19100/nodered',
+    npmRegistry: 'http://tle-mgr:19100/nodered/npm/',
+  });
+  assert.deepEqual(await f.docker.inspectMigrationRuntime('line-a'), {
+    running: true,
+    imageId: 'sha256:immutable-image-a',
+    environment: [
+      'TLE_INSTANCE_ID=line-a',
+      'TLE_MANAGER_URL=http://tle-mgr:19100/nodered',
+      'TLE_INGEST_TOKEN=opaque-token',
+      'NPM_CONFIG_REGISTRY=http://tle-mgr:19100/nodered/npm/',
+    ],
+  });
+
+  raw.getContainer = () => ({
+    inspect: async () => ({
+      Image: 'sha256:immutable-image-a',
+      State: { Running: true },
+      Config: { Labels: { [MANAGED_LABEL]: 'true', [instanceLabel]: 'line-b' }, Env: [] },
+    }),
+  });
+  await assert.rejects(
+    () => f.docker.inspectMigrationRuntime('line-a'),
+    /归属|managed|owner/i,
+  );
+});
+
 test('npm-mode data preparation never copies legacy raw nodes', async () => {
   const f = fixture();
   await f.docker.ensureDataDir('line-a', 'npm');

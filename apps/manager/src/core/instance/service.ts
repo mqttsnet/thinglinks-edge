@@ -13,6 +13,7 @@ import { adminRootFor } from '../config.ts';
 import {
   InstanceRepo,
   type NodeMigrationErrorCode,
+  type NodeRuntimeMode,
   type PortRecord,
 } from './repo.ts';
 import {
@@ -551,7 +552,7 @@ export class InstanceService {
    * 各写一份的话，改了其中一处（比如加了个新的 palette 字段）另外两处会悄悄落后，
    * 表现是「重置口令之后白名单变回旧的了」这种没人能一眼看懂的现象。
    */
-  #renderFor(id: string): string {
+  #renderFor(id: string, runtimeMode?: NodeRuntimeMode): string {
     const inst = this.o.repo.get(id);
     if (!inst) throw new ServiceError(`实例 ${id} 不存在`);
     return renderSettings({
@@ -564,8 +565,21 @@ export class InstanceService {
         permissions: c.permissions,
       })),
       palette: this.o.palettePolicy?.(),
-      nodeRuntimeMode: inst.nodeRuntimeMode ?? 'legacy',
+      nodeRuntimeMode: runtimeMode ?? inst.nodeRuntimeMode ?? 'legacy',
     });
+  }
+
+  /**
+   * Migration-only settings primitive. The caller must already hold the one outer lease;
+   * rendering performs no Docker, Admin, audit, or recursive gate operation.
+   */
+  renderNodeSettingsUnderLease(
+    id: string,
+    lease: InstanceOperationLease,
+    runtimeMode: NodeRuntimeMode,
+  ): string {
+    this.o.gate.assertLease(lease, id, ['platform-migration']);
+    return this.#renderFor(id, runtimeMode);
   }
 
   /**
