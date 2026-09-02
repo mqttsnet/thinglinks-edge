@@ -34,7 +34,10 @@ import {
   type NodeRuntimeMode,
 } from '../instance/repo.ts';
 import { redact } from '../diag/redact.ts';
-import { verifyInstalledPlatformFiles } from './installed-files.ts';
+import {
+  isAcceptedPlatformNodeRootSelector,
+  verifyInstalledPlatformFiles,
+} from './installed-files.ts';
 import { assertHealthyPlatformModule } from './inventory.ts';
 import type {
   MigrationCheckpointManifest,
@@ -1373,8 +1376,10 @@ export class PlatformMigrationService {
         .map((type) => [type, `${type}.js`] as const)
         .sort(([a], [b]) => a.localeCompare(b));
       if (
-        dependencies?.[PLATFORM_NODE_PACKAGE.name] !== PLATFORM_NODE_PACKAGE.version
-        || lockRootDependencies?.[PLATFORM_NODE_PACKAGE.name] !== PLATFORM_NODE_PACKAGE.version
+        !isAcceptedPlatformNodeRootSelector(dependencies?.[PLATFORM_NODE_PACKAGE.name])
+        || !isAcceptedPlatformNodeRootSelector(
+          lockRootDependencies?.[PLATFORM_NODE_PACKAGE.name],
+        )
         || edge['name'] !== PLATFORM_NODE_PACKAGE.name
         || edge['version'] !== PLATFORM_NODE_PACKAGE.version
         || edgeDependencies?.[PLATFORM_COMMON_PACKAGE.name] !== PLATFORM_COMMON_PACKAGE.version

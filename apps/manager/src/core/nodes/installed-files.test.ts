@@ -8,9 +8,28 @@ import {
   PLATFORM_COMMON_PACKAGE,
   PLATFORM_NODE_PACKAGE,
 } from './platform-contract.ts';
-import { verifyInstalledPlatformFiles } from './installed-files.ts';
+import {
+  isAcceptedPlatformNodeRootSelector,
+  verifyInstalledPlatformFiles,
+} from './installed-files.ts';
 
 const roots: string[] = [];
+const REJECTED_ROOT_SELECTORS = [
+  '^0.0.1',
+  '>=0.0.1',
+  'latest',
+  '*',
+  'workspace:*',
+  'file:../edge-nodes',
+  'https://registry.example/thinglinks-edge-nodes-0.0.1.tgz',
+  '~0.0.2',
+  '0.0.2',
+  ' 0.0.1',
+  '0.0.1 ',
+  '\t~0.0.1',
+  '~0.0.1\n',
+];
+
 after(() => {
   for (const root of roots) rmSync(root, { recursive: true, force: true });
 });
@@ -96,6 +115,22 @@ test('Node-RED canonical tilde selectors pass with exact installed artifact evid
   await assert.doesNotReject(() => verify(fixture.instanceDataRoot));
 });
 
+test('shared platform root selector predicate accepts only exact and canonical tilde pins', () => {
+  const version = PLATFORM_NODE_PACKAGE.version;
+  assert.equal(isAcceptedPlatformNodeRootSelector(version), true);
+  assert.equal(isAcceptedPlatformNodeRootSelector(`~${version}`), true);
+  for (const selector of REJECTED_ROOT_SELECTORS) {
+    assert.equal(
+      isAcceptedPlatformNodeRootSelector(selector),
+      false,
+      `accepted ${JSON.stringify(selector)}`,
+    );
+  }
+  for (const nonString of [undefined, null, 1, {}, []]) {
+    assert.equal(isAcceptedPlatformNodeRootSelector(nonString), false);
+  }
+});
+
 test('root package and lock must both declare an accepted Edge selector', async () => {
   const missing = validFixture();
   writeJson(missing.paths.root, { ...missing.rootPackage, dependencies: {} });
@@ -109,23 +144,7 @@ test('root package and lock must both declare an accepted Edge selector', async 
 });
 
 test('root package and lock-project reject non-canonical Edge selectors', async () => {
-  const rejectedSelectors = [
-    '^0.0.1',
-    '>=0.0.1',
-    'latest',
-    '*',
-    'workspace:*',
-    'file:../edge-nodes',
-    'https://registry.example/thinglinks-edge-nodes-0.0.1.tgz',
-    '~0.0.2',
-    '0.0.2',
-    ' 0.0.1',
-    '0.0.1 ',
-    '\t~0.0.1',
-    '~0.0.1\n',
-  ];
-
-  for (const selector of rejectedSelectors) {
+  for (const selector of REJECTED_ROOT_SELECTORS) {
     const rootPackage = validFixture();
     rootPackage.rootPackage.dependencies[PLATFORM_NODE_PACKAGE.name] = selector;
     writeJson(rootPackage.paths.root, rootPackage.rootPackage);

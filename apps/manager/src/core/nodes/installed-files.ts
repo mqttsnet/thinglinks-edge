@@ -73,11 +73,17 @@ function expectExact(value: unknown, expected: string, label: string): void {
   }
 }
 
-function expectRootSelector(value: unknown, expected: string, label: string): void {
+/** Only root declarations may use Node-RED 5.0.4's canonical tilde pin. */
+export function isAcceptedPlatformNodeRootSelector(value: unknown): boolean {
+  const exact = PLATFORM_NODE_PACKAGE.version;
+  return value === exact || value === `~${exact}`;
+}
+
+function expectRootSelector(value: unknown, label: string): void {
   // Node-RED 5.0.4 persists `~<version>` at the project root. The protected
   // Manager registry exposes no other version for this fixed package name;
   // exact lock package entries and SRI checks below still prove installed bytes.
-  if (value !== expected && value !== `~${expected}`) {
+  if (!isAcceptedPlatformNodeRootSelector(value)) {
     throw new InstalledPlatformFilesError(`${label} selector is not accepted`);
   }
 }
@@ -115,7 +121,6 @@ export async function verifyInstalledPlatformFiles(
 
   expectRootSelector(
     dependencies(rootPackage, 'root package')[PLATFORM_NODE_PACKAGE.name],
-    PLATFORM_NODE_PACKAGE.version,
     'root package Edge',
   );
 
@@ -123,7 +128,6 @@ export async function verifyInstalledPlatformFiles(
   const lockRoot = record(packages[''], 'root lock project');
   expectRootSelector(
     dependencies(lockRoot, 'root lock project')[PLATFORM_NODE_PACKAGE.name],
-    PLATFORM_NODE_PACKAGE.version,
     'root lock Edge',
   );
   const edgeLock = record(packages[edgeRelative], 'edge lock entry');

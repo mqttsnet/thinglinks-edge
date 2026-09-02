@@ -330,16 +330,23 @@ function writeJson(path: string, value: unknown): void {
   writeFileSync(path, `${JSON.stringify(value)}\n`, { mode: 0o600 });
 }
 
-function writeInstalledPackage(instanceRoot: string): void {
+function writeInstalledPackage(
+  instanceRoot: string,
+  rootSelectors: { packageJson?: string; lockProject?: string } = {},
+): void {
   const edgeRelative = join('node_modules', ...PLATFORM_NODE_PACKAGE.name.split('/'));
   const commonRelative = join('node_modules', ...PLATFORM_COMMON_PACKAGE.name.split('/'));
   writeJson(join(instanceRoot, 'package.json'), {
     name: 'line-a-runtime',
-    dependencies: { [PLATFORM_NODE_PACKAGE.name]: PLATFORM_NODE_PACKAGE.version },
+    dependencies: {
+      [PLATFORM_NODE_PACKAGE.name]: rootSelectors.packageJson ?? PLATFORM_NODE_PACKAGE.version,
+    },
   });
   writeJson(join(instanceRoot, 'package-lock.json'), {
     packages: {
-      '': { dependencies: { [PLATFORM_NODE_PACKAGE.name]: PLATFORM_NODE_PACKAGE.version } },
+      '': { dependencies: {
+        [PLATFORM_NODE_PACKAGE.name]: rootSelectors.lockProject ?? PLATFORM_NODE_PACKAGE.version,
+      } },
       [edgeRelative]: {
         version: PLATFORM_NODE_PACKAGE.version,
         integrity: PLATFORM_NODE_PACKAGE.integrity,
@@ -1517,6 +1524,159 @@ test('stopped migration verifies an isolated probe, applies allowlisted state, a
   assert.equal(existsSync(join(f.root, '.thinglinks-probes', 'line-a', 'tx-01')), false);
   assert.equal(await f.checkpoint.readyExists('line-a', 'tx-01'), true);
   assert.equal(existsSync(stoppedAuthorityPath(f)), true);
+});
+
+test('C49 stopped probe accepts exact and canonical tilde root selectors', async () => {
+  const version = PLATFORM_NODE_PACKAGE.version;
+  const cases = [
+    { name: 'exact', packageJson: version, lockProject: version },
+    { name: 'canonical tilde', packageJson: `~${version}`, lockProject: `~${version}` },
+    { name: 'package tilde only', packageJson: `~${version}`, lockProject: version },
+    { name: 'lock tilde only', packageJson: version, lockProject: `~${version}` },
+  ];
+
+  for (const item of cases) {
+    const f = migrationFixture({ originalRunning: false });
+    f.admin.stagePlatformModuleAt = async () => {
+      f.admin.installCalls += 1;
+      assert.ok(f.state.probeRoot);
+      writeInstalledPackage(f.state.probeRoot, item);
+      f.state.staged = true;
+      return healthyPlatformInventory();
+    };
+
+    const result = await f.service.migrate('line-a', 'admin');
+
+    assert.equal(result.phase, 'pending_start_verification', item.name);
+    assert.equal(result.error, 'none', item.name);
+  }
+});
+
+test('C49 stopped probe rejects every other root selector in either declaration', async () => {
+  const version = PLATFORM_NODE_PACKAGE.version;
+  const rejectedSelectors = [
+    '^0.0.1',
+    '>=0.0.1',
+    'latest',
+    '*',
+    'workspace:*',
+    'file:../edge-nodes',
+    'https://registry.example/thinglinks-edge-nodes-0.0.1.tgz',
+    '~0.0.2',
+    '0.0.2',
+    ' 0.0.1',
+    '0.0.1 ',
+    '\t~0.0.1',
+    '~0.0.1\n',
+  ];
+
+  for (const selector of rejectedSelectors) {
+    for (const declaration of ['packageJson', 'lockProject'] as const) {
+      const f = migrationFixture({ originalRunning: false });
+      f.admin.stagePlatformModuleAt = async () => {
+        f.admin.installCalls += 1;
+        assert.ok(f.state.probeRoot);
+        writeInstalledPackage(f.state.probeRoot, {
+          packageJson: declaration === 'packageJson' ? selector : version,
+          lockProject: declaration === 'lockProject' ? selector : version,
+        });
+        f.state.staged = true;
+        return healthyPlatformInventory();
+      };
+
+      const result = await f.service.migrate('line-a', 'admin');
+
+      assert.equal(result.phase, 'rolled_back', `${declaration} accepted ${JSON.stringify(selector)}`);
+      assert.equal(result.runtimeMode, 'legacy', `${declaration}/${JSON.stringify(selector)}`);
+    }
+  }
+});
+
+test('C49 tilde root selectors keep resolved probe package evidence exact', async () => {
+  const edgePath = join('node_modules', ...PLATFORM_NODE_PACKAGE.name.split('/'));
+  const commonPath = join('node_modules', ...PLATFORM_COMMON_PACKAGE.name.split('/'));
+  const updateJson = (
+    root: string,
+    path: string,
+    mutate: (value: Record<string, unknown>) => void,
+  ) => {
+    const absolute = join(root, path);
+    const value = JSON.parse(readFileSync(absolute, 'utf8')) as Record<string, unknown>;
+    mutate(value);
+    writeJson(absolute, value);
+  };
+  const cases: Array<{
+    name: string;
+    mutate: (root: string) => void;
+  }> = [
+    { name: 'edge manifest version', mutate: (root) => {
+      updateJson(root, join(edgePath, 'package.json'), (edge) => {
+        edge['version'] = `~${PLATFORM_NODE_PACKAGE.version}`;
+      });
+    } },
+    { name: 'common manifest version', mutate: (root) => {
+      updateJson(root, join(commonPath, 'package.json'), (common) => {
+        common['version'] = `~${PLATFORM_COMMON_PACKAGE.version}`;
+      });
+    } },
+    { name: 'edge lock version', mutate: (root) => {
+      updateJson(root, 'package-lock.json', (lock) => {
+        const packages = lock['packages'] as Record<string, Record<string, unknown>>;
+        packages[edgePath]!['version'] = `~${PLATFORM_NODE_PACKAGE.version}`;
+      });
+    } },
+    { name: 'common lock version', mutate: (root) => {
+      updateJson(root, 'package-lock.json', (lock) => {
+        const packages = lock['packages'] as Record<string, Record<string, unknown>>;
+        packages[commonPath]!['version'] = `~${PLATFORM_COMMON_PACKAGE.version}`;
+      });
+    } },
+    { name: 'edge lock integrity', mutate: (root) => {
+      updateJson(root, 'package-lock.json', (lock) => {
+        const packages = lock['packages'] as Record<string, Record<string, unknown>>;
+        packages[edgePath]!['integrity'] = 'sha512-wrong';
+      });
+    } },
+    { name: 'common lock integrity', mutate: (root) => {
+      updateJson(root, 'package-lock.json', (lock) => {
+        const packages = lock['packages'] as Record<string, Record<string, unknown>>;
+        packages[commonPath]!['integrity'] = 'sha512-wrong';
+      });
+    } },
+    { name: 'edge manifest common dependency', mutate: (root) => {
+      updateJson(root, join(edgePath, 'package.json'), (edge) => {
+        const dependencies = edge['dependencies'] as Record<string, unknown>;
+        dependencies[PLATFORM_COMMON_PACKAGE.name] = `~${PLATFORM_COMMON_PACKAGE.version}`;
+      });
+    } },
+    { name: 'edge lock common dependency', mutate: (root) => {
+      updateJson(root, 'package-lock.json', (lock) => {
+        const packages = lock['packages'] as Record<string, Record<string, unknown>>;
+        const dependencies = packages[edgePath]!['dependencies'] as Record<string, unknown>;
+        dependencies[PLATFORM_COMMON_PACKAGE.name] = `~${PLATFORM_COMMON_PACKAGE.version}`;
+      });
+    } },
+  ];
+
+  for (const item of cases) {
+    const f = migrationFixture({ originalRunning: false });
+    f.admin.stagePlatformModuleAt = async () => {
+      f.admin.installCalls += 1;
+      assert.ok(f.state.probeRoot);
+      writeInstalledPackage(f.state.probeRoot, {
+        packageJson: `~${PLATFORM_NODE_PACKAGE.version}`,
+        lockProject: `~${PLATFORM_NODE_PACKAGE.version}`,
+      });
+      item.mutate(f.state.probeRoot);
+      f.state.staged = true;
+      return healthyPlatformInventory();
+    };
+
+    const result = await f.service.migrate('line-a', 'admin');
+
+    assert.equal(result.phase, 'rolled_back', item.name);
+    assert.equal(result.runtimeMode, 'legacy', item.name);
+  }
 });
 
 test('explicit pending start claims once, starts once, verifies, commits, and removes rollback evidence', async () => {
