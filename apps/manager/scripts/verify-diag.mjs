@@ -10,8 +10,7 @@
  *   · 实例接入令牌与 Node-RED 口令 —— 加密入库，但日志与接口回显里可能有明文
  *   · 云侧 signKey / encryptKey / 口令 —— 同上
  */
-import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { writeFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { openDb } from '../dist/core/db.js';
@@ -28,8 +27,14 @@ import { UserRepo } from '../dist/core/auth/user-repo.js';
 import { untar } from '../dist/core/archive/tar.js';
 import { TEST_DATA_ROOT, TEST_EDGE_ROOT, ensureRoot } from './_data-root.mjs';
 import { adminSession, sessionFor } from './_session.mjs';
+import {
+  allocateLoopbackPort,
+  cleanupOwnedTempAreas,
+  closeVerifierResources,
+  createOwnedTempArea,
+  databaseCloser,
+} from './_owned-temp.mjs';
 
-const PORT = 13262;
 const ADMIN_PW = 'initial-password-123';
 const INSTANCE = 'diag-a';
 
@@ -50,13 +55,21 @@ const check = (name, ok, detail = '') => {
   results.push({ name, ok });
   console.log(`  ${ok ? '✓' : '✗'} ${name}${detail ? '  — ' + detail : ''}`);
 };
+const tempAreas = [];
+let server;
+let db;
+let spool;
+let cloud;
 
 async function main() {
   console.log('\n──── 远程诊断 · 导出后真 grep 验证 ────\n');
 
   process.env['MASTER_KEY'] = MASTER_KEY;
-  const dataDir = mkdtempSync(join(tmpdir(), 'tle-diag-'));
-  const db = openDb(join(dataDir, 'edge.db'));
+  const area = createOwnedTempArea('diag');
+  tempAreas.push(area);
+  const dataDir = area.dataDir;
+  const port = await allocateLoopbackPort();
+  db = openDb(join(dataDir, 'edge.db'));
   const key = deriveKey(MASTER_KEY, 'thinglinks-edge:instance-cred');
   const auth = new AuthService(db);
   auth.ensureInitialUser('admin', ADMIN_PW);
@@ -84,13 +97,13 @@ async function main() {
     allowedImageTags: ['5.0.4-24-minimal'],
   });
   const config = {
-    externalUrl: `http://127.0.0.1:${PORT}`, basePath: '', cookieSecure: false,
-    allowedOrigins: [`http://127.0.0.1:${PORT}`], listenAddr: '127.0.0.1', listenPort: PORT,
+    externalUrl: `http://127.0.0.1:${port}`, basePath: '', cookieSecure: false,
+    allowedOrigins: [`http://127.0.0.1:${port}`], listenAddr: '127.0.0.1', listenPort: port,
     dataDir, dataRoot: TEST_EDGE_ROOT, instanceDataRoot: TEST_DATA_ROOT,
     portRange: { min: 30000, max: 30999 }, timezone: 'Asia/Shanghai', updateCheckUrl: '',
   };
 
-  const spool = await Spool.open({ dir: join(dataDir, 'spool'), flushIntervalMs: 5, fullPolicy: 'drop-oldest' });
+  spool = await Spool.open({ dir: join(dataDir, 'spool'), flushIntervalMs: 5, fullPolicy: 'drop-oldest' });
   const cloudConfig = new CloudConfigRepo(db, key);
   // 存一份真实的云配置，让 signKey / encryptKey / 口令确实在库里
   cloudConfig.save({
@@ -104,15 +117,16 @@ async function main() {
     signKey: SIGN_KEY, encryptKey: ENC_KEY, encryptVector: ENC_IV,
   }, 'admin');
 
-  const cloud = new CloudRuntime();
+  cloud = new CloudRuntime();
   await cloud.apply(cloudConfig.get());
 
   const app = buildServer({
     config, db, auth, repo, service, spool, cloud, cloudConfig,
     cloudSink: (p) => cloud.publish(p),
   });
-  await app.listen({ host: '127.0.0.1', port: PORT });
-  const B = `http://127.0.0.1:${PORT}`;
+  server = app;
+  await app.listen({ host: '127.0.0.1', port });
+  const B = `http://127.0.0.1:${port}`;
 
   const loginAs = async (username, password) => {
     const r = await fetch(`${B}/api/login`, {
@@ -183,7 +197,7 @@ async function main() {
   // ── 4. 脱敏没有把有用信息一起抹掉 ──────────────────
   const cfg = String(files.find((f) => f.name === 'config.json').content);
   check('配置里非敏感字段保留', cfg.includes('externalUrl') && cfg.includes('19100') === false
-        && cfg.includes(`${PORT}`), '端口与外部地址仍可读');
+        && cfg.includes(`${port}`), '端口与外部地址仍可读');
 
   const runtime = String(files.find((f) => f.name === 'runtime.json').content);
   check('环境变量只报名字不报值', runtime.includes('MASTER_KEY') && !runtime.includes(MASTER_KEY),
@@ -218,7 +232,7 @@ async function main() {
   // ── 6. 单次探测 ───────────────────────────────────
   const probe = await fetch(`${B}/api/diag/probe`, {
     method: 'POST', headers: H(admin),
-    body: JSON.stringify({ targets: [`127.0.0.1:${PORT}`], timeoutMs: 3000 }),
+    body: JSON.stringify({ targets: [`127.0.0.1:${port}`], timeoutMs: 3000 }),
   });
   const probeBody = await probe.json();
   check('探测自身端口可达', probe.status === 200 && probeBody.probes[0]?.tcp?.ok === true,
@@ -280,9 +294,6 @@ async function main() {
   check('第二次导出同样不含凭据',
         !Object.values(SECRETS).some((v) => archive2.toString('utf8').includes(v)));
 
-  await cloud.close();
-  await app.close();
-
   const failed = results.filter((r) => !r.ok);
   console.log(`\n  ${results.length - failed.length}/${results.length} 通过`);
   if (failed.length) {
@@ -291,4 +302,20 @@ async function main() {
   }
 }
 
-main().catch((e) => { console.error('\n[fatal]', e); process.exitCode = 1; });
+main().catch((e) => { console.error('\n[fatal]', e); process.exitCode = 1; })
+  .finally(async () => {
+    const failures = [];
+    try {
+      await closeVerifierResources([
+        ...(server ? [{ label: 'server', close: () => server.close() }] : []),
+        ...(cloud ? [{ label: 'cloud', close: () => cloud.close() }] : []),
+        ...(spool ? [{ label: 'spool', close: () => spool.close() }] : []),
+        ...(db ? [databaseCloser(db)] : []),
+      ]);
+    } catch (error) { failures.push(error); }
+    try { cleanupOwnedTempAreas(tempAreas); } catch (error) { failures.push(error); }
+    if (failures.length) {
+      console.error('\n[cleanup fatal]', new AggregateError(failures, 'diag verifier cleanup failed'));
+      process.exitCode = 1;
+    }
+  });

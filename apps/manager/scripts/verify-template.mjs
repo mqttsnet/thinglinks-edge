@@ -10,32 +10,20 @@
  *   · 模板里的内联密钥会被扫出来（凭据不会导出，但 function 里硬编码的会）
  *   · 套用是实例级破坏性操作，必须过实例授权矩阵
  */
-import Docker from 'dockerode';
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-
-import { openDb } from '../dist/core/db.js';
-import { deriveKey } from '../dist/core/auth/crypto.js';
-import { AuthService } from '../dist/core/auth/service.js';
-import { InstanceRepo } from '../dist/core/instance/repo.js';
-import { InstanceService } from '../dist/core/instance/service.js';
-import { DockerClient } from '../dist/core/instance/docker-client.js';
-import { buildServer } from '../dist/http/app.js';
 import { UserRepo } from '../dist/core/auth/user-repo.js';
 import { containerName } from '../dist/core/instance/container-spec.js';
-import { TEST_DATA_ROOT, TEST_EDGE_ROOT, ensureRoot, resetDataDir } from './_data-root.mjs';
+import {
+  createFixtureIdentity,
+  createRealInstanceFixture,
+} from './_real-instance-fixture.mjs';
 import { adminSession, sessionFor } from './_session.mjs';
 
-const NET = 'tle-tpl-net';
-const BRIDGE = 'tle-tpl-bridge';
-const PORT = 13285;
-const ADMIN_PW = 'initial-password-123';
-const SRC = 'tpl-src';
-const DST = 'tpl-dst';
+const identity = createFixtureIdentity({ suite: 'tpl', roles: ['src', 'dst'] });
+const SRC = identity.instances.src;
+const DST = identity.instances.dst;
 const TAG = '5.0.4-24-minimal';
 
-const raw = new Docker();
+let fixture;
 const results = [];
 const check = (name, ok, detail = '') => {
   results.push({ name, ok });
@@ -43,23 +31,7 @@ const check = (name, ok, detail = '') => {
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const containerState = async (id) =>
-  raw.getContainer(containerName(id)).inspect().then((i) => i.State.Status).catch(() => 'missing');
-
-async function cleanup() {
-  for (const id of [SRC, DST]) {
-    await raw.getContainer(`${BRIDGE}-${id}`).remove({ force: true }).catch(() => {});
-    await raw.getContainer(containerName(id)).remove({ force: true }).catch(() => {});
-    /*
-     * **每实例网络**也要删。DockerClient 给每台实例单独建一个
-     * `<NET>-<id>` 网络做隔离，删容器不会连带删网络 ——
-     * 漏了这一步，残留检查会报「网络 N」而容器和卷都是干净的，
-     * 那种报告最容易被当成误报忽略掉。
-     */
-    await raw.getNetwork(`${NET}-${id}`).remove().catch(() => {});
-    await resetDataDir(id);
-  }
-  await raw.getNetwork(NET).remove().catch(() => {});
-}
+  fixture.raw.getContainer(containerName(id)).inspect().then((i) => i.State.Status).catch(() => 'missing');
 
 /** 一套有代表性的流程：含标签页、mqtt 节点、function、debug */
 const FLOWS = [
@@ -75,51 +47,18 @@ const FLOWS = [
 
 async function main() {
   console.log('\n──── 流程模板 · 两台真实 Node-RED 验证 ────\n');
-  await cleanup();
-
-  const dataDir = mkdtempSync(join(tmpdir(), 'tle-tpl-'));
-  const db = openDb(join(dataDir, 'edge.db'));
-  const auth = new AuthService(db);
-  auth.ensureInitialUser('admin', ADMIN_PW);
-  const repo = new InstanceRepo(db, deriveKey('verify', 'salt'));
-  await ensureRoot();
+  fixture = await createRealInstanceFixture({ identity, allowedImageTags: [TAG] });
+  const { db, repo } = fixture;
 
   const users = new UserRepo(db);
   const opsPassword = users.create('ops', 'operator', 'admin');
   const viewerPassword = users.create('watcher', 'viewer', 'admin');
-
-  const docker = new DockerClient({
-    network: NET, imageRepo: 'nodered/node-red',
-    portRange: { min: 30000, max: 30999 }, instanceDataRoot: TEST_DATA_ROOT, timezone: 'Asia/Shanghai',
-  });
-  const service = new InstanceService({
-    db, repo, docker, basePath: '', portRange: { min: 30000, max: 30999 }, allowedImageTags: [TAG],
-  });
-  const config = {
-    externalUrl: `http://127.0.0.1:${PORT}`, basePath: '', cookieSecure: false,
-    allowedOrigins: [`http://127.0.0.1:${PORT}`], listenAddr: '127.0.0.1', listenPort: PORT,
-    dataDir, dataRoot: TEST_EDGE_ROOT, instanceDataRoot: TEST_DATA_ROOT,
-    portRange: { min: 30000, max: 30999 }, timezone: 'Asia/Shanghai', updateCheckUrl: '',
-  };
-
-  /*
-   * Manager 跑在宿主上，而实例容器在 docker 网络里 —— 宿主按容器名解析不了。
-   * 所以这里把上游改成宿主可达的 127.0.0.1:<映射端口>。
-   * 生产里 Manager 与实例同处一个网络，用的是默认的容器名解析，不需要这一层。
-   */
-  const hostPorts = new Map();
-  const app = buildServer({
-    config, db, auth, repo, service,
-    upstreamFor: (id) => `http://127.0.0.1:${hostPorts.get(id)}`,
-  });
-  await app.listen({ host: '127.0.0.1', port: PORT });
-  server = app;
-  const B = `http://127.0.0.1:${PORT}`;
+  const B = fixture.baseUrl;
 
   const H = (s) => ({ cookie: s.cookie, 'content-type': 'application/json', 'x-csrf-token': s.csrf });
 
   // 先改掉初始口令：强制改密是后端闸门，不改的话后面每条业务接口都会 403
-  const admin = await adminSession(B, ADMIN_PW);
+  const admin = await adminSession(B, fixture.adminPassword, fixture.adminNextPassword);
   check('管理员登录成功', Boolean(admin.csrf));
 
   /*
@@ -129,13 +68,12 @@ async function main() {
    * 服务端会当场拒绝。宿主上的测试进程要访问实例，走 socat 边车搭桥 ——
    * 这是测试脚手架，不改变生产拓扑。与 verify-proxy 用的是同一套做法。
    */
-  for (const id of [SRC, DST]) {
-    const res = await fetch(`${B}/api/instances`, {
-      method: 'POST', headers: H(admin),
-      body: JSON.stringify({ id, name: id, imageTag: TAG, memoryMb: 512, cpus: 0.5, ports: [] }),
+  for (const role of ['src', 'dst']) {
+    const id = identity.instances[role];
+    await fixture.createInstance(role, admin, {
+      name: id, imageTag: TAG, memoryMb: 512, cpus: 0.5, ports: [],
     });
-    check(`创建实例 ${id}`, res.status === 201,
-          res.status === 201 ? '' : `HTTP ${res.status} ${JSON.stringify(await res.json()).slice(0, 160)}`);
+    check(`创建实例 ${id}`, true);
   }
 
   for (const id of [SRC, DST]) {
@@ -143,21 +81,6 @@ async function main() {
     for (let i = 0; i < 40 && state !== 'running'; i++) { await sleep(1000); state = await containerState(id); }
     check(`${id} 容器在运行`, state === 'running', `state=${state}`);
   }
-
-  // 每台实例一个 socat 边车，把容器内的 1880 转到宿主端口供本进程访问
-  for (const [id, bridgePort] of [[SRC, 30930], [DST, 30931]]) {
-    hostPorts.set(id, bridgePort);
-    await raw.createContainer({
-      name: `${BRIDGE}-${id}`, Image: 'alpine/socat',
-      Cmd: [`TCP-LISTEN:${bridgePort},fork,reuseaddr`, `TCP:${containerName(id)}:1880`],
-      ExposedPorts: { [`${bridgePort}/tcp`]: {} },
-      HostConfig: {
-        NetworkMode: docker.instanceNetwork(id),
-        PortBindings: { [`${bridgePort}/tcp`]: [{ HostIp: '127.0.0.1', HostPort: String(bridgePort) }] },
-      },
-    }).then((c) => c.start());
-  }
-  await sleep(1500);
 
   // 等两台 Node-RED 的 Admin API 真的起来
   const ready = async (id) => {
@@ -278,7 +201,7 @@ async function main() {
    */
   const dstRoot = (await (await fetch(`${B}/api/instances/${DST}`,
     { headers: { cookie: admin.cookie } })).json()).instance.adminRoot;
-  const direct = `http://127.0.0.1:${hostPorts.get(DST)}${dstRoot}`;
+  const direct = `http://127.0.0.1:${fixture.inboundPort('dst')}${dstRoot}`;
 
   const naked = await fetch(`${direct}flows`, { headers: { accept: 'application/json' } })
     .catch(() => null);
@@ -454,26 +377,25 @@ async function main() {
   const gone = await fetch(`${B}/api/templates/${exoticTpl.id}`, { headers: { cookie: admin.cookie } });
   check('删除后取不到', gone.status === 404, `HTTP ${gone.status}`);
 
-  await app.close();
-  await cleanup();
-
-  const failed = results.filter((r) => !r.ok);
-  console.log(`\n  ${results.length - failed.length}/${results.length} 通过`);
-  if (failed.length) {
-    console.log('  失败：' + failed.map((f) => f.name).join('、'));
-    process.exitCode = 1;
-  }
 }
 
 /*
  * 出错时也要把 HTTP 服务关掉。不关的话端口一直被占着，
  * 下一次跑直接 EADDRINUSE —— 上一个错误还没查完，又多了一个假故障。
  */
-let server;
-main().catch(async (e) => {
-  console.error('\n[fatal]', e);
-  await cleanup();
-  process.exitCode = 1;
-}).finally(async () => {
-  await server?.close().catch(() => {});
-});
+main()
+  .catch((e) => {
+    console.error('\n[fatal]', e);
+    results.push({ name: '脚本执行', ok: false });
+  })
+  .finally(async () => {
+    const cleanupFailures = fixture ? await fixture.cleanup() : [];
+    if (cleanupFailures.length > 0) {
+      console.error('\n验证资源清理失败：', cleanupFailures.join(' | '));
+      results.push({ name: '随机验证资源清理', ok: false });
+    }
+    const failed = results.filter((r) => !r.ok);
+    console.log(`\n  ${results.length - failed.length}/${results.length} 通过`);
+    if (failed.length) console.log('  失败：' + failed.map((f) => f.name).join('、'));
+    process.exitCode = failed.length > 0 ? 1 : 0;
+  });

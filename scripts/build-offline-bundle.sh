@@ -51,6 +51,18 @@ IMAGES=("$MANAGER_IMAGE" "$PROXY_IMAGE" "$INIT_IMAGE")
 IFS=',' read -ra TAGS <<< "$ALLOWED_IMAGE_TAGS"
 for t in "${TAGS[@]}"; do IMAGES+=("${NODE_RED_REPO}:$(echo "$t" | xargs)"); done
 
+# `docker save sha256:<id>` 在当前 Moby 会导出 RepoTags:null。现场 `docker load`
+# 虽然得到镜像层，却恢复不了 compose 要找的名字，最终仍会尝试联网拉取。
+# 离线包里的每个镜像必须用可恢复的 named tag，而不能用裸 ID 或 digest。
+for img in "${IMAGES[@]}"; do
+  case "$img" in
+    sha256:*|*@sha256:*)
+      echo "✗ 离线包镜像必须使用 named tag，不可使用裸 ID/digest：$img" >&2
+      exit 1
+      ;;
+  esac
+done
+
 echo "── 离线安装包 ${VERSION} · linux/${ARCH} ──"
 echo
 
@@ -64,7 +76,7 @@ for img in "${IMAGES[@]}"; do
   fi
   got="$(docker image inspect "$img" --format '{{.Architecture}}')"
   if [ "$got" != "$ARCH" ]; then
-    echo "✗ $img 是 $got，与本机 $ARCH 不一致 —— 装到现场会报 exec format error" >&2
+    echo "✗ $img 是 ${got}，与本机 $ARCH 不一致 —— 装到现场会报 exec format error" >&2
     exit 1
   fi
   echo "  ✓ $img ($got)"
@@ -78,11 +90,39 @@ echo
 echo "  导出镜像（几百 MB，耐心等）…"
 docker save -o "${STAGE}/images.tar" "${IMAGES[@]}"
 
+# `docker save` 完成后，tag 已可能被同机其它操作重指。最终清单不再回头
+# inspect 可变 tag，而是从刚写好的 archive 逐个读取 Config bytes：RepoTags 必须
+# 与请求集合精确相等，每个 Config 都是普通成员，其 sha256 就是可信 image ID。
+IMAGE_INDEX="${STAGE}/.image-index.json"
+node apps/manager/scripts/verify-offline-bundle.mjs \
+  --index "${STAGE}/images.tar" "$ARCH" "${IMAGES[@]}" > "$IMAGE_INDEX"
+echo "  ✓ images.tar RepoTags/Config ${#IMAGES[@]}/${#IMAGES[@]} 全部绑定"
+
 # 3) 部署文件。compose 主文件原样带走，另加一份 offline 覆盖：
 #    pull_policy: never 让「镜像没 load 进去」当场失败，而不是去连网拉
 cp docker-compose.yml "${STAGE}/"
 cp .env.example "${STAGE}/"
 cp -r changelogs "${STAGE}/changelogs" 2>/dev/null || true
+
+# 包内模板必须描述**这一个包实际携带的镜像**。否则 install.sh 的标准路径
+# `cp .env.example .env` 会让 compose 去找仓库默认版本，而不是 images.tar 中的版本。
+upsert_env() {
+  local key="$1" value="$2" file="$3" next="${3}.next.$$"
+  if grep -q "^${key}=" "$file"; then
+    awk -v key="$key" -v value="$value" \
+      'index($0, key "=") == 1 { print key "=" value; next } { print }' \
+      "$file" > "$next"
+  else
+    cp "$file" "$next"
+    printf '\n%s=%s\n' "$key" "$value" >> "$next"
+  fi
+  mv "$next" "$file"
+}
+upsert_env MANAGER_IMAGE "$MANAGER_IMAGE" "${STAGE}/.env.example"
+upsert_env PROXY_IMAGE "$PROXY_IMAGE" "${STAGE}/.env.example"
+upsert_env INIT_IMAGE "$INIT_IMAGE" "${STAGE}/.env.example"
+upsert_env NODE_RED_IMAGE_REPO "$NODE_RED_REPO" "${STAGE}/.env.example"
+upsert_env ALLOWED_IMAGE_TAGS "$ALLOWED_IMAGE_TAGS" "${STAGE}/.env.example"
 cat > "${STAGE}/docker-compose.offline.yml" <<'YAML'
 # 离线覆盖：任何服务都不许去网上拉镜像。
 #
@@ -120,12 +160,10 @@ fi
 
 # 4) 清单：装了什么、什么架构、什么时候打的。现场核对与售后追溯都靠它
 node -e '
-const { execFileSync } = require("node:child_process");
 const { createHash } = require("node:crypto");
 const { readdirSync, readFileSync, existsSync, writeFileSync } = require("node:fs");
-const [stage, version, arch, ...images] = process.argv.slice(1);
-const digest = (img) => JSON.parse(execFileSync("docker",
-  ["image", "inspect", img, "--format", "{{json .Id}}"], { encoding: "utf8" }));
+const [stage, version, arch, indexPath, ...images] = process.argv.slice(1);
+const imageIndex = JSON.parse(readFileSync(indexPath, "utf8"));
 const seedDir = `${stage}/node-seed`;
 const nodeSeed = existsSync(seedDir)
   ? readdirSync(seedDir).filter((f) => f.endsWith(".tgz")).sort()
@@ -138,18 +176,21 @@ writeFileSync(`${stage}/manifest.json`, JSON.stringify({
   product: "thinglinks-edge",
   version, platform: `linux/${arch}`,
   createdAt: new Date().toISOString(),
-  images: images.map((image) => ({ image, id: digest(image) })),
+  images: images.map((image) => ({ image, id: imageIndex[image].id })),
   // 现场要能回答「这批包里到底带了哪些节点」，而不是去数目录
   nodeSeed,
   // 与 Manager 的固定 SRI 合同可以直接对照；SHA256SUMS 另管整个离线包传输完整性
   nodeSeedIntegrity,
 }, null, 2) + "\n");
-' "$STAGE" "$VERSION" "$ARCH" "${IMAGES[@]}"
+' "$STAGE" "$VERSION" "$ARCH" "$IMAGE_INDEX" "${IMAGES[@]}"
+rm -f "$IMAGE_INDEX"
 
 # 5) 校验和 —— 见约束 3。节点包也要进校验：U 盘拷坏一个 tgz，
 #    现场表现是「这个节点导入失败」，同样看不出是文件坏了
 ( cd "$STAGE" && shasum -a 256 images.tar docker-compose.yml docker-compose.offline.yml \
-    install.sh manifest.json .env.example $(find node-seed -name '*.tgz' 2>/dev/null | sort) \
+    install.sh README.md manifest.json .env.example \
+    $(find changelogs -type f 2>/dev/null | sort) \
+    $(find node-seed -name '*.tgz' 2>/dev/null | sort) \
     > SHA256SUMS )
 
 # 6) 打包

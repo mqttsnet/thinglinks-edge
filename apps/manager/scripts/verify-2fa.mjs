@@ -9,8 +9,6 @@
  * 同样只有在这一层才验得了的：强制开启后没绑的人**具体被卡在哪些接口**、
  * 绑定那几条路由有没有被同一道闸误伤（那会变成死循环）。
  */
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { openDb } from '../dist/core/db.js';
@@ -22,8 +20,14 @@ import { DockerClient } from '../dist/core/instance/docker-client.js';
 import { buildServer } from '../dist/http/app.js';
 import { UserRepo } from '../dist/core/auth/user-repo.js';
 import { codeAt, stepAt } from '../dist/core/auth/totp.js';
+import {
+  allocateLoopbackPort,
+  cleanupOwnedTempAreas,
+  closeVerifierResources,
+  createOwnedTempArea,
+  databaseCloser,
+} from './_owned-temp.mjs';
 
-const PORT = 13271;
 const ADMIN_PW = 'initial-password-123';
 const NEW_PW = 'verify-admin-pass-01';
 
@@ -35,12 +39,18 @@ const check = (name, ok, detail = '') => {
 
 const jarOf = (res) => (res.headers.getSetCookie?.() ?? []).map((c) => c.split(';')[0]).join('; ');
 const csrfOf = (cookie) => /tle_csrf=([^;]+)/.exec(cookie)?.[1] ?? '';
+const tempAreas = [];
+let app;
+let db;
 
 async function main() {
   console.log('\n──── 系统设置与两步验证 · 端到端验证 ────\n');
 
-  const dataDir = mkdtempSync(join(tmpdir(), 'tle-2fa-'));
-  const db = openDb(join(dataDir, 'edge.db'));
+  const area = createOwnedTempArea('2fa');
+  tempAreas.push(area);
+  const dataDir = area.dataDir;
+  const port = await allocateLoopbackPort();
+  db = openDb(join(dataDir, 'edge.db'));
   const key = deriveKey('verify-master', 'thinglinks-edge:instance-cred');
   const auth = new AuthService(db, key);
   auth.ensureInitialUser('admin', ADMIN_PW);
@@ -54,16 +64,16 @@ async function main() {
     db, repo, docker, basePath: '', portRange: { min: 30000, max: 30999 },
     allowedImageTags: ['5.0.4-24-minimal'],
   });
-  const app = buildServer({
+  app = buildServer({
     config: {
-      externalUrl: `http://127.0.0.1:${PORT}`, basePath: '', cookieSecure: false,
-      allowedOrigins: [`http://127.0.0.1:${PORT}`], listenAddr: '127.0.0.1', listenPort: PORT,
+      externalUrl: `http://127.0.0.1:${port}`, basePath: '', cookieSecure: false,
+      allowedOrigins: [`http://127.0.0.1:${port}`], listenAddr: '127.0.0.1', listenPort: port,
       dataDir, portRange: { min: 30000, max: 30999 }, dataRoot: '/tmp', instanceDataRoot: '/tmp',
     },
     db, auth, repo, service,
   });
-  await app.listen({ host: '127.0.0.1', port: PORT });
-  const B = `http://127.0.0.1:${PORT}`;
+  await app.listen({ host: '127.0.0.1', port });
+  const B = `http://127.0.0.1:${port}`;
 
   const post = (path, body, cookie = '', csrf = '') => fetch(`${B}${path}`, {
     method: 'POST',
@@ -229,8 +239,6 @@ async function main() {
   check('恢复码只存哈希，表里搜不到明文',
         confirm.codes.every((c) => !codesDump.includes(c.replace(/-/g, ''))));
 
-  await app.close();
-
   const failed = results.filter((r) => !r.ok);
   console.log(`\n  ${results.length - failed.length}/${results.length} 通过`);
   if (failed.length) {
@@ -239,4 +247,18 @@ async function main() {
   }
 }
 
-main().catch((e) => { console.error('\n[fatal]', e); process.exitCode = 1; });
+main().catch((e) => { console.error('\n[fatal]', e); process.exitCode = 1; })
+  .finally(async () => {
+    const failures = [];
+    try {
+      await closeVerifierResources([
+        ...(app ? [{ label: 'server', close: () => app.close() }] : []),
+        ...(db ? [databaseCloser(db)] : []),
+      ]);
+    } catch (error) { failures.push(error); }
+    try { cleanupOwnedTempAreas(tempAreas); } catch (error) { failures.push(error); }
+    if (failures.length) {
+      console.error('\n[cleanup fatal]', new AggregateError(failures, '2fa verifier cleanup failed'));
+      process.exitCode = 1;
+    }
+  });

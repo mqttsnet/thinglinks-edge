@@ -4,107 +4,193 @@
  * 每步都回到 Docker 核对真实状态，不只看 API 返回码 ——
  * API 说成功但容器没起来，是最容易漏掉的一类问题。
  */
-import Docker from 'dockerode';
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { access, writeFile } from 'node:fs/promises';
+import { randomInt } from 'node:crypto';
+import { createServer as createTcpServer } from 'node:net';
+import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
-import { openDb } from '../dist/core/db.js';
-import { deriveKey } from '../dist/core/auth/crypto.js';
-import { AuthService } from '../dist/core/auth/service.js';
-import { InstanceRepo } from '../dist/core/instance/repo.js';
-import { InstanceService } from '../dist/core/instance/service.js';
-import { DockerClient } from '../dist/core/instance/docker-client.js';
-import { buildServer } from '../dist/http/app.js';
 import { ValueHistory } from '../dist/core/edge/history.js';
+import { redact } from '../dist/core/diag/redact.js';
 import { Spool } from '../dist/core/spool/spool.js';
 import { containerName } from '../dist/core/instance/container-spec.js';
-import { TEST_DATA_ROOT, ensureRoot, resetDataDir, dataDirExists, TEST_EDGE_ROOT } from './_data-root.mjs';
+import {
+  createFixtureIdentity,
+  createRealInstanceFixture,
+} from './_real-instance-fixture.mjs';
 import { adminSession } from './_session.mjs';
 
-const NET = 'tle-api-net';
-const PORT = 13202;
-const ADMIN_PW = 'initial-password-123';
-const ID = 'api-a';
-// 两个互不相邻的宿主端口，配两个互不相邻的容器端口（MQTT 1883 / Modbus 502）
-const PORT_A = 30810;
-const PORT_B = 30833;
-const ID2 = 'api-b';
 const TAG = '5.0.4-24-minimal';
-/** 白名单内、但本机不会去拉的版本。verify 环境不联网拉镜像，这一点是稳定的 */
-/*
- * 用一个**永远不会存在**的 tag，而不是某个「本机碰巧没拉」的真实版本。
- *
- * 原先这里写的是 4.1.13-22-minimal，前提是「开发机上没有它」——
- * 而 verify-upgrade 要跨大版本升级，必须把它拉下来，于是这条断言就红了。
- * 断言的前提一旦依赖「机器上恰好没有什么」，它迟早会被另一个脚本的正当需要打翻。
- */
-const MISSING_TAG = '0.0.0-never-published';
 
-const raw = new Docker();
 const results = [];
 const check = (name, ok, detail = '') => {
   results.push({ name, ok });
   console.log(`  ${ok ? '✓' : '✗'} ${name}${detail ? '  — ' + detail : ''}`);
 };
+
+/** 诊断信息永远只能辅助首因，不能因为值缺失再抛一次 TypeError。 */
+export function preview(value, limit = 70) {
+  let rendered;
+  try {
+    rendered = typeof value === 'string' ? value : JSON.stringify(value);
+  } catch {
+    rendered = String(value);
+  }
+  return String(rendered ?? value).slice(0, limit);
+}
+
+/** 后续步骤依赖的关键断言失败时立即停止，避免用级联噪声覆盖首因。 */
+export function requireCheck(name, ok, detail = '') {
+  check(name, ok, detail);
+  if (!ok) throw new Error(`${name}未通过${detail ? `：${detail}` : ''}`);
+}
+
+async function responseError(response) {
+  const text = await response.clone().text().catch(() => '');
+  if (!text) return '';
+  try {
+    const body = JSON.parse(text);
+    return preview(body?.error ?? body, 120);
+  } catch {
+    return preview(text, 120);
+  }
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const containerState = async (id) =>
+const containerState = async (raw, id) =>
   raw.getContainer(containerName(id)).inspect().then((i) => i.State.Status).catch(() => 'missing');
-async function cleanup() {
-  for (const id of [ID, ID2]) {
-    await raw.getContainer(containerName(id)).remove({ force: true }).catch(() => {});
-    await resetDataDir(id);
+
+const dataDirExists = async (root, id) =>
+  access(join(root, id)).then(() => true).catch(() => false);
+
+async function assertImageReferenceAbsent(raw, reference) {
+  try {
+    await raw.getImage(reference).inspect();
+  } catch (error) {
+    if (error?.statusCode === 404) return;
+    throw error;
   }
-  await raw.getNetwork(NET).remove().catch(() => {});
+  throw new Error(`随机缺镜像夹具意外存在：${reference}`);
+}
+
+const canBindPort = (port) => new Promise((resolveBind, reject) => {
+  const listener = createTcpServer();
+  listener.once('error', (error) => {
+    if (error.code === 'EADDRINUSE') { resolveBind(false); return; }
+    reject(error);
+  });
+  listener.listen(port, '127.0.0.1', () => {
+    listener.close((error) => {
+      if (error) { reject(error); return; }
+      resolveBind(true);
+    });
+  });
+});
+
+export async function allocateMappedPort(excluded = [], adapters = {}) {
+  const nextCandidate = adapters.nextCandidate ?? (() => randomInt(30000, 61000));
+  const canBind = adapters.canBind ?? canBindPort;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const port = nextCandidate();
+    if (portIsUsable(port, excluded) && await canBind(port)) return port;
+  }
+  throw new Error('无法在验证端口范围内分配互不相邻的宿主端口');
+}
+
+export function portIsUsable(port, excluded = []) {
+  return Number.isInteger(port)
+    && port >= 30000
+    && port <= 60999
+    && excluded.every((used) => Math.abs(used - port) > 1);
+}
+
+export function isFreshLogEvent(event, actionAt) {
+  const timestamp = Date.parse(String(event?.id ?? ''));
+  return Number.isFinite(timestamp) && timestamp >= actionAt;
+}
+
+let activeFixture;
+let activeSpool;
+async function cleanup() {
+  const failures = [];
+  if (activeSpool) {
+    const spool = activeSpool;
+    activeSpool = undefined;
+    try { await spool.close(); } catch (error) { failures.push(`spool: ${error.message}`); }
+  }
+  if (activeFixture) {
+    const fixture = activeFixture;
+    try {
+      const fixtureFailures = await fixture.cleanup();
+      failures.push(...fixtureFailures);
+      if (fixtureFailures.length === 0) activeFixture = undefined;
+    } catch (error) {
+      failures.push(`fixture: ${error.message}`);
+    }
+  }
+  if (failures.length > 0) throw new Error(`验证资源清理失败：${failures.join(' | ')}`);
 }
 
 async function main() {
   console.log('\n──── 实例 CRUD API · 真实 Docker 验证 ────\n');
-  await cleanup();
 
-  const db = openDb(join(mkdtempSync(join(tmpdir(), 'tle-api-')), 'edge.db'));
-  const auth = new AuthService(db);
-  auth.ensureInitialUser('admin', ADMIN_PW);
-  const repo = new InstanceRepo(db, deriveKey('verify', 'salt'));
-  await ensureRoot();
-  const docker = new DockerClient({
-    network: NET, imageRepo: 'nodered/node-red',
-    portRange: { min: 30000, max: 30999 }, instanceDataRoot: TEST_DATA_ROOT, timezone: 'Asia/Shanghai',
+  const identity = createFixtureIdentity({
+    suite: 'api',
+    roles: ['primary', 'second', 'missing'],
   });
-  const service = new InstanceService({
-    db, repo, docker, basePath: '', portRange: { min: 30000, max: 30999 },
-    // MISSING_TAG 是**本机没有拉取**的版本 —— 用它验镜像预检那条路径
-    allowedImageTags: [TAG, MISSING_TAG],
-  });
-  const config = {
-    externalUrl: `http://127.0.0.1:${PORT}`, basePath: '', cookieSecure: false,
-    allowedOrigins: [`http://127.0.0.1:${PORT}`], listenAddr: '127.0.0.1',
-    listenPort: PORT, dataDir: '/tmp', portRange: { min: 30000, max: 30999 },
-    // 南向探测要按这个根去实例目录读 flows.json
-    dataRoot: TEST_EDGE_ROOT, instanceDataRoot: TEST_DATA_ROOT,
-  };
+  const ID = identity.instances.primary;
+  const ID2 = identity.instances.second;
+  const MISSING_ID = identity.instances.missing;
+  // 缺镜像前提绑定本次 96-bit invocation，不依赖共享主机历史镜像集合。
+  const MISSING_TAG = `0.0.0-missing-${identity.invocation}`;
+
   // 假云出口：可开可关，用来验「攒批 → 送出」以及「断网 → 缓存 → 补传」
   const cloudBatches = [];
   let cloudUp = true;
-  const spoolDir = join(mkdtempSync(join(tmpdir(), 'tle-spool-')), 'spool');
-  const spool = await Spool.open({ dir: spoolDir, flushIntervalMs: 5, fullPolicy: 'drop-oldest' });
-  const valueHistory = new ValueHistory(db, { maxRows: 1000, minGapSec: 300 });
-  const app = buildServer({
-    config, db, auth, repo, service, spool, valueHistory,
-    cloudSink: async (payload) => {
-      if (!cloudUp) throw new Error('模拟断网');
-      cloudBatches.push(payload);
+  activeFixture = await createRealInstanceFixture({
+    identity,
+    allowedImageTags: [TAG, MISSING_TAG],
+    createServerExtras: async ({ db, runRoot }) => {
+      activeSpool = await Spool.open({
+        dir: join(runRoot, 'spool'),
+        flushIntervalMs: 5,
+        fullPolicy: 'drop-oldest',
+      });
+      return {
+        spool: activeSpool,
+        valueHistory: new ValueHistory(db, { maxRows: 1000, minGapSec: 300 }),
+        cloudSink: async (payload) => {
+          if (!cloudUp) throw new Error('模拟断网');
+          cloudBatches.push(payload);
+        },
+      };
     },
   });
-  await app.listen({ host: '127.0.0.1', port: PORT });
-  const B = `http://127.0.0.1:${PORT}`;
+  await assertImageReferenceAbsent(activeFixture.raw, `nodered/node-red:${MISSING_TAG}`);
+  const { raw, baseUrl: B, repo, instanceDataRoot } = activeFixture;
+
+  // Helper 已先占用 Manager 与三条 Admin bridge 端口。映射端口必须在它们之后分配，
+  // 否则 bind 前释放的“空闲端口”可能被 helper 复用，真正创建容器时才报冲突。
+  const reservedPorts = [
+    Number(new URL(B).port),
+    activeFixture.inboundPort('primary'),
+    activeFixture.inboundPort('second'),
+    activeFixture.inboundPort('missing'),
+  ];
+  // 两个互不相邻的宿主端口，配两个互不相邻的容器端口（MQTT 1883 / Modbus 502）
+  const PORT_A = await allocateMappedPort(reservedPorts);
+  const PORT_B = await allocateMappedPort([...reservedPorts, PORT_A]);
 
   // 登录并取 CSRF 令牌
-  const sess = await adminSession(B, ADMIN_PW);
+  const sess = await adminSession(
+    B,
+    activeFixture.adminPassword,
+    activeFixture.adminNextPassword,
+  );
   const { cookie, csrf } = sess;
-  const login = { status: sess.status };
-  check('登录并下发 CSRF 令牌', login.status === 200 && Boolean(csrf));
+  requireCheck('登录并下发 CSRF 令牌', sess.ok && sess.status === 200 && Boolean(csrf),
+    `stage=${sess.stage} HTTP ${sess.status}`);
 
   const H = { cookie, 'content-type': 'application/json', 'x-csrf-token': csrf };
 
@@ -124,26 +210,33 @@ async function main() {
     method: 'POST', headers: H,
     body: JSON.stringify({ id: ID, name: 'x', imageTag: 'latest', ports: [] }),
   });
-  check('白名单外的镜像 tag 被拒绝', badImg.status === 400, (await badImg.json()).error?.slice(0, 40));
+  const badImgError = await responseError(badImg);
+  requireCheck('白名单外的镜像 tag 被拒绝',
+    badImg.status === 400 && badImgError.includes('不在白名单'),
+    `HTTP ${badImg.status} · ${badImgError}`);
 
   // 创建实例
-  const created = await fetch(`${B}/api/instances`, {
-    method: 'POST', headers: H,
+  let created;
+  try {
     // 两条**不连号**的映射：MQTT 1883 与 Modbus 502。
     // 早先「区间 + 起始容器端口递增」的设计根本表达不出这种组合，
     // 而现场协议端口从来就不连号 —— 这条断言就是防它退回去
-    body: JSON.stringify({ id: ID, name: '一号产线', imageTag: TAG, memoryMb: 256, cpus: 0.5,
-                           ports: [
-                             { hostPort: PORT_A, containerPort: 1883, protocol: 'tcp', hostIp: '127.0.0.1', purpose: 'MQTT broker' },
-                             { hostPort: PORT_B, containerPort: 502, protocol: 'tcp', hostIp: '127.0.0.1', purpose: 'Modbus TCP' },
-                           ] }),
-  });
-  check('创建实例返回 201', created.status === 201, `HTTP ${created.status}`);
+    created = await activeFixture.createInstance('primary', sess, {
+      name: '一号产线', imageTag: TAG, memoryMb: 256, cpus: 0.5,
+      ports: [
+        { hostPort: PORT_A, containerPort: 1883, protocol: 'tcp', hostIp: '127.0.0.1', purpose: 'MQTT broker' },
+        { hostPort: PORT_B, containerPort: 502, protocol: 'tcp', hostIp: '127.0.0.1', purpose: 'Modbus TCP' },
+      ],
+    });
+  } catch (error) {
+    requireCheck('创建实例返回 201', false, preview(error?.message ?? error, 400));
+  }
+  requireCheck('创建实例返回 201', created?.status === 201, `HTTP ${created?.status ?? 'unknown'}`);
 
   let state = 'missing';
-  for (let i = 0; i < 30 && state !== 'running'; i++) { await sleep(1000); state = await containerState(ID); }
+  for (let i = 0; i < 30 && state !== 'running'; i++) { await sleep(1000); state = await containerState(raw, ID); }
   check('Docker 中容器确实在运行', state === 'running', `state=${state}`);
-  check('数据目录已创建', await dataDirExists(ID), `${TEST_DATA_ROOT}/${ID}`);
+  check('数据目录已创建', await dataDirExists(instanceDataRoot, ID), `${instanceDataRoot}/${ID}`);
 
   // 列表反映真实状态
   const list = await (await fetch(`${B}/api/instances`, { headers: { cookie } })).json();
@@ -168,18 +261,18 @@ async function main() {
   });
   const conflictMsg = (await conflict.json()).error ?? '';
   check('端口冲突被拒且指出占用方', conflict.status === 400 && conflictMsg.includes(ID), conflictMsg.slice(0, 46));
-  check('冲突后未残留半条记录', (await containerState(ID2)) === 'missing');
+  check('冲突后未残留半条记录', (await containerState(raw, ID2)) === 'missing');
 
   // 停止 / 启动
   const stopRes = await fetch(`${B}/api/instances/${ID}/stop`, { method: 'POST', headers: H });
   if (stopRes.status >= 400) console.log('    [debug] stop ->', stopRes.status, await stopRes.text());
   let stopped = 'x';
-  for (let i = 0; i < 20 && stopped !== 'exited'; i++) { await sleep(500); stopped = await containerState(ID); }
+  for (let i = 0; i < 20 && stopped !== 'exited'; i++) { await sleep(500); stopped = await containerState(raw, ID); }
   check('停止后容器进入 exited', stopped === 'exited', `state=${stopped}`);
 
   await fetch(`${B}/api/instances/${ID}/start`, { method: 'POST', headers: H });
   let restarted = 'x';
-  for (let i = 0; i < 20 && restarted !== 'running'; i++) { await sleep(500); restarted = await containerState(ID); }
+  for (let i = 0; i < 20 && restarted !== 'running'; i++) { await sleep(500); restarted = await containerState(raw, ID); }
   check('启动后容器回到 running', restarted === 'running', `state=${restarted}`);
 
   // 日志
@@ -252,7 +345,16 @@ async function main() {
   const events = [];
   const pump = readEvents(sse, (e) => events.push(e));
 
-  for (let i = 0; i < 25 && events.length === 0; i++) await sleep(200);
+  // tail 历史是流式送达的。只等“第一条”会把余下历史误算成 follow 新事件；
+  // 连续三个观察窗不再增长后，才冻结基线。
+  let previousCount = -1;
+  let stableWindows = 0;
+  for (let i = 0; i < 25 && stableWindows < 3; i++) {
+    await sleep(200);
+    if (events.length > 0 && events.length === previousCount) stableWindows += 1;
+    else stableWindows = 0;
+    previousCount = events.length;
+  }
   const history = events.length;
   check('连上先补发历史行', history > 0, `${history} 行`);
   check('推送的行已解帧',
@@ -260,17 +362,33 @@ async function main() {
   check('每行标出流别', events.every((e) => e.stream === 'stdout' || e.stream === 'stderr'),
         [...new Set(events.map((e) => e.stream))].join('+'));
 
-  // 连接保持打开，此时停实例 —— Node-RED 关闭时必然打印新行
-  await fetch(`${B}/api/instances/${ID}/stop`, { method: 'POST', headers: H });
+  // 连接保持打开，此时停实例。follow 只绑定 Docker 日志时间戳，不绑定某版
+  // Node-RED 的英文退出措辞（不同版本/空 flow 的文本并不稳定）。
+  const followActionAt = Date.now();
+  const followStop = await fetch(`${B}/api/instances/${ID}/stop`, { method: 'POST', headers: H });
+  check('实时日志验证的停止请求被接受', followStop.status === 204, `HTTP ${followStop.status}`);
   let fresh = [];
+  let followStopped = 'running';
   for (let i = 0; i < 40; i++) {
     await sleep(500);
-    fresh = events.slice(history);
-    if (fresh.some((e) => /Stopp(ing|ed) flows/i.test(e.text))) break;
+    fresh = events.slice(history).filter((e) => isFreshLogEvent(e, followActionAt));
+    followStopped = await containerState(raw, ID);
+    if (fresh.length > 0 && followStopped === 'exited') break;
   }
+  check('实时日志验证期间容器确实退出', followStopped === 'exited', `state=${followStopped}`);
+  const freshSummary = fresh.slice(0, 6).map((event) => {
+    const text = redact(String(event.text ?? ''), {
+      secrets: [
+        activeFixture.adminPassword,
+        activeFixture.adminNextPassword,
+        repo.ingestToken(ID),
+      ],
+    }).replace(/\s+/g, ' ').trim();
+    return `${event.stream ?? '?'}:${preview(text.slice(-60), 60)}`;
+  }).join(' | ');
   check('follow 生效：连接期间产生的新行被实时推送',
-        fresh.some((e) => /Stopp(ing|ed) flows/i.test(e.text)),
-        fresh.map((e) => e.text).find((t) => /Stopp/i.test(t))?.trim().slice(-40) ?? `新增 ${fresh.length} 行`);
+        fresh.length > 0,
+        freshSummary || '没有晚于停止请求的事件');
 
   const lastId = [...events].reverse().find((e) => e.id)?.id;
   check('每个事件都带时间戳 id（续传要靠它）', Boolean(lastId), lastId ?? '没有 id');
@@ -299,7 +417,7 @@ async function main() {
   check('客户端断开后 API 仍正常', afterAbort.status === 200, `HTTP ${afterAbort.status}`);
 
   await fetch(`${B}/api/instances/${ID}/start`, { method: 'POST', headers: H });
-  for (let i = 0; i < 30 && (await containerState(ID)) !== 'running'; i++) await sleep(500);
+  for (let i = 0; i < 30 && (await containerState(raw, ID)) !== 'running'; i++) await sleep(500);
 
   // ── 现场台账接入（@thinglinks 节点走的通道）──
   /*
@@ -420,7 +538,7 @@ async function main() {
   check('载荷结构对齐云侧 TopoDeviceDataReportParam',
         Array.isArray(payload?.devices) && payload.devices[0]?.deviceId === 'plc-1' &&
         Array.isArray(payload.devices[0]?.services),
-        JSON.stringify(payload).slice(0, 70));
+        preview(payload));
   const svc = payload?.devices?.[0]?.services?.[0];
   check('同一时刻的多个点合并进同一条服务记录',
         svc && Object.keys(svc.data).sort().join(',') === 'humidity,pressure,temperature',
@@ -532,8 +650,7 @@ async function main() {
    * 验证平台能把这些「平台本来看不见」的设备尽力认出来 ——
    * 并且**明确标为未纳管**。
    */
-  const { writeFile } = await import('node:fs/promises');
-  await writeFile(`${TEST_DATA_ROOT}/${ID}/flows.json`, JSON.stringify([
+  await writeFile(`${instanceDataRoot}/${ID}/flows.json`, JSON.stringify([
     { id: 'tab1', type: 'tab', label: '产线采集' },
     { id: 'cli1', type: 'modbus-client', name: '注塑机 PLC', clienttype: 'tcp',
       tcpHost: '192.168.10.31', tcpPort: '502' },
@@ -575,20 +692,32 @@ async function main() {
   check('重置口令返回新口令且仅此一次', reset.status === 200 && typeof newPw === 'string' && newPw.length >= 20);
 
   let back = 'x';
-  for (let i = 0; i < 40 && back !== 'running'; i++) { await sleep(1000); back = await containerState(ID); }
+  for (let i = 0; i < 40 && back !== 'running'; i++) { await sleep(1000); back = await containerState(raw, ID); }
   check('重置后实例重启并恢复运行', back === 'running', `state=${back}`);
+  if (back === 'running') await activeFixture.captureCurrentInstance('primary');
 
   // 未登录访问 API
   const anon = await fetch(`${B}/api/instances`);
   check('未登录访问 API 被拒绝', anon.status === 401);
 
   // 删除：默认保留数据卷
+  // 先移除验证专用的 Admin/registry bridge；否则它们会人为占住实例网络，
+  // 把生产 service.remove 的网络回收语义测成假失败。
+  const removal = await activeFixture.prepareInstanceRemoval('primary');
   const delRes = await fetch(`${B}/api/instances/${ID}`, { method: 'DELETE', headers: H });
-  if (delRes.status >= 400) console.log('    [debug] delete ->', delRes.status, await delRes.text());
-  check('删除后容器已移除', (await containerState(ID)) === 'missing');
-  check('默认保留数据目录（不默认删数据）', await dataDirExists(ID));
-
-  await resetDataDir(ID);
+  const delError = delRes.status === 204 ? '' : await responseError(delRes);
+  check('删除请求被接受', delRes.status === 204,
+    `HTTP ${delRes.status}${delError ? ` · ${delError}` : ''}`);
+  check('删除后容器已移除', (await containerState(raw, ID)) === 'missing');
+  let exactRemovalError = '';
+  try {
+    await activeFixture.assertPreparedInstanceRemoved(removal);
+  } catch (error) {
+    exactRemovalError = preview(error?.message ?? error, 160);
+  }
+  check('删除后按捕获的不可变 ID 与名称确认容器、网络均不存在',
+    exactRemovalError === '', exactRemovalError);
+  check('默认保留数据目录（不默认删数据）', await dataDirExists(instanceDataRoot, ID));
 
   // ── 控制台依赖的三个信息接口 ──
   /*
@@ -619,16 +748,15 @@ async function main() {
 
   const missRes = await fetch(`${B}/api/instances`, {
     method: 'POST', headers: H,
-    body: JSON.stringify({ id: 'api-miss', name: '缺镜像', imageTag: MISSING_TAG, ports: [] }),
+    body: JSON.stringify({ id: MISSING_ID, name: '缺镜像', imageTag: MISSING_TAG, ports: [] }),
   });
   const missErr = String((await missRes.json()).error ?? '');
   check('用本机没有的镜像建实例被拒，且给的是能照做的说明',
         missRes.status === 400 && missErr.includes('本机没有镜像') && missErr.includes('docker load'),
         missErr.slice(0, 60).replace(/\n/g, ' '));
   // 失败路径不该留下半个实例
-  check('预检失败后没有残留容器', (await containerState('api-miss')) === 'missing');
+  check('预检失败后没有残留容器', (await containerState(raw, MISSING_ID)) === 'missing');
 
-  await app.close();
   await cleanup();
 
   const pass = results.filter((r) => r.ok).length;
@@ -636,4 +764,17 @@ async function main() {
   process.exit(pass === results.length ? 0 : 1);
 }
 
-main().catch(async (e) => { console.error('\n验证失败：', e.message, e.stack); await cleanup(); process.exit(1); });
+const invokedDirectly = Boolean(process.argv[1])
+  && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
+
+if (invokedDirectly) {
+  main().catch(async (e) => {
+    console.error('\n验证失败：', e.message, e.stack);
+    try {
+      await cleanup();
+    } catch (cleanupError) {
+      console.error('\n清理失败：', cleanupError.message);
+    }
+    process.exit(1);
+  });
+}

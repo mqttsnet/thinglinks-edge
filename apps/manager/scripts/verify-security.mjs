@@ -12,8 +12,6 @@
  * 由 `verify-isolation.mjs` 负责，这里显式标注为「委派」并给出指向 ——
  * **委派要写明，不能默默算过**。
  */
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 
@@ -31,8 +29,14 @@ import { assertValidSpec, buildCreateOptions, assertSafeCreateOptions }
 import { redact, assertNoSecrets } from '../dist/core/diag/redact.js';
 import { TEST_DATA_ROOT, TEST_EDGE_ROOT, ensureRoot } from './_data-root.mjs';
 import { adminSession, sessionFor } from './_session.mjs';
+import {
+  allocateLoopbackPort,
+  cleanupOwnedTempAreas,
+  closeVerifierResources,
+  createOwnedTempArea,
+  databaseCloser,
+} from './_owned-temp.mjs';
 
-const PORT = 13295;
 const ADMIN_PW = 'initial-password-123';
 const MASTER = 'security-verify-master-key-0123456789';
 const REPO_ROOT = resolve(import.meta.dirname, '..', '..', '..');
@@ -47,6 +51,9 @@ const delegated = (item, name, to) => {
   results.push({ item, name, ok: true, delegated: to });
   console.log(`  → [${String(item).padStart(2)}] ${name}  — 由 ${to} 负责（需真容器）`);
 };
+const tempAreas = [];
+let server;
+let db;
 
 async function main() {
   console.log('\n──── 上线前安全验收 · 04 号文第 12 节逐条 ────\n');
@@ -88,8 +95,11 @@ async function main() {
   }
 
   // ══ 起服务，供 2/3/7/8/9 用 ════════════════════════
-  const dataDir = mkdtempSync(join(tmpdir(), 'tle-sec-'));
-  const db = openDb(join(dataDir, 'edge.db'));
+  const area = createOwnedTempArea('sec');
+  tempAreas.push(area);
+  const dataDir = area.dataDir;
+  const port = await allocateLoopbackPort();
+  db = openDb(join(dataDir, 'edge.db'));
   const key = deriveKey(MASTER, 'thinglinks-edge:instance-cred');
   const auth = new AuthService(db);
   auth.ensureInitialUser('admin', ADMIN_PW);
@@ -113,15 +123,15 @@ async function main() {
     allowedImageTags: ['5.0.4-24-minimal'],
   });
   const config = {
-    externalUrl: `http://127.0.0.1:${PORT}`, basePath: '', cookieSecure: false,
-    allowedOrigins: [`http://127.0.0.1:${PORT}`], listenAddr: '127.0.0.1', listenPort: PORT,
+    externalUrl: `http://127.0.0.1:${port}`, basePath: '', cookieSecure: false,
+    allowedOrigins: [`http://127.0.0.1:${port}`], listenAddr: '127.0.0.1', listenPort: port,
     dataDir, dataRoot: TEST_EDGE_ROOT, instanceDataRoot: TEST_DATA_ROOT,
     portRange: { min: 30000, max: 30999 }, timezone: 'UTC', updateCheckUrl: '',
   };
   const app = buildServer({ config, db, auth, repo, service });
-  await app.listen({ host: '127.0.0.1', port: PORT });
   server = app;
-  const B = `http://127.0.0.1:${PORT}`;
+  await app.listen({ host: '127.0.0.1', port });
+  const B = `http://127.0.0.1:${port}`;
 
   // ══ 2. 未登录访问一律被拒 ═══════════════════════════
   {
@@ -269,7 +279,9 @@ async function main() {
       leaked.length ? '泄漏：' + leaked.join(' ') : '3 项均未出现');
 
     // 10b：换一把密钥恢复必须失败，而不是恢复出一堆解不开的凭据
-    const otherRoot = mkdtempSync(join(tmpdir(), 'tle-sec-restore-'));
+    const restoreArea = createOwnedTempArea('sec-restore');
+    tempAreas.push(restoreArea);
+    const otherRoot = restoreArea.dataDir;
     let refused = false;
     let reason = '';
     try {
@@ -322,6 +334,7 @@ async function main() {
   }
 
   await app.close();
+  server = undefined;
 
   // ══ 验收矩阵 ══════════════════════════════════════
   const byItem = new Map();
@@ -350,6 +363,18 @@ async function main() {
  * fatal 时也要把服务关掉。不关的话端口一直被占着，下一次跑会卡在 listen 上
  * 且**毫无输出** —— 真正的错误被这个连锁反应完全盖住，这次就踩了。
  */
-let server;
 main().catch((e) => { console.error('\n[fatal]', e); process.exitCode = 1; })
-  .finally(async () => { await server?.close().catch(() => {}); });
+  .finally(async () => {
+    const failures = [];
+    try {
+      await closeVerifierResources([
+        ...(server ? [{ label: 'server', close: () => server.close() }] : []),
+        ...(db ? [databaseCloser(db)] : []),
+      ]);
+    } catch (error) { failures.push(error); }
+    try { cleanupOwnedTempAreas(tempAreas); } catch (error) { failures.push(error); }
+    if (failures.length) {
+      console.error('\n[cleanup fatal]', new AggregateError(failures, 'security verifier cleanup failed'));
+      process.exitCode = 1;
+    }
+  });

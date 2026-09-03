@@ -10,18 +10,38 @@
  */
 import mqtt from 'mqtt';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { createServer as createTcpServer } from 'node:net';
+import { basename, dirname, join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import { CloudGateway, topicsFor } from '../dist/core/cloud/gateway.js';
 import { dataSignOf, buildEnvelope, validateEnvelope, parseEnvelopeFull } from '../dist/core/cloud/envelope.js';
 import { TOPO_SUCCESS, TOPO_FAILURE } from '../dist/core/cloud/topo.js';
+import {
+  VERIFIER_INVOCATION_LABEL,
+  assertExactDockerResource,
+  createFixtureIdentity,
+  exactResourceLabels,
+  resolveCanonicalTempParent,
+} from './_real-instance-fixture.mjs';
 
 const IMAGE = 'eclipse-mosquitto:2.1.2-alpine';
-const NAME = 'tle-mqtt-verify';
-const PORT = 13240;
-const URL = `mqtt://127.0.0.1:${PORT}`;
+const identity = createFixtureIdentity({ suite: 'cgw', roles: ['main'] });
+const NAME = `tle-cloud-gateway-mqtt-${identity.invocation}`;
+const dockerLedger = [];
+let activeTempRoot;
 
 const DEVICE = 'edge-01-plant-a';
 const CREDS = {
@@ -47,8 +67,170 @@ const waitFor = async (fn, ms = 15000, step = 200) => {
   return false;
 };
 
-function startBroker() {
-  const dir = mkdtempSync(join(tmpdir(), 'tle-mosq-'));
+const allocatePort = () => new Promise((resolvePort, reject) => {
+  const listener = createTcpServer();
+  listener.once('error', reject);
+  listener.listen(0, '127.0.0.1', () => {
+    const address = listener.address();
+    if (!address || typeof address === 'string') {
+      listener.close();
+      reject(new Error('unable to allocate verifier port'));
+      return;
+    }
+    listener.close((error) => error ? reject(error) : resolvePort(address.port));
+  });
+});
+
+export async function requireSpyReconnect(spy, topic, options = {}) {
+  const waitForConnection = options.waitForConnection
+    ?? (() => waitFor(async () => spy.connected, 20000, 300));
+  if (!await waitForConnection()) {
+    throw new Error('MQTT spy 未重连，拒绝继续订阅');
+  }
+
+  const subscribeTimeoutMs = options.subscribeTimeoutMs ?? 5000;
+  const setTimer = options.setTimer ?? setTimeout;
+  const clearTimer = options.clearTimer ?? clearTimeout;
+  let timer;
+  try {
+    await Promise.race([
+      spy.subscribeAsync(topic, { qos: 1 }),
+      new Promise((_, reject) => {
+        timer = setTimer(
+          () => reject(new Error(`MQTT spy subscribe 超时（${subscribeTimeoutMs}ms）`)),
+          subscribeTimeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimer(timer);
+  }
+}
+
+const dockerNotFound = (error) => /no such (?:object|container)/i.test(
+  String(error?.stderr ?? error?.message ?? ''),
+);
+
+const inspectContainerOrAbsent = (runner, ref) => {
+  try {
+    const parsed = JSON.parse(runner(
+      ['inspect', '--type', 'container', '--', ref],
+      { stdio: 'pipe' },
+    ));
+    return parsed[0];
+  } catch (error) {
+    if (dockerNotFound(error)) return undefined;
+    throw error;
+  }
+};
+
+export function requireDockerNameAbsent(runner, name) {
+  if (inspectContainerOrAbsent(runner, name)) {
+    throw new Error(`verifier container name is already occupied: ${name}`);
+  }
+}
+
+export function captureCreatedDockerResource(runner, ledger, { name, labels, createdId }) {
+  const id = String(createdId ?? '').trim();
+  if (!/^[a-f0-9]{64}$/.test(id)) {
+    throw new Error(`created container ${name} did not return an immutable id`);
+  }
+  const expected = { kind: 'container', id, name, labels };
+  ledger.push(expected);
+  assertExactDockerResource(inspectContainerOrAbsent(runner, id), expected);
+  assertExactDockerResource(inspectContainerOrAbsent(runner, name), expected);
+  return expected;
+}
+
+export function cleanupTrackedDockerResources(runner, ledger) {
+  const failures = [];
+  for (const expected of [...ledger].reverse()) {
+    try {
+      const byId = inspectContainerOrAbsent(runner, expected.id);
+      if (!byId) {
+        if (inspectContainerOrAbsent(runner, expected.name)) {
+          throw new Error(`captured id disappeared but ${expected.name} was replaced`);
+        }
+      } else {
+        assertExactDockerResource(byId, expected);
+        assertExactDockerResource(inspectContainerOrAbsent(runner, expected.name), expected);
+        runner(['rm', '-f', '--', expected.id], { stdio: 'pipe' });
+        if (inspectContainerOrAbsent(runner, expected.id)) {
+          throw new Error(`container ${expected.id} still exists after cleanup`);
+        }
+        if (inspectContainerOrAbsent(runner, expected.name)) {
+          throw new Error(`container name ${expected.name} was replaced during cleanup`);
+        }
+      }
+      ledger.splice(ledger.indexOf(expected), 1);
+    } catch (error) {
+      failures.push(`${expected.name}: ${error.message}`);
+    }
+  }
+  return failures;
+}
+
+export function createOwnedTempRoot(purpose = 'run', onCapture = () => {}) {
+  if (!/^[a-z][a-z0-9-]{0,31}$/.test(purpose)) {
+    throw new Error(`invalid verifier temp purpose: ${purpose}`);
+  }
+  const parent = resolveCanonicalTempParent();
+  const prefix = `${identity.rootPrefix}${purpose}-`;
+  const root = realpathSync(mkdtempSync(join(parent, prefix)));
+  const owner = {
+    root,
+    parent,
+    prefix,
+    marker: join(root, '.verifier-owner'),
+    payload: JSON.stringify(exactResourceLabels(identity, `${purpose}-root`)),
+  };
+  onCapture(owner);
+  const stat = lstatSync(root);
+  if (
+    dirname(root) !== parent
+    || !basename(root).startsWith(prefix)
+    || !stat.isDirectory()
+    || stat.isSymbolicLink()
+  ) throw new Error(`verifier temp root escapes boundary: ${root}`);
+  writeFileSync(owner.marker, owner.payload, { flag: 'wx', mode: 0o600 });
+  return owner;
+}
+
+export function cleanupOwnedTempRoot(owner) {
+  if (!owner || !existsSync(owner.root)) return;
+  const root = realpathSync(owner.root);
+  const stat = lstatSync(root);
+  const markerStat = lstatSync(owner.marker);
+  if (
+    root !== owner.root
+    || dirname(root) !== owner.parent
+    || !basename(root).startsWith(owner.prefix)
+    || !stat.isDirectory()
+    || stat.isSymbolicLink()
+    || !markerStat.isFile()
+    || markerStat.isSymbolicLink()
+    || readFileSync(owner.marker, 'utf8') !== owner.payload
+  ) throw new Error(`refusing cleanup for unowned temp root: ${owner.root}`);
+  const quarantine = `${owner.root}.cleanup-${identity.invocation}`;
+  if (existsSync(quarantine)) throw new Error(`temp cleanup target already exists: ${quarantine}`);
+  renameSync(owner.root, quarantine);
+  if (readFileSync(join(quarantine, '.verifier-owner'), 'utf8') !== owner.payload) {
+    throw new Error(`temp owner changed during cleanup: ${owner.root}`);
+  }
+  rmSync(quarantine, { recursive: true, force: false });
+  if (existsSync(quarantine) || existsSync(owner.root)) {
+    throw new Error(`verifier temp root still exists after cleanup: ${owner.root}`);
+  }
+}
+
+const parsePublishedPort = (containerId, containerPort) => {
+  const output = sh(['port', containerId, `${containerPort}/tcp`]).trim();
+  const match = output.match(/^127\.0\.0\.1:(\d+)$/m);
+  if (!match) throw new Error(`cannot resolve broker port ${containerPort}: ${output}`);
+  return Number(match[1]);
+};
+
+function startBroker(dir, hostPort) {
   // 口令文件用镜像自带的 mosquitto_passwd 生成，避免手写哈希
   const hashed = sh(['run', '--rm', IMAGE, 'sh', '-c',
     `mosquitto_passwd -c -b /tmp/pw ${CREDS.username} ${CREDS.password} >/dev/null 2>&1 && cat /tmp/pw`]);
@@ -56,18 +238,43 @@ function startBroker() {
   // allow_anonymous false —— 凭据没真发出去就连不上，这条断言才有意义
   writeFileSync(join(dir, 'mosquitto.conf'),
     'listener 1883\nallow_anonymous false\npassword_file /mosquitto/config/passwd\n');
-  sh(['run', '-d', '--name', NAME, '-p', `127.0.0.1:${PORT}:1883`,
-      '-v', `${dir}/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro`,
-      '-v', `${dir}/passwd:/mosquitto/config/passwd:ro`, IMAGE]);
+  requireDockerNameAbsent(sh, NAME);
+  const labels = exactResourceLabels(identity, 'mqtt-broker');
+  const labelArgs = Object.entries(labels).flatMap(([key, value]) => ['--label', `${key}=${value}`]);
+  const createdId = sh(['run', '-d', '--name', NAME, ...labelArgs,
+    '-p', `127.0.0.1:${hostPort}:1883`,
+    '-v', `${dir}/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro`,
+    '-v', `${dir}/passwd:/mosquitto/config/passwd:ro`, IMAGE]);
+  const broker = captureCreatedDockerResource(sh, dockerLedger, {
+    name: NAME, labels, createdId,
+  });
+  const publishedPort = parsePublishedPort(broker.id, 1883);
+  if (publishedPort !== hostPort) {
+    throw new Error(`broker port identity mismatch: expected ${hostPort}, got ${publishedPort}`);
+  }
+  return { ...broker, port: publishedPort };
 }
 
-const cleanup = () => { try { sh(['rm', '-f', NAME], { stdio: 'pipe' }); } catch { /* 没起过 */ } };
+function cleanup() {
+  const failures = cleanupTrackedDockerResources(sh, dockerLedger);
+  try { cleanupOwnedTempRoot(activeTempRoot); } catch (error) { failures.push(error.message); }
+  if (failures.length > 0) throw new Error(`verifier cleanup failed: ${failures.join('; ')}`);
+  activeTempRoot = undefined;
+}
 
 async function main() {
   console.log('\n──── 虚拟网关 · 真实 MQTT broker 验证 ────\n');
-  cleanup();
+  activeTempRoot = createOwnedTempRoot('run', (captured) => { activeTempRoot = captured; });
+  chmodSync(activeTempRoot.root, 0o755);
+  const brokerDir = join(activeTempRoot.root, 'broker');
+  mkdirSync(brokerDir, { mode: 0o755 });
   console.log('  · 启动 mosquitto…');
-  startBroker();
+  const brokerPort = await allocatePort();
+  const broker = startBroker(brokerDir, brokerPort);
+  const URL = `mqtt://127.0.0.1:${broker.port}`;
+  check('broker 使用本轮不可混淆的 ownership 标签',
+    inspectContainerOrAbsent(sh, broker.id)?.Config?.Labels?.[VERIFIER_INVOCATION_LABEL]
+      === identity.invocation);
 
   const reachable = await waitFor(async () => {
     try {
@@ -302,7 +509,7 @@ async function main() {
 
   // ── 断线自愈 ──
   states.length = 0;
-  sh(['restart', NAME]);
+  sh(['restart', broker.id]);
   const back = await waitFor(async () => gw.connected, 30000, 500);
   check('broker 重启后网关自动重连', back, states.join(' → '));
 
@@ -314,8 +521,7 @@ async function main() {
    * 断言单条必达等于断言协议没承诺的事，只会随机翻红。
    * 补传保证由我们自己的 spool 提供（B5），不靠 broker 会话。
    */
-  await waitFor(async () => spy.connected, 20000, 300);
-  await spy.subscribeAsync(`/v1/devices/${DEVICE}/#`, { qos: 1 });
+  await requireSpyReconnect(spy, `/v1/devices/${DEVICE}/#`);
   const seenAfter = seen.length;
   let attempts = 0;
   const recovered = await waitFor(async () => {
@@ -327,7 +533,7 @@ async function main() {
   check('重连后上行恢复可用', recovered, `第 ${attempts} 次发出后收到`);
 
   // ── 离线时必须报错，好让上层进 spool ──
-  sh(['stop', NAME]);
+  sh(['stop', broker.id]);
   await waitFor(async () => !gw.connected, 15000, 300);
   let threw = false;
   try { await gw.publishData({ x: 1 }); } catch { threw = true; }
@@ -335,15 +541,21 @@ async function main() {
 
   await spy.endAsync(true).catch(() => {});
   await gw.close();
-  cleanup();
-
   const pass = results.filter((r) => r.ok).length;
   console.log(`\n  ${pass}/${results.length} 通过\n`);
-  if (pass !== results.length) process.exit(1);
+  if (pass !== results.length) throw new Error('虚拟网关验证存在失败项');
 }
 
-main().catch(async (e) => {
-  console.error('\n  验证异常：', e.message);
-  cleanup();
-  process.exit(1);
-});
+const direct = process.argv[1]
+  && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
+if (direct) {
+  main()
+    .then(() => cleanup())
+    .catch((error) => {
+      try { cleanup(); } catch (cleanupError) {
+        console.error('\n  清理异常：', cleanupError.message);
+      }
+      console.error('\n  验证异常：', error.message);
+      process.exit(1);
+    });
+}

@@ -13,9 +13,21 @@
  */
 import mqtt from 'mqtt';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, chmodSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { createServer as createTcpServer } from 'node:net';
+import { basename, dirname, join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import { openDb } from '../dist/core/db.js';
 import { deriveKey } from '../dist/core/auth/crypto.js';
@@ -26,16 +38,24 @@ import { DockerClient } from '../dist/core/instance/docker-client.js';
 import { buildServer } from '../dist/http/app.js';
 import { CloudConfigRepo } from '../dist/core/cloud/config-repo.js';
 import { CloudRuntime } from '../dist/core/cloud/runtime.js';
-import { TEST_DATA_ROOT, TEST_EDGE_ROOT, ensureRoot } from './_data-root.mjs';
 import { adminSession } from './_session.mjs';
+import {
+  VERIFIER_INVOCATION_LABEL,
+  assertExactDockerResource,
+  createFixtureIdentity,
+  exactResourceLabels,
+  resolveCanonicalTempParent,
+} from './_real-instance-fixture.mjs';
 
 const IMAGE = 'eclipse-mosquitto:2.1.2-alpine';
-const NAME = 'tle-cloudtls-mqtt';
-/** 只验服务端身份的监听口 */
-const PORT_SRV = 13251;
-/** require_certificate true，逼着客户端也出示证书 */
-const PORT_MUTUAL = 13252;
-const HTTP_PORT = 13253;
+const identity = createFixtureIdentity({ suite: 'ctls', roles: ['main'] });
+const NAME = `tle-cloud-tls-mqtt-${identity.invocation}`;
+const NETWORK_PREFIX = identity.networkPrefix;
+const dockerLedger = [];
+let activeTempRoot;
+let activeApp;
+let activeCloud;
+let activeDb;
 
 const ADMIN_PW = 'initial-password-123';
 const DEVICE = 'edge-gw-tls';
@@ -55,6 +75,143 @@ const ssl = (args, cwd) => execFileSync('openssl', args, { cwd, encoding: 'utf8'
 const waitFor = async (fn, ms = 20000, step = 200) => {
   for (let i = 0; i < ms / step; i++) { if (await fn()) return true; await sleep(step); }
   return false;
+};
+
+const allocatePort = () => new Promise((resolvePort, reject) => {
+  const listener = createTcpServer();
+  listener.once('error', reject);
+  listener.listen(0, '127.0.0.1', () => {
+    const address = listener.address();
+    if (!address || typeof address === 'string') {
+      listener.close();
+      reject(new Error('unable to allocate verifier port'));
+      return;
+    }
+    listener.close((error) => error ? reject(error) : resolvePort(address.port));
+  });
+});
+
+const dockerNotFound = (error) => /no such (?:object|container)/i.test(
+  String(error?.stderr ?? error?.message ?? ''),
+);
+
+const inspectContainerOrAbsent = (runner, ref) => {
+  try {
+    const parsed = JSON.parse(runner(
+      ['inspect', '--type', 'container', '--', ref],
+      { stdio: 'pipe' },
+    ));
+    return parsed[0];
+  } catch (error) {
+    if (dockerNotFound(error)) return undefined;
+    throw error;
+  }
+};
+
+export function requireDockerNameAbsent(runner, name) {
+  if (inspectContainerOrAbsent(runner, name)) {
+    throw new Error(`verifier container name is already occupied: ${name}`);
+  }
+}
+
+export function captureCreatedDockerResource(runner, ledger, { name, labels, createdId }) {
+  const id = String(createdId ?? '').trim();
+  if (!/^[a-f0-9]{64}$/.test(id)) {
+    throw new Error(`created container ${name} did not return an immutable id`);
+  }
+  const expected = { kind: 'container', id, name, labels };
+  ledger.push(expected);
+  assertExactDockerResource(inspectContainerOrAbsent(runner, id), expected);
+  assertExactDockerResource(inspectContainerOrAbsent(runner, name), expected);
+  return expected;
+}
+
+export function cleanupTrackedDockerResources(runner, ledger) {
+  const failures = [];
+  for (const expected of [...ledger].reverse()) {
+    try {
+      const byId = inspectContainerOrAbsent(runner, expected.id);
+      if (!byId) {
+        if (inspectContainerOrAbsent(runner, expected.name)) {
+          throw new Error(`captured id disappeared but ${expected.name} was replaced`);
+        }
+      } else {
+        assertExactDockerResource(byId, expected);
+        assertExactDockerResource(inspectContainerOrAbsent(runner, expected.name), expected);
+        runner(['rm', '-f', '--', expected.id], { stdio: 'pipe' });
+        if (inspectContainerOrAbsent(runner, expected.id)) {
+          throw new Error(`container ${expected.id} still exists after cleanup`);
+        }
+        if (inspectContainerOrAbsent(runner, expected.name)) {
+          throw new Error(`container name ${expected.name} was replaced during cleanup`);
+        }
+      }
+      ledger.splice(ledger.indexOf(expected), 1);
+    } catch (error) {
+      failures.push(`${expected.name}: ${error.message}`);
+    }
+  }
+  return failures;
+}
+
+export function createOwnedTempRoot(purpose = 'run', onCapture = () => {}) {
+  if (!/^[a-z][a-z0-9-]{0,31}$/.test(purpose)) {
+    throw new Error(`invalid verifier temp purpose: ${purpose}`);
+  }
+  const parent = resolveCanonicalTempParent();
+  const prefix = `${identity.rootPrefix}${purpose}-`;
+  const root = realpathSync(mkdtempSync(join(parent, prefix)));
+  const owner = {
+    root,
+    parent,
+    prefix,
+    marker: join(root, '.verifier-owner'),
+    payload: JSON.stringify(exactResourceLabels(identity, `${purpose}-root`)),
+  };
+  onCapture(owner);
+  const stat = lstatSync(root);
+  if (
+    dirname(root) !== parent
+    || !basename(root).startsWith(prefix)
+    || !stat.isDirectory()
+    || stat.isSymbolicLink()
+  ) throw new Error(`verifier temp root escapes boundary: ${root}`);
+  writeFileSync(owner.marker, owner.payload, { flag: 'wx', mode: 0o600 });
+  return owner;
+}
+
+export function cleanupOwnedTempRoot(owner) {
+  if (!owner || !existsSync(owner.root)) return;
+  const root = realpathSync(owner.root);
+  const stat = lstatSync(root);
+  const markerStat = lstatSync(owner.marker);
+  if (
+    root !== owner.root
+    || dirname(root) !== owner.parent
+    || !basename(root).startsWith(owner.prefix)
+    || !stat.isDirectory()
+    || stat.isSymbolicLink()
+    || !markerStat.isFile()
+    || markerStat.isSymbolicLink()
+    || readFileSync(owner.marker, 'utf8') !== owner.payload
+  ) throw new Error(`refusing cleanup for unowned temp root: ${owner.root}`);
+  const quarantine = `${owner.root}.cleanup-${identity.invocation}`;
+  if (existsSync(quarantine)) throw new Error(`temp cleanup target already exists: ${quarantine}`);
+  renameSync(owner.root, quarantine);
+  if (readFileSync(join(quarantine, '.verifier-owner'), 'utf8') !== owner.payload) {
+    throw new Error(`temp owner changed during cleanup: ${owner.root}`);
+  }
+  rmSync(quarantine, { recursive: true, force: false });
+  if (existsSync(quarantine) || existsSync(owner.root)) {
+    throw new Error(`verifier temp root still exists after cleanup: ${owner.root}`);
+  }
+}
+
+const parsePublishedPort = (containerId, containerPort) => {
+  const output = sh(['port', containerId, `${containerPort}/tcp`]).trim();
+  const match = output.match(/^127\.0\.0\.1:(\d+)$/m);
+  if (!match) throw new Error(`cannot resolve broker port ${containerPort}: ${output}`);
+  return Number(match[1]);
 };
 
 /**
@@ -119,25 +276,68 @@ function startBroker(dir) {
   ].join('\n'));
   chmodSync(join(dir, 'mosquitto.conf'), 0o644);
 
-  sh(['run', '-d', '--name', NAME,
-      '-p', `127.0.0.1:${PORT_SRV}:8883`, '-p', `127.0.0.1:${PORT_MUTUAL}:8884`,
-      '-v', `${dir}/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro`,
-      '-v', `${dir}/passwd:/mosquitto/config/passwd:ro`,
-      '-v', `${dir}/ca.crt:/mosquitto/config/ca.crt:ro`,
-      '-v', `${dir}/server.crt:/mosquitto/config/server.crt:ro`,
-      '-v', `${dir}/server.key:/mosquitto/config/server.key:ro`,
-      IMAGE]);
+  requireDockerNameAbsent(sh, NAME);
+  const labels = exactResourceLabels(identity, 'mqtt-broker');
+  const labelArgs = Object.entries(labels).flatMap(([key, value]) => ['--label', `${key}=${value}`]);
+  const createdId = sh(['run', '-d', '--name', NAME, ...labelArgs,
+    '-p', '127.0.0.1::8883', '-p', '127.0.0.1::8884',
+    '-v', `${dir}/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro`,
+    '-v', `${dir}/passwd:/mosquitto/config/passwd:ro`,
+    '-v', `${dir}/ca.crt:/mosquitto/config/ca.crt:ro`,
+    '-v', `${dir}/server.crt:/mosquitto/config/server.crt:ro`,
+    '-v', `${dir}/server.key:/mosquitto/config/server.key:ro`,
+    IMAGE]);
+  const broker = captureCreatedDockerResource(sh, dockerLedger, {
+    name: NAME, labels, createdId,
+  });
+  return {
+    ...broker,
+    serverPort: parsePublishedPort(broker.id, 8883),
+    mutualPort: parsePublishedPort(broker.id, 8884),
+  };
 }
-const cleanup = () => { try { sh(['rm', '-f', NAME], { stdio: 'pipe' }); } catch { /* 没起过 */ } };
+
+async function cleanup() {
+  const failures = [];
+  for (const [name, close] of [
+    ['cloud', async () => activeCloud?.close()],
+    ['app', async () => activeApp?.close()],
+    ['database', async () => activeDb?.close()],
+  ]) {
+    try { await close(); } catch (error) { failures.push(`${name}: ${error.message}`); }
+  }
+  activeCloud = undefined;
+  activeApp = undefined;
+  activeDb = undefined;
+  const dockerFailures = cleanupTrackedDockerResources(sh, dockerLedger);
+  failures.push(...dockerFailures);
+  try { cleanupOwnedTempRoot(activeTempRoot); } catch (error) { failures.push(error.message); }
+  if (failures.length > 0) throw new Error(`verifier cleanup failed: ${failures.join('; ')}`);
+  activeTempRoot = undefined;
+}
 
 async function main() {
   console.log('\n──── 云对接 TLS · 真实证书握手验证 ────\n');
-  cleanup();
-  const certDir = mkdtempSync(join(tmpdir(), 'tle-tls-certs-'));
+  activeTempRoot = createOwnedTempRoot('run', (captured) => { activeTempRoot = captured; });
+  chmodSync(activeTempRoot.root, 0o755);
+  const certDir = join(activeTempRoot.root, 'certs');
+  const dataDir = join(activeTempRoot.root, 'manager');
+  const edgeRoot = join(activeTempRoot.root, 'edge');
+  const instanceDataRoot = join(edgeRoot, 'instances');
+  mkdirSync(certDir, { mode: 0o755 });
+  mkdirSync(dataDir, { mode: 0o700 });
+  mkdirSync(edgeRoot, { mode: 0o755 });
+  mkdirSync(instanceDataRoot, { mode: 0o777 });
   console.log('  · 生成证书…');
   const C = makeCerts(certDir);
   console.log('  · 启动 mosquitto（TLS）…');
-  startBroker(certDir);
+  const broker = startBroker(certDir);
+  const PORT_SRV = broker.serverPort;
+  const PORT_MUTUAL = broker.mutualPort;
+  const HTTP_PORT = await allocatePort();
+  check('broker 使用本轮不可混淆的 ownership 标签',
+    inspectContainerOrAbsent(sh, broker.id)?.Config?.Labels?.[VERIFIER_INVOCATION_LABEL]
+      === identity.invocation);
 
   const reachable = await waitFor(async () => {
     try {
@@ -150,17 +350,16 @@ async function main() {
   if (!reachable) throw new Error('mosquitto TLS 未就绪');
 
   // ── 起 Manager，接线方式与 index.ts 一致 ──────────────
-  const dataDir = mkdtempSync(join(tmpdir(), 'tle-cloudtls-'));
   const db = openDb(join(dataDir, 'edge.db'));
+  activeDb = db;
   const key = deriveKey('verify-master', 'thinglinks-edge:instance-cred');
   const auth = new AuthService(db);
   auth.ensureInitialUser('admin', ADMIN_PW);
   const repo = new InstanceRepo(db, key);
-  await ensureRoot();
 
   const docker = new DockerClient({
-    network: 'tle-cloudtls-net', imageRepo: 'nodered/node-red',
-    portRange: { min: 30000, max: 30999 }, instanceDataRoot: TEST_DATA_ROOT, timezone: 'Asia/Shanghai',
+    network: NETWORK_PREFIX, imageRepo: 'nodered/node-red',
+    portRange: { min: 30000, max: 30999 }, instanceDataRoot, timezone: 'Asia/Shanghai',
   });
   const service = new InstanceService({
     db, repo, docker, basePath: '', portRange: { min: 30000, max: 30999 },
@@ -170,12 +369,14 @@ async function main() {
     externalUrl: `http://127.0.0.1:${HTTP_PORT}`, basePath: '', cookieSecure: false,
     allowedOrigins: [`http://127.0.0.1:${HTTP_PORT}`], listenAddr: '127.0.0.1',
     listenPort: HTTP_PORT, dataDir, portRange: { min: 30000, max: 30999 },
-    dataRoot: TEST_EDGE_ROOT, instanceDataRoot: TEST_DATA_ROOT,
+    dataRoot: edgeRoot, instanceDataRoot,
   };
 
   const cloudConfig = new CloudConfigRepo(db, key);
   const cloud = new CloudRuntime();
+  activeCloud = cloud;
   const app = buildServer({ config, db, auth, repo, service, cloud, cloudConfig });
+  activeApp = app;
   await app.listen({ host: '127.0.0.1', port: HTTP_PORT });
   const B = `http://127.0.0.1:${HTTP_PORT}`;
 
@@ -316,17 +517,24 @@ async function main() {
   const rows = db.prepare('SELECT COUNT(*) AS n FROM cloud_config').get();
   check('解除对接后配置行已删除，客户端私钥不再留在库里', rows.n === 0, `剩 ${rows.n} 行`);
 
-  await cloud.close();
-  await app.close();
-
   const failed = results.filter((r) => !r.ok);
   console.log(`\n  ${results.length - failed.length}/${results.length} 通过`);
   if (failed.length) {
     console.log('  失败：' + failed.map((f) => f.name).join('、'));
-    process.exitCode = 1;
+    throw new Error('云对接 TLS 验证存在失败项');
   }
 }
 
-main()
-  .catch((e) => { console.error('\n[fatal]', e); process.exitCode = 1; })
-  .finally(cleanup);
+const direct = process.argv[1]
+  && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
+if (direct) {
+  main()
+    .then(() => cleanup())
+    .catch(async (error) => {
+      try { await cleanup(); } catch (cleanupError) {
+        console.error('\n[cleanup]', cleanupError.message);
+      }
+      console.error('\n[fatal]', error);
+      process.exitCode = 1;
+    });
+}

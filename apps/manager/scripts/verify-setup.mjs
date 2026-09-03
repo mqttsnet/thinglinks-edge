@@ -12,8 +12,6 @@
  * 过期分支用一个极短的窗口（0.01 分钟）验，不靠改系统时间 ——
  * 这也是 SETUP_WINDOW_MIN 收小数的唯一理由。
  */
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { openDb } from '../dist/core/db.js';
@@ -23,6 +21,13 @@ import { InstanceRepo } from '../dist/core/instance/repo.js';
 import { InstanceService } from '../dist/core/instance/service.js';
 import { DockerClient } from '../dist/core/instance/docker-client.js';
 import { buildServer } from '../dist/http/app.js';
+import {
+  allocateLoopbackPort,
+  cleanupOwnedTempAreas,
+  closeVerifierResources,
+  createOwnedTempArea,
+  databaseCloser,
+} from './_owned-temp.mjs';
 
 const results = [];
 const check = (name, ok, detail = '') => {
@@ -30,13 +35,20 @@ const check = (name, ok, detail = '') => {
   console.log(`  ${ok ? '✓' : '✗'} ${name}${detail ? '  — ' + detail : ''}`);
 };
 const jarOf = (res) => (res.headers.getSetCookie?.() ?? []).map((c) => c.split(';')[0]).join('; ');
+const startedApps = [];
+const tempAreas = [];
 
 /** 起一台 Manager。`windowMin` 直接写进 env，注册路由时就读它 */
-async function start(port, windowMin) {
+async function start(windowMin) {
   if (windowMin === undefined) delete process.env['SETUP_WINDOW_MIN'];
   else process.env['SETUP_WINDOW_MIN'] = String(windowMin);
-  const dataDir = mkdtempSync(join(tmpdir(), 'tle-setup-'));
+  const area = createOwnedTempArea('setup');
+  tempAreas.push(area);
+  const dataDir = area.dataDir;
+  const port = await allocateLoopbackPort();
   const db = openDb(join(dataDir, 'edge.db'));
+  const runtime = { app: undefined, db, area, B: '', closed: false };
+  startedApps.push(runtime);
   const key = deriveKey('verify-master', 'thinglinks-edge:instance-cred');
   const auth = new AuthService(db, key);
   const repo = new InstanceRepo(db, key);
@@ -56,8 +68,19 @@ async function start(port, windowMin) {
     },
     db, auth, repo, service,
   });
+  runtime.app = app;
+  runtime.B = `http://127.0.0.1:${port}`;
   await app.listen({ host: '127.0.0.1', port });
-  return { app, db, auth, B: `http://127.0.0.1:${port}` };
+  return runtime;
+}
+
+async function closeRuntime(runtime) {
+  if (runtime.closed) return;
+  await closeVerifierResources([
+    ...(runtime.app ? [{ label: 'server', close: () => runtime.app.close() }] : []),
+    databaseCloser(runtime.db),
+  ]);
+  runtime.closed = true;
 }
 
 const post = (B, path, body) => fetch(`${B}${path}`, {
@@ -70,7 +93,7 @@ async function main() {
   // ── A. 正常认领 ───────────────────────────────────────
   // 不传 SETUP_WINDOW_MIN，走默认
   delete process.env['SETUP_WINDOW_MIN'];
-  const a = await start(13281, undefined);
+  const a = await start(undefined);
 
   const state0 = await (await fetch(`${a.B}/api/setup`)).json();
   check('全新部署上，未登录也读得到「需要首次设置」',
@@ -118,10 +141,10 @@ async function main() {
   check('设置的口令不落审计', !JSON.stringify(
     a.db.prepare('SELECT * FROM audit').all()).includes('my-own-password-1'));
 
-  await a.app.close();
+  await closeRuntime(a);
 
   // ── C. 显式开了限时的部署（暴露到厂区网/公网时才需要）─────
-  const c = await start(13282, 0.01);          // 0.6 秒，够跑完下面这几步
+  const c = await start(0.01);          // 0.6 秒，够跑完下面这几步
   const beforeExpiry = await (await fetch(`${c.B}/api/setup`)).json();
   check('配了 SETUP_WINDOW_MIN 时窗口内可以设置',
         beforeExpiry.needed === true && beforeExpiry.expired === false
@@ -144,16 +167,16 @@ async function main() {
   check('被拒的认领尝试进了审计，事后查得到有人来敲过门',
         JSON.stringify(c.db.prepare("SELECT * FROM audit WHERE action = 'setup'").all())
           .includes('认领窗口已过'));
-  await c.app.close();
+  await closeRuntime(c);
 
   // ── D. 显式写 0 与默认等价 ─────────────────────────────
-  const d = await start(13283, 0);
+  const d = await start(0);
   const unlimited = await (await fetch(`${d.B}/api/setup`)).json();
   check('显式 SETUP_WINDOW_MIN=0 与默认一样是不限时',
         unlimited.needed === true && unlimited.expired === false && unlimited.expiresInSec === 0);
   const okUnlimited = await post(d.B, '/api/setup', { username: 'admin', password: 'my-own-password-1' });
   check('不限时的实例照样能正常设置', okUnlimited.status === 200, `HTTP ${okUnlimited.status}`);
-  await d.app.close();
+  await closeRuntime(d);
 
   const failed = results.filter((r) => !r.ok);
   console.log(`\n  ${results.length - failed.length}/${results.length} 通过`);
@@ -163,4 +186,15 @@ async function main() {
   }
 }
 
-main().catch((e) => { console.error('\n[fatal]', e); process.exitCode = 1; });
+main().catch((e) => { console.error('\n[fatal]', e); process.exitCode = 1; })
+  .finally(async () => {
+    const failures = [];
+    for (const runtime of [...startedApps].reverse()) {
+      try { await closeRuntime(runtime); } catch (error) { failures.push(error); }
+    }
+    try { cleanupOwnedTempAreas(tempAreas); } catch (error) { failures.push(error); }
+    if (failures.length) {
+      console.error('\n[cleanup fatal]', new AggregateError(failures, 'setup verifier cleanup failed'));
+      process.exitCode = 1;
+    }
+  });

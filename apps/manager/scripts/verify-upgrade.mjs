@@ -15,26 +15,16 @@
  * 数据必须原样活下来：流程、账号、adminRoot、端口。升级的定义就是
  * 「换个版本继续跑同一台实例」。
  */
-import Docker from 'dockerode';
-
-import { openDb } from '../dist/core/db.js';
-import { deriveKey } from '../dist/core/auth/crypto.js';
-import { AuthService } from '../dist/core/auth/service.js';
-import { InstanceRepo } from '../dist/core/instance/repo.js';
-import { InstanceService } from '../dist/core/instance/service.js';
-import { DockerClient } from '../dist/core/instance/docker-client.js';
-import { buildServer } from '../dist/http/app.js';
 import { UserRepo } from '../dist/core/auth/user-repo.js';
 import { containerName } from '../dist/core/instance/container-spec.js';
-import { TEST_DATA_ROOT, TEST_EDGE_ROOT, ensureRoot, resetDataDir } from './_data-root.mjs';
+import {
+  createFixtureIdentity,
+  createRealInstanceFixture,
+} from './_real-instance-fixture.mjs';
 import { adminSession, sessionFor } from './_session.mjs';
 
-const NET = 'tle-upg-net';
-const BRIDGE = 'tle-upg-bridge';
-const PORT = 13288;
-const NR_PORT = 30950;
-const ADMIN_PW = 'initial-password-123';
-const ID = 'upg-a';
+const identity = createFixtureIdentity({ suite: 'upg', roles: ['main'] });
+const ID = identity.instances.main;
 
 const OLD_TAG = '4.1.13-22-minimal';
 const NEW_TAG = '5.0.4-24-minimal';
@@ -46,9 +36,9 @@ const ABSENT_TAG = '9.9.9-absent';
  * 于是 docker create 成功、docker start 报 "unable to find user node-red"。
  * 这是真实的 docker 失败，不是注入的桩 —— 正好用来逼出回滚路径。
  */
-const BROKEN_TAG = 'tle-broken-test';
+const BROKEN_TAG = `tle-broken-${identity.invocation}`;
 
-const raw = new Docker();
+let fixture;
 const results = [];
 const check = (name, ok, detail = '') => {
   results.push({ name, ok });
@@ -57,7 +47,7 @@ const check = (name, ok, detail = '') => {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const inspect = async () =>
-  raw.getContainer(containerName(ID)).inspect().catch(() => null);
+  fixture.raw.getContainer(containerName(ID)).inspect().catch(() => null);
 const imageOf = async () => {
   const i = await inspect();
   return i ? i.Config.Image : '(容器不存在)';
@@ -74,79 +64,52 @@ const FLOWS = [
     props: [{ p: 'payload' }], payload: 'keep-me', payloadType: 'str', x: 150, y: 100, wires: [[]] },
 ];
 
-async function cleanup() {
-  await raw.getContainer(`${BRIDGE}-${ID}`).remove({ force: true }).catch(() => {});
-  await raw.getContainer(containerName(ID)).remove({ force: true }).catch(() => {});
-  await raw.getNetwork(`${NET}-${ID}`).remove().catch(() => {});
-  await raw.getImage(`nodered/node-red:${BROKEN_TAG}`).remove().catch(() => {});
-  await resetDataDir(ID);
-}
-
-let server;
 async function main() {
-  await cleanup();
-  await ensureRoot();
-
-  // 造出那个「起不来」的镜像：给 alpine 打上 node-red 的 tag
-  await raw.getImage('alpine:3.22').tag({ repo: 'nodered/node-red', tag: BROKEN_TAG });
-
-  const db = openDb(':memory:');
-  const auth = new AuthService(db);
-  auth.ensureInitialUser('admin', ADMIN_PW);
-  const repo = new InstanceRepo(db, deriveKey('verify', 'salt'));
+  fixture = await createRealInstanceFixture({
+    identity,
+    allowedImageTags: [OLD_TAG, NEW_TAG, ABSENT_TAG, BROKEN_TAG],
+  });
+  const { db, repo } = fixture;
   const users = new UserRepo(db);
   const viewerPassword = users.create('watcher', 'viewer', 'admin');
 
-  const docker = new DockerClient({
-    network: NET, imageRepo: 'nodered/node-red',
-    portRange: { min: 30000, max: 30999 },
-    instanceDataRoot: TEST_DATA_ROOT, timezone: 'Asia/Shanghai',
-  });
-  const service = new InstanceService({
-    db, repo, docker, basePath: '', portRange: { min: 30000, max: 30999 },
-    allowedImageTags: [OLD_TAG, NEW_TAG, ABSENT_TAG, BROKEN_TAG],
-  });
-  const config = {
-    externalUrl: `http://127.0.0.1:${PORT}`, basePath: '', cookieSecure: false,
-    allowedOrigins: [`http://127.0.0.1:${PORT}`], listenAddr: '127.0.0.1', listenPort: PORT,
-    dataDir: `${TEST_EDGE_ROOT}/manager`, dataRoot: TEST_EDGE_ROOT,
-    instanceDataRoot: TEST_DATA_ROOT,
-    portRange: { min: 30000, max: 30999 }, timezone: 'Asia/Shanghai', updateCheckUrl: '',
-  };
+  // 造出那个「起不来」的镜像；随机 tag 由 fixture 按不可变 image ID 回收。
+  await fixture.createImageAlias('alpine:3.22', 'nodered/node-red', BROKEN_TAG);
 
-  const app = buildServer({
-    config, db, auth, repo, service,
-    upstreamFor: () => `http://127.0.0.1:${NR_PORT}`,
-  });
-  await app.listen({ host: '127.0.0.1', port: PORT });
-  server = app;
-  const B = `http://127.0.0.1:${PORT}`;
+  const B = fixture.baseUrl;
   const H = (s) => ({ cookie: s.cookie, 'content-type': 'application/json', 'x-csrf-token': s.csrf });
 
-  const admin = await adminSession(B, ADMIN_PW);
+  const admin = await adminSession(B, fixture.adminPassword, fixture.adminNextPassword);
   check('管理员登录成功', Boolean(admin.csrf));
 
-  // ── 建一台旧版本实例并部署流程 ─────────────────
-  const created = await fetch(`${B}/api/instances`, {
-    method: 'POST', headers: H(admin),
-    body: JSON.stringify({ id: ID, name: ID, imageTag: OLD_TAG, memoryMb: 512, cpus: 0.5, ports: [] }),
+  // ── 建模一台升级功能上线前已经存在的 legacy 旧实例 ──
+  // 新实例只允许 5.x npm bootstrap；4.1 起点必须走受控 legacy fixture，
+  // 否则是在要求一个声明仅支持 Node-RED >=5.0.4 的平台包装进 4.1。
+  const mappedPort = await fixture.allocateMappedPort();
+  await fixture.createLegacyInstance('main', {
+    name: ID,
+    imageTag: OLD_TAG,
+    memoryMb: 512,
+    cpus: 0.5,
+    ports: [{
+      hostPort: mappedPort,
+      containerPort: 1883,
+      protocol: 'tcp',
+      hostIp: '127.0.0.1',
+      purpose: '升级验证保留项',
+    }],
   });
-  check(`建实例（${OLD_TAG}）`, created.status === 201,
-    created.status === 201 ? '' : `HTTP ${created.status} ${JSON.stringify(await created.json()).slice(0, 200)}`);
+  check(`受控构造 legacy 实例（${OLD_TAG}）`, true);
+
+  const originalIdentity = {
+    adminRoot: repo.get(ID)?.adminRoot,
+    credentials: repo.credentials(ID),
+    ingestToken: repo.ingestToken(ID),
+    ports: repo.ports(ID),
+  };
 
   for (let i = 0; i < 40 && !(await running()); i++) await sleep(1000);
   check('实例在运行', await running(), await imageOf());
-
-  await raw.createContainer({
-    name: `${BRIDGE}-${ID}`, Image: 'alpine/socat',
-    Cmd: [`TCP-LISTEN:${NR_PORT},fork,reuseaddr`, `TCP:${containerName(ID)}:1880`],
-    ExposedPorts: { [`${NR_PORT}/tcp`]: {} },
-    HostConfig: {
-      NetworkMode: docker.instanceNetwork(ID),
-      PortBindings: { [`${NR_PORT}/tcp`]: [{ HostIp: '127.0.0.1', HostPort: String(NR_PORT) }] },
-    },
-  }).then((c) => c.start());
-  await sleep(1500);
 
   const ready = async () => {
     for (let i = 0; i < 60; i++) {
@@ -173,10 +136,15 @@ async function main() {
   check('流程读得回来', await flowsPresent());
 
   const upgrade = async (tag, s = admin) => {
-    const res = await fetch(`${B}/api/instances/${ID}/image`, {
-      method: 'POST', headers: H(s), body: JSON.stringify({ imageTag: tag }),
-    });
-    return { status: res.status, body: await res.json().catch(() => ({})) };
+    try {
+      const res = await fetch(`${B}/api/instances/${ID}/image`, {
+        method: 'POST', headers: H(s), body: JSON.stringify({ imageTag: tag }),
+      });
+      return { status: res.status, body: await res.json().catch(() => ({})) };
+    } finally {
+      // 成功升级与失败回滚都会替换容器；清理只能使用这里重新捕获的 immutable ID。
+      await fixture.captureCurrentInstance('main');
+    }
   };
 
   // ── 1. 白名单外的版本一律拒绝 ─────────────────
@@ -207,6 +175,13 @@ async function main() {
   check('平台侧记录的版本也更新了',
     listed.instances?.find((i) => i.id === ID)?.imageTag === NEW_TAG,
     listed.instances?.find((i) => i.id === ID)?.imageTag);
+  check('升级只换镜像，账号/adminRoot/接入令牌/端口全部保留',
+    JSON.stringify({
+      adminRoot: repo.get(ID)?.adminRoot,
+      credentials: repo.credentials(ID),
+      ingestToken: repo.ingestToken(ID),
+      ports: repo.ports(ID),
+    }) === JSON.stringify(originalIdentity));
 
   // ── 4. 同版本无需升级 ─────────────────────────
   const same = await upgrade(NEW_TAG);
@@ -223,6 +198,13 @@ async function main() {
   check('回滚后版本退回升级前的那个', (await imageOf()).endsWith(NEW_TAG), await imageOf());
   await sleep(1000);
   check('**回滚后流程仍然完好**', await ready() && await flowsPresent());
+  check('失败回滚仍保留账号/adminRoot/接入令牌/端口',
+    JSON.stringify({
+      adminRoot: repo.get(ID)?.adminRoot,
+      credentials: repo.credentials(ID),
+      ingestToken: repo.ingestToken(ID),
+      ports: repo.ports(ID),
+    }) === JSON.stringify(originalIdentity));
 
   // ── 6. 权限 ──────────────────────────────────
   const viewer = await sessionFor(B, 'watcher', viewerPassword);
@@ -246,13 +228,16 @@ async function main() {
 main()
   .catch((e) => { console.error('\n验证脚本自身出错：', e); results.push({ name: '脚本执行', ok: false }); })
   .finally(async () => {
-    await server?.close().catch(() => {});
-    await cleanup();
+    const cleanupFailures = fixture ? await fixture.cleanup() : [];
+    if (cleanupFailures.length > 0) {
+      console.error('\n验证资源清理失败：', cleanupFailures.join(' | '));
+      results.push({ name: '随机验证资源清理', ok: false });
+    }
     const bad = results.filter((r) => !r.ok);
     console.log(`\n实例版本升级验证：${results.length - bad.length}/${results.length} 通过`);
     if (bad.length > 0) {
       console.log('未通过：');
       for (const r of bad) console.log(`  ✗ ${r.name}`);
     }
-    process.exit(bad.length === 0 ? 0 : 1);
+    process.exitCode = bad.length === 0 ? 0 : 1;
   });

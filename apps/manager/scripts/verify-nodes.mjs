@@ -27,8 +27,10 @@ import { gzipSync } from 'node:zlib';
 import { createServer } from 'node:http';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { createServer as createTcpServer } from 'node:net';
+import { existsSync, realpathSync } from 'node:fs';
 import { chmod, lstat, mkdir, mkdtemp, realpath, rm } from 'node:fs/promises';
 import { basename, dirname, join, relative, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import { openDb } from '../dist/core/db.js';
 import { deriveKey } from '../dist/core/auth/crypto.js';
@@ -83,8 +85,21 @@ const BOOTSTRAP_TX_LABEL = 'com.mqttsnet.thinglinks-edge.bootstrap-tx';
 const VERIFY_RUN_LABEL = 'com.mqttsnet.thinglinks-edge.verify-run';
 const VERIFY_ROLE_LABEL = 'com.mqttsnet.thinglinks-edge.verify-role';
 const NETWORK_NAME = `${NET}-${ID}`;
-const PRIVATE_TMP = '/private/tmp';
 const REVIEWED_MANAGER_IMAGE = process.env.MANAGER_IMAGE?.trim() ?? '';
+const SOCAT_IMAGE = 'alpine/socat@sha256:5f275aa1b6e9889c851f61097142ee050fc6ac4615b4ea64ac1f2b0e81ff8d7f';
+
+export function resolveCanonicalTempParent(adapters = {}) {
+  const pathExists = adapters.existsSync ?? existsSync;
+  const canonicalize = adapters.realpathSync ?? realpathSync;
+  const candidate = pathExists('/private/tmp') ? '/private/tmp' : '/tmp';
+  const canonical = canonicalize(candidate);
+  if (canonical !== '/private/tmp' && canonical !== '/tmp') {
+    throw new Error(`canonical temp parent escapes allowed boundary: ${canonical}`);
+  }
+  return canonical;
+}
+
+const CANONICAL_TMP_PARENT = resolveCanonicalTempParent();
 
 let PORT;
 let NR_PORT;
@@ -249,24 +264,22 @@ const listVerifyNetworks = () => raw.listNetworks({
 
 async function assertRunRoot(path) {
   if (!path) throw new Error('随机验证根尚未创建');
-  const parent = await realpath(PRIVATE_TMP);
   const actual = await realpath(path);
   const stat = await lstat(path);
-  const rel = relative(parent, actual);
+  const rel = relative(CANONICAL_TMP_PARENT, actual);
   if (
     !stat.isDirectory()
     || stat.isSymbolicLink()
-    || dirname(actual) !== parent
+    || dirname(actual) !== CANONICAL_TMP_PARENT
     || rel.startsWith('..')
-    || resolve(parent, rel) !== actual
+    || resolve(CANONICAL_TMP_PARENT, rel) !== actual
     || !basename(actual).startsWith(`tle-nodes-${RUN_ID}-`)
   ) throw new Error(`随机验证根越界：${actual}`);
   return actual;
 }
 
 async function createRunRoot() {
-  const parent = await realpath(PRIVATE_TMP);
-  const root = await mkdtemp(`${parent}/tle-nodes-${RUN_ID}-`);
+  const root = await mkdtemp(join(CANONICAL_TMP_PARENT, `tle-nodes-${RUN_ID}-`));
   RUN_ROOT = root;
   RUN_ROOT = await assertRunRoot(root);
   TEST_EDGE_ROOT = RUN_ROOT;
@@ -336,7 +349,7 @@ async function createBootstrapBridges(docker) {
 
   await createVerifyContainer({
     name: BRIDGE_IN,
-    Image: 'alpine/socat',
+    Image: SOCAT_IMAGE,
     Cmd: [`TCP-LISTEN:${NR_PORT},fork,reuseaddr`, `TCP:${containerName(ID)}:1880`],
     ExposedPorts: { [`${NR_PORT}/tcp`]: {} },
     HostConfig: {
@@ -346,7 +359,7 @@ async function createBootstrapBridges(docker) {
   }, 'bridge-in', true);
   await createVerifyContainer({
     name: BRIDGE_OUT,
-    Image: 'alpine/socat',
+    Image: SOCAT_IMAGE,
     Cmd: [`TCP-LISTEN:${REG_PORT},fork,reuseaddr`, `TCP:host.docker.internal:${PORT}`],
     HostConfig: {
       NetworkMode: docker.instanceNetwork(ID),
@@ -1379,47 +1392,52 @@ async function main() {
   check('改批准清单要过 CSRF', noCsrf.status === 403, `HTTP ${noCsrf.status}`);
 }
 
-main()
-  .catch((e) => { console.error('\n验证脚本自身出错：', e); results.push({ name: '脚本执行', ok: false }); })
-  .finally(async () => {
-    failFast = false;
-    if (server) {
-      try {
-        await server.close();
-      } catch (error) {
-        check('Manager verifier listener 关闭', false, error.message);
+if (
+  process.argv[1]
+  && import.meta.url === pathToFileURL(realpathSync(resolve(process.argv[1]))).href
+) {
+  main()
+    .catch((e) => { console.error('\n验证脚本自身出错：', e); results.push({ name: '脚本执行', ok: false }); })
+    .finally(async () => {
+      failFast = false;
+      if (server) {
+        try {
+          await server.close();
+        } catch (error) {
+          check('Manager verifier listener 关闭', false, error.message);
+        }
       }
-    }
-    await closeHttpServer(upstreamServer).catch((error) => {
-      check('假上游监听关闭', false, error.message);
+      await closeHttpServer(upstreamServer).catch((error) => {
+        check('假上游监听关闭', false, error.message);
+      });
+      if (nodeStore) {
+        try {
+          const expectedModules = [
+            PLATFORM_NODE_PACKAGE.name,
+            PLATFORM_COMMON_PACKAGE.name,
+            ...GENERIC_FIXTURE_PACKAGES,
+          ].sort();
+          check('随机 store 只含两个固定根与五个精确命名夹具',
+            JSON.stringify(nodeStore.modules()) === JSON.stringify(expectedModules));
+          check('固定 Edge/common 信任根字节在验证前后保持不变',
+            [PLATFORM_NODE_PACKAGE, PLATFORM_COMMON_PACKAGE].every((pin) => {
+              const bytes = nodeStore.tarball(pin.name, pin.version);
+              return bytes
+                && createHash('sha256').update(bytes).digest('hex') === protectedDigests?.get(pin.name);
+            }));
+        } catch (error) {
+          check('普通夹具清理与固定信任根复核', false, error.message);
+        }
+      }
+      const cleanupFailures = await cleanup();
+      check('随机资源按不可变 ID 与归属标签清理干净', cleanupFailures.length === 0,
+        cleanupFailures.join(' | '));
+      const bad = results.filter((r) => !r.ok);
+      console.log(`\n节点管理验证：${results.length - bad.length}/${results.length} 通过`);
+      if (bad.length > 0) {
+        console.log('未通过：');
+        for (const r of bad) console.log(`  ✗ ${r.name}`);
+      }
+      process.exit(bad.length === 0 ? 0 : 1);
     });
-    if (nodeStore) {
-      try {
-        const expectedModules = [
-          PLATFORM_NODE_PACKAGE.name,
-          PLATFORM_COMMON_PACKAGE.name,
-          ...GENERIC_FIXTURE_PACKAGES,
-        ].sort();
-        check('随机 store 只含两个固定根与五个精确命名夹具',
-          JSON.stringify(nodeStore.modules()) === JSON.stringify(expectedModules));
-        check('固定 Edge/common 信任根字节在验证前后保持不变',
-          [PLATFORM_NODE_PACKAGE, PLATFORM_COMMON_PACKAGE].every((pin) => {
-            const bytes = nodeStore.tarball(pin.name, pin.version);
-            return bytes
-              && createHash('sha256').update(bytes).digest('hex') === protectedDigests?.get(pin.name);
-          }));
-      } catch (error) {
-        check('普通夹具清理与固定信任根复核', false, error.message);
-      }
-    }
-    const cleanupFailures = await cleanup();
-    check('随机资源按不可变 ID 与归属标签清理干净', cleanupFailures.length === 0,
-      cleanupFailures.join(' | '));
-    const bad = results.filter((r) => !r.ok);
-    console.log(`\n节点管理验证：${results.length - bad.length}/${results.length} 通过`);
-    if (bad.length > 0) {
-      console.log('未通过：');
-      for (const r of bad) console.log(`  ✗ ${r.name}`);
-    }
-    process.exit(bad.length === 0 ? 0 : 1);
-  });
+}

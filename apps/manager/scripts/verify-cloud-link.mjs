@@ -12,9 +12,21 @@
  */
 import mqtt from 'mqtt';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { createServer as createTcpServer } from 'node:net';
+import { basename, dirname, join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import { openDb } from '../dist/core/db.js';
 import { deriveKey } from '../dist/core/auth/crypto.js';
@@ -28,17 +40,29 @@ import { CloudConfigRepo } from '../dist/core/cloud/config-repo.js';
 import { CloudRuntime } from '../dist/core/cloud/runtime.js';
 import { dataSignOf, parseEnvelopeFull } from '../dist/core/cloud/envelope.js';
 import { UserRepo } from '../dist/core/auth/user-repo.js';
-import { TEST_DATA_ROOT, TEST_EDGE_ROOT, ensureRoot } from './_data-root.mjs';
 import { adminSession, sessionFor } from './_session.mjs';
+import {
+  VERIFIER_INVOCATION_LABEL,
+  assertExactDockerResource,
+  createFixtureIdentity,
+  exactResourceLabels,
+  resolveCanonicalTempParent,
+} from './_real-instance-fixture.mjs';
 
 const IMAGE = 'eclipse-mosquitto:2.1.2-alpine';
-const NAME = 'tle-cloudlink-mqtt';
-const MQTT_PORT = 13241;
-const HTTP_PORT = 13242;
-const BROKER = `mqtt://127.0.0.1:${MQTT_PORT}`;
+const identity = createFixtureIdentity({ suite: 'clink', roles: ['main'] });
+const NAME = `tle-cloud-link-mqtt-${identity.invocation}`;
+const NETWORK_PREFIX = identity.networkPrefix;
+const dockerLedger = [];
+let activeTempRoot;
+let activeApp;
+let activeCloud;
+let activeSpool;
+let activeDb;
+let activeSubscriber;
 
 const ADMIN_PW = 'initial-password-123';
-const INSTANCE = 'cloudlink-a';
+const INSTANCE = identity.instances.main;
 
 const DEVICE = 'edge-gw-verify';
 const CLIENT_ID = '2130020836696064@1';
@@ -64,8 +88,144 @@ const waitFor = async (fn, ms = 20000, step = 200) => {
   return false;
 };
 
-function startBroker() {
-  const dir = mkdtempSync(join(tmpdir(), 'tle-mosq-link-'));
+const allocatePort = () => new Promise((resolvePort, reject) => {
+  const listener = createTcpServer();
+  listener.once('error', reject);
+  listener.listen(0, '127.0.0.1', () => {
+    const address = listener.address();
+    if (!address || typeof address === 'string') {
+      listener.close();
+      reject(new Error('unable to allocate verifier port'));
+      return;
+    }
+    listener.close((error) => error ? reject(error) : resolvePort(address.port));
+  });
+});
+
+const dockerNotFound = (error) => /no such (?:object|container)/i.test(
+  String(error?.stderr ?? error?.message ?? ''),
+);
+
+const inspectContainerOrAbsent = (runner, ref) => {
+  try {
+    const parsed = JSON.parse(runner(
+      ['inspect', '--type', 'container', '--', ref],
+      { stdio: 'pipe' },
+    ));
+    return parsed[0];
+  } catch (error) {
+    if (dockerNotFound(error)) return undefined;
+    throw error;
+  }
+};
+
+export function requireDockerNameAbsent(runner, name) {
+  if (inspectContainerOrAbsent(runner, name)) {
+    throw new Error(`verifier container name is already occupied: ${name}`);
+  }
+}
+
+export function captureCreatedDockerResource(runner, ledger, { name, labels, createdId }) {
+  const id = String(createdId ?? '').trim();
+  if (!/^[a-f0-9]{64}$/.test(id)) {
+    throw new Error(`created container ${name} did not return an immutable id`);
+  }
+  const expected = { kind: 'container', id, name, labels };
+  ledger.push(expected);
+  assertExactDockerResource(inspectContainerOrAbsent(runner, id), expected);
+  assertExactDockerResource(inspectContainerOrAbsent(runner, name), expected);
+  return expected;
+}
+
+export function cleanupTrackedDockerResources(runner, ledger) {
+  const failures = [];
+  for (const expected of [...ledger].reverse()) {
+    try {
+      const byId = inspectContainerOrAbsent(runner, expected.id);
+      if (!byId) {
+        if (inspectContainerOrAbsent(runner, expected.name)) {
+          throw new Error(`captured id disappeared but ${expected.name} was replaced`);
+        }
+      } else {
+        assertExactDockerResource(byId, expected);
+        assertExactDockerResource(inspectContainerOrAbsent(runner, expected.name), expected);
+        runner(['rm', '-f', '--', expected.id], { stdio: 'pipe' });
+        if (inspectContainerOrAbsent(runner, expected.id)) {
+          throw new Error(`container ${expected.id} still exists after cleanup`);
+        }
+        if (inspectContainerOrAbsent(runner, expected.name)) {
+          throw new Error(`container name ${expected.name} was replaced during cleanup`);
+        }
+      }
+      ledger.splice(ledger.indexOf(expected), 1);
+    } catch (error) {
+      failures.push(`${expected.name}: ${error.message}`);
+    }
+  }
+  return failures;
+}
+
+export function createOwnedTempRoot(purpose = 'run', onCapture = () => {}) {
+  if (!/^[a-z][a-z0-9-]{0,31}$/.test(purpose)) {
+    throw new Error(`invalid verifier temp purpose: ${purpose}`);
+  }
+  const parent = resolveCanonicalTempParent();
+  const prefix = `${identity.rootPrefix}${purpose}-`;
+  const root = realpathSync(mkdtempSync(join(parent, prefix)));
+  const owner = {
+    root,
+    parent,
+    prefix,
+    marker: join(root, '.verifier-owner'),
+    payload: JSON.stringify(exactResourceLabels(identity, `${purpose}-root`)),
+  };
+  onCapture(owner);
+  const stat = lstatSync(root);
+  if (
+    dirname(root) !== parent
+    || !basename(root).startsWith(prefix)
+    || !stat.isDirectory()
+    || stat.isSymbolicLink()
+  ) throw new Error(`verifier temp root escapes boundary: ${root}`);
+  writeFileSync(owner.marker, owner.payload, { flag: 'wx', mode: 0o600 });
+  return owner;
+}
+
+export function cleanupOwnedTempRoot(owner) {
+  if (!owner || !existsSync(owner.root)) return;
+  const root = realpathSync(owner.root);
+  const stat = lstatSync(root);
+  const markerStat = lstatSync(owner.marker);
+  if (
+    root !== owner.root
+    || dirname(root) !== owner.parent
+    || !basename(root).startsWith(owner.prefix)
+    || !stat.isDirectory()
+    || stat.isSymbolicLink()
+    || !markerStat.isFile()
+    || markerStat.isSymbolicLink()
+    || readFileSync(owner.marker, 'utf8') !== owner.payload
+  ) throw new Error(`refusing cleanup for unowned temp root: ${owner.root}`);
+  const quarantine = `${owner.root}.cleanup-${identity.invocation}`;
+  if (existsSync(quarantine)) throw new Error(`temp cleanup target already exists: ${quarantine}`);
+  renameSync(owner.root, quarantine);
+  if (readFileSync(join(quarantine, '.verifier-owner'), 'utf8') !== owner.payload) {
+    throw new Error(`temp owner changed during cleanup: ${owner.root}`);
+  }
+  rmSync(quarantine, { recursive: true, force: false });
+  if (existsSync(quarantine) || existsSync(owner.root)) {
+    throw new Error(`verifier temp root still exists after cleanup: ${owner.root}`);
+  }
+}
+
+const parsePublishedPort = (containerId, containerPort) => {
+  const output = sh(['port', containerId, `${containerPort}/tcp`]).trim();
+  const match = output.match(/^127\.0\.0\.1:(\d+)$/m);
+  if (!match) throw new Error(`cannot resolve broker port ${containerPort}: ${output}`);
+  return Number(match[1]);
+};
+
+function startBroker(dir, hostPort) {
   const hashed = sh(['run', '--rm', IMAGE, 'sh', '-c',
     `mosquitto_passwd -c -b /tmp/pw ${MQTT_USER} ${MQTT_PASS} >/dev/null 2>&1 && cat /tmp/pw`]);
   writeFileSync(join(dir, 'passwd'), hashed);
@@ -75,17 +235,67 @@ function startBroker() {
   writeFileSync(join(dir, 'mosquitto.conf'),
     'listener 1883\nallow_anonymous false\npassword_file /mosquitto/config/passwd\n'
     + 'log_type all\n');
-  sh(['run', '-d', '--name', NAME, '-p', `127.0.0.1:${MQTT_PORT}:1883`,
-      '-v', `${dir}/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro`,
-      '-v', `${dir}/passwd:/mosquitto/config/passwd:ro`, IMAGE]);
+  requireDockerNameAbsent(sh, NAME);
+  const labels = exactResourceLabels(identity, 'mqtt-broker');
+  const labelArgs = Object.entries(labels).flatMap(([key, value]) => ['--label', `${key}=${value}`]);
+  const createdId = sh(['run', '-d', '--name', NAME, ...labelArgs,
+    '-p', `127.0.0.1:${hostPort}:1883`,
+    '-v', `${dir}/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro`,
+    '-v', `${dir}/passwd:/mosquitto/config/passwd:ro`, IMAGE]);
+  const broker = captureCreatedDockerResource(sh, dockerLedger, {
+    name: NAME, labels, createdId,
+  });
+  const publishedPort = parsePublishedPort(broker.id, 1883);
+  if (publishedPort !== hostPort) {
+    throw new Error(`broker port identity mismatch: expected ${hostPort}, got ${publishedPort}`);
+  }
+  return { ...broker, port: publishedPort };
 }
-const cleanup = () => { try { sh(['rm', '-f', NAME], { stdio: 'pipe' }); } catch { /* 没起过 */ } };
+
+async function cleanup() {
+  const failures = [];
+  for (const [name, close] of [
+    ['subscriber', async () => activeSubscriber?.endAsync(true)],
+    ['cloud', async () => activeCloud?.close()],
+    ['app', async () => activeApp?.close()],
+    ['spool', async () => activeSpool?.close()],
+    ['database', async () => activeDb?.close()],
+  ]) {
+    try { await close(); } catch (error) { failures.push(`${name}: ${error.message}`); }
+  }
+  activeSubscriber = undefined;
+  activeCloud = undefined;
+  activeApp = undefined;
+  activeSpool = undefined;
+  activeDb = undefined;
+
+  const dockerFailures = cleanupTrackedDockerResources(sh, dockerLedger);
+  failures.push(...dockerFailures);
+  try { cleanupOwnedTempRoot(activeTempRoot); } catch (error) { failures.push(error.message); }
+  if (failures.length > 0) throw new Error(`verifier cleanup failed: ${failures.join('; ')}`);
+  activeTempRoot = undefined;
+}
 
 async function main() {
   console.log('\n──── 云对接整条链路 · 真实 broker 验证 ────\n');
-  cleanup();
+  activeTempRoot = createOwnedTempRoot('run', (captured) => { activeTempRoot = captured; });
+  chmodSync(activeTempRoot.root, 0o755);
+  const brokerDir = join(activeTempRoot.root, 'broker');
+  const dataDir = join(activeTempRoot.root, 'manager');
+  const edgeRoot = join(activeTempRoot.root, 'edge');
+  const instanceDataRoot = join(edgeRoot, 'instances');
+  mkdirSync(brokerDir, { mode: 0o755 });
+  mkdirSync(dataDir, { mode: 0o700 });
+  mkdirSync(edgeRoot, { mode: 0o755 });
+  mkdirSync(instanceDataRoot, { mode: 0o777 });
   console.log('  · 启动 mosquitto…');
-  startBroker();
+  const brokerPort = await allocatePort();
+  const broker = startBroker(brokerDir, brokerPort);
+  const BROKER = `mqtt://127.0.0.1:${broker.port}`;
+  const HTTP_PORT = await allocatePort();
+  check('broker 使用本轮不可混淆的 ownership 标签',
+    inspectContainerOrAbsent(sh, broker.id)?.Config?.Labels?.[VERIFIER_INVOCATION_LABEL]
+      === identity.invocation);
 
   const reachable = await waitFor(async () => {
     try {
@@ -97,13 +307,12 @@ async function main() {
   if (!reachable) throw new Error('mosquitto 未就绪');
 
   // ── 起 Manager，接线方式与 index.ts 完全一致 ──────────────
-  const dataDir = mkdtempSync(join(tmpdir(), 'tle-cloudlink-'));
   const db = openDb(join(dataDir, 'edge.db'));
+  activeDb = db;
   const key = deriveKey('verify-master', 'thinglinks-edge:instance-cred');
   const auth = new AuthService(db);
   auth.ensureInitialUser('admin', ADMIN_PW);
   const repo = new InstanceRepo(db, key);
-  await ensureRoot();
 
   // 只要一条实例记录来换接入令牌，不需要真容器 —— 这一支验的是云那一侧
   repo.create(
@@ -120,8 +329,8 @@ async function main() {
   const opsPassword = users.create('ops', 'operator', 'admin');
 
   const docker = new DockerClient({
-    network: 'tle-cloudlink-net', imageRepo: 'nodered/node-red',
-    portRange: { min: 30000, max: 30999 }, instanceDataRoot: TEST_DATA_ROOT, timezone: 'Asia/Shanghai',
+    network: NETWORK_PREFIX, imageRepo: 'nodered/node-red',
+    portRange: { min: 30000, max: 30999 }, instanceDataRoot, timezone: 'Asia/Shanghai',
   });
   const service = new InstanceService({
     db, repo, docker, basePath: '', portRange: { min: 30000, max: 30999 },
@@ -131,20 +340,23 @@ async function main() {
     externalUrl: `http://127.0.0.1:${HTTP_PORT}`, basePath: '', cookieSecure: false,
     allowedOrigins: [`http://127.0.0.1:${HTTP_PORT}`], listenAddr: '127.0.0.1',
     listenPort: HTTP_PORT, dataDir, portRange: { min: 30000, max: 30999 },
-    dataRoot: TEST_EDGE_ROOT, instanceDataRoot: TEST_DATA_ROOT,
+    dataRoot: edgeRoot, instanceDataRoot,
   };
 
   const spool = await Spool.open({
     dir: join(dataDir, 'spool'), flushIntervalMs: 5, fullPolicy: 'drop-oldest',
   });
+  activeSpool = spool;
   const cloudConfig = new CloudConfigRepo(db, key);
   const cloud = new CloudRuntime();
+  activeCloud = cloud;
   await cloud.apply(cloudConfig.get());
 
   const app = buildServer({
     config, db, auth, repo, service, spool, cloud, cloudConfig,
     cloudSink: (payload) => cloud.publish(payload),
   });
+  activeApp = app;
   await app.listen({ host: '127.0.0.1', port: HTTP_PORT });
   const B = `http://127.0.0.1:${HTTP_PORT}`;
 
@@ -212,6 +424,7 @@ async function main() {
 
   // ── 5. 上行真的到了 broker，且签名用的就是配置里那把 key ──
   const sub = await mqtt.connectAsync(BROKER, { username: MQTT_USER, password: MQTT_PASS });
+  activeSubscriber = sub;
   const received = [];
   sub.on('message', (topic, payload) => received.push({ topic, payload }));
   await sub.subscribeAsync(DATAS_TOPIC, { qos: 1 });
@@ -251,7 +464,7 @@ async function main() {
   const connLine = (clientId) => {
     // mosquitto 把日志写到 **stderr**，而 execFileSync 只带回 stdout ——
     // 用 sh() 拿到的会是空字符串，且不报错。两个流都收才看得到东西
-    const r = spawnSync('docker', ['logs', NAME], { encoding: 'utf8' });
+    const r = spawnSync('docker', ['logs', broker.id], { encoding: 'utf8' });
     const log = `${r.stdout ?? ''}${r.stderr ?? ''}`;
     const lines = log.split('\n').filter((l) => l.includes('New client connected')
       && l.includes(`as ${clientId}`));
@@ -294,7 +507,7 @@ async function main() {
 
   // ── 6. 断网落缓存，恢复后补传 ─────────────────────────
   received.length = 0;
-  sh(['stop', NAME], { stdio: 'pipe' });
+  sh(['stop', broker.id], { stdio: 'pipe' });
   const wentOffline = await waitFor(async () => cloud.state !== 'online', 15000);
   check('broker 停掉后运行期状态变为非 online', wentOffline, `state=${cloud.state}`);
 
@@ -303,7 +516,7 @@ async function main() {
   const m = await spool.metrics();
   check('断网期间的数据落进断网缓存，没有丢', spooled, `缓存 ${m.pending} 条`);
 
-  sh(['start', NAME], { stdio: 'pipe' });
+  sh(['start', broker.id], { stdio: 'pipe' });
   const backOnline = await waitFor(async () => cloud.state === 'online', 40000);
   check('broker 恢复后自动重连', backOnline, `state=${cloud.state}`);
 
@@ -333,18 +546,24 @@ async function main() {
   check('解除后配置行已删除，凭据不再留在库里', rows.n === 0, `剩 ${rows.n} 行`);
   check('解除后运行期回到未配置', cloud.state === 'unconfigured', `state=${cloud.state}`);
 
-  await sub.endAsync(true);
-  await cloud.close();
-  await app.close();
-
   const failed = results.filter((r) => !r.ok);
   console.log(`\n  ${results.length - failed.length}/${results.length} 通过`);
   if (failed.length) {
     console.log('  失败：' + failed.map((f) => f.name).join('、'));
-    process.exitCode = 1;
+    throw new Error('云对接整条链路验证存在失败项');
   }
 }
 
-main()
-  .catch((e) => { console.error('\n[fatal]', e); process.exitCode = 1; })
-  .finally(cleanup);
+const direct = process.argv[1]
+  && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
+if (direct) {
+  main()
+    .then(() => cleanup())
+    .catch(async (error) => {
+      try { await cleanup(); } catch (cleanupError) {
+        console.error('\n[cleanup]', cleanupError.message);
+      }
+      console.error('\n[fatal]', error);
+      process.exitCode = 1;
+    });
+}

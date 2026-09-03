@@ -22,10 +22,10 @@ import {
   writeFileSync,
 } from 'node:fs';
 import net from 'node:net';
-import { dirname, isAbsolute, join, relative } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import process from 'node:process';
 import { PassThrough } from 'node:stream';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import Database from 'better-sqlite3';
 import Docker from 'dockerode';
 import { runProxyPolicySelfTests } from './verify-platform-manager-entry.mjs';
@@ -79,6 +79,19 @@ const EDGE_MODULE_PATH = 'node_modules/@mqttsnet/thinglinks-edge-nodes';
 const COMMON_MODULE_PATH = 'node_modules/@mqttsnet/thinglinks-node-red-common';
 const results = new Map(phases.map((phase) => [phase, undefined]));
 const raw = new Docker();
+
+export function resolveCanonicalTempParent(adapters = {}) {
+  const pathExists = adapters.existsSync ?? existsSync;
+  const canonicalize = adapters.realpathSync ?? realpathSync;
+  const candidate = pathExists('/private/tmp') ? '/private/tmp' : '/tmp';
+  const canonical = canonicalize(candidate);
+  if (canonical !== '/private/tmp' && canonical !== '/tmp') {
+    throw new Error(`canonical temp parent escapes allowed boundary: ${canonical}`);
+  }
+  return canonical;
+}
+
+const CANONICAL_TMP_PARENT = resolveCanonicalTempParent();
 
 const sleep = (ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
@@ -736,7 +749,7 @@ class PlatformVerifier {
   }
 
   initializeWorkspace() {
-    this.root = realpathSync(mkdtempSync(join('/private/tmp', `${this.runId}-`)));
+    this.root = realpathSync(mkdtempSync(join(CANONICAL_TMP_PARENT, `${this.runId}-`)));
     chmodSync(this.root, 0o700);
     const rootStat = lstatSync(this.root);
     assert.equal(rootStat.isDirectory() && !rootStat.isSymbolicLink()
@@ -1258,7 +1271,10 @@ console.log('TLE_PROXY_RESULT:'+JSON.stringify({status:response.statusCode,body:
       bootstrapContainerId = JSON.parse(bootstrapContainerCreate.body).Id;
       await this.resources.trackContainer(raw.getContainer(bootstrapContainerId), bootstrapCreate.name);
       const bootstrapConnect = await this.proxyHttp(
-        'POST', `/networks/${bootstrapNetworkId}/connect`, { Container: managerProbeId },
+        'POST', `/networks/${bootstrapNetworkId}/connect`, {
+          Container: managerProbeId,
+          EndpointConfig: { Aliases: [this.managerName] },
+        },
       );
       assert.equal(bootstrapConnect.status, 200, bootstrapConnect.body);
       const bootstrapArchive = await this.proxyHttp(
@@ -1404,7 +1420,10 @@ console.log('TLE_PROXY_RESULT:'+JSON.stringify({status:response.statusCode,body:
       assert.equal(foreignConnect.status, 403);
       assert.deepEqual(await exactResources(), expected);
       const connect = await this.proxyHttp(
-        'POST', `/networks/${allowedNetworkId}/connect`, { Container: managerProbeId },
+        'POST', `/networks/${allowedNetworkId}/connect`, {
+          Container: managerProbeId,
+          EndpointConfig: { Aliases: [this.managerName] },
+        },
       );
       assert.equal(connect.status, 200, connect.body);
       const disconnect = await this.proxyHttp(
@@ -1436,7 +1455,7 @@ console.log('TLE_PROXY_RESULT:'+JSON.stringify({status:response.statusCode,body:
       );
       assert.equal(removedNetworkRead.status, 404, removedNetworkRead.body);
       this.proxyPolicyEvidence = {
-        static: '82/82',
+        static: '87/87',
         liveDenied: maliciousNetworks.length + 1 + malicious.length + 1 + denied.length + 1,
       };
       this.proxyPolicyEvidence.denialLogCount = (await this.proxyDenialLines()).length;
@@ -1901,7 +1920,10 @@ console.log('TLE_PROXY_RESULT:'+JSON.stringify({status:response.statusCode,body:
     });
     assert.equal(injected, true);
     assert.equal(operation.response.status, 400);
-    assert.match(operation.response.body.error, /创建实例失败（install），已完成补偿清理/);
+    assert.match(
+      operation.response.body.error,
+      /创建实例失败（install\/container-barrier），已完成补偿清理/,
+    );
     assert.equal(await raw.getContainer(containerName(id)).inspect().then(() => true).catch(() => false), false);
     assert.equal(await raw.getNetwork(`${this.networkPrefix}-${id}`).inspect()
       .then(() => true).catch(() => false), false);
@@ -3074,8 +3096,8 @@ console.log('TLE_PROXY_RESULT:'+JSON.stringify({status:response.statusCode,body:
           const stat = lstatSync(this.root);
           assert.equal(stat.isDirectory() && !stat.isSymbolicLink(), true);
           assert.equal(realpathSync(this.root), this.root);
-          assert.equal(dirname(this.root), '/private/tmp');
-          assert.ok(this.root.startsWith(`/private/tmp/${this.runId}-`));
+          assert.equal(dirname(this.root), CANONICAL_TMP_PARENT);
+          assert.ok(basename(this.root).startsWith(`${this.runId}-`));
           cleanupRootValidated = true;
         });
         if (cleanupRootValidated && this.managerImageId) {
@@ -3105,8 +3127,8 @@ console.log('TLE_PROXY_RESULT:'+JSON.stringify({status:response.statusCode,body:
             const stat = lstatSync(this.root);
             assert.equal(stat.isDirectory() && !stat.isSymbolicLink(), true);
             assert.equal(realpathSync(this.root), this.root);
-            assert.equal(dirname(this.root), '/private/tmp');
-            assert.ok(this.root.startsWith(`/private/tmp/${this.runId}-`));
+            assert.equal(dirname(this.root), CANONICAL_TMP_PARENT);
+            assert.ok(basename(this.root).startsWith(`${this.runId}-`));
             rmSync(this.root, { recursive: true, force: false });
             assert.equal(existsSync(this.root), false);
           });
@@ -3236,7 +3258,12 @@ async function main() {
   process.stdout.write(`\n14/14 通过 · Manager ${verifier.managerImageId} · Node-RED ${verifier.nodeImageId}\n`);
 }
 
-main().catch((error) => {
-  process.stderr.write(`platform-node verifier FAIL: ${safeError(error)}\n`);
-  process.exitCode = 1;
-});
+if (
+  process.argv[1]
+  && import.meta.url === pathToFileURL(realpathSync(resolve(process.argv[1]))).href
+) {
+  main().catch((error) => {
+    process.stderr.write(`platform-node verifier FAIL: ${safeError(error)}\n`);
+    process.exitCode = 1;
+  });
+}

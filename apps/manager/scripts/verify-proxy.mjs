@@ -64,6 +64,7 @@ const ADMIN_PW = randomBytes(24).toString('base64url');
 const ADMIN_NEXT_PW = randomBytes(24).toString('base64url');
 const NR_PW = randomBytes(24).toString('base64url');
 const NR_CREDENTIAL_SECRET = randomBytes(24).toString('base64url');
+const SOCAT_IMAGE = 'alpine/socat@sha256:5f275aa1b6e9889c851f61097142ee050fc6ac4615b4ea64ac1f2b0e81ff8d7f';
 
 const raw = new Docker();
 const results = [];
@@ -451,7 +452,7 @@ async function main() {
   // 测试脚手架：实例 1880 不映射宿主，用边车转发给宿主测试
   const instNet = client.instanceNetwork(ID);
   const bridge = await raw.createContainer({
-    name: BRIDGE, Image: 'alpine/socat',
+    name: BRIDGE, Image: SOCAT_IMAGE,
     User: '65534:65534',
     Cmd: [`TCP-LISTEN:${BRIDGE_PORT},fork,reuseaddr`, `TCP:${containerName(ID)}:1880`],
     Labels: { [RUN_LABEL]: RUN_ID, [INSTANCE_LABEL]: ID, [ROLE_LABEL]: 'bridge' },

@@ -957,8 +957,19 @@ export async function authorizeDockerProxyRequest(request, env, adapters) {
     const value = policyJson(body, `network ${networkMutation[2]}`, 4 * 1024);
     const manager = await adapters.inspectContainer(env.managerName);
     const managerId = assertManager(manager, env);
-    if (networkMutation[2] === 'connect') policyKeys(value, ['Container']);
-    else policyKeys(value, ['Container', 'Force']);
+    if (networkMutation[2] === 'connect') {
+      policyKeys(value, ['Container', 'EndpointConfig']);
+      const endpoint = policyRecord(value.EndpointConfig, 'network Manager endpoint');
+      policyKeys(endpoint, ['Aliases']);
+      policy(
+        Array.isArray(endpoint.Aliases)
+          && endpoint.Aliases.length === 1
+          && endpoint.Aliases[0] === env.managerName,
+        'network Manager alias',
+      );
+    } else {
+      policyKeys(value, ['Container', 'Force']);
+    }
     policy(value.Container === managerId, 'network Manager target');
     if (networkMutation[2] === 'disconnect') policy(value.Force === true, 'disconnect force');
     return { body };
@@ -1273,6 +1284,10 @@ export async function runProxyPolicySelfTests() {
   const allowedBootstrap = await dispatch(requestFor(structuredClone(fixture.bootstrapCreate)));
   assert.equal(allowedBootstrap.status, 200);
   const allowedBefore = { forwarded, mutations };
+  const managerConnectBody = {
+    Container: fixture.managerId,
+    EndpointConfig: { Aliases: [env.managerName] },
+  };
 
   const maliciousCreates = [
     ['custom Cmd', (value) => { value.Cmd = ['sleep', '1']; }],
@@ -1333,6 +1348,36 @@ export async function runProxyPolicySelfTests() {
     assert.deepEqual({ forwarded, mutations }, allowedBefore, `${name} forwarded`);
   }
 
+  const deniedConnectBodies = [
+    ['missing Manager alias', { Container: fixture.managerId }],
+    ['foreign Manager alias', {
+      Container: fixture.managerId,
+      EndpointConfig: { Aliases: ['foreign-manager'] },
+    }],
+    ['multiple Manager aliases', {
+      Container: fixture.managerId,
+      EndpointConfig: { Aliases: [env.managerName, 'foreign-manager'] },
+    }],
+    ['extra endpoint key', {
+      Container: fixture.managerId,
+      EndpointConfig: { Aliases: [env.managerName], IPAddress: '127.0.0.1' },
+    }],
+    ['extra connect key', {
+      Container: fixture.managerId,
+      EndpointConfig: { Aliases: [env.managerName] },
+      Force: true,
+    }],
+  ];
+  for (const [name, value] of deniedConnectBodies) {
+    const response = await dispatch({
+      method: 'POST',
+      url: `/networks/${fixture.networkId}/connect`,
+      body: Buffer.from(JSON.stringify(value)),
+    });
+    assert.equal(response.status, 403, name);
+    assert.deepEqual({ forwarded, mutations }, allowedBefore, `${name} forwarded`);
+  }
+
   const deniedRequests = [
     ['foreign inspect', { method: 'GET', url: `/containers/${fixture.foreignContainerId}/json` }],
     ['foreign logs', { method: 'GET', url: `/containers/${fixture.foreignContainerId}/logs?stdout=1&stderr=1` }],
@@ -1341,7 +1386,9 @@ export async function runProxyPolicySelfTests() {
     ['foreign canonical container read', { method: 'GET', url: '/containers/tle-nr-vpolicy-foreign/json' }],
     ['foreign canonical network read', { method: 'GET', url: '/networks/v11-policy-test-instance-vpolicy-foreign' }],
     ['foreign connect target', { method: 'POST', url: `/networks/${fixture.networkId}/connect`,
-      body: Buffer.from(JSON.stringify({ Container: fixture.foreignContainerId })) }],
+      body: Buffer.from(JSON.stringify({
+        ...managerConnectBody, Container: fixture.foreignContainerId,
+      })) }],
     ['foreign connect network', { method: 'POST', url: `/networks/${fixture.foreignNetworkId}/connect`,
       body: Buffer.from(JSON.stringify({ Container: fixture.managerId })) }],
     ['encoded path', { method: 'GET', url: `/containers/%2e%2e/json` }],
@@ -1440,7 +1487,7 @@ export async function runProxyPolicySelfTests() {
   assert.equal(removedNetworkRead.status, 200);
   const connect = await dispatch({
     method: 'POST', url: `/networks/${fixture.networkId}/connect`,
-    body: Buffer.from(JSON.stringify({ Container: fixture.managerId })),
+    body: Buffer.from(JSON.stringify(managerConnectBody)),
   });
   assert.equal(connect.status, 200);
   const archiveWrite = await dispatch({
@@ -1476,7 +1523,8 @@ export async function runProxyPolicySelfTests() {
   const networkUpstreamFilters = JSON.parse(networkUpstream.searchParams.get('filters'));
   assert.ok(networkUpstreamFilters.label.includes(`${RUN_LABEL}=${env.runId}`));
 
-  const passed = 8 + maliciousCreates.length + networkCreates.length + deniedRequests.length + 13;
+  const passed = 8 + maliciousCreates.length + networkCreates.length
+    + deniedConnectBodies.length + deniedRequests.length + 13;
   return { passed, total: passed };
 }
 

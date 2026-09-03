@@ -55,8 +55,6 @@ const CANONICAL_TMP_PARENT = realpathSync(existsSync('/private/tmp') ? '/private
 assert.ok(CANONICAL_TMP_PARENT === '/private/tmp' || CANONICAL_TMP_PARENT === '/tmp');
 
 let PORT;
-let HEALTHY_PORT;
-let BROKEN_PORT;
 let B;
 let RUN_ROOT;
 let OWNER_FILE;
@@ -82,6 +80,28 @@ const check = (name, ok, detail = '') => {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const sh = (args, opts = {}) => execFileSync('docker', args, { encoding: 'utf8', cwd: REPO, ...opts });
 
+function probeInstanceRegistry(instanceContainerId, managerContainerId, network) {
+  assert.match(instanceContainerId, /^[a-f0-9]{64}$/);
+  assert.match(managerContainerId, /^[a-f0-9]{64}$/);
+  const endpoint = network.Containers?.[managerContainerId];
+  assert.equal(endpoint?.Name, MGR);
+  const expectedAddress = String(endpoint?.IPv4Address ?? '').split('/', 1)[0];
+  assert.match(expectedAddress, /^\d+\.\d+\.\d+\.\d+$/);
+  const registryUrl = `http://${MGR}:19100/npm/%40mqttsnet%2Fthinglinks-edge-nodes`;
+  const script = `const dns=require('node:dns').promises;Promise.all([`
+    + `dns.lookup(${JSON.stringify(MGR)},{family:4}),`
+    + `fetch(${JSON.stringify(registryUrl)},{signal:AbortSignal.timeout(4000)})])`
+    + `.then(([resolved,response])=>console.log(JSON.stringify({address:resolved.address,status:response.status})))`
+    + `.catch(error=>{console.log(JSON.stringify({error:error.code||error.name||'unknown'}));process.exitCode=1})`;
+  try {
+    const output = sh(['exec', instanceContainerId, 'node', '-e', script]).trim();
+    const observed = JSON.parse(output.split('\n').at(-1) ?? '{}');
+    return { expectedAddress, address: observed.address ?? '', status: observed.status ?? 0 };
+  } catch {
+    return { expectedAddress, address: '', status: 0 };
+  }
+}
+
 /*
  * 调用方必须先构建并提供已审查的 MANAGER_IMAGE。本脚本加载部署主文件和
  * 一个只调整随机测试数据根权限的临时覆盖（没有 build/image 字段），把解析后的
@@ -94,7 +114,8 @@ const composeEnvironment = () => {
     'EXTERNAL_URL', 'MASTER_KEY', 'DOCKER_GID', 'BIND_ADDR', 'HOST_PORT',
     'INSTANCE_NETWORK', 'ALLOWED_IMAGE_TAGS', 'EDGE_DATA_ROOT', 'EDGE_NAME_PREFIX',
     'INSTANCE_PORT_MIN', 'INSTANCE_PORT_MAX', 'EDGE_NODE_INSTALL_POLICY',
-    'EDGE_NPM_UPSTREAM', 'MANAGER_IMAGE', 'PROXY_IMAGE', 'INIT_IMAGE',
+    'EDGE_NPM_UPSTREAM', 'NODE_RED_IMAGE_REPO',
+    'MANAGER_IMAGE', 'PROXY_IMAGE', 'INIT_IMAGE',
   ]) delete env[key];
   if (managerImageId) env.MANAGER_IMAGE = managerImageId;
   if (proxyImageId) env.PROXY_IMAGE = proxyImageId;
@@ -460,10 +481,7 @@ async function main() {
   // The reviewed Manager image is Alpine-based, has no ENTRYPOINT override,
   // and is already pinned. Reuse it for the one-shot init service without pulling another tag.
   initImageId = managerImageId;
-  [PORT, HEALTHY_PORT, BROKEN_PORT] = await Promise.all([
-    allocatePort(), allocatePort(), allocatePort(),
-  ]);
-  assert.equal(new Set([PORT, HEALTHY_PORT, BROKEN_PORT]).size, 3);
+  PORT = await allocatePort();
   B = `http://127.0.0.1:${PORT}`;
   await createRunRoot();
   assert.deepEqual(await composeContainers(), []);
@@ -510,11 +528,12 @@ async function main() {
     'BIND_ADDR=127.0.0.1',
     `HOST_PORT=${PORT}`,
     `INSTANCE_NETWORK=${NET}`,
+    `NODE_RED_IMAGE_REPO=nodered/node-red`,
     `ALLOWED_IMAGE_TAGS=${TAG}`,
     `EDGE_DATA_ROOT=${TEST_EDGE_ROOT}`,
     `EDGE_NAME_PREFIX=${PREFIX}`,
-    `INSTANCE_PORT_MIN=${Math.min(HEALTHY_PORT, BROKEN_PORT)}`,
-    `INSTANCE_PORT_MAX=${Math.max(HEALTHY_PORT, BROKEN_PORT)}`,
+    'INSTANCE_PORT_MIN=30000',
+    'INSTANCE_PORT_MAX=30999',
     'EDGE_NODE_INSTALL_POLICY=allowlist',
     'EDGE_NPM_UPSTREAM=',
   ].join('\n') + '\n', { mode: 0o600 });
@@ -586,7 +605,9 @@ async function main() {
   const brokenCreated = await fetch(`${B}/api/instances`, {
     method: 'POST', headers: H,
     body: JSON.stringify({ id: BROKEN_ID, name: '损坏网络验证', imageTag: TAG,
-                           ports: [{ hostPort: BROKEN_PORT, containerPort: 1883, protocol: 'tcp', hostIp: '127.0.0.1', purpose: 'MQTT' }] }),
+                           // Compose 专属断言只走实例内部网络；不发布无关宿主端口，
+                           // 避免 allocate-close-bind 的竞态把端口占用误报成 bootstrap install 失败。
+                           ports: [] }),
   });
   const brokenDetail = brokenCreated.status === 201 ? '' : (await brokenCreated.text()).slice(0, 160);
   check('先创建将损坏的历史实例', brokenCreated.status === 201,
@@ -597,6 +618,51 @@ async function main() {
   const brokenNetwork = await captureNetwork(`${NET}-${BROKEN_ID}`, {
     [MANAGED_LABEL]: 'true', [INSTANCE_LABEL]: BROKEN_ID,
   });
+  const brokenRegistry = probeInstanceRegistry(brokenContainer.Id, info.Id, brokenNetwork);
+  check('首个实例通过本网络 Manager alias 访问固定平台包',
+    brokenRegistry.status === 200 && brokenRegistry.address === brokenRegistry.expectedAddress,
+    JSON.stringify(brokenRegistry));
+
+  const created = await fetch(`${B}/api/instances`, {
+    method: 'POST', headers: H,
+    body: JSON.stringify({ id: ID, name: 'compose 验证', imageTag: TAG,
+                           ports: [] }),
+  });
+  // 失败时把正文带出来 —— 光一个「HTTP 400」在这一步是排不动的
+  const createdDetail = created.status === 201 ? '' : (await created.text()).slice(0, 160);
+  check('创建实例成功（只读 rootfs 下 SQLite 仍可写）', created.status === 201,
+        `HTTP ${created.status}${createdDetail ? ' ' + createdDetail : ''}`);
+
+  const healthyContainer = await captureContainer(`tle-nr-${ID}`, {
+    [MANAGED_LABEL]: 'true', [INSTANCE_LABEL]: ID,
+  });
+  const netInfo = await captureNetwork(`${NET}-${ID}`, {
+    [MANAGED_LABEL]: 'true', [INSTANCE_LABEL]: ID,
+  });
+  const attached = Object.values(netInfo.Containers ?? {}).map((c) => c.Name);
+  check('MANAGER_CONTAINER 生效：Manager 接入了实例网络', attached.includes(MGR), attached.join(' + '));
+  const healthyRegistry = probeInstanceRegistry(healthyContainer.Id, info.Id, netInfo);
+  check('第二个实例通过本网络 Manager alias 访问固定平台包',
+    healthyRegistry.status === 200 && healthyRegistry.address === healthyRegistry.expectedAddress,
+    JSON.stringify(healthyRegistry));
+  const nodeRedBeforeRecreate = healthyContainer;
+  const nodeRedStateBeforeRecreate = {
+    id: nodeRedBeforeRecreate.Id,
+    status: nodeRedBeforeRecreate.State.Status,
+    running: nodeRedBeforeRecreate.State.Running,
+    startedAt: nodeRedBeforeRecreate.State.StartedAt,
+    restartCount: nodeRedBeforeRecreate.RestartCount,
+  };
+  // settings.js 是 Manager 下发且实例运行必需的数据；只比哈希，避免验证输出任何凭据。
+  const settingsDigestBeforeRecreate = createHash('sha256')
+    .update(await readFile(`${TEST_DATA_ROOT}/${ID}/settings.js`)).digest('hex');
+
+  /*
+   * 两条实例记录都已完成各自的 bootstrap 后，再把先登记的那条替换成同名
+   * 错误归属资源。`network disconnect` 会直接改 Manager 的网络命名空间，
+   * 不能让这种故障注入与另一条独立 bootstrap 的 registry/install 链路重叠；
+   * 真正要验证的是下面 Manager 重建时，坏记录不会阻断健康记录的恢复。
+   */
   await removeExactContainer(`tle-nr-${BROKEN_ID}`, (current) => {
     assert.ok(hasLabels(current.Config?.Labels, {
       [MANAGED_LABEL]: 'true', [INSTANCE_LABEL]: BROKEN_ID,
@@ -647,36 +713,6 @@ async function main() {
     [RUN_LABEL]: RUN_ID, [ROLE_LABEL]: 'foreign-network',
   });
   assert.equal(foreignNetworkInfo.Id, foreignNetwork.id);
-
-  const created = await fetch(`${B}/api/instances`, {
-    method: 'POST', headers: H,
-    body: JSON.stringify({ id: ID, name: 'compose 验证', imageTag: TAG,
-                           ports: [{ hostPort: HEALTHY_PORT, containerPort: 1883, protocol: 'tcp', hostIp: '127.0.0.1', purpose: 'MQTT' }] }),
-  });
-  // 失败时把正文带出来 —— 光一个「HTTP 400」在这一步是排不动的
-  const createdDetail = created.status === 201 ? '' : (await created.text()).slice(0, 160);
-  check('创建实例成功（只读 rootfs 下 SQLite 仍可写）', created.status === 201,
-        `HTTP ${created.status}${createdDetail ? ' ' + createdDetail : ''}`);
-
-  const healthyContainer = await captureContainer(`tle-nr-${ID}`, {
-    [MANAGED_LABEL]: 'true', [INSTANCE_LABEL]: ID,
-  });
-  const netInfo = await captureNetwork(`${NET}-${ID}`, {
-    [MANAGED_LABEL]: 'true', [INSTANCE_LABEL]: ID,
-  });
-  const attached = Object.values(netInfo.Containers ?? {}).map((c) => c.Name);
-  check('MANAGER_CONTAINER 生效：Manager 接入了实例网络', attached.includes(MGR), attached.join(' + '));
-  const nodeRedBeforeRecreate = healthyContainer;
-  const nodeRedStateBeforeRecreate = {
-    id: nodeRedBeforeRecreate.Id,
-    status: nodeRedBeforeRecreate.State.Status,
-    running: nodeRedBeforeRecreate.State.Running,
-    startedAt: nodeRedBeforeRecreate.State.StartedAt,
-    restartCount: nodeRedBeforeRecreate.RestartCount,
-  };
-  // settings.js 是 Manager 下发且实例运行必需的数据；只比哈希，避免验证输出任何凭据。
-  const settingsDigestBeforeRecreate = createHash('sha256')
-    .update(await readFile(`${TEST_DATA_ROOT}/${ID}/settings.js`)).digest('hex');
 
   // ── 受限 docker 代理 ────────────────────────────────────
   // 走到这里说明整条生命周期（建网络/建卷/建容器/塞 settings.js/启停/取日志/取 stats）
