@@ -63,7 +63,7 @@ test('每个动作至少归属一个角色 —— 否则谁都做不了', () => 
    * 数组则只会让这条断言悄悄少覆盖一个动作 —— 而那正是「谁都做不了」的漏网方式。
    */
   const ALL: Record<Action, true> = {
-    'system:view': true, 'instance:list': true, 'instance:view': true, 'instance:operate': true,
+    'system:view': true, 'system:manage': true, 'instance:list': true, 'instance:view': true, 'instance:operate': true,
     'instance:create': true, 'instance:delete': true, 'field:view': true, 'replay:run': true,
     'backup:run': true, 'cloud:view': true, 'cloud:manage': true, 'diag:run': true,
     'template:view': true, 'template:manage': true, 'node:view': true, 'node:manage': true,

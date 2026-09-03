@@ -249,7 +249,7 @@ test('沿用旧私钥时，「证书与私钥配不配对」照样被检出来',
   repo.save(mutual(), 'admin');
   // 只换客户端证书、不换私钥 —— 换上去的这张与库里那把私钥不是一对
   assert.throws(
-    () => repo.save(mutual({ tls: { mode: 'mutual', ca: CA_CERT, cert: CA_CERT } })),
+    () => repo.save(mutual({ tls: { mode: 'mutual', ca: CA_CERT, cert: CA_CERT } }), 'admin'),
     /不是一对/,
   );
 });

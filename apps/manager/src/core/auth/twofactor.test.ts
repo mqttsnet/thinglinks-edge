@@ -40,6 +40,13 @@ function enroll(auth: AuthService, username = 'admin') {
  */
 const nextCode = (secret: string) => codeAt(secret, stepAt() + 1);
 
+function hasEncryptedTotpSecret(row: unknown): row is { totp_secret_enc: string } {
+  return typeof row === 'object'
+    && row !== null
+    && 'totp_secret_enc' in row
+    && typeof row.totp_secret_enc === 'string';
+}
+
 test('没绑两步验证时，登录一步到位', () => {
   const { auth } = fresh();
   const r = auth.login('admin', PW);
@@ -203,6 +210,7 @@ test('密钥密文入库，直接读表看不到明文', () => {
   const { db, auth } = fresh();
   const { secret } = enroll(auth);
   const row = db.prepare('SELECT totp_secret_enc FROM app_user WHERE username = ?').get('admin');
+  assert.ok(hasEncryptedTotpSecret(row), '管理员的两步验证密钥应已加密入库');
   assert.ok(row.totp_secret_enc.length > 0);
   assert.ok(!row.totp_secret_enc.includes(secret), '表里出现了明文密钥');
 });

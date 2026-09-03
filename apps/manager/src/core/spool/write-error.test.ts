@@ -56,7 +56,7 @@ test('写不进去时：告警带原因，并且照样抛错给上层', async ()
   await breakDir(dir);
 
   await assert.rejects(() => spool.enqueue({ second: true }),
-    undefined, '写不进去必须抛错，不能吞掉当成功');
+    '写不进去必须抛错，不能吞掉当成功');
 
   assert.equal(alarms.length, 1, '一次失败一条告警');
   assert.equal(alarms[0]!.phase, 'append');

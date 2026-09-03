@@ -36,7 +36,7 @@ test('增删与启停', () => {
 test('同一个地址不重复加（归一后比较）', () => {
   const r = fresh();
   r.add({ name: 'a', url: 'https://registry.npmjs.org', actor: 'x' });
-  assert.throws(() => r.add({ name: 'b', url: 'https://registry.npmjs.org/' }, ),
+  assert.throws(() => r.add({ name: 'b', url: 'https://registry.npmjs.org/', actor: 'x' }),
     NodePolicyError);
 });
 

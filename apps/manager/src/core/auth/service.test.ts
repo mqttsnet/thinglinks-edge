@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { openDb } from '../db.ts';
-import { AuthService, AuthError } from './service.ts';
+import { AuthService, AuthError, type LoginResult } from './service.ts';
 import { UserRepo } from './user-repo.ts';
 
 const fresh = () => {
@@ -10,6 +10,11 @@ const fresh = () => {
   return svc;
 };
 
+function expectSessionLogin(result: LoginResult) {
+  assert.ok('sid' in result, '这个测试场景不应要求第二因子');
+  return result;
+}
+
 test('初始账号只创建一次', () => {
   const svc = new AuthService(openDb(':memory:'));
   assert.equal(svc.ensureInitialUser('admin', 'pw'), true);
@@ -17,7 +22,7 @@ test('初始账号只创建一次', () => {
 });
 
 test('初始账号被标记为必须改密', () => {
-  const { user } = fresh().login('admin', 'initial-password');
+  const { user } = expectSessionLogin(fresh().login('admin', 'initial-password'));
   assert.equal(user.mustChangePassword, true);
 });
 
@@ -40,7 +45,7 @@ test('连续失败触发锁定', () => {
 
 test('会话可解析，登出后立即失效', () => {
   const svc = fresh();
-  const { sid } = svc.login('admin', 'initial-password');
+  const { sid } = expectSessionLogin(svc.login('admin', 'initial-password'));
   assert.equal(svc.resolve(sid)?.username, 'admin');
   svc.logout(sid);
   assert.equal(svc.resolve(sid), undefined);
@@ -54,10 +59,10 @@ test('未知或空会话不通过', () => {
 
 test('改密后清除必须改密标记，且旧会话被踢下线', () => {
   const svc = fresh();
-  const { sid } = svc.login('admin', 'initial-password');
+  const { sid } = expectSessionLogin(svc.login('admin', 'initial-password'));
   svc.changePassword('admin', 'initial-password', 'a-much-longer-password');
   assert.equal(svc.resolve(sid), undefined, '改密后旧会话应失效');
-  assert.equal(svc.login('admin', 'a-much-longer-password').user.mustChangePassword, false);
+  assert.equal(expectSessionLogin(svc.login('admin', 'a-much-longer-password')).user.mustChangePassword, false);
 });
 
 test('改密需要原口令，且新口令有长度下限', () => {
@@ -90,7 +95,7 @@ test('管理员重置口令后，那个人手上的旧会话立刻失效', () =>
   users.create('lineop', 'operator', 'admin');
   // 直接用仓储改口令，模拟「管理员点了重置」这条路径
   const first = users.resetPassword('lineop');
-  const { sid } = svc.login('lineop', first);
+  const { sid } = expectSessionLogin(svc.login('lineop', first));
   assert.ok(svc.resolve(sid), '刚登录当然有效');
 
   users.resetPassword('lineop');
@@ -105,9 +110,9 @@ test('revokeUser 踢掉该账号全部会话，不动别人的', () => {
   const users = new UserRepo(db);
   const pw = users.create('lineop', 'operator', 'admin');
 
-  const a = svc.login('lineop', pw).sid;
-  const b = svc.login('lineop', pw).sid;
-  const other = svc.login('admin', 'initial-password').sid;
+  const a = expectSessionLogin(svc.login('lineop', pw)).sid;
+  const b = expectSessionLogin(svc.login('lineop', pw)).sid;
+  const other = expectSessionLogin(svc.login('admin', 'initial-password')).sid;
 
   assert.equal(svc.revokeUser('lineop'), 2);
   assert.equal(svc.resolve(a), undefined);
@@ -126,7 +131,7 @@ test('失败计数按来源分摊 —— 别人输错不影响管理员自己登
   assert.throws(() => svc.login('admin', 'initial-password', '10.0.0.9'),
     (e: unknown) => e instanceof AuthError && /锁定/.test((e as Error).message));
   // 管理员从自己的机器上照常登录
-  assert.ok(svc.login('admin', 'initial-password', '10.0.0.2').sid);
+  assert.ok(expectSessionLogin(svc.login('admin', 'initial-password', '10.0.0.2')).sid);
 });
 
 test('锁定期内继续失败不顺延，到点即可重试', () => {
@@ -140,7 +145,7 @@ test('锁定期内继续失败不顺延，到点即可重试', () => {
     // 锁定期内又试了一次（这正是「每隔几分钟试一次就永远锁着」的攻击方式）
     assert.throws(() => svc.login('admin', 'wrong', '10.0.0.9'));
     now += 61_000; // 距首次锁定已过 5 分钟
-    assert.ok(svc.login('admin', 'initial-password', '10.0.0.9').sid, '锁定不该被顺延');
+    assert.ok(expectSessionLogin(svc.login('admin', 'initial-password', '10.0.0.9')).sid, '锁定不该被顺延');
   } finally {
     Date.now = real;
   }

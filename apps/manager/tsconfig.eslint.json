@@ -1,11 +1,6 @@
 {
-  // lint 专用：与 tsconfig.json 同一套编译选项，但**包含测试与 fixtures**。
-  //
-  // 主 tsconfig 把 *.test.ts / *.fixtures.ts 排除在外是对的 —— 构建产物不该带测试。
-  // 但类型感知的 lint 规则（no-floating-promises 之类）需要它们在某个 project 里，
-  // 否则 ESLint 报 "was not found by the project service"，整批测试文件被跳过，
-  // 而跳过是**静默的**：lint 显示通过，实际一条测试都没检查。
+  // lint 使用默认的完整 typecheck 项目，测试与 fixtures 也归属其中。
+  // 构建产物范围由 tsconfig.build.json 单独控制。
   "extends": "./tsconfig.json",
-  "include": ["src/**/*.ts"],
-  "exclude": []
+  "include": ["src/**/*.ts"]
 }

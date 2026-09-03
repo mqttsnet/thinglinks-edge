@@ -6,7 +6,7 @@
   "main": "dist/index.js",
   "scripts": {
     "dev": "node --watch --experimental-strip-types src/index.ts",
-    "build": "rm -rf dist && tsc -p tsconfig.json",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --experimental-strip-types --test 'src/**/*.test.ts'",
     "lint": "echo '(lint 在仓库根统一跑：pnpm lint)'",
