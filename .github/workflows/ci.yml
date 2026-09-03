@@ -12,7 +12,6 @@ name: CI
 
 on:
   push:
-    branches: [main, dev]
   pull_request:
   # 手动触发，用于验证 workflow 本身
   workflow_dispatch:
@@ -43,6 +42,10 @@ jobs:
         # 而不是悄悄改 lockfile —— 那会让 CI 装的和本地装的不是同一套
         run: pnpm install --frozen-lockfile
 
+      - name: 全量回归入口自测
+        # fake Docker/pnpm/node，只验证入口编排；不会启动或修改任何真实容器。
+        run: node --test apps/manager/scripts/verify-all.test.mjs apps/manager/scripts/build-offline-bundle.test.mjs apps/manager/scripts/verify-offline-bundle.test.mjs
+
       - name: lint
         run: pnpm lint
 
@@ -55,6 +58,18 @@ jobs:
       - name: 构建
         # 放在最后：前面三道都过了才值得花时间编译
         run: pnpm build
+
+      - name: 真实实例验证夹具自测
+        # 只验证完整 DI、fail-fast 与安全清理契约；真 Docker 在 verify job 跑。
+        run: >-
+          node --test
+          apps/manager/scripts/real-instance-fixture.test.mjs
+          apps/manager/scripts/verify-api.test.mjs
+          apps/manager/scripts/verify-compose.test.mjs
+          apps/manager/scripts/verify-core-resource-ownership.test.mjs
+          apps/manager/scripts/verify-cloud-resource-ownership.test.mjs
+          apps/manager/scripts/verify-offline.test.mjs
+          apps/manager/scripts/verifier-temp-lifecycle.test.mjs
 
   verify:
     name: 真容器回归
@@ -78,8 +93,10 @@ jobs:
         # 提前拉好，避免验证脚本里的超时把「镜像还在下载」误判成「实例起不来」
         run: |
           docker pull nodered/node-red:5.0.4-24-minimal
+          docker pull nodered/node-red:4.1.13-22-minimal
           docker pull eclipse-mosquitto:2.1.2-alpine
-          docker pull alpine/socat
+          docker pull alpine/socat@sha256:5f275aa1b6e9889c851f61097142ee050fc6ac4615b4ea64ac1f2b0e81ff8d7f
+          docker pull alpine:3.22
           docker pull wollomatic/socket-proxy:1.13.1
 
       - name: 全量回归
@@ -87,6 +104,10 @@ jobs:
         env:
           # 验证脚本用的数据根。GH runner 上 /tmp 可写且 Docker 默认共享
           TLE_VERIFY_EDGE_ROOT: /tmp/tle-verify
+          # 所有入口自产资源共享一个仅属于本次 workflow attempt 的标识。
+          TLE_VERIFY_RUN_ID: gha-${{ github.run_id }}-${{ github.run_attempt }}
+          # GitHub runner 由本 job 独占，任意新增 Docker 资源都应视为残留。
+          TLE_VERIFY_EXCLUSIVE_DOCKER: '1'
         run: pnpm verify
 
       - name: 失败时导出容器日志
