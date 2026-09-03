@@ -9,8 +9,8 @@ import {
 test('closeAndDrain sends 1012 and completes only after every session unregisters', async () => {
   const registry = new ProxySessionRegistry();
   const events: string[] = [];
-  let unregisterA = () => undefined;
-  let unregisterB = () => undefined;
+  let unregisterA: () => void = () => undefined;
+  let unregisterB: () => void = () => undefined;
   const session = (name: string, unregister: () => void): ProxyWebSocketSession => ({
     close(code) {
       events.push(`close:${name}:${code}`);
@@ -57,7 +57,7 @@ test('drain timeout rejects before a caller can take its snapshot', async () => 
 test('draining one instance does not close another instance sessions', async () => {
   const registry = new ProxySessionRegistry();
   const closed: string[] = [];
-  let unregisterA = () => undefined;
+  let unregisterA: () => void = () => undefined;
   const a: ProxyWebSocketSession = {
     close() {
       closed.push('line-a');

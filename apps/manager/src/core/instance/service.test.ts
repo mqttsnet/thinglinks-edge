@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import Fastify from 'fastify';
@@ -23,6 +23,7 @@ import {
 import {
   BootstrapCompensationError,
   InstanceService,
+  ServiceError,
   type CreateInstanceInput,
 } from './service.ts';
 import type { DockerClient } from './docker-client.ts';
@@ -46,6 +47,10 @@ const record = (id = 'line-a'): InstanceRecord => ({
   credSecret: 'credential-secret',
   notes: '',
 });
+
+const badRequest: HttpContext['fail'] = (reply, error) => (
+  reply.code(400).send({ error: (error as Error).message })
+);
 
 type PolicySetup = (
   repo: InstanceRepo,
@@ -167,11 +172,10 @@ function fixture(
       diskPercent: 10, uptimeSec: 100,
     }),
     palettePolicy: () => ({
-      mode: 'allowlist',
       allowInstall: true,
       allowList: [],
       denyList: ['*'],
-      catalogueUrls: [],
+      catalogues: [],
     }),
   });
   return { db, repo, calls, gate, service, docker };
@@ -272,8 +276,9 @@ test('under-lease primitives reject wrong-operation and expired leases before Do
   assert.deepEqual(f.calls, []);
 
   assert.ok(expired);
+  const expiredLease = expired;
   await assert.rejects(
-    () => f.service.startUnderLease('line-a', expired, 'admin'),
+    () => f.service.startUnderLease('line-a', expiredLease, 'admin'),
     /invalid|no longer active/,
   );
   assert.deepEqual(f.calls, []);
@@ -582,6 +587,8 @@ test('image upgrade and rollback both preserve the explicitly persisted npm runt
 });
 
 type BootstrapFailure =
+  | 'image'
+  | 'image-probe'
   | 'trust'
   | 'data'
   | 'create'
@@ -695,6 +702,20 @@ async function bootstrapFixture(options: {
     raw: {},
     imageRepo: 'nodered/node-red',
     imageRef: (tag: string) => `nodered/node-red:${tag}`,
+    assertImagePresent: async (image: string) => {
+      events.push(`image:${image}`);
+      if (options.failure === 'image') {
+        throw new Error(
+          `本机没有镜像 ${image}，无法创建实例。\n`
+          + `有外网的机器：docker pull ${image}\n`
+          + `现场无外网：在有网机器上 docker pull 后 docker save ${image} -o image.tar，`
+          + '拷到现场执行 docker load -i image.tar',
+        );
+      }
+      if (options.failure === 'image-probe') {
+        throw new Error('registry authorization token=opaque-secret-value');
+      }
+    },
     assertBootstrapResourcesAbsent: async () => { events.push('resources-absent'); },
     prepareBootstrapDataDir: async (id: string, txId: string) => {
       events.push(`data:${txId}`);
@@ -764,7 +785,7 @@ async function bootstrapFixture(options: {
       diskPercent: 10, uptimeSec: 100,
     }),
     palettePolicy: () => ({
-      mode: 'allowlist', allowInstall: true, allowList: [], denyList: ['*'], catalogueUrls: [],
+      allowInstall: true, allowList: [], denyList: ['*'], catalogues: [],
     }),
   });
   const initialLedgerCounts = {
@@ -789,6 +810,59 @@ function assertNoSyntheticWrites(f: Awaited<ReturnType<typeof bootstrapFixture>>
   assert.equal(readFileSync(f.seedPath, 'utf8'), 'global-seed-must-survive');
 }
 
+test('missing bootstrap image fails before instance row token data or Docker resource side effects', async () => {
+  const f = await bootstrapFixture({ failure: 'image' });
+  try {
+    await assert.rejects(
+      () => f.service.create(newInstance),
+      (error: unknown) => {
+        assert.ok(error instanceof ServiceError);
+        assert.match(error.message, /本机没有镜像 nodered\/node-red:5\.0\.4-24-minimal/);
+        assert.match(error.message, /docker pull nodered\/node-red:5\.0\.4-24-minimal/);
+        assert.match(error.message, /docker load -i image\.tar/);
+        return true;
+      },
+    );
+
+    assert.deepEqual(f.events, ['image:nodered/node-red:5.0.4-24-minimal']);
+    assert.equal(f.repo.get('line-new'), undefined);
+    assert.equal(f.repo.ingestToken('line-new'), undefined);
+    assert.equal(f.repo.nodeMigration('line-new'), undefined);
+    assert.equal(existsSync(join(f.base, 'instances', 'line-new')), false);
+    const audit = f.db.prepare(
+      "SELECT detail FROM audit WHERE action = 'create-instance' AND target = 'line-new' AND result = 'fail'",
+    ).get() as { detail: string } | undefined;
+    assert.deepEqual(JSON.parse(audit?.detail ?? '{}'), { code: 'preflight', reason: 'image' });
+    assert.doesNotMatch(audit?.detail ?? '', /docker|image\.tar|opaque-secret-value/);
+    assertNoSyntheticWrites(f);
+  } finally {
+    await f.close();
+  }
+});
+
+test('unexpected image preflight errors never expose raw external details', async () => {
+  const f = await bootstrapFixture({ failure: 'image-probe' });
+  try {
+    await assert.rejects(
+      () => f.service.create(newInstance),
+      (error: unknown) => {
+        assert.ok(error instanceof ServiceError);
+        assert.match(error.message, /镜像 nodered\/node-red:5\.0\.4-24-minimal 预检未通过/);
+        assert.doesNotMatch(error.message, /authorization|token|opaque-secret-value/);
+        return true;
+      },
+    );
+    assert.deepEqual(f.events, ['image:nodered/node-red:5.0.4-24-minimal']);
+    const audit = f.db.prepare(
+      "SELECT detail FROM audit WHERE action = 'create-instance' AND target = 'line-new' AND result = 'fail'",
+    ).get() as { detail: string } | undefined;
+    assert.deepEqual(JSON.parse(audit?.detail ?? '{}'), { code: 'preflight', reason: 'image' });
+    assert.doesNotMatch(audit?.detail ?? '', /authorization|token|opaque-secret-value/);
+  } finally {
+    await f.close();
+  }
+});
+
 test('new instance returns only after npm install Admin health and host files are committed', async () => {
   const f = await bootstrapFixture();
   try {
@@ -801,6 +875,7 @@ test('new instance returns only after npm install Admin health and host files ar
     const txId = f.repo.nodeMigration('line-new')?.txId;
     assert.ok(txId);
     assert.deepEqual(f.events, [
+      'image:nodered/node-red:5.0.4-24-minimal',
       'trust',
       'resources-absent',
       `barrier:${txId}:preparing:after-phase-persist`,
@@ -821,13 +896,34 @@ test('new instance returns only after npm install Admin health and host files ar
   }
 });
 
+const expectedBootstrapBoundary = {
+  data: 'prepare-data',
+  create: 'create-container',
+  start: 'start-container',
+  readiness: 'wait-admin',
+  install: 'install-module',
+  'node-set': 'verify-module',
+  'on-disk': 'verify-files',
+} as const;
+
 for (const failure of [
   'trust', 'data', 'create', 'start', 'readiness', 'install', 'node-set', 'on-disk',
 ] as const) {
   test(`bootstrap ${failure} failure compensates before deleting row and token`, async () => {
     const f = await bootstrapFixture({ failure });
     try {
-      await assert.rejects(() => f.service.create(newInstance));
+      await assert.rejects(
+        () => f.service.create(newInstance),
+        (error: unknown) => {
+          assert.ok(error instanceof ServiceError);
+          assert.doesNotMatch(error.message, /opaque-secret-value|admin-password|test-token/);
+          if (failure !== 'trust') {
+            assert.match(error.message,
+              new RegExp(`\\b${expectedBootstrapBoundary[failure]}\\b`));
+          }
+          return true;
+        },
+      );
       assert.equal(f.repo.get('line-new'), undefined);
       assert.equal(f.repo.ingestToken('line-new'), undefined);
       if (failure === 'trust') assert.ok(!f.events.some((event) => event.startsWith('cleanup:')));
@@ -858,7 +954,7 @@ test('bootstrap failure never returns HTTP 201 from the public create route', as
     service: f.service,
     guard: () => ({ username: 'admin', role: 'admin' }),
     users: { grantFor: () => undefined },
-    fail: (reply, error) => reply.code(400).send({ error: (error as Error).message }),
+    fail: badRequest,
   } as unknown as HttpContext);
   try {
     const response = await app.inject({
@@ -1148,7 +1244,7 @@ test('audit-finalization failure reaches HTTP only as a controlled redacted comp
     service: f.service,
     guard: () => ({ username: 'admin', role: 'admin' }),
     users: { grantFor: () => undefined },
-    fail: (reply, error) => reply.code(400).send({ error: (error as Error).message }),
+    fail: badRequest,
   } as unknown as HttpContext);
   try {
     const response = await app.inject({

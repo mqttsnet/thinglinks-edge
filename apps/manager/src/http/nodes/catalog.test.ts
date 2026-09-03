@@ -34,6 +34,11 @@ const instance: InstanceRecord = {
   notes: '',
 };
 
+const visibleOnly: HttpContext['visibleOnly'] = (_user, items) => items;
+const badRequest: HttpContext['fail'] = (reply, error) => (
+  reply.code(400).send({ error: (error as Error).message })
+);
+
 test('install-node POST honors live and repository-backed gates before side effects', async () => {
   let adminCalls = 0;
   const upstream = createServer((req, res) => {
@@ -56,6 +61,9 @@ test('install-node POST honors live and repository-backed gates before side effe
   repo.create(instance, [], [{ username: 'admin', password: 'secret', permissions: '*' }]);
   const operationGate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repo));
   const app = Fastify({ logger: false });
+  const fail: HttpContext['fail'] = (reply, error) => reply
+    .code(error instanceof InstanceBusyError ? 409 : 400)
+    .send({ error: (error as Error).message });
   registerNodeCatalog(app, {
     config: { basePath: '' },
     db,
@@ -63,10 +71,8 @@ test('install-node POST honors live and repository-backed gates before side effe
     operationGate,
     upstreamFor: () => `http://127.0.0.1:${address.port}`,
     guard: () => ({ username: 'admin', role: 'admin' }),
-    visibleOnly: (_user, items) => items,
-    fail: (reply, error) => reply
-      .code(error instanceof InstanceBusyError ? 409 : 400)
-      .send({ error: (error as Error).message }),
+    visibleOnly,
+    fail,
   } as unknown as HttpContext, {
     store: new NodeStore(root),
     catalog: new NodeCatalog(db),
@@ -142,13 +148,20 @@ test('platform migration endpoints declare instance permissions, CSRF, and expos
       };
     },
   } as unknown as PlatformMigrationService;
+  const guard: HttpContext['guard'] = (_req, _reply, opts) => {
+    guarded.push(opts);
+    return {
+      username: 'operator',
+      role: 'admin',
+      mustChangePassword: false,
+      mustEnroll2fa: false,
+      totpEnabled: false,
+    };
+  };
   registerNodeCatalog(app, {
     config: { basePath: '' }, db,
-    guard: (_req, _reply, opts) => {
-      guarded.push(opts);
-      return { username: 'operator', role: 'admin' };
-    },
-    fail: (reply, error) => reply.code(400).send({ error: (error as Error).message }),
+    guard,
+    fail: badRequest,
   } as unknown as HttpContext, {
     store: new NodeStore(root), catalog: new NodeCatalog(db), migrationService,
   });
@@ -211,7 +224,7 @@ test('platform migration POST maps controlled failures without leaking the under
   registerNodeCatalog(app, {
     config: { basePath: '' }, db,
     guard: () => ({ username: 'operator', role: 'admin' }),
-    fail: (reply, error) => reply.code(400).send({ error: (error as Error).message }),
+    fail: badRequest,
   } as unknown as HttpContext, {
     store: new NodeStore(root), catalog: new NodeCatalog(db), migrationService,
   });
@@ -262,8 +275,8 @@ test('inventory response preserves Manager-observed source, health, and determin
     }) },
     upstreamFor: () => `http://127.0.0.1:${address.port}`,
     guard: () => ({ username: 'admin', role: 'admin' }),
-    visibleOnly: (_user, items) => items,
-    fail: (reply, error) => reply.code(400).send({ error: (error as Error).message }),
+    visibleOnly,
+    fail: badRequest,
   } as unknown as HttpContext, {
     store: new NodeStore(root), catalog: new NodeCatalog(db),
     migrationService: {} as PlatformMigrationService,
@@ -329,8 +342,12 @@ test('migration routes enforce real session grants and CSRF without route-side o
     store: new NodeStore(root), catalog: new NodeCatalog(db), migrationService,
   });
   await app.ready();
-  const viewerSid = auth.login('viewer', viewerReadyPassword).sid;
-  const operatorSid = auth.login('operator', operatorReadyPassword).sid;
+  const viewerLogin = auth.login('viewer', viewerReadyPassword);
+  const operatorLogin = auth.login('operator', operatorReadyPassword);
+  assert.ok('sid' in viewerLogin);
+  assert.ok('sid' in operatorLogin);
+  const viewerSid = viewerLogin.sid;
+  const operatorSid = operatorLogin.sid;
   const cookieFor = (sid: string, csrf = 'valid-csrf') => `tle_sid=${sid}; tle_csrf=${csrf}`;
 
   try {

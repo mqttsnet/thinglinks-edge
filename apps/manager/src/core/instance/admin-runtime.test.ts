@@ -58,8 +58,14 @@ test('waitReady polls the bounded Admin API until credentials are accepted', asy
   let attempts = 0;
   const server = createServer((req, res) => {
     attempts += 1;
-    if (!req.url?.endsWith('/auth/token')) return res.writeHead(404).end();
-    if (attempts === 1) return res.writeHead(503).end();
+    if (!req.url?.endsWith('/auth/token')) {
+      res.writeHead(404).end();
+      return;
+    }
+    if (attempts === 1) {
+      res.writeHead(503).end();
+      return;
+    }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end('{"access_token":"ready-token"}');
   });

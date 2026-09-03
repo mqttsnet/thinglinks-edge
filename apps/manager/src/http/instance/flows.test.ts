@@ -50,6 +50,9 @@ test('whole-flow POST honors live and repository-backed gates before side effect
   repo.create(instance, [], [{ username: 'admin', password: 'secret', permissions: '*' }]);
   const operationGate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repo));
   const app = Fastify({ logger: false });
+  const fail: HttpContext['fail'] = (reply, error) => reply
+    .code(error instanceof InstanceBusyError ? 409 : 400)
+    .send({ error: (error as Error).message });
   registerFlows(app, {
     config: { basePath: '' },
     db,
@@ -57,9 +60,7 @@ test('whole-flow POST honors live and repository-backed gates before side effect
     operationGate,
     upstreamFor: () => `http://127.0.0.1:${address.port}`,
     guard: () => ({ username: 'admin', role: 'admin' }),
-    fail: (reply, error) => reply
-      .code(error instanceof InstanceBusyError ? 409 : 400)
-      .send({ error: (error as Error).message }),
+    fail,
   } as unknown as HttpContext);
 
   try {

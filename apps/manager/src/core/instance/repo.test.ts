@@ -371,7 +371,9 @@ test('snapshot union requires exact bootstrap shape and complete existence-aware
   assert.throws(
     () => repo.beginNodeMigration({
       ...bootstrapBegin('line-a', 'tx-bootstrap-extra'),
-      snapshot: { ...bootstrapSnapshot(), env: { NPM_TOKEN: 'opaque' } },
+      snapshot: {
+        ...bootstrapSnapshot(), env: { NPM_TOKEN: 'opaque' },
+      } as unknown as ReturnType<typeof bootstrapSnapshot>,
     }),
     RepoError,
   );

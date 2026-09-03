@@ -181,8 +181,9 @@ test('an active lease cannot authorize the wrong operation and expires after rel
   });
 
   assert.ok(captured);
+  const expired = captured;
   assert.throws(
-    () => gate.assertLease(captured, 'line-a', ['start-instance']),
+    () => gate.assertLease(expired, 'line-a', ['start-instance']),
     /invalid|no longer active/,
   );
 });

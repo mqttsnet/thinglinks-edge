@@ -12,7 +12,10 @@ import {
   describe,
   startManagerRuntime,
 } from './index.ts';
-import { NOOP_PLATFORM_NODE_BARRIER } from './core/nodes/platform-operation-barrier.ts';
+import {
+  NOOP_PLATFORM_NODE_BARRIER,
+  type PlatformNodeOperationBarrier,
+} from './core/nodes/platform-operation-barrier.ts';
 import { InstanceRepo } from './core/instance/repo.ts';
 import { deriveKey } from './core/auth/crypto.ts';
 import { AuthService } from './core/auth/service.ts';
@@ -170,7 +173,9 @@ test('startup phase failure prevents every later phase and listener', async () =
 
 test('the object-only barrier seam is shared by creation and migration while production is NOOP', async () => {
   const events: string[] = [];
-  const barrier = { reach: async () => { events.push('reached'); } };
+  const barrier: PlatformNodeOperationBarrier = {
+    reach: async () => { events.push('reached'); },
+  };
   const verifier = assemblePlatformOperationBarrier({ barrier });
   assert.strictEqual(verifier.barrier, barrier);
   assert.strictEqual(verifier.instanceServiceDeps.barrier, barrier);

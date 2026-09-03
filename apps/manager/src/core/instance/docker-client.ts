@@ -103,6 +103,39 @@ export interface BootstrapCleanupResult {
   residuals: BootstrapResourceResidual[];
 }
 
+export type BootstrapContainerCreateStep =
+  | 'validate-spec'
+  | 'image-preflight'
+  | 'data-ownership'
+  | 'network-create'
+  | 'container-options'
+  | 'container-create'
+  | 'manager-attach'
+  | 'settings-write';
+
+/** 只向上层暴露受控步骤码；Docker/文件系统原始文本仅作 cause 留在进程内。 */
+export class BootstrapContainerCreateError extends Error {
+  readonly step: BootstrapContainerCreateStep;
+
+  constructor(step: BootstrapContainerCreateStep, cause: unknown) {
+    super(`bootstrap container create failed at ${step}`, { cause });
+    this.name = 'BootstrapContainerCreateError';
+    this.step = step;
+  }
+}
+
+async function bootstrapContainerStep<T>(
+  step: BootstrapContainerCreateStep,
+  action: () => Promise<T> | T,
+): Promise<T> {
+  try {
+    return await action();
+  } catch (error) {
+    if (error instanceof BootstrapContainerCreateError) throw error;
+    throw new BootstrapContainerCreateError(step, error);
+  }
+}
+
 export interface RecreateInstanceInput {
   spec: InstanceSpec;
   settingsJs: string;
@@ -247,6 +280,25 @@ export class DockerClient {
     return Object.keys(network.Containers ?? {}).some((id) => id === containerId);
   }
 
+  /**
+   * Every instance resolves the private registry through the same Manager hostname.
+   * Dynamic network attachment must register that hostname explicitly on each
+   * network; relying on Docker's implicit name registration becomes ambiguous once
+   * the Manager has endpoints on more than one isolated instance network.
+   */
+  private managerConnectOptions(
+    containerId: string,
+    signal?: AbortSignal,
+  ): Docker.NetworkConnectOptions & { abortSignal?: AbortSignal } {
+    const alias = this.opts.managerContainer;
+    if (!alias) throw new Error('Manager container alias is unavailable');
+    return {
+      Container: containerId,
+      EndpointConfig: { Aliases: [alias] },
+      ...(signal ? { abortSignal: signal } : {}),
+    };
+  }
+
   private assertBootstrapNetworkOwnership(
     instanceId: string,
     txId: string,
@@ -275,9 +327,7 @@ export class DockerClient {
     if (DockerClient.hasContainer(network, manager.Id)) return;
     try {
       // dockerode 5 会把 args.opts.abortSignal 转发给 modem，但 @types 尚未声明该字段。
-      await networkRef.connect({ Container: manager.Id, abortSignal: signal } as Docker.NetworkConnectOptions & {
-        abortSignal?: AbortSignal;
-      });
+      await networkRef.connect(this.managerConnectOptions(manager.Id, signal));
     } catch (error) {
       if (signal?.aborted) throw error;
       // Docker 可能在 inspect 与 connect 之间完成了另一次并发接入；只以当前
@@ -309,9 +359,7 @@ export class DockerClient {
     if (signal?.aborted) throw signal.reason;
     if (DockerClient.hasContainer(network, manager.Id)) return;
     try {
-      await networkRef.connect({ Container: manager.Id, abortSignal: signal } as Docker.NetworkConnectOptions & {
-        abortSignal?: AbortSignal;
-      });
+      await networkRef.connect(this.managerConnectOptions(manager.Id, signal));
     } catch (error) {
       if (signal?.aborted) throw error;
       const after = await networkRef.inspect().catch(() => undefined);
@@ -660,31 +708,50 @@ export class DockerClient {
     settingsJs: string,
     txId: string,
   ): Promise<void> {
-    this.requireBootstrapTxId(txId);
-    if (this.opts.managerUrl) spec = { ...spec, managerUrl: this.opts.managerUrl };
-    if (this.opts.npmRegistry) spec = { ...spec, npmRegistry: this.opts.npmRegistry };
-    assertValidSpec(spec, this.opts.portRange);
-    await this.assertImagePresent(this.imageRef(spec.imageTag));
-    if (await this.bootstrapDataOwnership(spec.id, txId) !== 'owned') {
-      throw new Error(`实例 ${spec.id} 的 bootstrap 数据 owner 不匹配`);
-    }
-    // 不查找或复用同名网络：createNetwork 的独占冲突关闭 preflight→create 竞态。
-    const networkId = await this.createBootstrapNetwork(spec.id, txId);
-    const options = buildCreateOptions(spec, {
-      network: networkId,
-      imageRepo: this.opts.imageRepo,
-      instanceDataRoot: this.opts.instanceDataRoot,
-      timezone: this.opts.timezone,
-      proxyEnv: this.opts.proxyEnv ?? [],
-      bootstrapTxId: txId,
+    await bootstrapContainerStep('validate-spec', () => {
+      this.requireBootstrapTxId(txId);
+      if (this.opts.managerUrl) spec = { ...spec, managerUrl: this.opts.managerUrl };
+      if (this.opts.npmRegistry) spec = { ...spec, npmRegistry: this.opts.npmRegistry };
+      assertValidSpec(spec, this.opts.portRange);
     });
-    assertSafeCreateOptions(options, { instanceDataRoot: this.opts.instanceDataRoot });
-    const container = await this.docker.createContainer(options as Docker.ContainerCreateOptions);
-    await this.attachManagerToBootstrapNetwork(spec.id, txId, networkId);
-    await container.putArchive(
+    await bootstrapContainerStep(
+      'image-preflight',
+      () => this.assertImagePresent(this.imageRef(spec.imageTag)),
+    );
+    await bootstrapContainerStep('data-ownership', async () => {
+      if (await this.bootstrapDataOwnership(spec.id, txId) !== 'owned') {
+        throw new Error(`实例 ${spec.id} 的 bootstrap 数据 owner 不匹配`);
+      }
+    });
+    // 不查找或复用同名网络：createNetwork 的独占冲突关闭 preflight→create 竞态。
+    const networkId = await bootstrapContainerStep(
+      'network-create',
+      () => this.createBootstrapNetwork(spec.id, txId),
+    );
+    const options = await bootstrapContainerStep('container-options', () => {
+      const value = buildCreateOptions(spec, {
+        network: networkId,
+        imageRepo: this.opts.imageRepo,
+        instanceDataRoot: this.opts.instanceDataRoot,
+        timezone: this.opts.timezone,
+        proxyEnv: this.opts.proxyEnv ?? [],
+        bootstrapTxId: txId,
+      });
+      assertSafeCreateOptions(value, { instanceDataRoot: this.opts.instanceDataRoot });
+      return value;
+    });
+    const container = await bootstrapContainerStep(
+      'container-create',
+      () => this.docker.createContainer(options as Docker.ContainerCreateOptions),
+    );
+    await bootstrapContainerStep(
+      'manager-attach',
+      () => this.attachManagerToBootstrapNetwork(spec.id, txId, networkId),
+    );
+    await bootstrapContainerStep('settings-write', () => container.putArchive(
       tarFile('settings.js', settingsJs, { uid: NODE_RED_UID, gid: NODE_RED_UID, mode: 0o644 }),
       { path: '/data' },
-    );
+    ));
   }
 
   /**
@@ -922,7 +989,7 @@ export class DockerClient {
       this.assertProbeLabels(network.Labels, spec.id, input.txId);
       if (network.Id !== networkId) throw new Error('migration probe network id changed');
       const manager = await this.docker.getContainer(this.opts.managerContainer).inspect();
-      await this.docker.getNetwork(networkId).connect({ Container: manager.Id });
+      await this.docker.getNetwork(networkId).connect(this.managerConnectOptions(manager.Id));
     }
     await container.start();
     return {

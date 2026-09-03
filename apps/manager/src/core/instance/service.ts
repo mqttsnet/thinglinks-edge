@@ -17,6 +17,7 @@ import {
   type PortRecord,
 } from './repo.ts';
 import {
+  BootstrapContainerCreateError,
   DockerClient,
   type BootstrapResourceResidual,
   type RecreateInstanceInput,
@@ -71,12 +72,41 @@ const RECOVERABLE_BOOTSTRAP_PHASES = new Set([
   'rolling_back',
 ]);
 
+type BootstrapFailureBoundary =
+  | 'persist-barrier'
+  | 'persist-token'
+  | 'prepare-data'
+  | 'render-settings'
+  | 'create-container'
+  | 'container-barrier'
+  | 'start-container'
+  | 'wait-admin'
+  | 'install-module'
+  | 'verify-module'
+  | 'verify-files'
+  | 'readback'
+  | 'commit';
+
 function controlledResiduals(value: unknown): BootstrapResourceResidual[] {
   if (!Array.isArray(value)) return [...BOOTSTRAP_RESOURCES];
   if (value.some((item) => !BOOTSTRAP_RESOURCES.includes(item as BootstrapResourceResidual))) {
     return [...BOOTSTRAP_RESOURCES];
   }
   return BOOTSTRAP_RESOURCES.filter((resource) => value.includes(resource));
+}
+
+function missingImageGuidance(image: string): string {
+  return `本机没有镜像 ${image}，无法创建实例。\n`
+    + `有外网的机器：docker pull ${image}\n`
+    + `现场无外网：在有网机器上 docker pull 后 docker save ${image} -o image.tar，`
+    + '拷到现场执行 docker load -i image.tar';
+}
+
+function controlledImagePreflightError(error: unknown, image: string): string {
+  const guidance = missingImageGuidance(image);
+  return error instanceof Error && error.message === guidance
+    ? guidance
+    : `创建实例失败：镜像 ${image} 预检未通过`;
 }
 
 export interface CreateInstanceInput {
@@ -246,6 +276,25 @@ export class InstanceService {
       { probeHost: this.o.probeHostPorts !== false },
     );
 
+    /*
+     * 镜像缺失是可在任何实例行、令牌、数据目录或 Docker 资源副作用之前回答的事实。
+     * 这里先给调用方可操作的 pull/load 指引；createBootstrapInstance 内仍会再查一次，
+     * 防止预检通过后镜像被并发删除的 TOCTOU。
+     */
+    const image = this.o.docker.imageRef(input.imageTag);
+    try {
+      await this.o.docker.assertImagePresent(image);
+    } catch (error) {
+      recordAudit(this.o.db, {
+        actor: input.actor,
+        action: 'create-instance',
+        target: input.id,
+        result: 'fail',
+        detail: JSON.stringify({ code: 'preflight', reason: 'image' }),
+      });
+      throw new ServiceError(controlledImagePreflightError(error, image));
+    }
+
     const adminRoot = adminRootFor(this.o.basePath, input.id);
     const password = generatePassword();
     const credSecret = generatePassword(24);
@@ -295,6 +344,7 @@ export class InstanceService {
     );
 
     let failureCode: NodeMigrationErrorCode = 'preflight';
+    let failureBoundary: BootstrapFailureBoundary = 'persist-barrier';
     let completedView: InstanceView | undefined;
     try {
       await this.o.barrier.reach({
@@ -304,9 +354,12 @@ export class InstanceService {
         sequence: 1,
         boundary: 'after-phase-persist',
       });
+      failureBoundary = 'persist-token';
       this.o.repo.setIngestToken(input.id, ingestToken);
       failureCode = 'install';
+      failureBoundary = 'prepare-data';
       await this.o.docker.prepareBootstrapDataDir(input.id, txId);
+      failureBoundary = 'render-settings';
       const settings = renderSettings({
         instanceId: input.id,
         adminRoot,
@@ -315,12 +368,14 @@ export class InstanceService {
         palette: this.o.palettePolicy?.(),
         nodeRuntimeMode: 'npm',
       });
+      failureBoundary = 'create-container';
       await this.o.docker.createBootstrapInstance(
         { id: input.id, imageTag: input.imageTag, memoryMb: input.memoryMb, cpus: input.cpus,
             ports, adminRoot, ingestToken },
         settings,
         txId,
       );
+      failureBoundary = 'container-barrier';
       await this.o.barrier.reach({
         instanceId: input.id,
         txId,
@@ -328,29 +383,40 @@ export class InstanceService {
         sequence: 2,
         boundary: 'after-container-create',
       });
+      failureBoundary = 'start-container';
       await this.o.docker.start(input.id);
+      failureBoundary = 'wait-admin';
       await this.o.adminRuntime.waitReady(input.id, {
         timeoutMs: 30_000,
         intervalMs: 250,
       });
+      failureBoundary = 'install-module';
       const installed = await installModule(
         this.o.adminRuntime.target(input.id),
         PLATFORM_NODE_PACKAGE.name,
         PLATFORM_NODE_PACKAGE.version,
       );
       failureCode = 'verification';
+      failureBoundary = 'verify-module';
       assertHealthyPlatformModule(installed);
+      failureBoundary = 'verify-files';
       await verifyInstalledPlatformFiles({
         instanceDataRoot: this.o.instanceDataRoot,
         instanceId: input.id,
         readFile,
       });
       // 所有可能失败的外部读都放在最终提交之前；提交后不得再因只读状态查询而回失败。
+      failureBoundary = 'readback';
       completedView = await this.get(input.id);
       if (!completedView) throw new Error('创建后的实例状态不可见');
+      failureBoundary = 'commit';
       this.o.repo.updateNodeMigration(input.id, 'verifying');
       this.o.repo.commitNodeMigration(input.id, PLATFORM_NODE_PACKAGE.version, input.actor);
-    } catch {
+    } catch (error) {
+      const controlledBoundary = failureBoundary === 'create-container'
+        && error instanceof BootstrapContainerCreateError
+        ? `${failureBoundary}.${error.step}`
+        : failureBoundary;
       const residuals = await this.compensateBootstrap(
         input.id,
         txId,
@@ -360,7 +426,9 @@ export class InstanceService {
       if (residuals.length > 0) {
         throw new BootstrapCompensationError(input.id, residuals);
       }
-      throw new ServiceError(`创建实例失败（${failureCode}），已完成补偿清理`);
+      throw new ServiceError(
+        `创建实例失败（${failureCode}/${controlledBoundary}），已完成补偿清理`,
+      );
     }
 
     return completedView;

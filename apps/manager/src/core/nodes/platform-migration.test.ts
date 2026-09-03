@@ -562,7 +562,7 @@ function platformInventoryWithFiles(
   return inventory;
 }
 
-function stagedPlatformInventory(version = PLATFORM_NODE_PACKAGE.version): InstalledModule {
+function stagedPlatformInventory(version: string = PLATFORM_NODE_PACKAGE.version): InstalledModule {
   const module = PLATFORM_NODE_PACKAGE.name;
   const nodeSets = PLATFORM_NODE_TYPES.map((type) => (
     nodeSet(module, type, version, 'type_already_registered')
@@ -834,14 +834,14 @@ class FakeDocker implements PlatformMigrationDocker {
   async cleanupMigrationProbe(): Promise<{ residuals: [] }> {
     this.runtimeCalls.push('probe-cleanup');
     if (this.state.probeRoot) rmSync(this.state.probeRoot, { recursive: true, force: true });
-    this.state.probeRoot = undefined;
+    delete this.state.probeRoot;
     return { residuals: [] };
   }
 
   async cleanupMigrationProbeByTx(): Promise<{ residuals: [] }> {
     this.runtimeCalls.push('probe-recovery-cleanup');
     if (this.state.probeRoot) rmSync(this.state.probeRoot, { recursive: true, force: true });
-    this.state.probeRoot = undefined;
+    delete this.state.probeRoot;
     return { residuals: [] };
   }
 }
@@ -1101,7 +1101,7 @@ function migrationFixture(options: FixtureOptions = {}) {
     barrierFailure: options.barrierFailure,
     cleanupFailure: options.cleanupFailure === true,
   };
-  let unregister = () => undefined;
+  let unregister: () => void = () => undefined;
   unregister = proxySessions.register('line-a', {
     close(code) {
       events.push(`proxy-close:${code}`);
@@ -2456,7 +2456,11 @@ test('C64 v3 authority accepts semantic main A with rotated backup A', async () 
     (nodePost[1]?.postStart['canonicalSha256s'] as string[])[1],
   ]);
   assert.equal((nodePost[1]?.postStart['canonicalSha256s'] as string[]).length, 2);
-  assert.notEqual(nodePost[0]?.desired.sha256, nodePost[1]?.desired.sha256);
+  const mainDesired = nodePost[0]?.desired;
+  const backupDesired = nodePost[1]?.desired;
+  assert.ok(mainDesired?.exists);
+  assert.ok(backupDesired?.exists);
+  assert.notEqual(mainDesired.sha256, backupDesired.sha256);
 
   f.docker.afterStart = () => {
     writeFileSync(

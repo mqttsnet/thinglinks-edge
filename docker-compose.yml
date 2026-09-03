@@ -80,6 +80,9 @@ services:
     volumes:
       - ${EDGE_DATA_ROOT:-/data01/mqttsnet/thinglinks-edge}:/data-root
     restart: "no"
+    # 只处理本地 bind mount，完全不需要网络；同时避免 Compose 为它
+    # 额外创建一张无用 default bridge，边缘主机的默认地址池很有限。
+    network_mode: none
 
   manager:
     # 公开镜像：现场机器只要装了 docker，`docker compose up -d` 就直接拉起来跑 ——
@@ -110,6 +113,7 @@ services:
       INSTANCE_NETWORK: ${INSTANCE_NETWORK:-thinglinks-edge}
       INSTANCE_PORT_MIN: ${INSTANCE_PORT_MIN:-30000}
       INSTANCE_PORT_MAX: ${INSTANCE_PORT_MAX:-30999}
+      NODE_RED_IMAGE_REPO: ${NODE_RED_IMAGE_REPO:-nodered/node-red}
       ALLOWED_IMAGE_TAGS: ${ALLOWED_IMAGE_TAGS:-5.0.4-24-minimal,4.1.13-22-minimal}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
       # 宿主持久化根。Manager 自己的库与全部实例数据都在这下面，排障只看这一处。

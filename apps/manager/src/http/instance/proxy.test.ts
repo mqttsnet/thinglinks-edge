@@ -61,7 +61,7 @@ function terminateWebSockets(server: WebSocketServer): void {
 
 function trackConnections(app: ReturnType<typeof Fastify>): Set<Socket> {
   const sockets = new Set<Socket>();
-  app.server.on('connection', (socket) => {
+  app.server.on('connection', (socket: Socket) => {
     sockets.add(socket);
     socket.once('close', () => sockets.delete(socket));
   });

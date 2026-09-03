@@ -45,7 +45,11 @@ function validFixture() {
   const instance = join(instanceDataRoot, 'line-a');
   const edgePath = `node_modules/${PLATFORM_NODE_PACKAGE.name}`;
   const commonPath = `node_modules/${PLATFORM_COMMON_PACKAGE.name}`;
-  const rootPackage = {
+  const rootPackage: {
+    name: string;
+    private: boolean;
+    dependencies: Record<string, string>;
+  } = {
     name: 'node-red-project', private: true,
     dependencies: { [PLATFORM_NODE_PACKAGE.name]: PLATFORM_NODE_PACKAGE.version },
   };
@@ -64,7 +68,12 @@ function validFixture() {
       },
     },
   };
-  const edge = {
+  const edge: {
+    name: string;
+    version: string;
+    dependencies: Record<string, string>;
+    'node-red': { version: string; nodes: Record<string, string> };
+  } = {
     name: PLATFORM_NODE_PACKAGE.name,
     version: PLATFORM_NODE_PACKAGE.version,
     dependencies: { [PLATFORM_COMMON_PACKAGE.name]: PLATFORM_COMMON_PACKAGE.version },

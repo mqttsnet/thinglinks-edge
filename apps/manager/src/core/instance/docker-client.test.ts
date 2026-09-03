@@ -14,6 +14,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
   BOOTSTRAP_OWNER_FILE,
+  BootstrapContainerCreateError,
   DockerClient,
   MANAGED_LABEL,
   type DockerClientOptions,
@@ -214,7 +215,7 @@ test('stopped probe restores only immutable checkpoint files and owns exact cont
   const raw = rawOf(f.docker);
   let networkOptions: Record<string, unknown> | undefined;
   let containerOptions: Record<string, unknown> | undefined;
-  let connected = '';
+  let connectOptions: Record<string, unknown> | undefined;
   let started = 0;
   let containerExists = true;
   let networkExists = true;
@@ -242,7 +243,7 @@ test('stopped probe restores only immutable checkpoint files and owns exact cont
         Id: 'probe-network-id', Labels: networkOptions?.['Labels'], Containers: {},
       };
     },
-    connect: async ({ Container }: { Container: string }) => { connected = Container; },
+    connect: async (options: Record<string, unknown>) => { connectOptions = options; },
     disconnect: async () => undefined,
     remove: async () => { networkExists = false; },
   });
@@ -271,7 +272,10 @@ test('stopped probe restores only immutable checkpoint files and owns exact cont
   assert.equal((containerOptions?.['Labels'] as Record<string, unknown>)[MIGRATION_TX_LABEL], txId);
   assert.equal((networkOptions?.['Labels'] as Record<string, unknown>)[MIGRATION_PROBE_LABEL], 'true');
   assert.equal(networkOptions?.['Internal'], true);
-  assert.equal(connected, 'manager-id');
+  assert.deepEqual(connectOptions, {
+    Container: 'manager-id',
+    EndpointConfig: { Aliases: ['manager-ref'] },
+  });
   assert.equal(started, 1);
 
   assert.deepEqual(await f.docker.cleanupMigrationProbe(handle), { residuals: [] });
@@ -353,11 +357,32 @@ test('bootstrap create writes the exact tx owner label to network and container 
   );
 });
 
+test('bootstrap create reports a controlled data-ownership substep without raw filesystem detail', async () => {
+  const f = fixture();
+  const raw = rawOf(f.docker);
+  raw.getImage = () => ({ inspect: async () => ({}) });
+
+  await assert.rejects(
+    () => f.docker.createBootstrapInstance({
+      id: 'line-a', imageTag: '5.0.4-24-minimal', memoryMb: 512, cpus: 0.5,
+      ports: [], adminRoot: '/red/line-a/',
+    }, 'module.exports = {};', 'bootstrap-tx-a'),
+    (error: unknown) => {
+      assert.ok(error instanceof BootstrapContainerCreateError);
+      assert.equal(error.step, 'data-ownership');
+      assert.match(error.message, /data-ownership/);
+      assert.doesNotMatch(error.message, /thinglinks-docker-client-test|line-a\/\.thinglinks/);
+      return true;
+    },
+  );
+});
+
 test('bootstrap Manager attach uses captured network ID and never a same-name replacement', async () => {
   const f = fixture({ managerContainer: 'manager-ref' });
   const raw = rawOf(f.docker);
   let capturedConnects = 0;
   let foreignConnects = 0;
+  let connectOptions: Record<string, unknown> | undefined;
   const ownedNetwork = {
     Id: 'owned-network-id', Labels: ownedLabels('line-a', 'bootstrap-tx-a'), Containers: {},
   };
@@ -374,7 +399,10 @@ test('bootstrap Manager attach uses captured network ID and never a same-name re
     if (ref === 'owned-network-id') {
       return {
         inspect: async () => ownedNetwork,
-        connect: async () => { capturedConnects += 1; },
+        connect: async (options: Record<string, unknown>) => {
+          capturedConnects += 1;
+          connectOptions = options;
+        },
       };
     }
     return {
@@ -390,6 +418,41 @@ test('bootstrap Manager attach uses captured network ID and never a same-name re
   }, 'module.exports = {};', 'bootstrap-tx-a');
   assert.equal(capturedConnects, 1);
   assert.equal(foreignConnects, 0);
+  assert.deepEqual(connectOptions, {
+    Container: 'manager-immutable-id',
+    EndpointConfig: { Aliases: ['manager-ref'] },
+  });
+});
+
+test('reconnect Manager registers its stable registry alias on every owned instance network', async () => {
+  const f = fixture({ managerContainer: 'manager-ref' });
+  const raw = rawOf(f.docker);
+  let connectOptions: Record<string, unknown> | undefined;
+  raw.getContainer = (ref: string) => ({
+    inspect: async () => {
+      assert.equal(ref, 'manager-ref');
+      return { Id: 'manager-immutable-id' };
+    },
+  });
+  raw.getNetwork = (ref: string) => ({
+    inspect: async () => {
+      assert.equal(ref, 'test-edge-line-a');
+      return {
+        Id: 'owned-network-id',
+        Name: 'test-edge-line-a',
+        Labels: { [MANAGED_LABEL]: 'true', [instanceLabel]: 'line-a' },
+        Containers: {},
+      };
+    },
+    connect: async (options: Record<string, unknown>) => { connectOptions = options; },
+  });
+
+  await f.docker.reconnectManager('line-a');
+
+  assert.deepEqual(connectOptions, {
+    Container: 'manager-immutable-id',
+    EndpointConfig: { Aliases: ['manager-ref'] },
+  });
 });
 
 test('bootstrap Manager attach rejects captured network ID with mismatched tx label', async () => {
@@ -409,10 +472,18 @@ test('bootstrap Manager attach rejects captured network ID with mismatched tx la
   });
   await f.docker.prepareBootstrapDataDir('line-a', 'bootstrap-tx-a');
 
-  await assert.rejects(() => f.docker.createBootstrapInstance({
-    id: 'line-a', imageTag: '5.0.4-24-minimal', memoryMb: 512, cpus: 0.5,
-    ports: [], adminRoot: '/red/line-a/',
-  }, 'module.exports = {};', 'bootstrap-tx-a'), /bootstrap.*network.*owner|owner.*network/i);
+  await assert.rejects(
+    () => f.docker.createBootstrapInstance({
+      id: 'line-a', imageTag: '5.0.4-24-minimal', memoryMb: 512, cpus: 0.5,
+      ports: [], adminRoot: '/red/line-a/',
+    }, 'module.exports = {};', 'bootstrap-tx-a'),
+    (error: unknown) => {
+      assert.ok(error instanceof BootstrapContainerCreateError);
+      assert.equal(error.step, 'manager-attach');
+      assert.match((error.cause as Error).message, /bootstrap.*network.*owner|owner.*network/i);
+      return true;
+    },
+  );
   assert.equal(connects, 0);
 });
 
@@ -434,10 +505,18 @@ test('network created after preflight is rejected and preserved as a foreign rac
     remove: async () => { networkRemoveCalls += 1; },
   });
 
-  await assert.rejects(() => f.docker.createBootstrapInstance({
-    id: 'line-a', imageTag: '5.0.4-24-minimal', memoryMb: 512, cpus: 0.5,
-    ports: [], adminRoot: '/red/line-a/',
-  }, 'module.exports = {};', 'bootstrap-tx-a'), /network name conflict/);
+  await assert.rejects(
+    () => f.docker.createBootstrapInstance({
+      id: 'line-a', imageTag: '5.0.4-24-minimal', memoryMb: 512, cpus: 0.5,
+      ports: [], adminRoot: '/red/line-a/',
+    }, 'module.exports = {};', 'bootstrap-tx-a'),
+    (error: unknown) => {
+      assert.ok(error instanceof BootstrapContainerCreateError);
+      assert.equal(error.step, 'network-create');
+      assert.match((error.cause as Error).message, /network name conflict/);
+      return true;
+    },
+  );
   assert.deepEqual(
     await f.docker.cleanupBootstrap('line-a', 'bootstrap-tx-a'),
     { residuals: ['network'] },
@@ -541,10 +620,18 @@ test('container created after preflight is preserved while owned network and dat
   raw.createContainer = async () => { throw new Error('container name conflict'); };
   await f.docker.prepareBootstrapDataDir('line-a', 'bootstrap-tx-a');
 
-  await assert.rejects(() => f.docker.createBootstrapInstance({
-    id: 'line-a', imageTag: '5.0.4-24-minimal', memoryMb: 512, cpus: 0.5,
-    ports: [], adminRoot: '/red/line-a/',
-  }, 'module.exports = {};', 'bootstrap-tx-a'), /container name conflict/);
+  await assert.rejects(
+    () => f.docker.createBootstrapInstance({
+      id: 'line-a', imageTag: '5.0.4-24-minimal', memoryMb: 512, cpus: 0.5,
+      ports: [], adminRoot: '/red/line-a/',
+    }, 'module.exports = {};', 'bootstrap-tx-a'),
+    (error: unknown) => {
+      assert.ok(error instanceof BootstrapContainerCreateError);
+      assert.equal(error.step, 'container-create');
+      assert.match((error.cause as Error).message, /container name conflict/);
+      return true;
+    },
+  );
   assert.deepEqual(
     await f.docker.cleanupBootstrap('line-a', 'bootstrap-tx-a'),
     { residuals: ['container'] },
