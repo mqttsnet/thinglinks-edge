@@ -25,7 +25,8 @@ import {
 import { api, ApiError } from '../../api/client';
 import type {
   CatalogEntry, StorePackage, InstanceInventory, InventoryItem, Instance, NodeCompliance,
-  NpmSource, NodeSearchHit,
+  NpmSource, NodeSearchHit, PlatformNodeMigration, PlatformMigrationPhase,
+  PlatformMigrationErrorCode, NodeInventoryHealth, NodeInventorySource,
 } from '../../api/types';
 import { can, canOperate, loadPermissions } from '../../api/permissions';
 // approvedAt 来自 SQLite 的 datetime('now')：是 UTC 但不带 Z，
@@ -35,8 +36,9 @@ import FieldHelp from '../../components/FieldHelp.vue';
 
 const message = useMessage();
 
-type Section = 'catalog' | 'store' | 'inventory' | 'sources';
+type Section = 'platform' | 'catalog' | 'store' | 'inventory' | 'sources';
 const SECTIONS: Array<{ value: Section; label: string }> = [
+  { value: 'platform', label: '平台节点迁移' },
   { value: 'catalog', label: '批准清单' },
   { value: 'store', label: '离线包库' },
   { value: 'inventory', label: '已装台账' },
@@ -51,6 +53,11 @@ const inventory = ref<InstanceInventory[]>([]);
 const instances = ref<Instance[]>([]);
 const loading = ref(true);
 const loadError = ref('');
+const migrations = ref<Record<string, PlatformNodeMigration>>({});
+const migrationLoadErrors = ref<Record<string, string>>({});
+const migrationLoading = ref(false);
+const migrationBusy = ref<Record<string, boolean>>({});
+const migrationActionErrors = ref<Record<string, string>>({});
 
 const manage = computed(() => can('node:manage'));
 
@@ -77,8 +84,85 @@ async function refresh() {
     storeRoot.value = s.value.root;
   }
   if (inv.status === 'fulfilled') inventory.value = inv.value.instances;
-  if (ins.status === 'fulfilled') instances.value = ins.value.instances;
+  if (ins.status === 'fulfilled') {
+    instances.value = ins.value.instances;
+    await refreshMigrationStatuses(ins.value.instances);
+  }
   loading.value = false;
+}
+
+/** 状态读取是只读请求；不复用搜索、批准或刷新结果来推断迁移是否已经发生。 */
+async function refreshMigrationStatuses(current: Instance[]) {
+  migrationLoading.value = true;
+  const settled = await Promise.allSettled(current.map((item) => api.platformNodeMigration(item.id)));
+  const next: Record<string, PlatformNodeMigration> = {};
+  const errors: Record<string, string> = {};
+  settled.forEach((result, index) => {
+    const id = current[index]!.id;
+    if (result.status === 'fulfilled') next[id] = result.value;
+    else errors[id] = result.reason instanceof ApiError ? result.reason.message : '迁移状态读取失败';
+  });
+  migrations.value = next;
+  migrationLoadErrors.value = errors;
+  migrationLoading.value = false;
+}
+
+const MIGRATION_PHASE: Record<PlatformMigrationPhase, string> = {
+  idle: '尚未迁移', preparing: '正在预检', checkpointed: '已建立回滚检查点',
+  staged: '已暂存平台包', cutover: '正在切换运行模式', verifying: '正在校验',
+  pending_start_verification: '等待启动校验', rolling_back: '正在回滚',
+  committed: '迁移已完成', rolled_back: '已回滚',
+  rolled_back_dirty: '回滚遗留待处理', manual_required: '需要人工处理',
+};
+
+const MIGRATION_ERROR: Record<PlatformMigrationErrorCode, string> = {
+  none: '无错误', preflight: '预检未通过', checkpoint: '检查点不可用', install: '平台包安装未完成',
+  cutover: '运行模式切换未完成', verification: '迁移校验未通过', rollback: '回滚未完全完成',
+  compensation: '补偿未完成', 'state-inconsistent': '状态不一致',
+};
+
+const PLATFORM_MODULE = '@mqttsnet/thinglinks-edge-nodes';
+const PLATFORM_VERSION = '0.0.1';
+
+function platformState(instanceId: string) {
+  const cached = packages.value.some((p) =>
+    p.module === PLATFORM_MODULE && p.versions.includes(PLATFORM_VERSION));
+  const approved = entries.value.some((e) =>
+    e.module === PLATFORM_MODULE && e.version === PLATFORM_VERSION);
+  const observed = inventory.value.find((item) => item.instanceId === instanceId)?.modules
+    .find((item) => item.module === PLATFORM_MODULE && item.version === PLATFORM_VERSION);
+  return {
+    cached,
+    approved,
+    installed: observed !== undefined,
+    active: observed?.enabled === true && observed.health === 'healthy',
+    health: observed?.health,
+    source: observed?.source,
+    errors: observed?.errors ?? [],
+  };
+}
+
+function canStartMigration(instanceId: string): boolean {
+  const phase = migrations.value[instanceId]?.phase;
+  return phase === 'idle' || phase === 'rolled_back';
+}
+
+async function startPlatformMigration(instanceId: string) {
+  migrationBusy.value = { ...migrationBusy.value, [instanceId]: true };
+  migrationActionErrors.value = { ...migrationActionErrors.value, [instanceId]: '' };
+  try {
+    const result = await api.migratePlatformNodes(instanceId);
+    migrations.value = { ...migrations.value, [instanceId]: result };
+    await refresh();
+    message.success(`已收到 ${nameOf(instanceId)} 的迁移请求：${MIGRATION_PHASE[result.phase]}`);
+  } catch (error) {
+    migrationActionErrors.value = {
+      ...migrationActionErrors.value,
+      [instanceId]: error instanceof ApiError ? error.message : '迁移请求失败，请刷新状态后重试',
+    };
+  } finally {
+    migrationBusy.value = { ...migrationBusy.value, [instanceId]: false };
+  }
 }
 
 // ── 批准清单 ────────────────────────────────────────────
@@ -422,6 +506,19 @@ const COMPLIANCE: Record<NodeCompliance, { text: string; type: 'default' | 'succ
   unapproved: { text: '未批准', type: 'warning' },
 };
 
+const INVENTORY_SOURCE: Record<NodeInventorySource, string> = {
+  builtin: '镜像内置', raw: 'legacy 原始节点', npm: 'npm 平台/第三方包',
+  mixed: '镜像与 legacy 混合', unknown: 'Manager 未识别来源',
+};
+
+const INVENTORY_HEALTH: Record<NodeInventoryHealth, string> = {
+  healthy: '加载健康', conflict: '存在类型冲突', failed: '加载失败',
+};
+
+function instanceInventory(instanceId: string): InstanceInventory | undefined {
+  return inventory.value.find((item) => item.instanceId === instanceId);
+}
+
 /** 未批准的排在最前 —— 这一页要人看见的就是它们 */
 function sortedModules(inv: InstanceInventory): InventoryItem[] {
   const rank = (m: InventoryItem) => (m.compliance === 'unapproved' ? 0 : 1);
@@ -461,6 +558,99 @@ onMounted(async () => {
     </NRadioGroup>
 
     <NSpin :show="loading">
+      <!-- ── 平台节点迁移 ───────────────────────────────── -->
+      <section v-show="section === 'platform'" class="sec">
+        <div class="sh">
+          <p class="lead">
+            将实例从镜像中的 legacy 平台节点切换到受信任的发布包。
+            <b>迁移会短暂停止并重启实例，采集会中断；失败时按已保存的检查点回滚。</b>
+            此处状态来自 Manager 当前受控事务，搜索、批准、缓存和刷新都不会启动迁移。
+          </p>
+        </div>
+
+        <NAlert type="info" :bordered="false">
+          <b>外部发现入口，不是 Manager 的实时断言：</b>
+          <a href="https://flows.nodered.org/node/@mqttsnet/thinglinks-edge-nodes"
+             target="_blank" rel="noreferrer">Flow Library 平台包详情</a>
+          与
+          <a href="https://catalogue.nodered.org/catalogue.json"
+             target="_blank" rel="noreferrer">官方 Catalogue JSON</a>
+          仅供在浏览器中独立核验；它们不代表本 Manager 已搜索、已缓存或可安装。
+        </NAlert>
+
+        <NEmpty v-if="instances.length === 0 && !loading" class="empty" description="没有可查看的实例" />
+
+        <NCard v-for="item in instances" :key="item.id" class="card" :bordered="false">
+          <div class="th">
+            <div class="tn">
+              <span class="name">{{ item.name }}</span>
+              <NTag size="small" :bordered="false" class="mono">{{ item.id }}</NTag>
+              <NTag v-if="migrations[item.id]" size="small" :bordered="false"
+                    :type="migrations[item.id]!.phase === 'committed' ? 'success'
+                      : ['manual_required', 'rolled_back_dirty'].includes(migrations[item.id]!.phase)
+                        ? 'warning' : 'info'">
+                {{ MIGRATION_PHASE[migrations[item.id]!.phase] }}
+              </NTag>
+              <NTag v-else size="small" :bordered="false" type="default">
+                {{ migrationLoading ? '正在读取迁移状态' : '迁移状态不可用' }}
+              </NTag>
+            </div>
+            <NPopconfirm v-if="canOperate(item.id)" @positive-click="startPlatformMigration(item.id)">
+              <template #trigger>
+                <NButton size="tiny" type="primary" :loading="migrationBusy[item.id] === true"
+                         :disabled="migrationBusy[item.id] === true || !canStartMigration(item.id)">
+                  迁移到发布平台包
+                </NButton>
+              </template>
+              会停止并重启 {{ item.name }}，期间采集会中断。失败时 Manager 会按检查点回滚；
+              若出现“需要人工处理”或“回滚遗留待处理”，请先按状态处理后再试。确定迁移？
+            </NPopconfirm>
+          </div>
+
+          <NAlert v-if="migrationLoadErrors[item.id]" type="warning" :bordered="false" class="warn">
+            <b>迁移状态未读取到：</b>{{ migrationLoadErrors[item.id] }}。不会据此自动启动迁移。
+          </NAlert>
+          <NAlert v-if="migrationActionErrors[item.id]" type="error" :bordered="false" class="warn">
+            {{ migrationActionErrors[item.id] }}
+          </NAlert>
+          <NAlert v-if="migrations[item.id] && migrations[item.id]!.error !== 'none'"
+                  type="warning" :bordered="false" class="warn">
+            <b>受控错误：</b>{{ MIGRATION_ERROR[migrations[item.id]!.error] }}（{{ migrations[item.id]!.error }}）。
+            <span v-if="migrations[item.id]!.phase === 'manual_required' || migrations[item.id]!.phase === 'rolled_back_dirty'">
+              此状态需要人工确认，不会自动重试或隐藏。
+            </span>
+          </NAlert>
+
+          <div class="platform-state">
+            <span><b>Manager 缓存：</b>{{ platformState(item.id).cached ? '已缓存精确包 0.0.1' : '未见精确包 0.0.1' }}</span>
+            <span><b>平台批准：</b>{{ platformState(item.id).approved ? '已批准精确版本' : '未批准精确版本' }}</span>
+            <span><b>实例安装：</b>{{ platformState(item.id).installed ? '台账已观察到精确版本' : '台账未观察到精确版本' }}</span>
+            <span><b>实例激活：</b>{{ platformState(item.id).active ? '已启用且无已知加载冲突' : '尚无健康激活证据' }}</span>
+          </div>
+          <div v-if="platformState(item.id).source || platformState(item.id).health
+                       || platformState(item.id).errors.length || instanceInventory(item.id)?.health" class="meta">
+            <span v-if="platformState(item.id).source">
+              平台模块来源：{{ INVENTORY_SOURCE[platformState(item.id).source!] }}
+            </span>
+            <span>Manager 台账加载健康：{{ platformState(item.id).health ?? '旧 Manager 未提供' }}</span>
+            <span v-if="instanceInventory(item.id)?.health">
+              实例台账健康：{{ INVENTORY_HEALTH[instanceInventory(item.id)!.health!] }}
+            </span>
+            <span v-if="platformState(item.id).errors.length">加载/冲突证据：{{ platformState(item.id).errors.join('；') }}</span>
+          </div>
+          <NAlert v-if="instanceInventory(item.id)?.conflicts?.length" type="warning" :bordered="false" class="warn">
+            <b>Manager 观察到的类型冲突：</b>
+            <span v-for="conflict in instanceInventory(item.id)!.conflicts!" :key="conflict.type" class="conflict">
+              {{ conflict.type }}：{{ conflict.owners.join('、') }}
+            </span>
+          </NAlert>
+          <p v-if="migrations[item.id]" class="meta">
+            运行模式：{{ migrations[item.id]!.runtimeMode === 'npm' ? 'npm 发布包' : 'legacy 镜像节点' }}
+            <template v-if="migrations[item.id]!.platformVersion"> · 平台版本：{{ migrations[item.id]!.platformVersion }}</template>
+          </p>
+        </NCard>
+      </section>
+
       <!-- ── 批准清单 ─────────────────────────────────── -->
       <section v-show="section === 'catalog'" class="sec">
         <div class="sh">
@@ -638,6 +828,9 @@ onMounted(async () => {
               <NTag v-if="inv.unapproved > 0" size="small" :bordered="false" type="warning">
                 {{ inv.unapproved }} 个未批准
               </NTag>
+              <NTag v-if="inv.health" size="small" :bordered="false">
+                {{ INVENTORY_HEALTH[inv.health] }}
+              </NTag>
             </div>
             <NButton v-if="inv.ok && canOperate(inv.instanceId)" size="tiny" secondary
                      @click="openInstall(inv.instanceId)">装节点包</NButton>
@@ -648,6 +841,12 @@ onMounted(async () => {
             <br>
             实例停着时读不到是正常的 —— 清单存在实例自己的管理接口后面，容器停着那个接口就不存在。
           </NAlert>
+          <NAlert v-if="inv.conflicts?.length" type="warning" :bordered="false" class="warn">
+            <b>类型冲突（Manager 当前台账）：</b>
+            <span v-for="conflict in inv.conflicts" :key="conflict.type" class="conflict">
+              {{ conflict.type }}：{{ conflict.owners.join('、') }}
+            </span>
+          </NAlert>
 
           <div v-else class="mods">
             <div v-for="m in sortedModules(inv)" :key="m.module"
@@ -657,6 +856,8 @@ onMounted(async () => {
               <NTag size="small" :bordered="false" :type="COMPLIANCE[m.compliance].type">
                 {{ COMPLIANCE[m.compliance].text }}
               </NTag>
+              <span v-if="m.source" class="off">来源：{{ INVENTORY_SOURCE[m.source] }}</span>
+              <span v-if="m.health" class="off">加载：{{ INVENTORY_HEALTH[m.health] }}</span>
               <NButton v-if="manage && m.compliance === 'unapproved'" size="tiny" secondary
                        @click="openApprove(m.module)">补批准</NButton>
               <span v-if="!m.enabled" class="off">有节点被禁用</span>
@@ -936,6 +1137,11 @@ h2 { margin: 0 0 4px; font-size: 20px; }
 .types { max-width: 100%; overflow-wrap: anywhere; }
 .warn { margin-top: 12px; line-height: 1.75; }
 .drift { line-height: 1.75; }
+.platform-state { display: grid; grid-template-columns: repeat(auto-fit, minmax(185px, 1fr));
+  gap: 8px 16px; margin-top: 12px; font-size: 12px; color: var(--text-2); }
+.platform-state b { color: var(--text-1); }
+.n-alert a { color: var(--primary); text-decoration: underline; }
+.conflict { display: inline-block; margin-left: 8px; overflow-wrap: anywhere; }
 
 .filt { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 

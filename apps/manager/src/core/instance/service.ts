@@ -1,15 +1,26 @@
 /**
  * 实例服务 —— 编排仓储与 Docker。
  *
- * 创建顺序：先在仓储内以事务占坑（端口冲突在此原子检出），再落 Docker。
- * Docker 失败时补偿删除仓储记录，避免留下「有记录无容器」的半条状态。
+ * 创建顺序：先原子写实例与 bootstrap 日志，再落 Docker/npm 并严格验证。
+ * 失败补偿会保留日志直到容器、网络、数据三类资源都核验不存在。
  */
 import bcrypt from 'bcryptjs';
+import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import type { Db } from '../db.ts';
 import { recordAudit } from '../db.ts';
 import { adminRootFor } from '../config.ts';
-import { InstanceRepo, type PortRecord } from './repo.ts';
-import { DockerClient } from './docker-client.ts';
+import {
+  InstanceRepo,
+  type NodeMigrationErrorCode,
+  type NodeRuntimeMode,
+  type PortRecord,
+} from './repo.ts';
+import {
+  DockerClient,
+  type BootstrapResourceResidual,
+  type RecreateInstanceInput,
+} from './docker-client.ts';
 import { renderSettings } from './settings-template.ts';
 import type { PalettePolicy } from '../nodes/policy.ts';
 import { assertValidId } from './container-spec.ts';
@@ -17,12 +28,55 @@ import { generatePassword } from '../auth/crypto.ts';
 import { validatePortMappings, recommendPorts, type PortRange, type PortMapping } from './ports.ts';
 import { HealthProbe, analyzeLogs, judge, type InstanceHealth } from '../health/probes.ts';
 import { readHostStats, isExhausted, type HostStats } from '../health/host-stats.ts';
+import type { InstanceOperationLease } from './operation-gate.ts';
+import { InstanceOperationGate } from './operation-gate.ts';
+import type { InstanceAdminRuntime } from './admin-runtime.ts';
+import type { PlatformPackageService } from '../nodes/platform-package.ts';
+import {
+  PLATFORM_NODE_PACKAGE,
+} from '../nodes/platform-contract.ts';
+import { installModule } from '../flows/admin-client.ts';
+import { assertHealthyPlatformModule } from '../nodes/inventory.ts';
+import { verifyInstalledPlatformFiles } from '../nodes/installed-files.ts';
+import {
+  type PlatformNodeOperationBarrier,
+} from '../nodes/platform-operation-barrier.ts';
 
 export class ServiceError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'ServiceError';
   }
+}
+
+export class BootstrapCompensationError extends ServiceError {
+  readonly code = 'BOOTSTRAP_COMPENSATION_REQUIRED';
+  readonly residuals: BootstrapResourceResidual[];
+
+  constructor(instanceId: string, residuals: BootstrapResourceResidual[]) {
+    super(
+      residuals.length > 0
+        ? `实例 ${instanceId} 创建补偿未完成，需人工处理：${residuals.join(',')}`
+        : `实例 ${instanceId} 创建补偿收尾未完成，需人工处理`,
+    );
+    this.name = 'BootstrapCompensationError';
+    this.residuals = [...residuals];
+  }
+}
+
+const BOOTSTRAP_RESOURCES = ['container', 'network', 'data'] as const;
+const RECOVERABLE_BOOTSTRAP_PHASES = new Set([
+  'preparing',
+  'verifying',
+  'rolling_back',
+]);
+
+function controlledResiduals(value: unknown): BootstrapResourceResidual[] {
+  if (!Array.isArray(value)) return [...BOOTSTRAP_RESOURCES];
+  if (value.some((item) => !BOOTSTRAP_RESOURCES.includes(item as BootstrapResourceResidual))) {
+    return [...BOOTSTRAP_RESOURCES];
+  }
+  return BOOTSTRAP_RESOURCES.filter((resource) => value.includes(resource));
 }
 
 export interface CreateInstanceInput {
@@ -58,12 +112,26 @@ export interface InstanceServiceOptions {
   db: Db;
   repo: InstanceRepo;
   docker: DockerClient;
+  gate: InstanceOperationGate;
+  adminRuntime: InstanceAdminRuntime;
+  instanceDataRoot: string;
+  platformPackages: PlatformPackageService;
+  barrier: PlatformNodeOperationBarrier;
+  pendingStartCompletion?: {
+    completePendingStartUnderLease(
+      instanceId: string,
+      lease: InstanceOperationLease,
+      actor: string,
+    ): Promise<{ phase: string }>;
+  } | undefined;
   basePath: string;
   portRange: PortRange;
   /** 允许创建的镜像 tag 白名单 */
   allowedImageTags: string[];
   /** 校验端口时是否探测宿主实际占用；测试可关掉 */
   probeHostPorts?: boolean;
+  /** 创建前宿主资源读数；生产使用真实读数，隔离测试可注入稳定快照。 */
+  readHostStats?: (() => Promise<HostStats>) | undefined;
   /** 实例 HTTP 基址解析；生产按容器名，验证时可注入 */
   upstreamFor?: ((instanceId: string) => string) | undefined;
   /**
@@ -75,6 +143,8 @@ export interface InstanceServiceOptions {
    */
   palettePolicy?: (() => PalettePolicy) | undefined;
 }
+
+export type SameImageRecreateReason = 'operator' | 'environment-repair' | 'rollback';
 
 export class InstanceService {
   private readonly o: InstanceServiceOptions;
@@ -147,6 +217,15 @@ export class InstanceService {
   }
 
   async create(input: CreateInstanceInput): Promise<InstanceView> {
+    return this.o.gate.run(input.id, 'create-instance',
+      async (lease) => this.createUnderLease(input, lease));
+  }
+
+  async createUnderLease(
+    input: CreateInstanceInput,
+    lease: InstanceOperationLease,
+  ): Promise<InstanceView> {
+    this.o.gate.assertLease(lease, input.id, ['create-instance']);
     assertValidId(input.id);
     if (!input.name.trim()) throw new ServiceError('实例名称不能为空');
     if (!this.o.allowedImageTags.includes(input.imageTag)) {
@@ -157,7 +236,7 @@ export class InstanceService {
     if (this.o.repo.get(input.id)) throw new ServiceError(`实例 ${input.id} 已存在`);
 
     // 宿主资源逼近上限时阻止创建，而不是等它把机器压垮
-    const exhausted = isExhausted(await readHostStats());
+    const exhausted = isExhausted(await (this.o.readHostStats?.() ?? readHostStats()));
     if (exhausted.exhausted) {
       throw new ServiceError(`${exhausted.reason}，已阻止创建新实例`);
     }
@@ -174,45 +253,204 @@ export class InstanceService {
     const ingestToken = generatePassword(32);
     const ports: PortRecord[] = input.ports.map((m) => ({ ...m }));
 
-    // 1. 先在仓储占坑 —— 端口冲突在事务内原子检出
-    this.o.repo.create(
+    let verified: ReturnType<PlatformPackageService['verifyForInstall']>;
+    try {
+      // 紧邻首个持久化/资源副作用前重验固定平台包与批准基线。
+      verified = this.o.platformPackages.verifyForInstall();
+      await this.o.docker.assertBootstrapResourcesAbsent(input.id);
+    } catch {
+      recordAudit(this.o.db, {
+        actor: input.actor,
+        action: 'create-instance',
+        target: input.id,
+        result: 'fail',
+        detail: JSON.stringify({ code: 'preflight' }),
+      });
+      throw new ServiceError('创建实例失败：平台包或实例资源预检未通过');
+    }
+
+    const txId = `bootstrap-${randomUUID()}`;
+    this.o.repo.createWithNodeMigration(
       {
         id: input.id, name: input.name, imageTag: input.imageTag,
         memLimit: input.memoryMb, cpuLimit: input.cpus,
-        adminRoot, credSecret, notes: '',
+        adminRoot, credSecret, notes: '', nodeRuntimeMode: 'npm',
       },
       ports,
       [{ username: 'admin', password, permissions: '*' }],
+      {
+        instanceId: input.id,
+        txId,
+        operationKind: 'bootstrap',
+        phase: 'preparing',
+        originalRunning: false,
+        stagedBefore: false,
+        modeBefore: 'npm',
+        imageIdBefore: this.o.docker.imageRef(input.imageTag),
+        targetIntegrity: verified.meta.integrity,
+        checkpointDir: '',
+        snapshot: { version: 1, kind: 'bootstrap' },
+        actor: input.actor,
+      },
     );
-    this.o.repo.setIngestToken(input.id, ingestToken);
 
-    // 2. 再落 Docker；失败则补偿删除仓储记录
+    let failureCode: NodeMigrationErrorCode = 'preflight';
+    let completedView: InstanceView | undefined;
     try {
+      await this.o.barrier.reach({
+        instanceId: input.id,
+        txId,
+        phase: 'preparing',
+        sequence: 1,
+        boundary: 'after-phase-persist',
+      });
+      this.o.repo.setIngestToken(input.id, ingestToken);
+      failureCode = 'install';
+      await this.o.docker.prepareBootstrapDataDir(input.id, txId);
       const settings = renderSettings({
         instanceId: input.id,
         adminRoot,
         credentialSecret: credSecret,
         credentials: [{ username: 'admin', passwordHash: bcrypt.hashSync(password, 8), permissions: '*' }],
         palette: this.o.palettePolicy?.(),
+        nodeRuntimeMode: 'npm',
       });
-      await this.o.docker.createInstance(
+      await this.o.docker.createBootstrapInstance(
         { id: input.id, imageTag: input.imageTag, memoryMb: input.memoryMb, cpus: input.cpus,
             ports, adminRoot, ingestToken },
         settings,
+        txId,
       );
-      await this.o.docker.start(input.id);
-    } catch (e) {
-      this.o.repo.remove(input.id);
-      await this.o.docker.remove(input.id, { removeData: true }).catch(() => undefined);
-      recordAudit(this.o.db, {
-        actor: input.actor, action: 'create-instance', target: input.id,
-        result: 'fail', detail: (e as Error).message,
+      await this.o.barrier.reach({
+        instanceId: input.id,
+        txId,
+        phase: 'preparing',
+        sequence: 2,
+        boundary: 'after-container-create',
       });
-      throw new ServiceError(`创建实例失败：${(e as Error).message}`);
+      await this.o.docker.start(input.id);
+      await this.o.adminRuntime.waitReady(input.id, {
+        timeoutMs: 30_000,
+        intervalMs: 250,
+      });
+      const installed = await installModule(
+        this.o.adminRuntime.target(input.id),
+        PLATFORM_NODE_PACKAGE.name,
+        PLATFORM_NODE_PACKAGE.version,
+      );
+      failureCode = 'verification';
+      assertHealthyPlatformModule(installed);
+      await verifyInstalledPlatformFiles({
+        instanceDataRoot: this.o.instanceDataRoot,
+        instanceId: input.id,
+        readFile,
+      });
+      // 所有可能失败的外部读都放在最终提交之前；提交后不得再因只读状态查询而回失败。
+      completedView = await this.get(input.id);
+      if (!completedView) throw new Error('创建后的实例状态不可见');
+      this.o.repo.updateNodeMigration(input.id, 'verifying');
+      this.o.repo.commitNodeMigration(input.id, PLATFORM_NODE_PACKAGE.version, input.actor);
+    } catch {
+      const residuals = await this.compensateBootstrap(
+        input.id,
+        txId,
+        input.actor,
+        failureCode,
+      );
+      if (residuals.length > 0) {
+        throw new BootstrapCompensationError(input.id, residuals);
+      }
+      throw new ServiceError(`创建实例失败（${failureCode}），已完成补偿清理`);
     }
 
-    recordAudit(this.o.db, { actor: input.actor, action: 'create-instance', target: input.id, result: 'ok' });
-    return (await this.get(input.id))!;
+    return completedView;
+  }
+
+  private async compensateBootstrap(
+    instanceId: string,
+    txId: string,
+    actor: string,
+    failureCode: NodeMigrationErrorCode,
+  ): Promise<BootstrapResourceResidual[]> {
+    this.o.repo.updateNodeMigration(instanceId, 'rolling_back', failureCode);
+    let residuals: BootstrapResourceResidual[];
+    try {
+      residuals = controlledResiduals(
+        (await this.o.docker.cleanupBootstrap(instanceId, txId)).residuals,
+      );
+    } catch {
+      // 清理器本应把三类结果闭合返回；若边界自身异常，保守地全部标残留。
+      residuals = ['container', 'network', 'data'];
+    }
+    if (residuals.length === 0) {
+      // 资源均已核验不存在后，才允许删除实例行；journal/凭据/令牌随 FK 级联。
+      try {
+        this.o.db.transaction(() => {
+          this.o.repo.remove(instanceId);
+          recordAudit(this.o.db, {
+            actor,
+            action: 'create-instance',
+            target: instanceId,
+            result: 'fail',
+            detail: JSON.stringify({ code: failureCode }),
+          });
+        })();
+      } catch {
+        this.preserveManualCompensation(instanceId);
+        throw new BootstrapCompensationError(instanceId, []);
+      }
+      return [];
+    }
+    try {
+      this.o.db.transaction(() => {
+        this.o.repo.updateNodeMigration(instanceId, 'manual_required', 'compensation');
+        recordAudit(this.o.db, {
+          actor,
+          action: 'bootstrap-compensation',
+          target: instanceId,
+          result: 'fail',
+          detail: JSON.stringify({ code: 'compensation', residuals }),
+        });
+      })();
+    } catch {
+      this.preserveManualCompensation(instanceId);
+      throw new BootstrapCompensationError(instanceId, residuals);
+    }
+    return residuals;
+  }
+
+  /** Audit finalization fallback: persist only the closed recovery state, never raw DB text. */
+  private preserveManualCompensation(instanceId: string): void {
+    try {
+      this.o.db.transaction(() => {
+        this.o.repo.updateNodeMigration(instanceId, 'manual_required', 'compensation');
+      })();
+    } catch {
+      // Outward callers still receive only BootstrapCompensationError below.
+    }
+  }
+
+  /** 启动期内部恢复：不递归获取公开 gate，直接复用同一严格补偿原语。 */
+  async recoverInterruptedBootstraps(): Promise<Array<{
+    instanceId: string;
+    residuals: BootstrapResourceResidual[];
+  }>> {
+    const interrupted = this.o.repo.interruptedNodeMigrations()
+      .filter((journal) => (
+        journal.operationKind === 'bootstrap'
+        && RECOVERABLE_BOOTSTRAP_PHASES.has(journal.phase)
+      ));
+    const results: Array<{ instanceId: string; residuals: BootstrapResourceResidual[] }> = [];
+    for (const journal of interrupted) {
+      const residuals = await this.compensateBootstrap(
+        journal.instanceId,
+        journal.txId,
+        'system',
+        journal.error === 'none' ? 'compensation' : journal.error,
+      );
+      results.push({ instanceId: journal.instanceId, residuals });
+    }
+    return results;
   }
 
   async list(): Promise<InstanceView[]> {
@@ -235,13 +473,46 @@ export class InstanceService {
   }
 
   async start(id: string, actor: string): Promise<void> {
+    return this.o.gate.run(id, 'start-instance',
+      async (lease) => this.startUnderLease(id, lease, actor));
+  }
+
+  async startUnderLease(
+    id: string,
+    lease: InstanceOperationLease,
+    actor: string,
+  ): Promise<void> {
+    this.o.gate.assertLease(lease, id, ['start-instance']);
     this.assertExists(id);
+    if (this.o.repo.nodeRuntime(id)?.migrationState === 'pending_start_verification') {
+      if (!this.o.pendingStartCompletion) {
+        throw new ServiceError(`实例 ${id} 缺少待启动迁移验证服务`);
+      }
+      const result = await this.o.pendingStartCompletion.completePendingStartUnderLease(
+        id, lease, actor,
+      );
+      if (result.phase !== 'committed') {
+        throw new ServiceError(`实例 ${id} 启动验证失败，已恢复并保持停机`);
+      }
+      recordAudit(this.o.db, { actor, action: 'start-instance', target: id, result: 'ok' });
+      return;
+    }
     await this.o.docker.assertManaged(id);
     await this.o.docker.start(id);
     recordAudit(this.o.db, { actor, action: 'start-instance', target: id, result: 'ok' });
   }
 
   async stop(id: string, actor: string): Promise<void> {
+    return this.o.gate.run(id, 'stop-instance',
+      async (lease) => this.stopUnderLease(id, lease, actor));
+  }
+
+  async stopUnderLease(
+    id: string,
+    lease: InstanceOperationLease,
+    actor: string,
+  ): Promise<void> {
+    this.o.gate.assertLease(lease, id, ['stop-instance']);
     this.assertExists(id);
     await this.o.docker.assertManaged(id);
     await this.o.docker.stop(id);
@@ -250,6 +521,16 @@ export class InstanceService {
 
   /** 删除实例；是否连带删除数据卷由调用方显式指定，绝不默认删数据 */
   async remove(id: string, opts: { removeData: boolean; actor: string }): Promise<void> {
+    return this.o.gate.run(id, 'remove-instance',
+      async (lease) => this.removeUnderLease(id, lease, opts));
+  }
+
+  async removeUnderLease(
+    id: string,
+    lease: InstanceOperationLease,
+    opts: { removeData: boolean; actor: string },
+  ): Promise<void> {
+    this.o.gate.assertLease(lease, id, ['remove-instance']);
     this.assertExists(id);
     await this.o.docker.assertManaged(id).catch(() => undefined);
     await this.o.docker.remove(id, { removeData: opts.removeData }).catch(() => undefined);
@@ -262,6 +543,17 @@ export class InstanceService {
 
   /** 重置实例账号口令：改仓储 → 重写 settings.js → 重启实例 */
   async resetCredential(id: string, username: string, actor: string): Promise<string> {
+    return this.o.gate.run(id, 'reset-credential',
+      async (lease) => this.resetCredentialUnderLease(id, lease, username, actor));
+  }
+
+  async resetCredentialUnderLease(
+    id: string,
+    lease: InstanceOperationLease,
+    username: string,
+    actor: string,
+  ): Promise<string> {
+    this.o.gate.assertLease(lease, id, ['reset-credential']);
     const inst = this.o.repo.get(id);
     if (!inst) throw new ServiceError(`实例 ${id} 不存在`);
 
@@ -283,7 +575,7 @@ export class InstanceService {
    * 各写一份的话，改了其中一处（比如加了个新的 palette 字段）另外两处会悄悄落后，
    * 表现是「重置口令之后白名单变回旧的了」这种没人能一眼看懂的现象。
    */
-  #renderFor(id: string): string {
+  #renderFor(id: string, runtimeMode?: NodeRuntimeMode): string {
     const inst = this.o.repo.get(id);
     if (!inst) throw new ServiceError(`实例 ${id} 不存在`);
     return renderSettings({
@@ -296,6 +588,120 @@ export class InstanceService {
         permissions: c.permissions,
       })),
       palette: this.o.palettePolicy?.(),
+      nodeRuntimeMode: runtimeMode ?? inst.nodeRuntimeMode ?? 'legacy',
+    });
+  }
+
+  /**
+   * Migration-only settings primitive. The caller must already hold the one outer lease;
+   * rendering performs no Docker, Admin, audit, or recursive gate operation.
+   */
+  renderNodeSettingsUnderLease(
+    id: string,
+    lease: InstanceOperationLease,
+    runtimeMode: NodeRuntimeMode,
+  ): string {
+    this.o.gate.assertLease(lease, id, ['platform-migration']);
+    return this.#renderFor(id, runtimeMode);
+  }
+
+  /** Public same-image repair facade; every direct call owns exactly one durable gate lease. */
+  async recreateSameImage(id: string): Promise<void> {
+    return this.o.gate.run(id, 'same-image-rebuild',
+      async (lease) => this.recreateSameImageUnderLease(id, lease, 'operator'));
+  }
+
+  /**
+   * Same-image internal primitive for an outer migration lease. It builds every
+   * mutable field from the repository and pins only the inspected immutable image id.
+   */
+  async recreateSameImageUnderLease(
+    id: string,
+    lease: InstanceOperationLease,
+    reason: SameImageRecreateReason,
+  ): Promise<void> {
+    this.o.gate.assertLease(lease, id, ['same-image-rebuild', 'platform-migration']);
+    const inst = this.o.repo.get(id);
+    if (!inst) throw new ServiceError(`实例 ${id} 不存在`);
+    const runtimeBefore = this.o.repo.nodeRuntime(id);
+    const journalBefore = this.o.repo.nodeMigration(id);
+    const inspection = await this.o.docker.inspectMigrationRuntime(id).catch(() => {
+      throw new ServiceError(`实例 ${id} 无法读取受管容器身份，拒绝同镜像重建`);
+    });
+    const runtimeMode = inst.nodeRuntimeMode ?? 'legacy';
+    const input: RecreateInstanceInput = {
+      spec: {
+        id,
+        imageTag: inst.imageTag,
+        memoryMb: inst.memLimit,
+        cpus: inst.cpuLimit,
+        ports: this.o.repo.ports(id),
+        adminRoot: inst.adminRoot,
+        ingestToken: this.o.repo.ingestToken(id),
+      },
+      settingsJs: this.#renderFor(id, runtimeMode),
+      runtimeMode,
+      imageId: inspection.imageId,
+      running: inspection.running,
+    };
+    const apply = async () => {
+      await this.o.docker.recreateInstance(input);
+      if (input.running) {
+        await this.o.adminRuntime.waitReady(id, { timeoutMs: 30_000, intervalMs: 250 });
+      }
+    };
+    try {
+      await apply();
+    } catch {
+      try {
+        // Reapply the exact captured input. No repository or environment fact is reread
+        // after a partial replacement, so compensation cannot drift to a new image/spec.
+        await apply();
+      } catch {
+        let fenced = false;
+        try {
+          if (
+            journalBefore
+            && (journalBefore.phase === 'committed' || journalBefore.phase === 'rolled_back')
+          ) {
+            this.o.repo.fenceSameImageRebuildFailureExact(
+              id, journalBefore.txId, journalBefore.phase, 'system',
+            );
+          } else if (!journalBefore && runtimeBefore?.migrationState === 'idle') {
+            this.o.repo.fenceSameImageRebuildFailure(id, 'system');
+          }
+          const runtimeAfter = this.o.repo.nodeRuntime(id);
+          const journalAfter = this.o.repo.nodeMigration(id);
+          fenced = runtimeAfter?.migrationState === 'manual_required'
+            && runtimeAfter.migrationError === 'compensation'
+            && (
+              journalBefore
+                ? journalAfter?.txId === journalBefore.txId
+                  && journalAfter.phase === 'manual_required'
+                  && journalAfter.error === 'compensation'
+                : journalAfter === undefined
+            );
+        } catch {
+          // An active migration journal remains its own recovery authority.
+        }
+        if (!fenced) {
+          throw new ServiceError(
+            `实例 ${id} 同镜像重建与自动恢复均失败，且未能持久化人工围栏，需立即人工处理`,
+          );
+        }
+        throw new ServiceError(
+          `实例 ${id} 同镜像重建失败且自动恢复未完成，数据目录仍保留，需人工处理`,
+        );
+      }
+      recordAudit(this.o.db, {
+        actor: 'system', action: 'same-image-rebuild', target: id, result: 'fail',
+        detail: JSON.stringify({ code: 'rollback', reason }),
+      });
+      throw new ServiceError(`实例 ${id} 同镜像重建失败，已按原镜像与运行状态恢复`);
+    }
+    recordAudit(this.o.db, {
+      actor: 'system', action: 'same-image-rebuild', target: id, result: 'ok',
+      detail: JSON.stringify({ reason, running: input.running }),
     });
   }
 
@@ -310,6 +716,16 @@ export class InstanceService {
    * 而替用户把停掉的实例拉起来是越权的动作（人家可能是故意停的）。
    */
   async applyNodePolicy(id: string, actor: string): Promise<{ restarted: boolean }> {
+    return this.o.gate.run(id, 'apply-node-policy',
+      async (lease) => this.applyNodePolicyUnderLease(id, lease, actor));
+  }
+
+  async applyNodePolicyUnderLease(
+    id: string,
+    lease: InstanceOperationLease,
+    actor: string,
+  ): Promise<{ restarted: boolean }> {
+    this.o.gate.assertLease(lease, id, ['apply-node-policy']);
     const inst = this.o.repo.get(id);
     if (!inst) throw new ServiceError(`实例 ${id} 不存在`);
     await this.o.docker.assertManaged(id);
@@ -356,6 +772,17 @@ export class InstanceService {
   async upgradeImage(
     id: string, imageTag: string, actor: string,
   ): Promise<{ from: string; to: string; rolledBack: boolean }> {
+    return this.o.gate.run(id, 'upgrade-image',
+      async (lease) => this.upgradeImageUnderLease(id, lease, imageTag, actor));
+  }
+
+  async upgradeImageUnderLease(
+    id: string,
+    lease: InstanceOperationLease,
+    imageTag: string,
+    actor: string,
+  ): Promise<{ from: string; to: string; rolledBack: boolean }> {
+    this.o.gate.assertLease(lease, id, ['upgrade-image']);
     const inst = this.o.repo.get(id);
     if (!inst) throw new ServiceError(`实例 ${id} 不存在`);
     if (!this.o.allowedImageTags.includes(imageTag)) {
@@ -379,19 +806,20 @@ export class InstanceService {
       id, imageTag: tag, memoryMb: inst.memLimit, cpus: inst.cpuLimit,
       ports, adminRoot: inst.adminRoot, ingestToken,
     });
+    const runtimeMode = inst.nodeRuntimeMode ?? 'legacy';
 
     // ② 删容器**保数据**。数据目录是 bind 挂载，不随容器走
     await this.o.docker.remove(id, { removeData: false });
 
     try {
-      await this.o.docker.createInstance(spec(imageTag), settings);
+      await this.o.docker.createInstance(spec(imageTag), settings, runtimeMode);
       await this.o.docker.start(id);
     } catch (e) {
       // ③ 起不来就退回旧版本，别把实例丢在半路
       let rollbackError = '';
       try {
         await this.o.docker.remove(id, { removeData: false });
-        await this.o.docker.createInstance(spec(from), settings);
+        await this.o.docker.createInstance(spec(from), settings, runtimeMode);
         await this.o.docker.start(id);
       } catch (re) {
         rollbackError = (re as Error).message;

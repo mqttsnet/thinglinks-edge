@@ -91,8 +91,28 @@ test('特殊字符不会破坏文件结构', () => {
   assert.equal(s['credentialSecret'], 'a"b\nc');
 });
 
-test('settings 指向 @thinglinks 节点集目录', () => {
-  // 少了这行，Manager 拷进去的节点集不会被 Node-RED 扫到，
-  // 表现是「面板里没有 ThingLinks 分类」而没有任何报错
-  assert.equal(evalSettings(renderSettings(input())).nodesDir, '/data/nodes');
+test('legacy settings do not exclude raw platform nodes', () => {
+  const settings = evalSettings(renderSettings(input({
+    nodeRuntimeMode: 'legacy',
+  })));
+  assert.equal(settings.nodesDir, undefined);
+  assert.equal(settings.nodesExcludes.includes('tl-device.js'), false);
+});
+
+test('npm settings exclude only three legacy runtime files', () => {
+  const settings = evalSettings(renderSettings(input({
+    nodeRuntimeMode: 'npm',
+  })));
+  assert.equal(settings.nodesDir, undefined);
+  assert.deepEqual(settings.nodesExcludes, [
+    '90-exec.js', '28-tail.js', '10-file.js', '23-watch.js',
+    'tl-device.js', 'tl-tag.js', 'tl-uplink.js',
+  ]);
+});
+
+test('settings reject an invalid runtime mode', () => {
+  assert.throws(
+    () => renderSettings(input({ nodeRuntimeMode: 'invalid' as 'legacy' })),
+    /节点运行模式/,
+  );
 });

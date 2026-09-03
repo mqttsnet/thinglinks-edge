@@ -8,26 +8,64 @@
  * 这样它能在几秒内跑完，值得在每次改路由后都跑一遍。
  */
 import { createServer } from 'node:http';
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
+import {
+  existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync,
+} from 'node:fs';
+import net from 'node:net';
+import { basename, dirname, join } from 'node:path';
 
 import { openDb } from '../dist/core/db.js';
 import { deriveKey } from '../dist/core/auth/crypto.js';
 import { AuthService } from '../dist/core/auth/service.js';
 import { InstanceRepo } from '../dist/core/instance/repo.js';
-import { UserRepo } from '../dist/core/auth/user-repo.js';
 import { InstanceService } from '../dist/core/instance/service.js';
+import {
+  InstanceOperationGate,
+  InstanceRepositoryOperationPolicy,
+} from '../dist/core/instance/operation-gate.js';
+import { ProxySessionRegistry } from '../dist/core/instance/proxy-session-registry.js';
+import { NodeStore } from '../dist/core/nodes/store.js';
+import { NodeCatalog } from '../dist/core/nodes/catalog.js';
+import { PlatformPackageService } from '../dist/core/nodes/platform-package.js';
+import { MigrationCheckpointStore } from '../dist/core/nodes/migration-checkpoint.js';
+import {
+  NodeRedPlatformMigrationAdminActions,
+  PlatformMigrationService,
+} from '../dist/core/nodes/platform-migration.js';
+import {
+  assembleInstanceAdminRuntime,
+  assemblePlatformOperationBarrier,
+} from '../dist/index.js';
 import { MetricsHistory } from '../dist/core/health/metrics-history.js';
 import { FieldRegistry } from '../dist/core/edge/registry.js';
 import { buildServer } from '../dist/http/app.js';
-import WebSocket from 'ws';
+import WebSocket, { WebSocketServer } from 'ws';
 
-const PORT = 13260;
-const B = `http://127.0.0.1:${PORT}`;
-const ADMIN_PW = 'initial-password-123';
+let PORT;
+let B;
+const AUTHZ_RUN_ID = `authz-${randomBytes(5).toString('hex')}`;
+const CANONICAL_TMP_PARENT = realpathSync(existsSync('/private/tmp') ? '/private/tmp' : '/tmp');
+assert.ok(CANONICAL_TMP_PARENT === '/private/tmp' || CANONICAL_TMP_PARENT === '/tmp');
+const randomPassword = () => `Aa1!${randomBytes(20).toString('base64url')}`;
+const ADMIN_PW = randomPassword();
+const ADMIN_NEXT_PW = randomPassword();
+const INSTANCE_PW = randomPassword();
+const INSTANCE_SECRET = randomBytes(24).toString('base64url');
+const OPERATOR_PW = randomPassword();
+const VIEWER_PW = randomPassword();
+const PENDING_PW = randomPassword();
+const SHIFT_PW = randomPassword();
+const WRONG_PW = randomPassword();
 
 const results = [];
+let authzApp;
+let authzDb;
+let authzRoot;
+let authzOwner;
+let upstreamServer;
+let upstreamWebSockets;
 const check = (name, ok, detail = '') => {
   results.push({ name, ok });
   console.log(`  ${ok ? '✓' : '✗'} ${name}${detail ? '  — ' + detail : ''}`);
@@ -42,6 +80,114 @@ const fakeDocker = {
   containerRef() { return { async inspect() { return { State: { Status: 'running', Running: true } }; },
                             async stats() { return {}; } }; },
 };
+
+async function freePort() {
+  const server = net.createServer();
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  const port = address.port;
+  await new Promise((resolve) => server.close(resolve));
+  return port;
+}
+
+function assembleRuntime({ db, repo, docker, dataRoot, upstreamFor }) {
+  const operationGate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repo));
+  const proxySessions = new ProxySessionRegistry();
+  const instanceAdmin = assembleInstanceAdminRuntime({ repo, upstreamFor });
+  const platformOperation = assemblePlatformOperationBarrier();
+  // Authz never installs a node package. Keep the real trust service fail-closed
+  // instead of fabricating a verifier-only trusted package response.
+  const platformPackages = new PlatformPackageService({
+    store: new NodeStore(join(dataRoot, 'npm')),
+    catalog: new NodeCatalog(db),
+  });
+  let migrationService;
+  const pendingStartCompletion = {
+    completePendingStartUnderLease(instanceId, lease, actor) {
+      if (!migrationService) throw new Error('migration service is not assembled');
+      return migrationService.completePendingStartUnderLease(instanceId, lease, actor);
+    },
+  };
+  const service = new InstanceService({
+    ...instanceAdmin.instanceServiceDeps,
+    ...platformOperation.instanceServiceDeps,
+    db, repo, docker, gate: operationGate, instanceDataRoot: dataRoot,
+    platformPackages, pendingStartCompletion,
+    basePath: '', portRange: { min: 30000, max: 30999 },
+    allowedImageTags: ['5.0.4-24-minimal'], probeHostPorts: false,
+    upstreamFor,
+  });
+  migrationService = new PlatformMigrationService({
+    repo, gate: operationGate, proxySessions, docker,
+    adminRuntime: instanceAdmin.adminRuntime,
+    admin: new NodeRedPlatformMigrationAdminActions(instanceAdmin.adminRuntime),
+    platformPackages,
+    checkpoint: new MigrationCheckpointStore(dataRoot),
+    settings: service, repair: service, bootstrapRecovery: service,
+    ...platformOperation.migrationServiceDeps,
+    instanceDataRoot: dataRoot,
+  });
+  return {
+    service, operationGate, proxySessions, migrationService, platformPackages,
+    adminRuntime: instanceAdmin.adminRuntime,
+  };
+}
+
+async function cleanup() {
+  const errors = [];
+  const attempt = async (label, task) => {
+    try { await task(); } catch (error) { errors.push(`${label}: ${error.message}`); }
+  };
+  await attempt('Manager close', async () => {
+    if (authzApp) await authzApp.close();
+    authzApp = undefined;
+  });
+  await attempt('upstream close', () => new Promise((resolve, reject) => {
+    for (const client of upstreamWebSockets?.clients ?? []) client.terminate();
+    upstreamWebSockets?.close();
+    upstreamWebSockets = undefined;
+    if (!upstreamServer?.listening) return resolve();
+    upstreamServer.close((error) => error ? reject(error) : resolve());
+  }));
+  upstreamServer = undefined;
+  await attempt('database close', async () => {
+    if (authzDb?.open) authzDb.close();
+    authzDb = undefined;
+  });
+  await attempt('data cleanup', async () => {
+    if (!authzRoot) return;
+    let rootStat;
+    try {
+      rootStat = lstatSync(authzRoot);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+      authzRoot = undefined;
+      authzOwner = undefined;
+      return;
+    }
+    assert.ok(rootStat.isDirectory() && !rootStat.isSymbolicLink());
+    assert.equal(realpathSync(authzRoot), authzRoot);
+    assert.equal(dirname(authzRoot), CANONICAL_TMP_PARENT);
+    assert.ok(basename(authzRoot).startsWith(`${AUTHZ_RUN_ID}-`));
+    const ownerStat = lstatSync(authzOwner);
+    assert.ok(ownerStat.isFile() && !ownerStat.isSymbolicLink());
+    assert.equal(readFileSync(authzOwner, 'utf8'), AUTHZ_RUN_ID);
+    rmSync(authzRoot, { recursive: true, force: false });
+    try {
+      lstatSync(authzRoot);
+      throw new Error('authz verifier data root still exists');
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+    authzRoot = undefined;
+    authzOwner = undefined;
+  });
+  if (errors.length > 0) throw new Error(`verifier cleanup failed: ${errors.join('; ')}`);
+}
 
 async function login(username, password) {
   const res = await fetch(`${B}/api/login`, {
@@ -60,22 +206,32 @@ const status = async (path, sess, init = {}) =>
 async function main() {
   console.log('\n──── 越权用例 · 全拒验证 ────\n');
 
-  const db = openDb(join(mkdtempSync(join(tmpdir(), 'tle-authz-')), 'edge.db'));
+  PORT = await freePort();
+  B = `http://127.0.0.1:${PORT}`;
+  const dataRoot = realpathSync(mkdtempSync(join(CANONICAL_TMP_PARENT, `${AUTHZ_RUN_ID}-`)));
+  assert.equal(dirname(dataRoot), CANONICAL_TMP_PARENT);
+  authzRoot = dataRoot;
+  authzOwner = join(dataRoot, '.verifier-owner');
+  writeFileSync(authzOwner, AUTHZ_RUN_ID, { flag: 'wx', mode: 0o600 });
+  const db = openDb(join(dataRoot, 'edge.db'));
+  authzDb = db;
   const auth = new AuthService(db);
   auth.ensureInitialUser('admin', ADMIN_PW);
   const repo = new InstanceRepo(db, deriveKey('authz', 'salt'));
-  const users = new UserRepo(db);
-  const service = new InstanceService({
-    db, repo, docker: fakeDocker, basePath: '', portRange: { min: 30000, max: 30999 },
-    allowedImageTags: ['5.0.4-24-minimal'],
-  });
+  let upstreamUrl = 'http://127.0.0.1:1';
+  let upstreamResolveHits = 0;
+  const upstreamFor = () => {
+    upstreamResolveHits += 1;
+    return upstreamUrl;
+  };
+  const runtime = assembleRuntime({ db, repo, docker: fakeDocker, dataRoot, upstreamFor });
 
   // 两台实例直接落库，绕开 Docker
   for (const id of ['line-a', 'line-b']) {
     repo.create(
       { id, name: id, imageTag: '5.0.4-24-minimal', memLimit: 512, cpuLimit: 0.5,
-        adminRoot: `/red/${id}/`, credSecret: 'cs', notes: '' },
-      [], [{ username: 'admin', password: 'pw', permissions: '*' }],
+        adminRoot: `/red/${id}/`, credSecret: INSTANCE_SECRET, notes: '' },
+      [], [{ username: 'admin', password: INSTANCE_PW, permissions: '*' }],
     );
   }
 
@@ -98,8 +254,22 @@ async function main() {
 
   // 假上游：反代若放行就会打到它；被拒时它一次都不会被访问到
   let upstreamHits = 0;
+  let upstreamUpgradeHits = 0;
   const upstream = createServer((_q, s) => { upstreamHits += 1; s.end('UPSTREAM'); });
-  await new Promise((r) => upstream.listen(13261, '127.0.0.1', r));
+  const upstreamWs = new WebSocketServer({ server: upstream });
+  upstreamWebSockets = upstreamWs;
+  upstreamWs.on('connection', (ws) => {
+    upstreamUpgradeHits += 1;
+    ws.on('error', () => undefined);
+  });
+  upstreamServer = upstream;
+  await new Promise((resolve, reject) => {
+    upstream.once('error', reject);
+    upstream.listen(0, '127.0.0.1', resolve);
+  });
+  const upstreamAddress = upstream.address();
+  assert.ok(upstreamAddress && typeof upstreamAddress !== 'string');
+  upstreamUrl = `http://127.0.0.1:${upstreamAddress.port}`;
 
   const app = buildServer({
     config: {
@@ -107,51 +277,70 @@ async function main() {
       listenAddr: '127.0.0.1', listenPort: PORT, dataDir: '/tmp',
       dataRoot: '/tmp', instanceDataRoot: '/tmp', portRange: { min: 30000, max: 30999 },
     },
-    db, auth, repo, service, metrics,
-    upstreamFor: () => 'http://127.0.0.1:13261',
+    db, auth, repo, metrics,
+    service: runtime.service,
+    operationGate: runtime.operationGate,
+    migrationService: runtime.migrationService,
+    proxySessions: runtime.proxySessions,
+    adminRuntime: runtime.adminRuntime,
+    platformPackages: runtime.platformPackages,
+    upstreamFor,
   });
+  authzApp = app;
   await app.listen({ host: '127.0.0.1', port: PORT });
 
   // ── 准备账号 ──
   const admin = await login('admin', ADMIN_PW);
-  await fetch(`${B}/api/change-password`, {
+  assert.ok(admin, 'initial admin login failed');
+  const initialChange = await fetch(`${B}/api/change-password`, {
     method: 'POST', headers: admin.headers,
-    body: JSON.stringify({ oldPassword: ADMIN_PW, newPassword: 'admin-pass-1234' }),
+    body: JSON.stringify({ oldPassword: ADMIN_PW, newPassword: ADMIN_NEXT_PW }),
   });
-  const root = await login('admin', 'admin-pass-1234');
+  assert.equal(initialChange.status, 204, 'initial admin password change failed');
+  const root = await login('admin', ADMIN_NEXT_PW);
   check('管理员登录并完成首次改密', Boolean(root));
+  assert.ok(root, 'admin relogin failed');
 
   const mk = async (username, role) => {
     const res = await fetch(`${B}/api/users`, {
       method: 'POST', headers: root.headers, body: JSON.stringify({ username, role }),
     });
-    return (await res.json()).password;
+    assert.ok(res.ok, `create user ${username} failed with HTTP ${res.status}`);
+    const body = await res.json();
+    assert.equal(typeof body.password, 'string', `create user ${username} returned no password`);
+    return body.password;
   };
   const opPw = await mk('lineop', 'operator');
   const viPw = await mk('watcher', 'viewer');
   check('管理员可新建用户并拿到一次性口令', typeof opPw === 'string' && opPw.length >= 20);
 
   // 只授权 line-a
-  await fetch(`${B}/api/users/lineop/grants`, {
+  const opGrant = await fetch(`${B}/api/users/lineop/grants`, {
     method: 'POST', headers: root.headers,
     body: JSON.stringify({ instanceId: 'line-a', level: 'operate' }),
   });
-  await fetch(`${B}/api/users/watcher/grants`, {
+  assert.equal(opGrant.status, 204, 'operator grant failed');
+  const viewerGrant = await fetch(`${B}/api/users/watcher/grants`, {
     method: 'POST', headers: root.headers,
     body: JSON.stringify({ instanceId: 'line-a', level: 'view' }),
   });
+  assert.equal(viewerGrant.status, 204, 'viewer grant failed');
 
   // 新用户首次登录要改密，改完再用
   const useAs = async (username, initial, next) => {
     const s0 = await login(username, initial);
-    await fetch(`${B}/api/change-password`, {
+    assert.ok(s0, `${username} initial login failed`);
+    const changed = await fetch(`${B}/api/change-password`, {
       method: 'POST', headers: s0.headers,
       body: JSON.stringify({ oldPassword: initial, newPassword: next }),
     });
-    return login(username, next);
+    assert.equal(changed.status, 204, `${username} password change failed`);
+    const session = await login(username, next);
+    assert.ok(session, `${username} relogin failed`);
+    return session;
   };
-  const op = await useAs('lineop', opPw, 'operator-pass-1234');
-  const vi = await useAs('watcher', viPw, 'viewer-pass-12345');
+  const op = await useAs('lineop', opPw, OPERATOR_PW);
+  const vi = await useAs('watcher', viPw, VIEWER_PW);
   check('新建的用户可登录（首次强制改密后）', Boolean(op) && Boolean(vi));
 
   // ── 运维：授权范围内可用 ──
@@ -201,10 +390,10 @@ async function main() {
   check('待改密·仍可读自己的会话（/api/me）', await status('/api/me', pend) === 200);
   const changed = await fetch(`${B}/api/change-password`, {
     method: 'POST', headers: pend.headers,
-    body: JSON.stringify({ oldPassword: pendPw, newPassword: 'pending-pass-1234' }),
+    body: JSON.stringify({ oldPassword: pendPw, newPassword: PENDING_PW }),
   });
   check('待改密·改密接口可用（不能把人锁死）', changed.status === 204, `HTTP ${changed.status}`);
-  const afterPend = await login('pending', 'pending-pass-1234');
+  const afterPend = await login('pending', PENDING_PW);
   check('改密后恢复正常访问', await status('/api/instances', afterPend) === 200);
   /*
    * 用完降级。这个账号特意建成 admin，是为了证明「角色再大也得先改密」；
@@ -221,36 +410,54 @@ async function main() {
    * 一个反代前缀，流程里放个 `websocket in` 节点就能对外开端点，
    * 只读用户握手成功即可往流程灌消息。那是写，不是看。
    */
-  /*
-   * 必须用原生 http.request 发升级请求：**Node 的 fetch 不支持 Upgrade**，
-   * 它会直接抛异常。用 fetch 写这条断言会拿到 status 0 ——
-   * 「只读被拒」那条看似失败、「可操作放行」那条却因 0 !== 403 **假通过**。
-   */
-  const { request: httpRequest } = await import('node:http');
-  const upgradeStatus = (sess) => new Promise((resolve) => {
-    const req = httpRequest({
-      host: '127.0.0.1', port: PORT, path: '/red/line-a/comms', method: 'GET',
-      headers: {
-        ...sess.headers,
-        connection: 'Upgrade',
-        upgrade: 'websocket',
-        'sec-websocket-version': '13',
-        'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==',
-      },
+  // 使用真实 WebSocket 客户端并区分 HTTP 拒绝、成功升级、传输错误和超时。
+  const upgradeStatus = (sess, options = {}) => new Promise((resolve) => {
+    let settled = false;
+    let timer;
+    const finish = (outcome) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(outcome);
+    };
+    const ws = new WebSocket(`ws://127.0.0.1:${PORT}/red/line-a/comms`, {
+      headers: { cookie: sess.cookie, origin: B },
     });
-    // 被授权层放行时上游不可达，会走 error 或非 101 响应；两者都不是 403
-    req.on('response', (res) => { res.resume(); resolve(res.statusCode ?? 0); });
-    req.on('upgrade', (res, socket) => { socket.destroy(); resolve(101); });
-    req.on('error', () => resolve(-1));
-    req.setTimeout(4000, () => { req.destroy(); resolve(-2); });
-    req.end();
+    ws.on('open', async () => {
+      if (options.waitForUpstream) {
+        const deadline = Date.now() + 2000;
+        while (upstreamUpgradeHits === 0 && Date.now() < deadline) {
+          await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+        }
+      }
+      ws.close();
+      finish({ kind: 'upgrade', status: 101, upstreamConnected: upstreamUpgradeHits > 0 });
+    });
+    ws.on('unexpected-response', (_request, response) => {
+      response.resume();
+      finish({ kind: 'http', status: response.statusCode ?? 0 });
+    });
+    ws.on('error', (error) => finish({ kind: 'transport', code: error.code ?? error.name }));
+    ws.on('close', (code) => finish({ kind: 'closed', code }));
+    timer = setTimeout(() => {
+      ws.terminate();
+      finish({ kind: 'timeout' });
+    }, 4000);
   });
 
+  upstreamUpgradeHits = 0;
+  upstreamResolveHits = 0;
   const viUp = await upgradeStatus(vi);
-  check('越权·只读用户建立实时通道被拒（该通道可向流程写入）', viUp === 403, `HTTP ${viUp}`);
-  const opUp = await upgradeStatus(op);
+  check('越权·只读用户建立实时通道被拒（该通道可向流程写入）',
+    viUp.kind === 'http' && viUp.status === 403 && upstreamUpgradeHits === 0,
+    viUp.kind === 'http' ? `HTTP ${viUp.status}` : viUp.kind);
+  const opUp = await upgradeStatus(op, { waitForUpstream: true });
   check('可操作用户的实时通道通过了授权层（未被 403）',
-        opUp !== 403 && opUp !== 0, `结果 ${opUp}（403 表示被拦，其它表示已放行到上游）`);
+    opUp.kind === 'upgrade' && opUp.status === 101
+      && opUp.upstreamConnected === true && upstreamUpgradeHits === 1,
+    `${opUp.kind}${opUp.status === undefined ? '' : ` HTTP ${opUp.status}`}`
+      + `${opUp.code === undefined ? '' : ` ${opUp.code}`}`
+      + ` · upstream resolutions ${upstreamResolveHits} · upgrades ${upstreamUpgradeHits}`);
 
   // ── 越权：角色级动作 ──
   check('越权·运维建实例被拒',
@@ -323,7 +530,7 @@ async function main() {
     method: 'POST', headers: root.headers, body: JSON.stringify({ disabled: true }),
   });
   check('停用后已有会话立即失效', await status('/api/instances', vi) === 401);
-  check('停用后无法重新登录', (await login('watcher', 'viewer-pass-12345')) === undefined);
+  check('停用后无法重新登录', (await login('watcher', VIEWER_PW)) === undefined);
 
   // ── 不能把自己锁在门外 ──
   const selfDisable = await fetch(`${B}/api/users/admin/disabled`, {
@@ -339,29 +546,34 @@ async function main() {
   // ── 重置口令必须当场踢掉旧会话 ──
   // 重置的场景往往是「凭据可能泄漏了」，旧会话还活着的话这个动作等于没做
   const tmpPw = await mk('shift-b', 'viewer');
-  const tmp = await useAs('shift-b', tmpPw, 'shiftb-pass-12345');
+  const tmp = await useAs('shift-b', tmpPw, SHIFT_PW);
   check('新账号登录后会话可用', await status('/api/instances', tmp) === 200);
   await fetch(`${B}/api/users/shift-b/password/reset`, { method: 'POST', headers: root.headers });
   check('管理员重置口令后，旧会话立即失效', await status('/api/instances', tmp) === 401);
 
   // ── 登录失败限速不能变成锁死管理员的按钮 ──
-  for (let i = 0; i < 6; i += 1) await login('admin', 'wrong-password-xxx');
+  for (let i = 0; i < 6; i += 1) await login('admin', WRONG_PW);
   check('同一来源连续失败会被锁定',
         (await (await fetch(`${B}/api/login`, {
           method: 'POST', headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ username: 'admin', password: 'admin-pass-1234' }),
+          body: JSON.stringify({ username: 'admin', password: ADMIN_NEXT_PW }),
         })).json()).error?.includes('锁定') === true);
 
   // ── 未登录 ──
   check('未登录访问实例被拒', await status('/api/instances') === 401);
   check('未登录访问反代被拒', await status('/red/line-a/') === 401);
 
-  await app.close();
-  upstream.close();
+  await cleanup();
 
   const pass = results.filter((r) => r.ok).length;
   console.log(`\n  ${pass}/${results.length} 通过\n`);
   if (pass !== results.length) process.exit(1);
 }
 
-main().catch((e) => { console.error('\n  验证异常：', e.message); process.exit(1); });
+main().catch(async (e) => {
+  let cleanupError;
+  try { await cleanup(); } catch (error) { cleanupError = error; }
+  console.error('\n  验证异常：', e.message,
+    cleanupError ? `；清理失败：${cleanupError.message}` : '');
+  process.exit(1);
+});

@@ -75,6 +75,49 @@ export interface SearchHit {
  */
 const PACKUMENT_TTL_MS = 30_000;
 
+function isExactModuleQuery(value: string): boolean {
+  try {
+    assertModuleName(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function hitFromPackument(doc: UpstreamPackument, source: string): SearchHit | undefined {
+  const version = doc['dist-tags']?.latest;
+  if (!version) return undefined;
+  const manifest = doc.versions[version];
+  const nodeRed = manifest?.['node-red'];
+  if (!manifest || !nodeRed || typeof nodeRed !== 'object' || !('nodes' in nodeRed)) return undefined;
+
+  const keywords = Array.isArray(manifest.keywords)
+    ? manifest.keywords.filter((keyword): keyword is string => typeof keyword === 'string')
+    : [];
+  const time = (doc.time ?? {}) as Record<string, string>;
+  return {
+    name: typeof manifest.name === 'string' ? manifest.name : doc.name,
+    version: typeof manifest.version === 'string' ? manifest.version : version,
+    description: typeof manifest.description === 'string' ? manifest.description : '',
+    keywords,
+    date: time[version] ?? '',
+    source,
+  };
+}
+
+function isNodeRedSearchPackage(pkg: {
+  keywords?: string[];
+  name?: string;
+  description?: string;
+}): boolean {
+  return pkg.keywords?.some((keyword) => keyword.toLowerCase() === 'node-red') ?? false;
+}
+
+function matchesSearchTerms(hit: SearchHit, query: string): boolean {
+  const searchable = [hit.name, hit.description, ...hit.keywords].join(' ').toLowerCase();
+  return query.toLowerCase().split(/\s+/).every((term) => searchable.includes(term));
+}
+
 export class UpstreamRegistry {
   #sources: () => Array<{ name: string; url: string }>;
   #timeoutMs: number;
@@ -106,23 +149,45 @@ export class UpstreamRegistry {
     }
   }
 
-  /**
-   * 在所有启用的源里模糊搜索节点包。
-   *
-   * 加 `keywords:node-red` 限定：不加的话搜 modbus 返回的是 `modbus`、
-   * `jsmodbus`、`modbus-serial` 这些普通库，而现场要找的是 Node-RED 节点。
-   * 实测加了之后前几条就是 `node-red-contrib-modbus` 这类。
-   *
-   * **某个源挂了不影响其它源** —— 现场常见「配了三个源，其中内网那个临时不通」，
-   * 一个失败就整体报错会让人以为搜索坏了。
-   */
+  /** 在所有启用的源里搜索节点包，精确包名优先于模糊结果。 */
   async search(text: string, size = 20): Promise<SearchHit[]> {
     const q = text.trim();
     if (!q) return [];
+
+    if (isExactModuleQuery(q)) {
+      const errors: string[] = [];
+      const path = encodeURIComponent(q);
+      for (const src of this.#sources()) {
+        try {
+          const res = await this.#get(`${src.url}/${path}`);
+          if (res.status === 404) continue;
+          if (!res.ok) {
+            errors.push(`${src.name}: HTTP ${res.status}`);
+            continue;
+          }
+          const doc = await res.json() as UpstreamPackument;
+          const latest = doc['dist-tags']?.latest;
+          const manifestName = latest ? doc.versions[latest]?.name : undefined;
+          if (doc.name !== q || (manifestName !== undefined && manifestName !== q)) {
+            errors.push(`${src.name}: 包名不匹配（请求 ${q}，返回 ${doc.name}）`);
+            continue;
+          }
+          const hit = hitFromPackument(doc, src.name);
+          return hit ? [hit] : [];
+        } catch (e) {
+          errors.push(`${src.name}: ${(e as Error).message}`);
+        }
+      }
+      // 只有所有源都明确说不存在，才允许继续向模糊搜索回退。
+      if (errors.length > 0) {
+        throw new NodePolicyError(`所有节点源都取不到 ${q}：${errors.join('；')}`);
+      }
+    }
+
     const seen = new Map<string, SearchHit>();
     for (const src of this.#sources()) {
       try {
-        const url = `${src.url}/-/v1/search?text=${encodeURIComponent(`keywords:node-red ${q}`)}`
+        const url = `${src.url}/-/v1/search?text=${encodeURIComponent(q)}`
           + `&size=${Math.min(Math.max(size, 1), 50)}`;
         const res = await this.#get(url);
         if (!res.ok) continue;
@@ -134,15 +199,17 @@ export class UpstreamRegistry {
         };
         for (const o of body.objects ?? []) {
           const p = o.package;
-          if (!p?.name || !p.version) continue;
+          if (!p?.name || !p.version || !isNodeRedSearchPackage(p)) continue;
           // 先到的源优先：多个源有同名包时，按源的排列顺序取第一个
           if (seen.has(p.name)) continue;
-          seen.set(p.name, {
+          const hit: SearchHit = {
             name: p.name, version: p.version,
             description: p.description ?? '',
             keywords: p.keywords ?? [], date: p.date ?? '',
             source: src.name,
-          });
+          };
+          if (!matchesSearchTerms(hit, q)) continue;
+          seen.set(p.name, hit);
         }
       } catch { /* 这个源不通就跳过，别让它拖垮整次搜索 */ }
     }

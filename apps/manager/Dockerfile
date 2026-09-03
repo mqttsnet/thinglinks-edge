@@ -19,7 +19,9 @@
 # linuxmusl-arm64 / linuxmusl-x64 等各平台 .node，运行期才按当前平台挑。
 FROM --platform=$BUILDPLATFORM node:24.19.0-alpine AS builder
 WORKDIR /repo
-RUN corepack enable
+# pack-nodes.sh 使用 Bash 数组并按 lock 的 resolved 地址下载原始 tarball。
+# 两个工具只属于构建链，不带进 runtime，避免扩大线上镜像的工具面。
+RUN apk add --no-cache bash curl && corepack enable
 
 # 先只拷依赖清单，依赖层可跨代码改动复用
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
@@ -34,6 +36,7 @@ COPY tsconfig.base.json ./
 COPY apps/manager apps/manager
 COPY apps/web-console apps/web-console
 COPY packages packages
+COPY scripts/pack-nodes.sh scripts/pack-nodes.sh
 RUN pnpm --filter @thinglinks-edge/manager build
 # 控制台按相对路径构建（base: './'），挂载前缀由 Manager 运行期注入 <base href>
 RUN pnpm --filter @thinglinks-edge/web-console build
@@ -54,6 +57,14 @@ RUN pnpm --filter @thinglinks-edge/manager deploy --legacy --prod --ignore-scrip
 # 按 -path 匹配而不是写死版本号目录，升级 better-sqlite3 时不用回来改这里。
 RUN find /out/node_modules/.pnpm -path '*/better-sqlite3/prebuilds/*.node' \
       ! -name 'linuxmusl-*' -delete
+
+# 固定平台包必须是 registry 发布的原始 tarball，不能从 workspace 重打包。
+# expectation 同时证明依赖闭包包含 Edge/common，并锁死最终进入镜像的字节。
+RUN bash ./scripts/pack-nodes.sh \
+      --out /out/npm-seed \
+      --expect '@mqttsnet/thinglinks-edge-nodes@0.0.1=sha512-NKsIKyUHNyB+xuXNpCrOqzEYbYflEFeXqC/IgjM2/+AzktSTb7+TZFBWHoqp9FjLDX2crpoah6gn8n+Uy32AkA==' \
+      --expect '@mqttsnet/thinglinks-node-red-common@0.0.1=sha512-T6QN9RlBF0qbvujaAKNY81BjrcIdbqeqFkLfQsGuKHI8UY2cgad9prF8xUC5n4BbHbNJ7ftBmSBkj+IEZvTJWQ==' \
+      '@mqttsnet/thinglinks-edge-nodes@0.0.1'
 
 # 使用者变更说明（vX.Y.Z.zh-CN.md）随镜像走：升级后控制台要弹一次。
 # 刻意放在所有 RUN **之后**：没有任何构建步骤读它，而发版前改文案是常事 ——
@@ -106,6 +117,7 @@ COPY --from=builder /out/node_modules ./node_modules
 COPY --from=builder /out/dist ./dist
 COPY --from=builder /out/package.json ./package.json
 COPY --from=builder /repo/apps/web-console/dist ./web
+COPY --from=builder /out/npm-seed ./npm-seed
 # @thinglinks 节点集：创建实例时整份拷进实例数据目录，由 nodesDir 加载
 COPY --from=builder /repo/packages/thinglinks-nodes ./nodes
 COPY --from=builder /repo/changelogs ./changelogs

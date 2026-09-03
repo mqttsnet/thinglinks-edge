@@ -9,6 +9,8 @@
  * 由固定模板生成最终配置，并在下发前二次校验。
  */
 
+import { createHash } from 'node:crypto';
+import { isAbsolute, relative, resolve } from 'node:path';
 import { registryEnv } from '../nodes/policy.ts';
 
 export class SpecError extends Error {
@@ -99,6 +101,46 @@ export function assertValidSpec(spec: InstanceSpec, portRange: { min: number; ma
 }
 
 export const containerName = (id: string) => `tle-nr-${id}`;
+export const BOOTSTRAP_TX_LABEL = 'com.mqttsnet.thinglinks-edge.bootstrap-tx';
+export const MIGRATION_TX_LABEL = 'com.mqttsnet.thinglinks-edge.migration-tx';
+export const MIGRATION_PROBE_LABEL = 'com.mqttsnet.thinglinks-edge.migration-probe';
+const BOOTSTRAP_TX_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const IMMUTABLE_IMAGE_ID = /^sha256:[a-f0-9]{64}$/;
+
+export function assertImmutableImageId(imageId: string): void {
+  if (!IMMUTABLE_IMAGE_ID.test(imageId)) {
+    throw new SpecError('不可变镜像 ID 必须是 sha256: 后跟 64 位小写十六进制');
+  }
+}
+
+function assertTxId(txId: string): void {
+  if (!BOOTSTRAP_TX_ID.test(txId)) throw new SpecError('migration tx id 非法');
+}
+
+function shortHash(value: string): string {
+  return createHash('sha256').update(value).digest('hex').slice(0, 8);
+}
+
+export function migrationProbeName(instanceId: string, txId: string): string {
+  assertValidId(instanceId);
+  assertTxId(txId);
+  return `tle-nr-migrate-${instanceId}-${shortHash(txId)}`;
+}
+
+export function migrationProbeNetworkName(instanceId: string, txId: string): string {
+  return `${migrationProbeName(instanceId, txId)}-net`;
+}
+
+export function migrationProbeDataDir(root: string, instanceId: string, txId: string): string {
+  assertValidId(instanceId);
+  assertTxId(txId);
+  if (!isAbsolute(root)) throw new SpecError('probe data root 必须是绝对路径');
+  const parent = resolve(root, '.thinglinks-probes');
+  const path = resolve(parent, instanceId, txId);
+  const rel = relative(parent, path);
+  if (rel.startsWith('..') || isAbsolute(rel)) throw new SpecError('probe data path 越界');
+  return path;
+}
 
 /**
  * 实例数据目录（宿主路径）。
@@ -121,8 +163,16 @@ export function buildCreateOptions(
      * 而现场常常只有企业代理这一条路。留空表示不配 —— 离线部署即此形态。
      */
     proxyEnv?: readonly string[];
+    /** 仅由全新实例 bootstrap 专用创建路径传入；普通重建不得携带。 */
+    bootstrapTxId?: string;
+    /** 仅由 same-image rebuild/probe 使用；普通创建仍固定使用仓储 image tag。 */
+    imageIdOverride?: string;
   },
 ): Record<string, unknown> {
+  if (opts.bootstrapTxId !== undefined && !BOOTSTRAP_TX_ID.test(opts.bootstrapTxId)) {
+    throw new SpecError('bootstrap tx id 非法');
+  }
+  if (opts.imageIdOverride !== undefined) assertImmutableImageId(opts.imageIdOverride);
   const exposed: Record<string, Record<string, never>> = {};
   const bindings: Record<string, Array<{ HostIp: string; HostPort: string }>> = {};
   for (const p of spec.ports) {
@@ -133,7 +183,7 @@ export function buildCreateOptions(
 
   return {
     name: containerName(spec.id),
-    Image: `${opts.imageRepo}:${spec.imageTag}`,
+    Image: opts.imageIdOverride ?? `${opts.imageRepo}:${spec.imageTag}`,
     // 非 root 运行
     User: 'node-red',
     Env: [
@@ -162,6 +212,7 @@ export function buildCreateOptions(
     Labels: {
       'com.mqttsnet.thinglinks-edge.managed': 'true',
       'com.mqttsnet.thinglinks-edge.instance': spec.id,
+      ...(opts.bootstrapTxId ? { [BOOTSTRAP_TX_LABEL]: opts.bootstrapTxId } : {}),
     },
     ExposedPorts: exposed,
     HostConfig: {
@@ -184,6 +235,46 @@ export function buildCreateOptions(
   };
 }
 
+/** Build the stopped-copy probe. It has no published ports and is tx-owned. */
+export function buildMigrationProbeCreateOptions(
+  spec: InstanceSpec,
+  opts: {
+    instanceDataRoot: string;
+    imageRepo: string;
+    timezone: string;
+    txId: string;
+    imageId: string;
+    networkId: string;
+    proxyEnv?: readonly string[];
+  },
+): Record<string, unknown> {
+  assertTxId(opts.txId);
+  assertImmutableImageId(opts.imageId);
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(opts.networkId)) {
+    throw new SpecError('probe network id 非法');
+  }
+  const options = buildCreateOptions({ ...spec, ports: [] }, {
+    network: opts.networkId,
+    imageRepo: opts.imageRepo,
+    instanceDataRoot: opts.instanceDataRoot,
+    timezone: opts.timezone,
+    ...(opts.proxyEnv ? { proxyEnv: opts.proxyEnv } : {}),
+    imageIdOverride: opts.imageId,
+  });
+  options['name'] = migrationProbeName(spec.id, opts.txId);
+  options['Labels'] = {
+    ...(options['Labels'] as Record<string, unknown>),
+    [MIGRATION_TX_LABEL]: opts.txId,
+    [MIGRATION_PROBE_LABEL]: 'true',
+  };
+  const host = options['HostConfig'] as Record<string, unknown>;
+  host['Binds'] = [`${migrationProbeDataDir(opts.instanceDataRoot, spec.id, opts.txId)}:/data`];
+  host['PortBindings'] = {};
+  host['RestartPolicy'] = { Name: 'no' };
+  options['ExposedPorts'] = {};
+  return options;
+}
+
 /** 下发前的二次校验：确保模板没有被意外改出提权配置 */
 const FORBIDDEN_HOST_CONFIG = [
   'Privileged',
@@ -201,6 +292,13 @@ export function assertSafeCreateOptions(
   opts: { instanceDataRoot: string },
 ): void {
   const hc = (options['HostConfig'] ?? {}) as Record<string, unknown>;
+  const labels = (options['Labels'] ?? {}) as Record<string, unknown>;
+  const bootstrapTxId = labels[BOOTSTRAP_TX_LABEL];
+  if (bootstrapTxId !== undefined && (
+    typeof bootstrapTxId !== 'string' || !BOOTSTRAP_TX_ID.test(bootstrapTxId)
+  )) {
+    throw new SpecError('bootstrap tx label 非法');
+  }
 
   for (const key of FORBIDDEN_HOST_CONFIG) {
     if (hc[key] !== undefined) {
@@ -223,7 +321,6 @@ export function assertSafeCreateOptions(
     if (!Array.isArray(binds)) throw new SpecError('Binds 必须是数组');
     // 合法挂载只有一个，且完全由平台算出：数据根来自配置，实例 id 取自标签并过 ID_RE。
     // 用「精确等于」而不是模式匹配 —— 模式匹配留给 ../ 之类构造的余地，等号不留。
-    const labels = (options['Labels'] ?? {}) as Record<string, unknown>;
     const instanceId = labels['com.mqttsnet.thinglinks-edge.instance'];
     if (typeof instanceId !== 'string') {
       throw new SpecError('缺少实例标签，无法校验数据目录挂载');
@@ -255,5 +352,47 @@ export function assertSafeCreateOptions(
   const pb = (hc['PortBindings'] ?? {}) as Record<string, unknown>;
   if (Object.keys(pb).some((k) => k.startsWith('1880/'))) {
     throw new SpecError('实例 1880 端口不得映射到宿主 —— 唯一入口必须是 Manager 反代');
+  }
+}
+
+/** Probe-specific secondary guard for its independent sibling data root. */
+export function assertSafeMigrationProbeOptions(
+  options: Record<string, unknown>,
+  opts: { instanceDataRoot: string; instanceId: string; txId: string },
+): void {
+  assertValidId(opts.instanceId);
+  assertTxId(opts.txId);
+  const labels = (options['Labels'] ?? {}) as Record<string, unknown>;
+  const host = (options['HostConfig'] ?? {}) as Record<string, unknown>;
+  if (
+    labels['com.mqttsnet.thinglinks-edge.managed'] !== 'true'
+    || labels['com.mqttsnet.thinglinks-edge.instance'] !== opts.instanceId
+    || labels[MIGRATION_TX_LABEL] !== opts.txId
+    || labels[MIGRATION_PROBE_LABEL] !== 'true'
+  ) throw new SpecError('probe 标签归属不匹配');
+  if (options['name'] !== migrationProbeName(opts.instanceId, opts.txId)) {
+    throw new SpecError('probe 容器名不匹配');
+  }
+  assertImmutableImageId(String(options['Image'] ?? ''));
+  if (options['User'] !== 'node-red' || host['ReadonlyRootfs'] !== true) {
+    throw new SpecError('probe 必须以只读根非 root 运行');
+  }
+  for (const key of FORBIDDEN_HOST_CONFIG) {
+    if (host[key] !== undefined) throw new SpecError(`probe 命中禁用项 HostConfig.${key}`);
+  }
+  const expectedBind = `${migrationProbeDataDir(
+    opts.instanceDataRoot, opts.instanceId, opts.txId,
+  )}:/data`;
+  if (JSON.stringify(host['Binds']) !== JSON.stringify([expectedBind])) {
+    throw new SpecError('probe 挂载路径不匹配');
+  }
+  if (Object.keys((host['PortBindings'] ?? {}) as Record<string, unknown>).length !== 0) {
+    throw new SpecError('probe 不得映射宿主端口');
+  }
+  if (Object.keys((options['ExposedPorts'] ?? {}) as Record<string, unknown>).length !== 0) {
+    throw new SpecError('probe 不得暴露端口');
+  }
+  if ((host['RestartPolicy'] as { Name?: unknown } | undefined)?.Name !== 'no') {
+    throw new SpecError('probe 不得配置自动重启');
   }
 }

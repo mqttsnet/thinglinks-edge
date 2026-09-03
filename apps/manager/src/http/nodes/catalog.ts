@@ -18,6 +18,12 @@ import { NodePolicyError } from '../../core/nodes/policy.ts';
 import { closureReport, type NodeStore } from '../../core/nodes/store.ts';
 import { inventoryOf } from '../../core/nodes/inventory.ts';
 import { installModule, AdminApiError } from '../../core/flows/admin-client.ts';
+import { assertValidId } from '../../core/instance/container-spec.ts';
+import {
+  PlatformMigrationError,
+  type PlatformMigrationService,
+} from '../../core/nodes/platform-migration.ts';
+import type { NodeMigrationErrorCode } from '../../core/instance/repo.ts';
 import type { NodeCatalog } from '../../core/nodes/catalog.ts';
 import type { NpmSourceRepo } from '../../core/nodes/sources.ts';
 import type { UpstreamRegistry } from '../../core/nodes/upstream.ts';
@@ -30,16 +36,74 @@ const MAX_TGZ_BYTES = 64 * 1024 * 1024;
 export interface CatalogDeps {
   store: NodeStore;
   catalog: NodeCatalog;
+  /** Task9 构造的唯一迁移服务；HTTP 层只转发显式请求，绝不自行重建。 */
+  migrationService: PlatformMigrationService;
   /** 节点源清单。留空则不挂源管理与在线搜索（纯离线部署） */
   sources?: NpmSourceRepo | undefined;
   upstream?: UpstreamRegistry | undefined;
 }
 
+/**
+ * inventoryOf 已按 Node-RED node set 聚合出模块来源和模块健康度；HTTP 响应再保留
+ * 这台实例的整体健康与重复类型 owner。这里不看可选 file 字段，来源只来自已有聚合。
+ */
+function inventoryEvidence<T extends {
+  ok: boolean;
+  modules: Array<{ module: string; types: string[]; health: 'healthy' | 'conflict' | 'failed' }>;
+}>(inventory: T): T & {
+  health?: 'healthy' | 'conflict' | 'failed';
+  conflicts: Array<{ type: string; owners: string[] }>;
+} {
+  if (!inventory.ok) return { ...inventory, conflicts: [] };
+  const ownersByType = new Map<string, Set<string>>();
+  for (const module of inventory.modules) {
+    for (const type of module.types) {
+      const owners = ownersByType.get(type) ?? new Set<string>();
+      owners.add(module.module);
+      ownersByType.set(type, owners);
+    }
+  }
+  const conflicts = [...ownersByType.entries()]
+    .filter(([, owners]) => owners.size > 1)
+    .map(([type, owners]) => ({ type, owners: [...owners].sort() }))
+    .sort((left, right) => left.type.localeCompare(right.type));
+  const health = inventory.modules.some((module) => module.health === 'failed') ? 'failed'
+    : conflicts.length > 0 ? 'conflict' : 'healthy';
+  return { ...inventory, health, conflicts };
+}
+
 export function registerNodeCatalog(
   api: FastifyInstance, ctx: HttpContext, deps: CatalogDeps,
 ): void {
-  const { config, db, guard } = ctx;
-  const { store, catalog, sources, upstream } = deps;
+  const { config, db, guard, operationGate } = ctx;
+  const { store, catalog, migrationService, sources, upstream } = deps;
+
+  /*
+   * 迁移失败信息不能直接回显：底层预检会接触实例环境、检查点和运行期凭据。
+   * 状态中的 error 是持久化的受控枚举，下面的摘要同样只基于该枚举生成。
+   */
+  const migrationErrorSummary: Record<NodeMigrationErrorCode, string> = {
+    none: '没有迁移错误',
+    preflight: '迁移预检未通过，请检查实例状态后重试',
+    checkpoint: '迁移检查点不可用，未继续执行',
+    install: '平台节点包安装未完成，请刷新迁移状态',
+    cutover: '节点运行模式切换未完成，请刷新迁移状态',
+    verification: '迁移校验未通过，已保留受控状态',
+    rollback: '迁移回滚未完全完成，需要按状态处理',
+    compensation: '迁移补偿未完成，需要按状态处理',
+    'state-inconsistent': '迁移状态不一致，需要人工确认',
+  };
+
+  const migrationInstanceId = (req: any, reply: any): string | undefined => {
+    const id = String((req.params as { id?: unknown }).id ?? '');
+    try {
+      assertValidId(id);
+      return id;
+    } catch {
+      reply.code(400).send({ error: '实例 ID 非法' });
+      return undefined;
+    }
+  };
 
   /*
    * 节点包是二进制。只在本插件作用域内加这一个解析器 ——
@@ -383,7 +447,7 @@ export function registerNodeCatalog(
         out.push({ instanceId: id, ok: false, reason: t.error, modules: [], unapproved: 0 });
         continue;
       }
-      out.push(await inventoryOf(id, t, approved));
+      out.push(inventoryEvidence(await inventoryOf(id, t, approved)));
     }
     return reply.send({ instances: out });
   });
@@ -405,32 +469,38 @@ export function registerNodeCatalog(
     const user = guard(req, reply, { csrf: true, need: 'instance:operate', instance: id });
     if (!user) return;
 
-    const b = (req.body ?? {}) as { module?: string; version?: string };
-    const module = String(b.module ?? '').trim();
-    if (!module) return reply.code(400).send({ error: '缺少 module' });
-    const version = String(b.version ?? '').trim() || undefined;
-
-    const t = targetFor(ctx, id);
-    if ('error' in t) return reply.code(t.code).send({ error: t.error });
-
     try {
-      const r = await installModule(t, module, version);
-      recordAudit(db, {
-        actor: user.username, action: 'install-node', target: `${id}/${r.module}@${r.version}`,
-        result: 'ok', detail: r.types.join(', '),
+      return await operationGate.run(id, 'install-node', async () => {
+        const b = (req.body ?? {}) as { module?: string; version?: string };
+        const module = String(b.module ?? '').trim();
+        if (!module) return reply.code(400).send({ error: '缺少 module' });
+        const version = String(b.version ?? '').trim() || undefined;
+
+        const t = targetFor(ctx, id);
+        if ('error' in t) return reply.code(t.code).send({ error: t.error });
+
+        try {
+          const r = await installModule(t, module, version);
+          recordAudit(db, {
+            actor: user.username, action: 'install-node', target: `${id}/${r.module}@${r.version}`,
+            result: 'ok', detail: r.types.join(', '),
+          });
+          return reply.send(r);
+        } catch (e) {
+          recordAudit(db, {
+            actor: user.username, action: 'install-node', target: `${id}/${module}`,
+            result: 'fail', detail: (e as Error).message,
+          });
+          if (e instanceof AdminApiError) {
+            // 实例说不行是 400（配置问题，现场能改）；连不上实例是 502（不是现场的错）
+            return reply.code(e.status >= 400 && e.status < 500 ? 400 : 502)
+              .send({ error: e.message });
+          }
+          return fail(reply, e);
+        }
       });
-      return reply.send(r);
     } catch (e) {
-      recordAudit(db, {
-        actor: user.username, action: 'install-node', target: `${id}/${module}`,
-        result: 'fail', detail: (e as Error).message,
-      });
-      if (e instanceof AdminApiError) {
-        // 实例说不行是 400（配置问题，现场能改）；连不上实例是 502（不是现场的错）
-        return reply.code(e.status >= 400 && e.status < 500 ? 400 : 502)
-          .send({ error: e.message });
-      }
-      return fail(reply, e);
+      return ctx.fail(reply, e);
     }
   });
 
@@ -439,6 +509,44 @@ export function registerNodeCatalog(
     if (!guard(req, reply, { csrf: false, need: 'instance:view', instance: id })) return;
     const t = targetFor(ctx, id);
     if ('error' in t) return reply.code(t.code).send({ error: t.error });
-    return reply.send(await inventoryOf(id, t, catalog.names()));
+    return reply.send(inventoryEvidence(await inventoryOf(id, t, catalog.names())));
+  });
+
+  // ── 平台节点包迁移 ──────────────────────────────────
+  //
+  // 迁移是唯一会从 legacy raw nodes 切到受信任 npm 平台包的动作。搜索、批准、
+  // 缓存与台账刷新都不能触发它；同一服务内部持有 operation gate 与事务幂等性。
+
+  api.get(`${config.basePath}/api/instances/:id/nodes/thinglinks-migration`, async (req, reply) => {
+    const id = migrationInstanceId(req, reply);
+    if (!id) return;
+    if (!guard(req, reply, { csrf: false, need: 'instance:view', instance: id })) return;
+    try {
+      return reply.send(migrationService.status(id));
+    } catch (error) {
+      // 不存在是受控的 preflight；其余底层故障不能伪装成 404，也不能回显文本。
+      if (error instanceof PlatformMigrationError) {
+        return reply.code(404).send({ error: '实例不存在' });
+      }
+      return reply.code(500).send({ error: '迁移状态读取失败，请稍后重试' });
+    }
+  });
+
+  api.post(`${config.basePath}/api/instances/:id/nodes/thinglinks-migration`, async (req, reply) => {
+    const id = migrationInstanceId(req, reply);
+    if (!id) return;
+    const user = guard(req, reply, { csrf: true, need: 'instance:operate', instance: id });
+    if (!user) return;
+    try {
+      // migrate() 已在 active/existing transaction 时返回当前状态，不能再套一层 gate。
+      return reply.send(await migrationService.migrate(id, user.username));
+    } catch (error) {
+      if (error instanceof PlatformMigrationError) {
+        return reply.code(409).send({
+          error: migrationErrorSummary[error.code], code: error.code,
+        });
+      }
+      return reply.code(500).send({ error: '迁移请求未完成，请刷新状态后重试' });
+    }
   });
 }

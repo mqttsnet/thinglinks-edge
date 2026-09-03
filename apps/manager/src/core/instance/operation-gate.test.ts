@@ -1,0 +1,361 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { openDb } from '../db.ts';
+import { deriveKey } from '../auth/crypto.ts';
+import { InstanceRepo, type InstanceRecord } from './repo.ts';
+import { PLATFORM_NODE_PACKAGE } from '../nodes/platform-contract.ts';
+import {
+  InstanceBusyError,
+  InstanceOperationGate,
+  InstanceRepositoryOperationPolicy,
+  type InstanceOperationLease,
+  type RepositoryOperationPolicy,
+} from './operation-gate.ts';
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+const ALLOW_ALL_POLICY: RepositoryOperationPolicy = {
+  assertAllowed: () => undefined,
+};
+
+const record = (id: string): InstanceRecord => ({
+  id,
+  name: id,
+  imageTag: '5.0.4-24-minimal',
+  memLimit: 512,
+  cpuLimit: 0.5,
+  adminRoot: `/red/${id}/`,
+  credSecret: 'credential-secret',
+  notes: '',
+});
+
+function repositoryFixture(id = 'line-a') {
+  const db = openDb(':memory:');
+  const repo = new InstanceRepo(db, deriveKey('operation-gate-test', 'instance'));
+  repo.create(record(id), [], [{ username: 'admin', password: 'secret', permissions: '*' }]);
+  return { db, repo };
+}
+
+function beginBootstrap(repo: InstanceRepo, txId: string): void {
+  repo.beginNodeMigration({
+    instanceId: 'line-a',
+    txId,
+    operationKind: 'bootstrap',
+    phase: 'preparing',
+    originalRunning: false,
+    stagedBefore: false,
+    modeBefore: 'legacy',
+    imageIdBefore: 'sha256:image-a',
+    targetIntegrity: PLATFORM_NODE_PACKAGE.integrity,
+    checkpointDir: '',
+    snapshot: { version: 1, kind: 'bootstrap' },
+    actor: 'admin',
+  });
+}
+
+function beginMigration(repo: InstanceRepo, txId: string): void {
+  repo.beginNodeMigration({
+    instanceId: 'line-a',
+    txId,
+    operationKind: 'migration',
+    phase: 'preparing',
+    originalRunning: true,
+    stagedBefore: false,
+    modeBefore: 'legacy',
+    imageIdBefore: `sha256:${'a'.repeat(64)}`,
+    targetIntegrity: PLATFORM_NODE_PACKAGE.integrity,
+    checkpointDir: `.thinglinks-migration/line-a/${txId}`,
+    snapshot: {
+      version: 1,
+      kind: 'migration',
+      settings: { exists: true, sha256: 'a'.repeat(64) },
+      flows: { exists: true, sha256: 'b'.repeat(64) },
+      credentials: { exists: true, sha256: 'c'.repeat(64) },
+      packageManifest: { exists: true, sha256: 'd'.repeat(64) },
+      lock: { exists: true, sha256: 'e'.repeat(64) },
+      legacyManifestSha256: 'f'.repeat(64),
+      nodeInventorySha256: '1'.repeat(64),
+    },
+    actor: 'admin',
+  });
+}
+
+test('same instance rejects concurrent mutations', async () => {
+  const gate = new InstanceOperationGate(ALLOW_ALL_POLICY);
+  const release = deferred<void>();
+  const first = gate.run('line-a', 'platform-migration', async () => release.promise);
+  await assert.rejects(
+    () => gate.run('line-a', 'apply-node-policy', async () => undefined),
+    /platform-migration/,
+  );
+  release.resolve();
+  await first;
+});
+
+test('active platform migration blocks the internal recovery lease', async () => {
+  const gate = new InstanceOperationGate(ALLOW_ALL_POLICY);
+  const release = deferred<void>();
+  const active = gate.run('line-a', 'platform-migration', async () => release.promise);
+
+  await assert.rejects(
+    () => gate.run('line-a', 'platform-recovery', async () => undefined),
+    (error: unknown) => error instanceof InstanceBusyError
+      && error.activeOperation === 'platform-migration'
+      && error.requestedOperation === 'platform-recovery',
+  );
+
+  release.resolve();
+  await active;
+});
+
+test('different instances may operate concurrently', async () => {
+  const gate = new InstanceOperationGate(ALLOW_ALL_POLICY);
+  await Promise.all([
+    gate.run('line-a', 'upgrade-image', async () => undefined),
+    gate.run('line-b', 'upgrade-image', async () => undefined),
+  ]);
+});
+
+test('failed work always releases the instance lease', async () => {
+  const gate = new InstanceOperationGate(ALLOW_ALL_POLICY);
+  await assert.rejects(() => gate.run('line-a', 'stop-instance', async () => {
+    throw new Error('stop failed');
+  }));
+  await gate.run('line-a', 'start-instance', async () => undefined);
+  assert.equal(gate.current('line-a'), undefined);
+});
+
+test('runOrCurrent returns the current same-operation status without starting duplicate work', async () => {
+  const gate = new InstanceOperationGate(ALLOW_ALL_POLICY);
+  const release = deferred<void>();
+  const first = gate.run('line-a', 'platform-migration', async () => release.promise);
+  let workCalls = 0;
+  const result = await gate.runOrCurrent(
+    'line-a',
+    'platform-migration',
+    () => ({ phase: 'preparing' }),
+    async () => {
+      workCalls += 1;
+      return { phase: 'committed' };
+    },
+  );
+  assert.deepEqual(result, { phase: 'preparing' });
+  assert.equal(workCalls, 0);
+  release.resolve();
+  await first;
+});
+
+test('fabricated and wrong-instance leases are rejected', async () => {
+  const gate = new InstanceOperationGate(ALLOW_ALL_POLICY);
+  const fake = {
+    instanceId: 'line-a',
+    operation: 'start-instance',
+  } as InstanceOperationLease;
+  assert.throws(
+    () => gate.assertLease(fake, 'line-a', ['start-instance']),
+    /lease.*invalid|invalid.*lease/i,
+  );
+
+  await gate.run('line-a', 'start-instance', async (lease) => {
+    assert.throws(
+      () => gate.assertLease(lease, 'line-b', ['start-instance']),
+      /line-b/,
+    );
+  });
+});
+
+test('an active lease cannot authorize the wrong operation and expires after release', async () => {
+  const gate = new InstanceOperationGate(ALLOW_ALL_POLICY);
+  let captured: InstanceOperationLease | undefined;
+  await gate.run('line-a', 'start-instance', async (lease) => {
+    captured = lease;
+    assert.throws(
+      () => gate.assertLease(lease, 'line-a', ['stop-instance']),
+      /cannot authorize/,
+    );
+    gate.assertLease(lease, 'line-a', ['start-instance']);
+  });
+
+  assert.ok(captured);
+  assert.throws(
+    () => gate.assertLease(captured, 'line-a', ['start-instance']),
+    /invalid|no longer active/,
+  );
+});
+
+for (const persisted of [
+  { state: 'idle', error: 'verification' },
+  { state: 'committed', error: 'verification' },
+  { state: 'rolled_back', error: 'rollback' },
+  { state: 'pending_start_verification', error: 'verification' },
+] as const) {
+  test(`${persisted.state} is not usable while its durable error is ${persisted.error}`, async () => {
+    const { db, repo } = repositoryFixture();
+    if (persisted.state === 'idle') {
+      db.prepare(
+        'UPDATE instance SET node_migration_state = ?, node_migration_error = ? WHERE id = ?',
+      ).run(persisted.state, persisted.error, 'line-a');
+    } else {
+      beginBootstrap(repo, `tx-dirty-${persisted.state}`);
+      db.transaction(() => {
+        db.prepare(
+          'UPDATE instance_node_migration SET phase = ?, error = ? WHERE instance_id = ?',
+        ).run(persisted.state, persisted.error, 'line-a');
+        db.prepare(
+          'UPDATE instance SET node_migration_state = ?, node_migration_error = ? WHERE id = ?',
+        ).run(persisted.state, persisted.error, 'line-a');
+      })();
+    }
+
+    const gate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repo));
+    await assert.rejects(
+      () => gate.run('line-a', 'start-instance', async () => undefined),
+      new RegExp(`${persisted.state}/${persisted.error}`),
+    );
+  });
+}
+
+test('manual_required survives gate recreation and blocks every runtime mutation', async () => {
+  const { repo } = repositoryFixture();
+  beginBootstrap(repo, 'tx-manual');
+  repo.updateNodeMigration('line-a', 'manual_required', 'state-inconsistent');
+
+  const gate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repo));
+  const operations = [
+    'start-instance', 'stop-instance', 'remove-instance', 'reset-credential',
+    'upgrade-image', 'same-image-rebuild', 'apply-node-policy', 'install-node',
+    'flow-write', 'proxy-write', 'platform-migration',
+  ] as const;
+  for (const operation of operations) {
+    await assert.rejects(
+      () => gate.run('line-a', operation, async () => undefined),
+      (error: unknown) => error instanceof InstanceBusyError
+        && /manual_required/.test(error.message),
+    );
+  }
+});
+
+test('pending_start_verification allows only explicit start', async () => {
+  const { repo } = repositoryFixture();
+  beginBootstrap(repo, 'tx-pending');
+  repo.updateNodeMigration('line-a', 'pending_start_verification');
+  const gate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repo));
+
+  await gate.run('line-a', 'start-instance', async () => undefined);
+  for (const operation of ['stop-instance', 'remove-instance', 'install-node', 'flow-write', 'proxy-write'] as const) {
+    await assert.rejects(
+      () => gate.run('line-a', operation, async () => undefined),
+      /pending_start_verification/,
+    );
+  }
+});
+
+test('all interrupted durable phases block ordinary writes after restart', async () => {
+  const { repo } = repositoryFixture();
+  beginBootstrap(repo, 'tx-interrupted');
+  for (const phase of ['preparing', 'checkpointed', 'staged', 'cutover', 'verifying', 'rolling_back', 'rolled_back_dirty'] as const) {
+    repo.updateNodeMigration('line-a', phase);
+    const gate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repo));
+    await assert.rejects(
+      () => gate.run('line-a', 'proxy-write', async () => undefined),
+      new RegExp(phase),
+    );
+  }
+});
+
+test('platform recovery policy allows only consistent recoverable migration journals', async () => {
+  for (const phase of [
+    'preparing', 'checkpointed', 'staged', 'cutover', 'verifying', 'rolling_back',
+  ] as const) {
+    const { repo } = repositoryFixture();
+    beginMigration(repo, `tx-recoverable-${phase}`);
+    if (phase !== 'preparing') repo.updateNodeMigration('line-a', phase);
+    const gate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repo));
+    await gate.run('line-a', 'platform-recovery', async () => undefined);
+  }
+
+  for (const phase of [
+    'idle', 'committed', 'rolled_back', 'rolled_back_dirty',
+    'manual_required', 'pending_start_verification',
+  ] as const) {
+    const { repo } = repositoryFixture();
+    if (phase !== 'idle') {
+      beginMigration(repo, `tx-blocked-${phase}`);
+      if (phase === 'committed') {
+        repo.updateNodeMigration('line-a', 'verifying');
+        repo.commitNodeMigration('line-a', PLATFORM_NODE_PACKAGE.version, 'admin');
+      } else {
+        repo.updateNodeMigration(
+          'line-a',
+          phase,
+          phase === 'rolled_back_dirty' || phase === 'manual_required' ? 'rollback' : 'none',
+        );
+      }
+    }
+    const gate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repo));
+    await assert.rejects(
+      () => gate.run('line-a', 'platform-recovery', async () => undefined),
+      (error: unknown) => error instanceof InstanceBusyError
+        && error.requestedOperation === 'platform-recovery',
+      phase,
+    );
+  }
+
+  {
+    const { repo } = repositoryFixture();
+    beginBootstrap(repo, 'tx-bootstrap-not-recovery');
+    repo.updateNodeMigration('line-a', 'checkpointed');
+    const gate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repo));
+    await assert.rejects(
+      () => gate.run('line-a', 'platform-recovery', async () => undefined),
+      (error: unknown) => error instanceof InstanceBusyError,
+      'bootstrap journal',
+    );
+  }
+  {
+    const { repo } = repositoryFixture();
+    beginMigration(repo, 'tx-inconsistent-error');
+    repo.updateNodeMigration('line-a', 'preparing', 'state-inconsistent');
+    const gate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repo));
+    await assert.rejects(
+      () => gate.run('line-a', 'platform-recovery', async () => undefined),
+      (error: unknown) => error instanceof InstanceBusyError,
+      'dirty recoverable phase',
+    );
+  }
+});
+
+test('repository policy fails closed when journal and projection disagree after construction', async () => {
+  const { db, repo } = repositoryFixture();
+  beginBootstrap(repo, 'tx-policy-mismatch');
+  db.prepare(
+    `UPDATE instance
+     SET node_migration_state = 'idle', node_migration_error = 'none'
+     WHERE id = 'line-a'`,
+  ).run();
+
+  const gate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repo));
+  await assert.rejects(
+    () => gate.run('line-a', 'start-instance', async () => undefined),
+    /不一致|inconsistent/i,
+  );
+});
+
+test('repository policy fails closed when a non-idle projection has no journal', async () => {
+  const { db, repo } = repositoryFixture();
+  db.prepare(
+    `UPDATE instance
+     SET node_migration_state = 'pending_start_verification', node_migration_error = 'none'
+     WHERE id = 'line-a'`,
+  ).run();
+
+  const gate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repo));
+  await assert.rejects(
+    () => gate.run('line-a', 'start-instance', async () => undefined),
+    /不一致|inconsistent/i,
+  );
+});

@@ -783,6 +783,8 @@ export interface ImportResult {
 
 /** 一条节点在合规意义上的判定 */
 export type NodeCompliance = 'builtin' | 'platform' | 'approved' | 'unapproved';
+export type NodeInventorySource = 'builtin' | 'raw' | 'npm' | 'mixed' | 'unknown';
+export type NodeInventoryHealth = 'healthy' | 'conflict' | 'failed';
 
 export interface InventoryItem {
   module: string;
@@ -791,6 +793,11 @@ export interface InventoryItem {
   types: string[];
   enabled: boolean;
   compliance: NodeCompliance;
+  /** Manager 根据 node set 聚合的来源，不从可选 file 字段推断。 */
+  source?: NodeInventorySource;
+  /** Node-RED Admin API 的加载证据；旧 Manager 可不提供，前端必须如实降级。 */
+  health?: NodeInventoryHealth;
+  errors?: string[];
 }
 
 export interface InstanceInventory {
@@ -800,6 +807,45 @@ export interface InstanceInventory {
   reason: string;
   modules: InventoryItem[];
   unapproved: number;
+  /** 当前 Manager 聚合出的实例级健康度；读不到实例时保持未提供。 */
+  health?: NodeInventoryHealth;
+  /** 冲突的节点类型及其全部 owner，按类型与 owner 字典序稳定排序。 */
+  conflicts?: Array<{ type: string; owners: string[] }>;
+}
+
+/** 平台节点包迁移的持久化事务阶段；与 Manager 的 NodeMigrationState 一一对应。 */
+export type PlatformMigrationPhase =
+  | 'idle'
+  | 'preparing'
+  | 'checkpointed'
+  | 'staged'
+  | 'cutover'
+  | 'verifying'
+  | 'pending_start_verification'
+  | 'rolling_back'
+  | 'committed'
+  | 'rolled_back'
+  | 'rolled_back_dirty'
+  | 'manual_required';
+
+/** 只有此受控枚举能进入迁移状态响应，绝不回显底层异常或检查点路径。 */
+export type PlatformMigrationErrorCode =
+  | 'none'
+  | 'preflight'
+  | 'checkpoint'
+  | 'install'
+  | 'cutover'
+  | 'verification'
+  | 'rollback'
+  | 'compensation'
+  | 'state-inconsistent';
+
+export interface PlatformNodeMigration {
+  instanceId: string;
+  phase: PlatformMigrationPhase;
+  runtimeMode: 'legacy' | 'npm';
+  platformVersion: string;
+  error: PlatformMigrationErrorCode;
 }
 
 /** 下发策略到某台实例的结果。逐台给，一台失败不影响其余 */

@@ -17,6 +17,11 @@
 import type { Db } from '../db.ts';
 import { assertModuleName, assertVersionRange, NodePolicyError, type ApprovedModule }
   from './policy.ts';
+import {
+  PLATFORM_APPROVAL_NOTE,
+  PLATFORM_COMMON_PACKAGE,
+  PLATFORM_NODE_PACKAGE,
+} from './platform-contract.ts';
 
 export interface CatalogEntry extends ApprovedModule {
   note: string;
@@ -69,6 +74,24 @@ export class NodeCatalog {
     const version = input.version?.trim() ?? '';
     if (version !== '') assertVersionRange(version);
     if (!input.actor) throw new NodePolicyError('缺少审批人');
+    if (input.module === PLATFORM_COMMON_PACKAGE.name) {
+      throw new NodePolicyError(
+        `common 公共包禁止批准：${PLATFORM_COMMON_PACKAGE.name}`,
+      );
+    }
+
+    const current = this.get(input.module);
+    if (
+      current?.module === PLATFORM_NODE_PACKAGE.name
+      && current.version === PLATFORM_NODE_PACKAGE.version
+    ) {
+      if (version === PLATFORM_NODE_PACKAGE.version && input.note === PLATFORM_APPROVAL_NOTE) {
+        return current;
+      }
+      throw new NodePolicyError(
+        `固定平台批准禁止更新：${PLATFORM_NODE_PACKAGE.name}@${PLATFORM_NODE_PACKAGE.version}`,
+      );
+    }
 
     this.#db.prepare(
       `INSERT INTO node_catalog (module, version, note, approved_by, approved_at)
@@ -85,16 +108,29 @@ export class NodeCatalog {
 
   /** 撤销批准。返回是否真的删掉了一条 */
   revoke(module: string): boolean {
+    const current = this.get(module);
+    if (
+      current?.module === PLATFORM_NODE_PACKAGE.name
+      && current.version === PLATFORM_NODE_PACKAGE.version
+    ) {
+      throw new NodePolicyError(
+        `固定平台批准禁止撤销：${PLATFORM_NODE_PACKAGE.name}@${PLATFORM_NODE_PACKAGE.version}`,
+      );
+    }
     return this.#db.prepare('DELETE FROM node_catalog WHERE module = ?')
       .run(module).changes > 0;
   }
 
   /** 生成 policy 用的形状 */
   approved(): ApprovedModule[] {
-    return this.list().map((e) => ({ module: e.module, version: e.version }));
+    return this.list()
+      .filter((e) => e.module !== PLATFORM_COMMON_PACKAGE.name)
+      .map((e) => ({ module: e.module, version: e.version }));
   }
 
   names(): Set<string> {
-    return new Set(this.list().map((e) => e.module));
+    return new Set(this.list()
+      .filter((e) => e.module !== PLATFORM_COMMON_PACKAGE.name)
+      .map((e) => e.module));
   }
 }

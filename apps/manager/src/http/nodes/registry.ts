@@ -32,6 +32,15 @@ import { tarballUrl } from '../../core/nodes/packument.ts';
 import type { UpstreamRegistry } from '../../core/nodes/upstream.ts';
 import { recordAudit } from '../../core/db.ts';
 import type { HttpContext } from '../context.ts';
+import {
+  isPlatformPackageName,
+  type PlatformRegistryVerifier,
+  type VerifiedPlatformPackage,
+} from '../../core/nodes/platform-package.ts';
+import {
+  PLATFORM_COMMON_PACKAGE,
+  PLATFORM_NODE_PACKAGE,
+} from '../../core/nodes/platform-contract.ts';
 
 export interface RegistryDeps {
   store: NodeStore;
@@ -43,6 +52,46 @@ export interface RegistryDeps {
    * 启用后库里没有的包会转发上游并**在取包体时入库**，之后即离线可用。
    */
   upstream?: UpstreamRegistry | undefined;
+  /**
+   * Task 3 从启动装配注入同一个 PlatformPackageService 单例。过渡期留空时，
+   * 固定包请求必须失败关闭，绝不能退回未经校验的通用 store 路径。
+   */
+  platformPackages?: PlatformRegistryVerifier | undefined;
+}
+
+function platformPin(name: string) {
+  if (name === PLATFORM_NODE_PACKAGE.name) return PLATFORM_NODE_PACKAGE;
+  if (name === PLATFORM_COMMON_PACKAGE.name) return PLATFORM_COMMON_PACKAGE;
+  return undefined;
+}
+
+function buildPlatformPackument(snapshot: VerifiedPlatformPackage, base: string) {
+  const { meta } = snapshot;
+  return {
+    _id: meta.name,
+    name: meta.name,
+    description: meta.description,
+    'dist-tags': { latest: meta.version },
+    versions: {
+      [meta.version]: {
+        name: meta.name,
+        version: meta.version,
+        description: meta.description,
+        keywords: meta.keywords,
+        dependencies: meta.dependencies,
+        optionalDependencies: meta.optionalDependencies,
+        peerDependencies: meta.peerDependencies,
+        peerDependenciesMeta: meta.peerDependenciesMeta,
+        engines: meta.engines,
+        dist: {
+          tarball: tarballUrl(base, meta.name, meta.version),
+          shasum: meta.shasum,
+          integrity: meta.integrity,
+        },
+      },
+    },
+    time: { [meta.version]: meta.updatedAt },
+  };
 }
 
 /**
@@ -90,7 +139,7 @@ export function registerNpmRegistry(
   api: FastifyInstance, ctx: HttpContext, deps: RegistryDeps,
 ): void {
   const { config } = ctx;
-  const { store, catalog, internalBase, upstream } = deps;
+  const { store, catalog, internalBase, upstream, platformPackages } = deps;
 
   /**
    * 编辑器节点目录。
@@ -98,14 +147,54 @@ export function registerNpmRegistry(
    * 路径放在 `/-/` 下：npm 的包名不允许以 `-` 开头，所以这个前缀
    * 永远不会和某个真实包撞上。
    */
-  api.get(`${config.basePath}/npm/-/catalogue.json`, async (_req, reply) =>
-    reply
+  api.get(`${config.basePath}/npm/-/catalogue.json`, async (req, reply) => {
+    const approved = catalog.names();
+    const genericApproved = new Set(
+      [...approved].filter((name) => !isPlatformPackageName(name)),
+    );
+    const doc = buildCatalogue(store, {
+      name: 'ThingLinks Edge Community catalogue',
+      approved: genericApproved,
+    });
+
+    /*
+     * 两个固定包名永不进入 buildCatalogue 的「取最新版本」路径。Edge 只有在
+     * 精确基线已批准且本次快照校验通过时才追加；common 永不出现在 palette。
+     * 校验能力尚未由 Task 3 注入或磁盘漂移时，只省略 Edge，普通目录仍可用。
+     */
+    const edgeApproval = catalog.get(PLATFORM_NODE_PACKAGE.name);
+    if (
+      edgeApproval?.version === PLATFORM_NODE_PACKAGE.version
+      && platformPackages
+    ) {
+      try {
+        const snapshot = platformPackages.snapshotForRegistry(
+          PLATFORM_NODE_PACKAGE.name,
+          PLATFORM_NODE_PACKAGE.version,
+        );
+        if (snapshot) {
+          doc.modules.push({
+            id: snapshot.meta.name,
+            version: snapshot.meta.version,
+            description: snapshot.meta.description,
+            keywords: snapshot.meta.keywords,
+            types: snapshot.meta.types,
+            updated_at: snapshot.meta.updatedAt,
+          });
+          doc.modules.sort((a, b) => a.id.localeCompare(b.id));
+        }
+      } catch (e) {
+        req.log.warn(
+          `[npm] catalogue 省略平台包：${(e as Error).message}`,
+        );
+      }
+    }
+
+    return reply
       // 编辑器每次打开面板都会带缓存破坏参数重取，明确禁缓存免得中间层自作主张
       .header('cache-control', 'no-store')
-      .send(buildCatalogue(store, {
-        name: 'ThingLinks Edge Community catalogue',
-        approved: catalog.names(),
-      })));
+      .send(doc);
+  });
 
   /**
    * packument 与包体。
@@ -124,6 +213,41 @@ export function registerNpmRegistry(
       // 包名非法一律回 404 而不是 400：npm 对 404 有明确处理，
       // 对 400 会打出一大段无关的排障建议
       return reply.code(404).send({ error: 'not found' });
+    }
+
+    /*
+     * 官方包名永远先进入固定信任边界。即使 store 里有人塞了同名其它版本，
+     * 也不能通过通用 packument 暴露出去。
+     */
+    if (isPlatformPackageName(parsed.module)) {
+      const pin = platformPin(parsed.module)!;
+      if (!platformPackages) {
+        return reply.code(503).send({ error: 'platform package verifier unavailable' });
+      }
+      if (parsed.tarball !== undefined) {
+        const version = versionFromTarball(parsed.module, parsed.tarball);
+        if (version !== pin.version) return reply.code(404).send({ error: 'not found' });
+        try {
+          const snapshot = platformPackages.snapshotForRegistry(pin.name, pin.version);
+          if (!snapshot) return reply.code(404).send({ error: 'not found' });
+          return reply
+            .header('content-type', 'application/octet-stream')
+            .header('content-length', String(snapshot.buffer.length))
+            .send(snapshot.buffer);
+        } catch (e) {
+          req.log.warn(`[npm] 平台包校验失败 ${pin.name}@${pin.version}：${(e as Error).message}`);
+          return reply.code(503).send({ error: 'platform package verification failed' });
+        }
+      }
+      try {
+        const snapshot = platformPackages.snapshotForRegistry(pin.name, pin.version);
+        if (!snapshot) return reply.code(404).send({ error: 'not found' });
+        return reply.header('cache-control', 'no-store')
+          .send(buildPlatformPackument(snapshot, internalBase));
+      } catch (e) {
+        req.log.warn(`[npm] 平台包校验失败 ${pin.name}@${pin.version}：${(e as Error).message}`);
+        return reply.code(503).send({ error: 'platform package verification failed' });
+      }
     }
 
     if (parsed.tarball !== undefined) {

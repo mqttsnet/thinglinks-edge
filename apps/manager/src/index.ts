@@ -9,10 +9,20 @@ import { openDb } from './core/db.ts';
 import { requireMasterKey, deriveKey } from './core/auth/crypto.ts';
 import { AuthService } from './core/auth/service.ts';
 import { InstanceRepo } from './core/instance/repo.ts';
-import { InstanceService } from './core/instance/service.ts';
+import { InstanceService, type InstanceServiceOptions } from './core/instance/service.ts';
+import {
+  InstanceOperationGate,
+  InstanceRepositoryOperationPolicy,
+} from './core/instance/operation-gate.ts';
+import { ProxySessionRegistry } from './core/instance/proxy-session-registry.ts';
 import { DockerClient } from './core/instance/docker-client.ts';
+import { containerName } from './core/instance/container-spec.ts';
+import {
+  RepositoryInstanceAdminRuntime,
+  type InstanceAdminRuntime,
+} from './core/instance/admin-runtime.ts';
 import { reconcileInstanceNetworks } from './core/instance/network-reconcile.ts';
-import { buildServer } from './http/app.ts';
+import { buildServer, type ServerDeps } from './http/app.ts';
 import { Spool, type FullPolicy } from './core/spool/spool.ts';
 import { SpoolDrainer } from './core/spool/drainer.ts';
 import { CloudConfigRepo } from './core/cloud/config-repo.ts';
@@ -27,6 +37,17 @@ import { buildPolicy, installModeFromEnv } from './core/nodes/policy.ts';
 import { UpstreamRegistry } from './core/nodes/upstream.ts';
 import { NpmSourceRepo } from './core/nodes/sources.ts';
 import { seedFromDir, describeSeed } from './core/nodes/seed.ts';
+import { PlatformPackageService } from './core/nodes/platform-package.ts';
+import {
+  NOOP_PLATFORM_NODE_BARRIER,
+  type PlatformNodeOperationBarrier,
+} from './core/nodes/platform-operation-barrier.ts';
+import { MigrationCheckpointStore } from './core/nodes/migration-checkpoint.ts';
+import {
+  NodeRedPlatformMigrationAdminActions,
+  PlatformMigrationService,
+} from './core/nodes/platform-migration.ts';
+import type { RegistryDeps } from './http/nodes/registry.ts';
 import { ValueHistory, limitsFromEnv } from './core/edge/history.ts';
 import {
   readProxySettings, proxyConfigured, proxyEnvFor, proxyHasCredentials, missingInternalNoProxy,
@@ -43,6 +64,98 @@ import { hostname } from 'node:os';
 // 不会把名字带进本模块作用域。
 import { VERSION, describe } from './core/version.ts';
 export { VERSION, describe };
+
+/**
+ * 装配平台节点包的唯一运行期信任服务。
+ *
+ * generic seed 必须由调用方先导入；这里随即校验固定字节并建立 Edge 基线批准。
+ * 返回的两个依赖片段刻意都持有同一对象，避免 HTTP 层或后续实例服务各造一个
+ * 信任根，导致启动校验和请求时校验读到不同状态。
+ */
+export function assemblePlatformNodeServices(deps: {
+  store: NodeStore;
+  catalog: NodeCatalog;
+}): {
+  platformPackages: PlatformPackageService;
+  serverDeps: Pick<ServerDeps, 'platformPackages'>;
+  registryDeps: Pick<RegistryDeps, 'platformPackages'> & {
+    platformPackages: PlatformPackageService;
+  };
+} {
+  const platformPackages = new PlatformPackageService(deps);
+  platformPackages.bootstrap('system');
+  return {
+    platformPackages,
+    serverDeps: { platformPackages },
+    registryDeps: { platformPackages },
+  };
+}
+
+export function assembleInstanceAdminRuntime(deps: {
+  repo: InstanceRepo;
+  upstreamFor: (instanceId: string) => string;
+}): {
+  adminRuntime: InstanceAdminRuntime;
+  instanceServiceDeps: Pick<InstanceServiceOptions, 'adminRuntime'>;
+  serverDeps: Pick<ServerDeps, 'adminRuntime'>;
+} {
+  const adminRuntime = new RepositoryInstanceAdminRuntime(deps);
+  return {
+    adminRuntime,
+    instanceServiceDeps: { adminRuntime },
+    serverDeps: { adminRuntime },
+  };
+}
+
+export interface InternalManagerOverrides {
+  /** In-process verifier seam only; never sourced from env/HTTP/DB/UI. */
+  barrier?: PlatformNodeOperationBarrier;
+}
+
+export function assemblePlatformOperationBarrier(overrides: InternalManagerOverrides = {}): {
+  barrier: PlatformNodeOperationBarrier;
+  instanceServiceDeps: Pick<InstanceServiceOptions, 'barrier'>;
+  migrationServiceDeps: { barrier: PlatformNodeOperationBarrier };
+} {
+  const keys = Object.keys(overrides);
+  if (keys.some((key) => key !== 'barrier')) throw new Error('unsupported internal Manager override');
+  const barrier = overrides.barrier ?? NOOP_PLATFORM_NODE_BARRIER;
+  return {
+    barrier,
+    instanceServiceDeps: { barrier },
+    migrationServiceDeps: { barrier },
+  };
+}
+
+export interface ManagerStartupHooks<Context, Server = unknown> {
+  initializeData: () => Promise<Context> | Context;
+  bootstrapTrust: (context: Context) => Promise<void> | void;
+  constructServices: (context: Context) => Promise<void> | void;
+  reconcileNetworks: (context: Context) => Promise<void>;
+  recoverInterrupted: (context: Context) => Promise<void>;
+  startBackground: (context: Context) => Promise<void> | void;
+  buildServer: (context: Context) => Promise<{
+    server: Server;
+    listen: () => Promise<void>;
+  }> | {
+    server: Server;
+    listen: () => Promise<void>;
+  };
+}
+
+export async function startManagerRuntime<Context, Server>(
+  hooks: ManagerStartupHooks<Context, Server>,
+): Promise<Server> {
+  const context = await hooks.initializeData();
+  await hooks.bootstrapTrust(context);
+  await hooks.constructServices(context);
+  await hooks.reconcileNetworks(context);
+  await hooks.recoverInterrupted(context);
+  await hooks.startBackground(context);
+  const built = await hooks.buildServer(context);
+  await built.listen();
+  return built.server;
+}
 
 /**
  * 解析 Manager 自身的容器标识，用于把自己接入每个实例的独立网络。
@@ -207,14 +320,61 @@ async function runPreflightCli(argv: string[]): Promise<void> {
   if (!report.ok) process.exitCode = 1;
 }
 
-export async function main(): Promise<void> {
-  const config = loadConfig();
-  const key = deriveKey(requireMasterKey(), 'thinglinks-edge:instance-cred');
-  const db = openDb(join(config.dataDir, 'edge.db'));
+interface ProductionManagerStartupContext {
+  config: ReturnType<typeof loadConfig>;
+  db: ReturnType<typeof openDb>;
+  nodeStore: NodeStore;
+  nodeCatalog: NodeCatalog;
+  platformNodeServices?: ReturnType<typeof assemblePlatformNodeServices>;
+  reconcileNetworks?: () => Promise<void>;
+  recoverInterrupted?: () => Promise<void>;
+  startBackground?: () => Promise<void>;
+  buildServer?: () => {
+    server: ReturnType<typeof buildServer>;
+    listen: () => Promise<void>;
+  };
+}
 
+function requireStartupPhase<T>(value: T | undefined, phase: string): T {
+  if (value === undefined) throw new Error(`Manager startup phase ${phase} was not constructed`);
+  return value;
+}
+
+export async function main(overrides: InternalManagerOverrides = {}): Promise<void> {
+  await startManagerRuntime<ProductionManagerStartupContext, ReturnType<typeof buildServer>>({
+    initializeData: () => {
+      const config = loadConfig();
+      const db = openDb(join(config.dataDir, 'edge.db'));
+      const nodeStore = new NodeStore(join(config.dataDir, 'npm'));
+      const nodeCatalog = new NodeCatalog(db);
+      for (const seedDir of [
+        join(config.dataDir, 'npm-seed'), process.env['NODE_SEED_DIR'] ?? '',
+      ]) {
+        const line = describeSeed(seedDir, seedFromDir(nodeStore, seedDir));
+        if (line) console.log(`[nodes] ${line}`);
+      }
+      return { config, db, nodeStore, nodeCatalog };
+    },
+    bootstrapTrust: (context) => {
+      context.platformNodeServices = assemblePlatformNodeServices({
+        store: context.nodeStore,
+        catalog: context.nodeCatalog,
+      });
+    },
+    constructServices: async (context) => {
+  const { config, db, nodeStore, nodeCatalog } = context;
+  const key = deriveKey(requireMasterKey(), 'thinglinks-edge:instance-cred');
+  const platformNodeServices = requireStartupPhase(
+    context.platformNodeServices, 'bootstrapTrust',
+  );
   // 主密钥同时用于两步验证的 TOTP 密钥加密，与实例凭据同一套
   const auth = new AuthService(db, key);
   const repo = new InstanceRepo(db, key);
+  const platformOperation = assemblePlatformOperationBarrier(overrides);
+  const operationGate = new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repo));
+  const proxySessions = new ProxySessionRegistry();
+  const instanceUpstreamFor = (id: string) => `http://${containerName(id)}:1880`;
+  const instanceAdmin = assembleInstanceAdminRuntime({ repo, upstreamFor: instanceUpstreamFor });
 
   /*
    * 账号从哪来，两条路：
@@ -285,22 +445,6 @@ export async function main(): Promise<void> {
    *   internal —— 实例容器里的 npm 用，靠容器名解析，Manager 非容器时为空
    *   catalogue —— 现场浏览器里的编辑器前端用，与控制台同源，永远是相对路径
    */
-  const nodeStore = new NodeStore(join(config.dataDir, 'npm'));
-  const nodeCatalog = new NodeCatalog(db);
-
-  /*
-   * 预置节点包（01 号文 5.7「离线场景下节点可用」）。两个来源都扫：
-   *
-   *   <dataDir>/npm-seed  —— bind 挂进来的目录，现场拷个 .tgz 进去重启即可。
-   *                          离线现场最需要的就是这条不依赖任何工具的路子。
-   *   NODE_SEED_DIR       —— 镜像里随包发的那份（离线安装包用）
-   *
-   * 只导入进库，**不自动批准** —— 批准是管理员的动作，见 core/nodes/seed.ts。
-   */
-  for (const seedDir of [join(config.dataDir, 'npm-seed'), process.env['NODE_SEED_DIR'] ?? '']) {
-    const line = describeSeed(seedDir, seedFromDir(nodeStore, seedDir));
-    if (line) console.log(`[nodes] ${line}`);
-  }
   const npmRegistryUrl = managerContainer
     ? `http://${managerContainer}:${config.listenPort}${config.basePath}/npm/`
     : '';
@@ -359,8 +503,24 @@ export async function main(): Promise<void> {
       : undefined,
     npmRegistry: npmRegistryUrl || undefined,
   });
+  const migrationHolder: { service?: PlatformMigrationService } = {};
+  const pendingStartCompletion = {
+    completePendingStartUnderLease: (
+      instanceId: string,
+      lease: Parameters<PlatformMigrationService['completePendingStartUnderLease']>[1],
+      actor: string,
+    ) => {
+      if (!migrationHolder.service) throw new Error('platform migration service is not constructed');
+      return migrationHolder.service.completePendingStartUnderLease(instanceId, lease, actor);
+    },
+  };
   const service = new InstanceService({
-    db, repo, docker,
+    ...instanceAdmin.instanceServiceDeps,
+    ...platformOperation.instanceServiceDeps,
+    db, repo, docker, gate: operationGate,
+    instanceDataRoot: config.instanceDataRoot,
+    platformPackages: platformNodeServices.platformPackages,
+    pendingStartCompletion,
     basePath: config.basePath,
     portRange: config.portRange,
     allowedImageTags: (process.env['ALLOWED_IMAGE_TAGS'] ??
@@ -377,6 +537,22 @@ export async function main(): Promise<void> {
       mode: installMode,
     }),
   });
+  const migrationService = new PlatformMigrationService({
+    repo,
+    gate: operationGate,
+    proxySessions,
+    docker,
+    adminRuntime: instanceAdmin.adminRuntime,
+    admin: new NodeRedPlatformMigrationAdminActions(instanceAdmin.adminRuntime),
+    platformPackages: platformNodeServices.platformPackages,
+    checkpoint: new MigrationCheckpointStore(config.instanceDataRoot),
+    settings: service,
+    repair: service,
+    bootstrapRecovery: service,
+    ...platformOperation.migrationServiceDeps,
+    instanceDataRoot: config.instanceDataRoot,
+  });
+  migrationHolder.service = migrationService;
 
   /*
    * 单独重建 Manager 不会重启历史实例，Docker 也不会把新 Manager 自动接回
@@ -384,21 +560,23 @@ export async function main(): Promise<void> {
    * 容器名解析立即可用。每个实例最多等待 5 秒；单个网络可能已被人工清理，
    * 只告警并继续，不能因此阻止控制台启动或影响其它实例的隔离网络。
    */
-  if (managerContainer) {
-    const reconciled = await reconcileInstanceNetworks(
-      repo.list().map((instance) => instance.id),
-      (id, signal) => docker.reconnectManager(id, signal),
-      5_000,
-    );
-    for (const result of reconciled) {
-      if (!result.ok) {
-        console.warn(
-          `[warn] 实例 ${result.id} 的网络 ${docker.instanceNetwork(result.id)} 未能重新接入 Manager：`
-          + result.error,
-        );
+  const reconcileNetworks = async () => {
+    if (managerContainer) {
+      const reconciled = await reconcileInstanceNetworks(
+        repo.list().map((instance) => instance.id),
+        (id, signal) => docker.reconnectManager(id, signal),
+        5_000,
+      );
+      for (const result of reconciled) {
+        if (!result.ok) {
+          console.warn(
+            `[warn] 实例 ${result.id} 的网络 ${docker.instanceNetwork(result.id)} 未能重新接入 Manager：`
+            + result.error,
+          );
+        }
       }
     }
-  }
+  };
 
   // WEB_ROOT 由镜像设定（/app/web）；宿主开发态不设，前端走 Vite
   /*
@@ -456,10 +634,11 @@ export async function main(): Promise<void> {
    */
   const metricsIntervalSec = resolveMetricsIntervalSec();
   const metrics = metricsIntervalSec > 0 ? new MetricsHistory({ fineStepSec: metricsIntervalSec }) : undefined;
+  let startMetrics = () => undefined;
   if (metrics) {
     // 采样出错每 10 秒一条会把日志刷爆，同一个原因只报第一次
     let lastError = '';
-    new MetricsSampler({
+    const sampler = new MetricsSampler({
       history: metrics,
       source: service,
       intervalMs: metricsIntervalSec * 1000,
@@ -469,7 +648,8 @@ export async function main(): Promise<void> {
         lastError = msg;
         console.error(`[metrics] 采样失败：${msg}（同样的原因不再重复打印）`);
       },
-    }).start();
+    });
+    startMetrics = () => { sampler.start(); };
   }
 
   /*
@@ -548,13 +728,6 @@ export async function main(): Promise<void> {
       }
     },
   });
-  try {
-    await cloud.apply(cloudConfig.get());
-  } catch (e) {
-    // 配置坏了不该拖垮启动：本地实例管理与采集不依赖云
-    console.error(`[cloud] 接入配置无法应用：${(e as Error).message}`);
-  }
-
   /*
    * 补传调度。
    *
@@ -591,30 +764,73 @@ export async function main(): Promise<void> {
     },
   });
   drainerRef = drainer;
-  drainer.start();
 
-  const app = buildServer({
-    config, db, auth, repo, service, spool, metrics, drainer, outages,
-    cloud, cloudConfig,
-    cloudSink: (payload) => cloud.publish(payload),
-    webRoot: process.env['WEB_ROOT']?.trim() || undefined,
-    nodeStore, nodeCatalog, valueHistory, nodeUpstream, nodeSources,
-    /*
-     * packument 里的包体地址要写成实例视角的绝对地址 —— 取它的是容器里的 npm。
-     * Manager 跑在宿主上（开发态）时给不出这个地址，此时私有源仍可读，
-     * 只是实例侧本来也没配 registry，用不到。
-     */
-    npmRegistryUrl,
+  context.reconcileNetworks = reconcileNetworks;
+  context.recoverInterrupted = async () => {
+      const recovered = await migrationService.recoverInterrupted();
+      for (const result of recovered) {
+        if (result.phase === 'manual_required') {
+          console.warn(`[warn] 实例 ${result.instanceId} 的节点迁移需人工处理`);
+        }
+      }
+    };
+  context.startBackground = async () => {
+      startMetrics();
+      try {
+        await cloud.apply(cloudConfig.get());
+      } catch (e) {
+        // 配置坏了不该拖垮启动：本地实例管理与采集不依赖云
+        console.error(`[cloud] 接入配置无法应用：${(e as Error).message}`);
+      }
+      drainer.start();
+    };
+  context.buildServer = () => {
+      const app = buildServer({
+        ...platformNodeServices.serverDeps,
+        ...instanceAdmin.serverDeps,
+        config, db, auth, repo, service, operationGate, migrationService, proxySessions,
+        upstreamFor: instanceUpstreamFor,
+        spool, metrics, drainer, outages,
+        cloud, cloudConfig,
+        cloudSink: (payload) => cloud.publish(payload),
+        webRoot: process.env['WEB_ROOT']?.trim() || undefined,
+        nodeStore, nodeCatalog, valueHistory, nodeUpstream, nodeSources,
+        /*
+         * packument 里的包体地址要写成实例视角的绝对地址 —— 取它的是容器里的 npm。
+         * Manager 跑在宿主上（开发态）时给不出这个地址，此时私有源仍可读，
+         * 只是实例侧本来也没配 registry，用不到。
+         */
+        npmRegistryUrl,
+      });
+      return {
+        server: app,
+        listen: async () => {
+          await app.listen({ host: config.listenAddr, port: config.listenPort });
+          console.log(
+            `[ready] ${describe()} 监听 ${config.listenAddr}:${config.listenPort}` +
+              ` · 外部地址 ${config.externalUrl}` +
+              ` · docker 端点 ${describeDockerEndpoint(connection)}` +
+              ` · 缓存写满策略 ${fullPolicy}` +
+              ` · 指标采样 ${metricsIntervalSec > 0 ? `${metricsIntervalSec}s` : '已关闭'}` +
+              ` · 云对接 ${cloud.state}`,
+          );
+        },
+      };
+    };
+    },
+    reconcileNetworks: (context) => requireStartupPhase(
+      context.reconcileNetworks, 'constructServices.reconcileNetworks',
+    )(),
+    recoverInterrupted: (context) => requireStartupPhase(
+      context.recoverInterrupted, 'constructServices.recoverInterrupted',
+    )(),
+    startBackground: (context) => requireStartupPhase(
+      context.startBackground, 'constructServices.startBackground',
+    )(),
+    buildServer: (context) => requireStartupPhase(
+      context.buildServer, 'constructServices.buildServer',
+    )(),
   });
-  await app.listen({ host: config.listenAddr, port: config.listenPort });
-  console.log(
-    `[ready] ${describe()} 监听 ${config.listenAddr}:${config.listenPort}` +
-      ` · 外部地址 ${config.externalUrl}` +
-      ` · docker 端点 ${describeDockerEndpoint(connection)}` +
-      ` · 缓存写满策略 ${fullPolicy}` +
-      ` · 指标采样 ${metricsIntervalSec > 0 ? `${metricsIntervalSec}s` : '已关闭'}` +
-      ` · 云对接 ${cloud.state}`,
-  );
 }
 
 // 直接运行时启动服务；被 import 时只导出

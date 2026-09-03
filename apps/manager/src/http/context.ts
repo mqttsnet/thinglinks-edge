@@ -25,6 +25,11 @@ import type { NodeCatalog } from '../core/nodes/catalog.ts';
 import type { ValueHistory } from '../core/edge/history.ts';
 import type { UpstreamRegistry } from '../core/nodes/upstream.ts';
 import type { NpmSourceRepo } from '../core/nodes/sources.ts';
+import type { PlatformPackageService } from '../core/nodes/platform-package.ts';
+import { InstanceBusyError, type InstanceOperationGate } from '../core/instance/operation-gate.ts';
+import type { ProxySessionRegistry } from '../core/instance/proxy-session-registry.ts';
+import type { InstanceAdminRuntime } from '../core/instance/admin-runtime.ts';
+import type { PlatformMigrationService } from '../core/nodes/platform-migration.ts';
 
 export const SID = 'tle_sid';
 export const CSRF = 'tle_csrf';
@@ -35,6 +40,14 @@ export interface ServerDeps {
   auth: AuthService;
   repo: InstanceRepo;
   service: InstanceService;
+  /** Core 与 HTTP 共用的同一个 Admin API runtime；路由只做错误映射。 */
+  adminRuntime: InstanceAdminRuntime;
+  /** 所有运行期实例写操作共用的唯一闸门；路由不得自行构造。 */
+  operationGate: InstanceOperationGate;
+  /** Task9 构造的唯一平台节点迁移服务；路由只使用此实例。 */
+  migrationService: PlatformMigrationService;
+  /** 反代层现存 WebSocket 的唯一登记表；迁移核心只依赖这个 core port。 */
+  proxySessions: ProxySessionRegistry;
   /** 实例上游地址；默认按容器名解析（Manager 与实例同处一个 docker 网络） */
   upstreamFor?: (instanceId: string) => string;
   /** 控制台前端产物目录。留空则不托管（宿主开发态走 Vite） */
@@ -75,6 +88,8 @@ export interface ServerDeps {
    */
   nodeStore?: NodeStore | undefined;
   nodeCatalog?: NodeCatalog | undefined;
+  /** 启动时已校验并建立基线的唯一平台包服务；固定包 HTTP 响应必须复用它。 */
+  platformPackages: PlatformPackageService;
   /** 实例容器视角的私有源地址，用于生成 packument 里的包体 URL */
   npmRegistryUrl?: string | undefined;
   /**
@@ -107,6 +122,10 @@ export interface HttpContext {
   auth: AuthService;
   repo: InstanceRepo;
   service: InstanceService;
+  adminRuntime: InstanceAdminRuntime;
+  operationGate: InstanceOperationGate;
+  migrationService: PlatformMigrationService;
+  proxySessions: ProxySessionRegistry;
   upstreamFor: (instanceId: string) => string;
   currentUser: (req: { cookies: Record<string, string | undefined> }) => ReturnType<AuthService['resolve']>;
   /**
@@ -173,6 +192,10 @@ export function createContext(deps: ServerDeps): HttpContext {
     auth,
     repo: deps.repo,
     service: deps.service,
+    adminRuntime: deps.adminRuntime,
+    operationGate: deps.operationGate,
+    migrationService: deps.migrationService,
+    proxySessions: deps.proxySessions,
     upstreamFor: deps.upstreamFor ?? defaultUpstream,
     currentUser,
     canSeeInstance: (user, instanceId) =>
@@ -246,7 +269,12 @@ export function createContext(deps: ServerDeps): HttpContext {
       }
       return user;
     },
-    fail: (reply, e) => reply.code(400).send({ error: (e as Error).message }),
+    fail: (reply, e) => reply
+      .code(e instanceof InstanceBusyError ? 409 : 400)
+      .send({
+        error: (e as Error).message,
+        ...(e instanceof InstanceBusyError ? { code: e.code } : {}),
+      }),
     instanceIdFromUrl: (url: string) => {
       const re = new RegExp(`^${config.basePath}/red/([^/?]+)`);
       return re.exec(url)?.[1];

@@ -3,8 +3,11 @@ import assert from 'node:assert/strict';
 import { openDb, migrate, recordAudit } from '../db.ts';
 import { deriveKey } from '../auth/crypto.ts';
 import { InstanceRepo, RepoError, type InstanceRecord, type PortRecord } from './repo.ts';
+import { PLATFORM_NODE_PACKAGE } from '../nodes/platform-contract.ts';
 
 const KEY = deriveKey('test-master', 'salt');
+const TEST_EXECUTION_OWNER = 'owner-migration-tests-0001';
+const TEST_EXECUTION_NOW = 1_000;
 const fresh = () => new InstanceRepo(openDb(':memory:'), KEY);
 
 const rec = (over: Partial<InstanceRecord> = {}): InstanceRecord => ({
@@ -16,6 +19,62 @@ const port = (over: Partial<PortRecord> = {}): PortRecord => ({
   hostPort: 30001, containerPort: 1883, protocol: 'tcp', hostIp: '127.0.0.1', purpose: 'MQTT', ...over,
 });
 const cred = () => [{ username: 'admin', password: 'p@ss-1', permissions: '*' as const }];
+
+const fileFact = (seed: string, exists = true) => exists
+  ? { exists: true as const, sha256: seed.repeat(64) }
+  : { exists: false as const };
+
+const migrationSnapshot = (over: Record<string, unknown> = {}) => ({
+  version: 1 as const,
+  kind: 'migration' as const,
+  settings: fileFact('a'),
+  flows: fileFact('b'),
+  credentials: fileFact('c'),
+  packageManifest: fileFact('d'),
+  lock: fileFact('e'),
+  legacyManifestSha256: 'f'.repeat(64),
+  nodeInventorySha256: '1'.repeat(64),
+  ...over,
+});
+
+const bootstrapSnapshot = () => ({ version: 1 as const, kind: 'bootstrap' as const });
+
+const migrationBegin = (
+  instanceId: string,
+  txId: string,
+  over: Record<string, unknown> = {},
+) => ({
+  instanceId,
+  txId,
+  operationKind: 'migration' as const,
+  phase: 'preparing' as const,
+  originalRunning: true,
+  stagedBefore: false,
+  modeBefore: 'legacy' as const,
+  imageIdBefore: 'sha256:image-a',
+  targetIntegrity: PLATFORM_NODE_PACKAGE.integrity,
+  checkpointDir: `.thinglinks-migration/${instanceId}/${txId}`,
+  snapshot: migrationSnapshot(),
+  actor: 'admin',
+  executionOwner: TEST_EXECUTION_OWNER,
+  executionLeaseExpiresAt: 10_000,
+  ...over,
+});
+
+const bootstrapBegin = (instanceId: string, txId: string) => ({
+  instanceId,
+  txId,
+  operationKind: 'bootstrap' as const,
+  phase: 'preparing' as const,
+  originalRunning: false,
+  stagedBefore: false,
+  modeBefore: 'legacy' as const,
+  imageIdBefore: 'sha256:image-a',
+  targetIntegrity: PLATFORM_NODE_PACKAGE.integrity,
+  checkpointDir: '',
+  snapshot: bootstrapSnapshot(),
+  actor: 'admin',
+});
 
 test('迁移可重复执行且幂等', () => {
   const db = openDb(':memory:');
@@ -31,6 +90,7 @@ test('创建后可读回，字段完整', () => {
   assert.equal(got?.name, '一号产线');
   assert.equal(got?.adminRoot, '/red/line-a/');
   assert.equal(got?.cpuLimit, 0.5);
+  assert.equal(repo.nodeRuntime('line-a')?.mode, 'legacy');
 });
 
 test('重复 id 被拒绝', () => {
@@ -107,10 +167,1205 @@ test('创建失败时整体回滚，不留半条记录', () => {
   assert.equal(repo.get('line-b'), undefined, '冲突后不应残留实例记录');
 });
 
+test('npm bootstrap instance row and preparing journal are created in one SQLite transaction', () => {
+  const db = openDb(':memory:');
+  const repo = new InstanceRepo(db, KEY);
+  const bootstrap = {
+    ...bootstrapBegin('line-a', 'tx-bootstrap-create'),
+    modeBefore: 'npm' as const,
+  };
+
+  repo.createWithNodeMigration(
+    rec({ nodeRuntimeMode: 'npm' }),
+    [port()],
+    cred(),
+    bootstrap,
+  );
+
+  assert.deepEqual(repo.nodeRuntime('line-a'), {
+    mode: 'npm',
+    platformVersion: '',
+    migrationState: 'preparing',
+    migrationError: 'none',
+  });
+  assert.deepEqual(repo.nodeMigration('line-a')?.snapshot, bootstrapSnapshot());
+  assert.equal(repo.ports('line-a').length, 1);
+  assert.equal(repo.credentials('line-a').length, 1);
+});
+
+test('failed bootstrap journal insert rolls back the instance row ports and credentials', () => {
+  const db = openDb(':memory:');
+  const repo = new InstanceRepo(db, KEY);
+  db.exec(`CREATE TRIGGER reject_bootstrap_journal BEFORE INSERT ON instance_node_migration
+    BEGIN SELECT RAISE(ABORT, 'bootstrap journal rejected'); END;`);
+
+  assert.throws(
+    () => repo.createWithNodeMigration(
+      rec({ nodeRuntimeMode: 'npm' }),
+      [port()],
+      cred(),
+      {
+        ...bootstrapBegin('line-a', 'tx-bootstrap-rejected'),
+        modeBefore: 'npm',
+      },
+    ),
+    /bootstrap journal rejected/,
+  );
+  assert.equal(repo.get('line-a'), undefined);
+  assert.equal(repo.ports('line-a').length, 0);
+  assert.equal(repo.credentials('line-a').length, 0);
+  assert.equal(repo.nodeMigration('line-a'), undefined);
+});
+
 test('审计可写入且带时间戳', () => {
   const db = openDb(':memory:');
   recordAudit(db, { actor: 'admin', action: 'create-instance', target: 'line-a', result: 'ok' });
   const row = db.prepare('SELECT * FROM audit').get() as Record<string, unknown>;
   assert.equal(row['actor'], 'admin');
   assert.ok(String(row['ts']).length > 0);
+});
+
+test('journal phase and instance projection update and commit atomically', () => {
+  const db = openDb(':memory:');
+  const repo = new InstanceRepo(db, Buffer.alloc(32, 1));
+  repo.create({
+    id: 'line-a',
+    name: 'Line A',
+    imageTag: '5.0.4-24-minimal',
+    memLimit: 512,
+    cpuLimit: 0.5,
+    adminRoot: '/red/line-a/',
+    credSecret: 'secret',
+    notes: '',
+    nodeRuntimeMode: 'legacy',
+  }, [], [{ username: 'admin', password: 'pass', permissions: '*' }]);
+  repo.beginNodeMigration(migrationBegin('line-a', 'tx-sync'));
+  repo.updateNodeMigration('line-a', 'verifying');
+  assert.deepEqual(repo.nodeRuntime('line-a'), {
+    mode: 'legacy',
+    platformVersion: '',
+    migrationState: 'verifying',
+    migrationError: 'none',
+  });
+  assert.equal(repo.nodeMigration('line-a')?.phase, 'verifying');
+  repo.commitNodeMigration('line-a', '0.0.1', 'admin');
+  assert.deepEqual(repo.nodeRuntime('line-a'), {
+    mode: 'npm', platformVersion: '0.0.1',
+    migrationState: 'committed', migrationError: 'none',
+  });
+  assert.equal(repo.nodeMigration('line-a')?.phase, 'committed');
+  const audit = db.prepare(
+    "SELECT actor, target FROM audit WHERE action = 'commit-node-migration'",
+  ).get() as { actor: string; target: string };
+  assert.deepEqual(audit, { actor: 'admin', target: 'line-a' });
+});
+
+test('journal round-trips versioned migration and bootstrap snapshots without secrets', () => {
+  const repo = fresh();
+  repo.create(rec(), [], cred());
+  repo.create(rec({ id: 'line-b', adminRoot: '/red/line-b/' }), [], cred());
+  const snapshot = migrationSnapshot({ credentials: fileFact('c', false) });
+  repo.beginNodeMigration(migrationBegin('line-a', 'tx-01', { snapshot }));
+  repo.beginNodeMigration(bootstrapBegin('line-b', 'tx-bootstrap'));
+  const journal = repo.nodeMigration('line-a');
+  assert.deepEqual(journal?.snapshot, snapshot);
+  assert.deepEqual(repo.nodeMigration('line-b')?.snapshot, bootstrapSnapshot());
+  assert.doesNotMatch(JSON.stringify(journal), /token|password|secret|npmrc/i);
+});
+
+test('startup projection mismatch becomes manual_required', () => {
+  const db = openDb(':memory:');
+  const repo = new InstanceRepo(db, KEY);
+  repo.create(rec(), [], cred());
+  repo.beginNodeMigration(migrationBegin('line-a', 'tx-recover'));
+  db.prepare(
+    "UPDATE instance SET node_migration_state = 'verifying', node_migration_error = 'verification' WHERE id = 'line-a'",
+  ).run();
+
+  const reopened = new InstanceRepo(db, KEY);
+  assert.equal(reopened.nodeRuntime('line-a')?.migrationState, 'manual_required');
+  assert.equal(reopened.nodeMigration('line-a')?.phase, 'manual_required');
+  assert.equal(reopened.nodeMigration('line-a')?.error, 'state-inconsistent');
+  assert.equal(
+    reopened.nodeRuntime('line-a')?.migrationError,
+    reopened.nodeMigration('line-a')?.error,
+  );
+});
+
+test('phase update rolls back journal when projection update fails', () => {
+  const db = openDb(':memory:');
+  const repo = new InstanceRepo(db, KEY);
+  repo.create(rec(), [], cred());
+  repo.beginNodeMigration(migrationBegin('line-a', 'tx-atomic'));
+  db.exec(`CREATE TRIGGER reject_projection BEFORE UPDATE ON instance
+    WHEN NEW.node_migration_state = 'verifying'
+    BEGIN SELECT RAISE(ABORT, 'projection rejected'); END;`);
+  assert.throws(() => repo.updateNodeMigration('line-a', 'verifying', 'verification'), /projection rejected/);
+  assert.equal(repo.nodeMigration('line-a')?.phase, 'preparing');
+  assert.equal(repo.nodeRuntime('line-a')?.migrationState, 'preparing');
+});
+
+test('final commit rolls back journal and projection when audit fails', () => {
+  const db = openDb(':memory:');
+  const repo = new InstanceRepo(db, KEY);
+  repo.create(rec(), [], cred());
+  repo.beginNodeMigration(migrationBegin('line-a', 'tx-commit'));
+  repo.updateNodeMigration('line-a', 'verifying');
+  db.exec(`CREATE TRIGGER reject_audit BEFORE INSERT ON audit
+    WHEN NEW.action = 'commit-node-migration'
+    BEGIN SELECT RAISE(ABORT, 'audit rejected'); END;`);
+  assert.throws(() => repo.commitNodeMigration('line-a', '0.0.1', 'admin'), /audit rejected/);
+  assert.equal(repo.nodeMigration('line-a')?.phase, 'verifying');
+  assert.deepEqual(repo.nodeRuntime('line-a'), {
+    mode: 'legacy', platformVersion: '', migrationState: 'verifying', migrationError: 'none',
+  });
+});
+
+test('begin accepts only preparing and validates mode against the persisted projection', () => {
+  const db = openDb(':memory:');
+  const repo = new InstanceRepo(db, KEY);
+  repo.create(rec(), [], cred());
+  const valid = migrationBegin('line-a', 'tx-valid');
+  assert.throws(
+    () => repo.beginNodeMigration({ ...valid, phase: 'committed' as 'preparing' }),
+    RepoError,
+  );
+  assert.throws(
+    () => repo.beginNodeMigration({ ...valid, modeBefore: 'npm' }),
+    /运行模式/,
+  );
+  assert.equal(repo.nodeMigration('line-a'), undefined);
+});
+
+test('begin validates ids paths enums and bootstrap empty-checkpoint facts', () => {
+  const repo = fresh();
+  repo.create(rec(), [], cred());
+  const valid = migrationBegin('line-a', 'tx-valid');
+  assert.throws(() => repo.beginNodeMigration({ ...valid, txId: '../escape' }), RepoError);
+  assert.throws(() => repo.beginNodeMigration({ ...valid, checkpointDir: '/tmp/checkpoint' }), RepoError);
+  assert.throws(() => repo.beginNodeMigration({ ...valid, checkpointDir: '../checkpoint' }), RepoError);
+  assert.throws(() => repo.beginNodeMigration({ ...valid, checkpointDir: '' }), RepoError);
+  assert.throws(() => repo.beginNodeMigration({ ...valid, operationKind: 'invalid' as 'migration' }), RepoError);
+  assert.throws(() => repo.beginNodeMigration({ ...valid, modeBefore: 'invalid' as 'legacy' }), RepoError);
+  assert.throws(() => repo.beginNodeMigration({ ...bootstrapBegin('line-a', 'tx-bootstrap'), originalRunning: true }), RepoError);
+  assert.equal(repo.nodeMigration('line-a'), undefined);
+});
+
+test('snapshot union requires exact bootstrap shape and complete existence-aware migration facts', () => {
+  const repo = fresh();
+  repo.create(rec(), [], cred());
+  const invalidSnapshots = [
+    { version: 1, kind: 'bootstrap', env: { NPM_TOKEN: 'opaque' } },
+    { version: 1, kind: 'migration' },
+    migrationSnapshot({ settings: { exists: true } }),
+    migrationSnapshot({ flows: { exists: false, sha256: 'a'.repeat(64) } }),
+    migrationSnapshot({ nodeInventorySha256: 'short' }),
+    migrationSnapshot({ rawInventory: ['tl-device'] }),
+  ];
+  for (const [i, snapshot] of invalidSnapshots.entries()) {
+    assert.throws(
+      () => repo.beginNodeMigration(migrationBegin('line-a', `tx-invalid-${i}`, { snapshot })),
+      RepoError,
+    );
+  }
+  assert.throws(
+    () => repo.beginNodeMigration({
+      ...bootstrapBegin('line-a', 'tx-bootstrap-extra'),
+      snapshot: { ...bootstrapSnapshot(), env: { NPM_TOKEN: 'opaque' } },
+    }),
+    RepoError,
+  );
+  assert.throws(
+    () => repo.beginNodeMigration({ ...bootstrapBegin('line-a', 'tx-kind'), snapshot: migrationSnapshot() }),
+    RepoError,
+  );
+  assert.equal(repo.nodeMigration('line-a'), undefined);
+});
+
+test('journal and projection persist only closed migration error codes', () => {
+  const repo = fresh();
+  repo.create(rec(), [], cred());
+  repo.beginNodeMigration(migrationBegin('line-a', 'tx-error'));
+  assert.throws(
+    () => repo.updateNodeMigration('line-a', 'manual_required', 'opaque-secret-value' as 'verification'),
+    RepoError,
+  );
+  assert.equal(repo.nodeMigration('line-a')?.error, 'none');
+  assert.equal(repo.nodeRuntime('line-a')?.migrationError, 'none');
+  repo.updateNodeMigration('line-a', 'manual_required', 'verification');
+  assert.equal(repo.nodeMigration('line-a')?.error, 'verification');
+  assert.equal(repo.nodeRuntime('line-a')?.migrationError, 'verification');
+});
+
+test('identical same-tx begin is idempotent but changed same-tx facts reject', () => {
+  const repo = fresh();
+  repo.create(rec(), [], cred());
+  const input = migrationBegin('line-a', 'tx-idempotent');
+  repo.beginNodeMigration(input);
+  const before = repo.nodeMigration('line-a');
+  repo.beginNodeMigration(input);
+  assert.deepEqual(repo.nodeMigration('line-a'), before);
+  assert.throws(() => repo.beginNodeMigration({ ...input, actor: 'other-admin' }), RepoError);
+  assert.deepEqual(repo.nodeMigration('line-a'), before);
+});
+
+test('global tx collision and a different active tx are rejected', () => {
+  const repo = fresh();
+  repo.create(rec(), [], cred());
+  repo.create(rec({ id: 'line-b', adminRoot: '/red/line-b/' }), [], cred());
+  repo.beginNodeMigration(migrationBegin('line-a', 'tx-shared'));
+  assert.throws(() => repo.beginNodeMigration(migrationBegin('line-b', 'tx-shared')), RepoError);
+  assert.throws(() => repo.beginNodeMigration(migrationBegin('line-a', 'tx-other')), RepoError);
+  assert.equal(repo.nodeMigration('line-b'), undefined);
+  assert.equal(repo.nodeMigration('line-a')?.txId, 'tx-shared');
+});
+
+test('committed dirty and manual journals reject a fresh begin', () => {
+  for (const [instanceId, terminal] of [
+    ['line-committed', 'committed'],
+    ['line-dirty', 'rolled_back_dirty'],
+    ['line-manual', 'manual_required'],
+  ] as const) {
+    const repo = fresh();
+    repo.create(rec({ id: instanceId, adminRoot: `/red/${instanceId}/` }), [], cred());
+    repo.beginNodeMigration(migrationBegin(instanceId, `tx-${terminal}`));
+    if (terminal === 'committed') {
+      repo.updateNodeMigration(instanceId, 'verifying');
+      repo.commitNodeMigration(instanceId, '0.0.1', 'admin');
+    } else {
+      repo.updateNodeMigration(instanceId, terminal, terminal === 'manual_required' ? 'state-inconsistent' : 'rollback');
+    }
+    assert.throws(() => repo.beginNodeMigration(migrationBegin(instanceId, `tx-retry-${terminal}`)), RepoError);
+  }
+});
+
+test('clean rolled-back replacement requires the exact prior tx and replaces atomically', () => {
+  const repo = fresh();
+  repo.create(rec(), [], cred());
+  repo.beginNodeMigration(migrationBegin('line-a', 'tx-old'));
+  repo.updateNodeMigration('line-a', 'rolled_back');
+  assert.throws(() => repo.beginNodeMigration(migrationBegin('line-a', 'tx-new')), RepoError);
+  assert.throws(() => repo.beginNodeMigration(migrationBegin('line-a', 'tx-new', {
+    replaceRolledBackTxId: 'tx-wrong',
+  })), RepoError);
+  repo.beginNodeMigration(migrationBegin('line-a', 'tx-new', {
+    replaceRolledBackTxId: 'tx-old',
+  }));
+  assert.equal(repo.nodeMigration('line-a')?.txId, 'tx-new');
+  assert.deepEqual(repo.nodeRuntime('line-a'), {
+    mode: 'legacy', platformVersion: '', migrationState: 'preparing', migrationError: 'none',
+  });
+});
+
+test('failed clean rolled-back replacement restores the prior journal and projection', () => {
+  const db = openDb(':memory:');
+  const repo = new InstanceRepo(db, KEY);
+  repo.create(rec(), [], cred());
+  repo.beginNodeMigration(migrationBegin('line-a', 'tx-old'));
+  repo.updateNodeMigration('line-a', 'rolled_back');
+  db.exec(`CREATE TRIGGER reject_replacement BEFORE INSERT ON instance_node_migration
+    WHEN NEW.tx_id = 'tx-new'
+    BEGIN SELECT RAISE(ABORT, 'replacement rejected'); END;`);
+  assert.throws(() => repo.beginNodeMigration(migrationBegin('line-a', 'tx-new', {
+    replaceRolledBackTxId: 'tx-old',
+  })), /replacement rejected/);
+  assert.equal(repo.nodeMigration('line-a')?.txId, 'tx-old');
+  assert.equal(repo.nodeMigration('line-a')?.phase, 'rolled_back');
+  assert.equal(repo.nodeRuntime('line-a')?.migrationState, 'rolled_back');
+});
+
+test('final commit accepts only a matching clean verifying journal and projection', () => {
+  const db = openDb(':memory:');
+  const repo = new InstanceRepo(db, KEY);
+  for (const instanceId of ['line-preparing', 'line-manual', 'line-mismatch']) {
+    repo.create(rec({ id: instanceId, adminRoot: `/red/${instanceId}/` }), [], cred());
+    repo.beginNodeMigration(migrationBegin(instanceId, `tx-${instanceId}`));
+  }
+
+  assert.throws(() => repo.commitNodeMigration('line-preparing', '0.0.1', 'admin'), RepoError);
+  repo.updateNodeMigration('line-manual', 'manual_required', 'state-inconsistent');
+  assert.throws(() => repo.commitNodeMigration('line-manual', '0.0.1', 'admin'), RepoError);
+  repo.updateNodeMigration('line-mismatch', 'verifying');
+  db.prepare(
+    "UPDATE instance SET node_migration_error = 'verification' WHERE id = 'line-mismatch'",
+  ).run();
+  assert.throws(() => repo.commitNodeMigration('line-mismatch', '0.0.1', 'admin'), RepoError);
+
+  assert.equal(repo.nodeMigration('line-preparing')?.phase, 'preparing');
+  assert.equal(repo.nodeMigration('line-manual')?.phase, 'manual_required');
+  assert.equal(repo.nodeMigration('line-mismatch')?.phase, 'verifying');
+  assert.deepEqual(repo.nodeRuntime('line-preparing'), {
+    mode: 'legacy', platformVersion: '', migrationState: 'preparing', migrationError: 'none',
+  });
+  assert.deepEqual(repo.nodeRuntime('line-manual'), {
+    mode: 'legacy', platformVersion: '',
+    migrationState: 'manual_required', migrationError: 'state-inconsistent',
+  });
+  assert.deepEqual(repo.nodeRuntime('line-mismatch'), {
+    mode: 'legacy', platformVersion: '',
+    migrationState: 'verifying', migrationError: 'verification',
+  });
+  const audits = db.prepare(
+    "SELECT COUNT(*) AS n FROM audit WHERE action = 'commit-node-migration'",
+  ).get() as { n: number };
+  assert.equal(audits.n, 0);
+});
+
+test('interrupted migrations exclude clean terminal phases', () => {
+  const repo = fresh();
+  repo.create(rec(), [], cred());
+  repo.create(rec({ id: 'line-b', adminRoot: '/red/line-b/' }), [], cred());
+  repo.beginNodeMigration(migrationBegin('line-a', 'tx-a'));
+  repo.beginNodeMigration(migrationBegin('line-b', 'tx-b'));
+  repo.updateNodeMigration('line-b', 'rolled_back');
+  assert.deepEqual(repo.interruptedNodeMigrations().map((j) => j.instanceId), ['line-a']);
+});
+
+test('terminal checkpoint cleanup pending audit is controlled and idempotent', () => {
+  const db = openDb(':memory:');
+  const repo = new InstanceRepo(db, KEY);
+  repo.create(rec(), [], cred());
+  repo.beginNodeMigration(migrationBegin('line-a', 'tx-cleanup'));
+  repo.updateNodeMigration('line-a', 'rolled_back');
+
+  repo.recordCheckpointCleanupPending('line-a', 'system');
+  repo.recordCheckpointCleanupPending('line-a', 'system');
+
+  assert.deepEqual(
+    db.prepare(
+      "SELECT action, detail, result FROM audit WHERE action = 'checkpoint_cleanup_pending'",
+    ).all(),
+    [{
+      action: 'checkpoint_cleanup_pending',
+      detail: '{"code":"checkpoint_cleanup_pending"}',
+      result: 'fail',
+    }],
+  );
+  assert.deepEqual(
+    repo.nodeMigrations().map((journal) => [journal.instanceId, journal.phase]),
+    [['line-a', 'rolled_back']],
+  );
+});
+
+test('C45 exact stopped cleanup audit accepts committed and rolled_back terminals idempotently', () => {
+  const cases = [
+    {
+      phase: 'committed' as const,
+      action: 'stopped_evidence_cleanup_pending',
+      detail: '{"code":"stopped_evidence_cleanup_pending"}',
+    },
+    {
+      phase: 'rolled_back' as const,
+      action: 'stopped_rollback_cleanup_pending',
+      detail: '{"code":"stopped_rollback_cleanup_pending"}',
+    },
+  ];
+
+  for (const item of cases) {
+    const db = openDb(':memory:');
+    const repo = new InstanceRepo(db, KEY);
+    const txId = `tx-cleanup-${item.phase}`;
+    const owner = `owner-cleanup-${item.phase}-0001`;
+    repo.create(rec(), [], cred());
+    repo.beginNodeMigration(migrationBegin('line-a', txId, {
+      originalRunning: false,
+      executionOwner: owner,
+      executionLeaseExpiresAt: 10_000,
+    }));
+    if (item.phase === 'committed') {
+      repo.transitionNodeMigrationExact(
+        'line-a', txId, owner, 1_000, ['preparing'], 'verifying',
+      );
+      repo.commitNodeMigrationExact(
+        'line-a', txId, owner, 1_000, 'verifying',
+        PLATFORM_NODE_PACKAGE.version, 'admin',
+      );
+    } else {
+      repo.transitionNodeMigrationExact(
+        'line-a', txId, owner, 1_000, ['preparing'], 'rolling_back', 'rollback',
+      );
+      repo.finishNodeMigrationRollbackExact(
+        'line-a', txId, owner, 1_000, 'rolling_back', 'rolled_back', 'admin',
+      );
+    }
+
+    repo.recordStoppedEvidenceCleanupPendingExact('line-a', txId, item.phase, 'system');
+    repo.recordStoppedEvidenceCleanupPendingExact('line-a', txId, item.phase, 'system');
+
+    assert.deepEqual(
+      db.prepare(
+        `SELECT actor, action, target, detail, result FROM audit
+         WHERE action = ? ORDER BY id`,
+      ).all(item.action),
+      [{
+        actor: 'system',
+        action: item.action,
+        target: 'line-a',
+        detail: item.detail,
+        result: 'fail',
+      }],
+      item.phase,
+    );
+    assert.equal(repo.nodeMigration('line-a')?.phase, item.phase);
+    assert.equal(repo.nodeRuntime('line-a')?.migrationState, item.phase);
+    if (item.phase === 'rolled_back') {
+      const nextTxId = 'tx-cleanup-rolled-back-next';
+      const nextOwner = 'owner-cleanup-rolled-back-next';
+      repo.beginNodeMigration(migrationBegin('line-a', nextTxId, {
+        originalRunning: false,
+        executionOwner: nextOwner,
+        executionLeaseExpiresAt: 10_000,
+        replaceRolledBackTxId: txId,
+      }));
+      repo.transitionNodeMigrationExact(
+        'line-a', nextTxId, nextOwner, 1_000, ['preparing'], 'rolling_back', 'rollback',
+      );
+      repo.finishNodeMigrationRollbackExact(
+        'line-a', nextTxId, nextOwner, 1_000, 'rolling_back', 'rolled_back', 'admin',
+      );
+      repo.recordStoppedEvidenceCleanupPendingExact(
+        'line-a', nextTxId, 'rolled_back', 'system',
+      );
+      repo.recordStoppedEvidenceCleanupPendingExact(
+        'line-a', nextTxId, 'rolled_back', 'system',
+      );
+      assert.equal(
+        (db.prepare(
+          "SELECT COUNT(*) AS n FROM audit WHERE action = 'stopped_rollback_cleanup_pending'",
+        ).get() as { n: number }).n,
+        2,
+      );
+    }
+  }
+});
+
+test('C45 exact stopped cleanup audit rejects stale, non-clean, and projection-mismatched state', () => {
+  for (const phase of [
+    'preparing',
+    'pending_start_verification',
+    'rolled_back_dirty',
+    'manual_required',
+  ] as const) {
+    const repo = fresh();
+    const txId = `tx-cleanup-reject-${phase}`;
+    repo.create(rec(), [], cred());
+    repo.beginNodeMigration(migrationBegin('line-a', txId, { originalRunning: false }));
+    repo.updateNodeMigration(
+      'line-a',
+      phase,
+      phase === 'rolled_back_dirty' || phase === 'manual_required' ? 'rollback' : 'none',
+    );
+    assert.throws(
+      () => repo.recordStoppedEvidenceCleanupPendingExact(
+        'line-a', txId, 'committed', 'system',
+      ),
+      /exact|clean|terminal|终态|日志|状态|投影/i,
+      phase,
+    );
+  }
+
+  const stale = fresh();
+  stale.create(rec(), [], cred());
+  stale.beginNodeMigration(migrationBegin('line-a', 'tx-cleanup-current', {
+    originalRunning: false,
+  }));
+  stale.updateNodeMigration('line-a', 'rolled_back');
+  assert.throws(
+    () => stale.recordStoppedEvidenceCleanupPendingExact(
+      'line-a', 'tx-cleanup-stale', 'rolled_back', 'system',
+    ),
+    /exact|tx|日志|状态/i,
+  );
+  assert.throws(
+    () => stale.recordStoppedEvidenceCleanupPendingExact(
+      'line-a', 'tx-cleanup-current', 'committed', 'system',
+    ),
+    /exact|phase|终态|日志|状态/i,
+  );
+
+  const db = openDb(':memory:');
+  const projection = new InstanceRepo(db, KEY);
+  projection.create(rec(), [], cred());
+  projection.beginNodeMigration(migrationBegin('line-a', 'tx-cleanup-projection', {
+    originalRunning: false,
+  }));
+  projection.updateNodeMigration('line-a', 'rolled_back');
+  db.prepare(
+    "UPDATE instance SET node_migration_state = 'manual_required', node_migration_error = 'rollback' WHERE id = ?",
+  ).run('line-a');
+  assert.throws(
+    () => projection.recordStoppedEvidenceCleanupPendingExact(
+      'line-a', 'tx-cleanup-projection', 'rolled_back', 'system',
+    ),
+    /exact|projection|投影|日志|状态/i,
+  );
+  assert.equal(
+    (db.prepare(
+      "SELECT COUNT(*) AS n FROM audit WHERE action LIKE 'stopped_%_cleanup_pending'",
+    ).get() as { n: number }).n,
+    0,
+  );
+});
+
+test('C45 stopped cleanup audit insertion failure leaves the exact rolled_back terminal unchanged', () => {
+  const db = openDb(':memory:');
+  const repo = new InstanceRepo(db, KEY);
+  const txId = 'tx-cleanup-audit-failure';
+  const owner = 'owner-cleanup-audit-failure';
+  repo.create(rec(), [], cred());
+  repo.beginNodeMigration(migrationBegin('line-a', txId, {
+    originalRunning: false,
+    executionOwner: owner,
+    executionLeaseExpiresAt: 10_000,
+  }));
+  repo.transitionNodeMigrationExact(
+    'line-a', txId, owner, 1_000, ['preparing'], 'rolling_back', 'rollback',
+  );
+  repo.finishNodeMigrationRollbackExact(
+    'line-a', txId, owner, 1_000, 'rolling_back', 'rolled_back', 'admin',
+  );
+  db.exec(`CREATE TRIGGER reject_stopped_rollback_cleanup_audit
+    BEFORE INSERT ON audit
+    WHEN NEW.action = 'stopped_rollback_cleanup_pending'
+    BEGIN SELECT RAISE(ABORT, 'C45 cleanup audit rejected'); END;`);
+
+  assert.throws(
+    () => repo.recordStoppedEvidenceCleanupPendingExact(
+      'line-a', txId, 'rolled_back', 'system',
+    ),
+    /C45 cleanup audit rejected/,
+  );
+  assert.equal(repo.nodeMigration('line-a')?.phase, 'rolled_back');
+  assert.equal(repo.nodeMigration('line-a')?.error, 'none');
+  assert.deepEqual(repo.nodeRuntime('line-a'), {
+    mode: 'legacy', platformVersion: '', migrationState: 'rolled_back', migrationError: 'none',
+  });
+  assert.equal(
+    (db.prepare(
+      "SELECT COUNT(*) AS n FROM audit WHERE action = 'stopped_rollback_cleanup_pending'",
+    ).get() as { n: number }).n,
+    0,
+  );
+});
+
+test('exact tx phase CAS refuses a stale replacement and leaves the new journal untouched', () => {
+  const repo = fresh();
+  repo.create(rec(), [], cred());
+  repo.beginNodeMigration(migrationBegin('line-a', 'tx-old'));
+  repo.updateNodeMigration('line-a', 'rolled_back');
+  repo.beginNodeMigration(migrationBegin('line-a', 'tx-new', { replaceRolledBackTxId: 'tx-old' }));
+
+  assert.throws(
+    () => repo.transitionNodeMigrationExact(
+      'line-a', 'tx-old', TEST_EXECUTION_OWNER, TEST_EXECUTION_NOW,
+      ['preparing'], 'checkpointed',
+    ),
+    /所有权|CAS|变化/i,
+  );
+  assert.equal(repo.nodeMigration('line-a')?.txId, 'tx-new');
+  repo.transitionNodeMigrationExact(
+    'line-a', 'tx-new', TEST_EXECUTION_OWNER, TEST_EXECUTION_NOW,
+    ['preparing'], 'checkpointed',
+  );
+  assert.equal(repo.nodeMigration('line-a')?.phase, 'checkpointed');
+});
+
+test('exact Task 8 finalizers reject stale tx ownership and preserve the replacement journal', () => {
+  const scenarios = [
+    {
+      name: 'commit',
+      prepare: (repo: InstanceRepo) => repo.transitionNodeMigrationExact(
+        'line-a', 'tx-old', TEST_EXECUTION_OWNER, TEST_EXECUTION_NOW,
+        ['preparing'], 'verifying',
+      ),
+      finalize: (repo: InstanceRepo) => repo.commitNodeMigrationExact(
+        'line-a', 'tx-old', TEST_EXECUTION_OWNER, TEST_EXECUTION_NOW,
+        'verifying', PLATFORM_NODE_PACKAGE.version, 'admin',
+      ),
+      phase: 'verifying',
+    },
+    {
+      name: 'rollback',
+      prepare: (repo: InstanceRepo) => repo.transitionNodeMigrationExact(
+        'line-a', 'tx-old', TEST_EXECUTION_OWNER, TEST_EXECUTION_NOW,
+        ['preparing'], 'rolling_back', 'rollback',
+      ),
+      finalize: (repo: InstanceRepo) => repo.finishNodeMigrationRollbackExact(
+        'line-a', 'tx-old', TEST_EXECUTION_OWNER, TEST_EXECUTION_NOW,
+        'rolling_back', 'rolled_back', 'admin',
+      ),
+      phase: 'rolling_back',
+    },
+    {
+      name: 'manual',
+      prepare: () => undefined,
+      finalize: (repo: InstanceRepo) => repo.finishNodeMigrationManualExact(
+        'line-a', 'tx-old', TEST_EXECUTION_OWNER, TEST_EXECUTION_NOW,
+        ['preparing'], 'rollback', 'admin',
+      ),
+      phase: 'preparing',
+    },
+  ] as const;
+
+  for (const scenario of scenarios) {
+    const db = openDb(':memory:');
+    const repo = new InstanceRepo(db, KEY);
+    repo.create(rec(), [], cred());
+    repo.beginNodeMigration(migrationBegin('line-a', 'tx-old'));
+    scenario.prepare(repo);
+    db.prepare(
+      'UPDATE instance_node_migration SET tx_id = ? WHERE instance_id = ?',
+    ).run('tx-replacement', 'line-a');
+
+    assert.throws(() => scenario.finalize(repo), /所有权|CAS|变化/i, scenario.name);
+    assert.equal(repo.nodeMigration('line-a')?.txId, 'tx-replacement', scenario.name);
+    assert.equal(repo.nodeMigration('line-a')?.phase, scenario.phase, scenario.name);
+    assert.equal(repo.nodeRuntime('line-a')?.migrationState, scenario.phase, scenario.name);
+  }
+});
+
+test('Task 8 execution ownership claims, renews, fences peers, and clears on terminals', () => {
+  const repo = fresh();
+  repo.create(rec(), [], cred());
+  const ownerA = 'owner-repository-a-0001';
+  const ownerB = 'owner-repository-b-0001';
+  repo.beginNodeMigration(migrationBegin('line-a', 'tx-owned', {
+    executionOwner: ownerA,
+    executionLeaseExpiresAt: 2_000,
+  }));
+  assert.equal(repo.nodeMigration('line-a')?.executionOwner, ownerA);
+  assert.equal(repo.nodeMigration('line-a')?.executionLeaseExpiresAt, 2_000);
+
+  assert.equal(
+    repo.claimNodeMigrationExecution(
+      'line-a', 'tx-owned', ownerB, ['preparing'], 1_999, 1_000,
+    ),
+    undefined,
+  );
+  assert.equal(
+    repo.claimNodeMigrationExecution(
+      'line-a', 'tx-owned', ownerA, ['preparing'], 1_000, 2_000,
+    )?.executionLeaseExpiresAt,
+    3_000,
+  );
+  assert.equal(
+    repo.renewNodeMigrationExecution(
+      'line-a', 'tx-owned', ownerA, ['preparing'], 1_500, 2_000,
+    ).executionLeaseExpiresAt,
+    3_500,
+  );
+  assert.throws(
+    () => repo.renewNodeMigrationExecution(
+      'line-a', 'tx-owned', ownerB, ['preparing'], 1_500, 2_000,
+    ),
+    /所有权|租约|owner/i,
+  );
+  assert.equal(
+    repo.claimNodeMigrationExecution(
+      'line-a', 'tx-owned', ownerB, ['preparing'], 3_500, 1_000,
+    )?.executionOwner,
+    ownerB,
+  );
+  assert.throws(
+    () => repo.transitionNodeMigrationExact(
+      'line-a', 'tx-owned', ownerA, 3_500, ['preparing'], 'verifying',
+    ),
+    /所有权|租约|CAS|变化/i,
+  );
+  repo.transitionNodeMigrationExact(
+    'line-a', 'tx-owned', ownerB, 3_500, ['preparing'], 'verifying',
+  );
+  repo.commitNodeMigrationExact(
+    'line-a', 'tx-owned', ownerB, 3_500,
+    'verifying', PLATFORM_NODE_PACKAGE.version, 'admin',
+  );
+  assert.equal(repo.nodeMigration('line-a')?.executionOwner, '');
+  assert.equal(repo.nodeMigration('line-a')?.executionLeaseExpiresAt, 0);
+  assert.doesNotMatch(JSON.stringify(repo.nodeRuntime('line-a')), /owner-repository/);
+});
+
+test('exact Task 8 rollback and manual terminals clear execution ownership', () => {
+  for (const terminal of ['rolled_back', 'manual_required'] as const) {
+    const repo = fresh();
+    repo.create(rec(), [], cred());
+    const txId = `tx-clear-${terminal}`;
+    const owner = `owner-clear-${terminal}`;
+    repo.beginNodeMigration(migrationBegin('line-a', txId, {
+      executionOwner: owner,
+      executionLeaseExpiresAt: 10_000,
+    }));
+    repo.transitionNodeMigrationExact(
+      'line-a', txId, owner, 1_000, ['preparing'], 'rolling_back', 'rollback',
+    );
+    if (terminal === 'rolled_back') {
+      repo.finishNodeMigrationRollbackExact(
+        'line-a', txId, owner, 1_000, 'rolling_back', 'rolled_back', 'admin',
+      );
+    } else {
+      repo.finishNodeMigrationManualExact(
+        'line-a', txId, owner, 1_000, ['rolling_back'], 'rollback', 'admin',
+      );
+    }
+    assert.equal(repo.nodeMigration('line-a')?.executionOwner, '', terminal);
+    assert.equal(repo.nodeMigration('line-a')?.executionLeaseExpiresAt, 0, terminal);
+  }
+});
+
+test('C31 parks an exact owned migration pending and clears execution ownership atomically', () => {
+  const repo = fresh();
+  repo.create(rec(), [], cred());
+  const txId = 'tx-pending-park';
+  const owner = 'owner-pending-park-0001';
+  repo.beginNodeMigration(migrationBegin('line-a', txId, {
+    executionOwner: owner,
+    executionLeaseExpiresAt: 10_000,
+  }));
+  repo.transitionNodeMigrationExact(
+    'line-a', txId, owner, 1_000, ['preparing'], 'cutover',
+  );
+
+  repo.parkNodeMigrationPendingStartExact(
+    'line-a', txId, owner, 1_000, 'cutover',
+  );
+
+  const journal = repo.nodeMigration('line-a');
+  assert.equal(journal?.phase, 'pending_start_verification');
+  assert.equal(journal?.error, 'none');
+  assert.equal(journal?.executionOwner, '');
+  assert.equal(journal?.executionLeaseExpiresAt, 0);
+  assert.deepEqual(repo.nodeRuntime('line-a'), {
+    mode: 'legacy', platformVersion: '',
+    migrationState: 'pending_start_verification', migrationError: 'none',
+  });
+  assert.throws(
+    () => repo.parkNodeMigrationPendingStartExact(
+      'line-a', 'tx-stale', owner, 1_000, 'cutover',
+    ),
+    /所有权|CAS|变化/i,
+  );
+});
+
+test('C31 pending park rolls back the journal update when projection CAS fails', () => {
+  const db = openDb(':memory:');
+  const repo = new InstanceRepo(db, KEY);
+  const txId = 'tx-pending-atomic';
+  const owner = 'owner-pending-atomic-0001';
+  repo.create(rec(), [], cred());
+  repo.beginNodeMigration(migrationBegin('line-a', txId, {
+    executionOwner: owner,
+    executionLeaseExpiresAt: 10_000,
+  }));
+  repo.transitionNodeMigrationExact(
+    'line-a', txId, owner, 1_000, ['preparing'], 'cutover',
+  );
+  db.exec(`CREATE TRIGGER reject_pending_projection
+    BEFORE UPDATE OF node_migration_state ON instance
+    WHEN NEW.node_migration_state = 'pending_start_verification'
+    BEGIN SELECT RAISE(ABORT, 'pending projection rejected'); END;`);
+
+  assert.throws(
+    () => repo.parkNodeMigrationPendingStartExact(
+      'line-a', txId, owner, 1_000, 'cutover',
+    ),
+    /pending projection rejected/,
+  );
+  const journal = repo.nodeMigration('line-a');
+  assert.equal(journal?.phase, 'cutover');
+  assert.equal(journal?.executionOwner, owner);
+  assert.equal(journal?.executionLeaseExpiresAt, 10_000);
+  assert.equal(repo.nodeRuntime('line-a')?.migrationState, 'cutover');
+});
+
+test('C31 pending start claim is exact, peer-fenced, and same-owner idempotent only while live', () => {
+  const repo = fresh();
+  repo.create(rec(), [], cred());
+  const txId = 'tx-pending-claim';
+  const parkedOwner = 'owner-pending-parked-0001';
+  const startOwner = 'owner-pending-start-0001';
+  const peerOwner = 'owner-pending-peer-0001';
+  repo.beginNodeMigration(migrationBegin('line-a', txId, {
+    executionOwner: parkedOwner,
+    executionLeaseExpiresAt: 10_000,
+  }));
+  repo.parkNodeMigrationPendingStartExact(
+    'line-a', txId, parkedOwner, 1_000, 'preparing',
+  );
+
+  assert.equal(
+    repo.claimPendingStartExecutionExact(
+      'line-a', 'tx-stale', startOwner, 2_000, 1_000,
+    ),
+    undefined,
+  );
+  assert.equal(
+    repo.claimPendingStartExecutionExact(
+      'line-a', txId, startOwner, 2_000, 1_000,
+    )?.executionLeaseExpiresAt,
+    3_000,
+  );
+  assert.equal(
+    repo.claimPendingStartExecutionExact(
+      'line-a', txId, peerOwner, 2_100, 1_000,
+    ),
+    undefined,
+  );
+  assert.equal(
+    repo.claimPendingStartExecutionExact(
+      'line-a', txId, startOwner, 2_500, 1_000,
+    )?.executionLeaseExpiresAt,
+    3_500,
+  );
+  assert.equal(
+    repo.claimPendingStartExecutionExact(
+      'line-a', txId, startOwner, 3_500, 1_000,
+    ),
+    undefined,
+  );
+
+  repo.transitionNodeMigrationExact(
+    'line-a', txId, startOwner, 3_000,
+    ['pending_start_verification'], 'verifying',
+  );
+  repo.commitNodeMigrationExact(
+    'line-a', txId, startOwner, 3_000,
+    'verifying', PLATFORM_NODE_PACKAGE.version, 'admin',
+  );
+  assert.equal(repo.nodeMigration('line-a')?.executionOwner, '');
+  assert.equal(repo.nodeMigration('line-a')?.executionLeaseExpiresAt, 0);
+});
+
+test('C31 pending start claim leaves the ownerless journal unchanged when SQLite aborts the claim', () => {
+  const db = openDb(':memory:');
+  const repo = new InstanceRepo(db, KEY);
+  const txId = 'tx-pending-claim-atomic';
+  const parkedOwner = 'owner-pending-atomic-0002';
+  repo.create(rec(), [], cred());
+  repo.beginNodeMigration(migrationBegin('line-a', txId, {
+    executionOwner: parkedOwner,
+    executionLeaseExpiresAt: 10_000,
+  }));
+  repo.parkNodeMigrationPendingStartExact(
+    'line-a', txId, parkedOwner, 1_000, 'preparing',
+  );
+  db.exec(`CREATE TRIGGER reject_pending_claim
+    BEFORE UPDATE OF execution_owner ON instance_node_migration
+    WHEN NEW.execution_owner != ''
+    BEGIN SELECT RAISE(ABORT, 'pending claim rejected'); END;`);
+
+  assert.throws(
+    () => repo.claimPendingStartExecutionExact(
+      'line-a', txId, 'owner-pending-start-atomic', 2_000, 1_000,
+    ),
+    /pending claim rejected/,
+  );
+  assert.equal(repo.nodeMigration('line-a')?.phase, 'pending_start_verification');
+  assert.equal(repo.nodeMigration('line-a')?.executionOwner, '');
+  assert.equal(repo.nodeMigration('line-a')?.executionLeaseExpiresAt, 0);
+});
+
+test('C43 ownerless pending manual finalizer is exact and clears both journal and projection atomically', () => {
+  const repo = fresh();
+  repo.create(rec(), [], cred());
+  const txId = 'tx-ownerless-pending-manual';
+  const owner = 'owner-before-pending-manual';
+  repo.beginNodeMigration(migrationBegin('line-a', txId, {
+    executionOwner: owner,
+    executionLeaseExpiresAt: 10_000,
+  }));
+  repo.parkNodeMigrationPendingStartExact(
+    'line-a', txId, owner, 1_000, 'preparing',
+  );
+
+  repo.finishOwnerlessPendingManualExact('line-a', txId, 'rollback', 'system');
+
+  assert.equal(repo.nodeMigration('line-a')?.phase, 'manual_required');
+  assert.equal(repo.nodeMigration('line-a')?.error, 'rollback');
+  assert.equal(repo.nodeMigration('line-a')?.executionOwner, '');
+  assert.equal(repo.nodeMigration('line-a')?.executionLeaseExpiresAt, 0);
+  assert.deepEqual(repo.nodeRuntime('line-a'), {
+    mode: 'legacy', platformVersion: '',
+    migrationState: 'manual_required', migrationError: 'rollback',
+  });
+});
+
+test('C43 ownerless pending manual finalizer rejects stale tx, owner, phase, and error', () => {
+  const makePending = (txId: string) => {
+    const db = openDb(':memory:');
+    const repo = new InstanceRepo(db, KEY);
+    repo.create(rec(), [], cred());
+    const owner = `owner-${txId}-before-pending`;
+    repo.beginNodeMigration(migrationBegin('line-a', txId, {
+      executionOwner: owner,
+      executionLeaseExpiresAt: 10_000,
+    }));
+    repo.parkNodeMigrationPendingStartExact('line-a', txId, owner, 1_000, 'preparing');
+    return { db, repo };
+  };
+
+  const { repo: stale } = makePending('tx-c43-stale');
+  assert.throws(
+    () => stale.finishOwnerlessPendingManualExact(
+      'line-a', 'tx-c43-replacement', 'rollback', 'system',
+    ),
+    /pending|CAS|变化|事务/i,
+  );
+  assert.equal(stale.nodeMigration('line-a')?.phase, 'pending_start_verification');
+
+  const { repo: owned } = makePending('tx-c43-owned');
+  owned.claimPendingStartExecutionExact(
+    'line-a', 'tx-c43-owned', 'owner-c43-start-0001', 2_000, 1_000,
+  );
+  assert.throws(
+    () => owned.finishOwnerlessPendingManualExact(
+      'line-a', 'tx-c43-owned', 'rollback', 'system',
+    ),
+    /pending|CAS|变化|事务/i,
+  );
+  assert.equal(owned.nodeMigration('line-a')?.phase, 'pending_start_verification');
+  assert.equal(owned.nodeMigration('line-a')?.executionOwner, 'owner-c43-start-0001');
+
+  const { repo: verifying } = makePending('tx-c43-verifying');
+  verifying.claimPendingStartVerifyingExact(
+    'line-a', 'tx-c43-verifying', 'owner-c43-verifying-01', 2_000, 1_000,
+  );
+  assert.throws(
+    () => verifying.finishOwnerlessPendingManualExact(
+      'line-a', 'tx-c43-verifying', 'rollback', 'system',
+    ),
+    /pending|CAS|变化|事务/i,
+  );
+  assert.equal(verifying.nodeMigration('line-a')?.phase, 'verifying');
+
+  const { db: erroredDb, repo: errored } = makePending('tx-c43-error');
+  erroredDb.prepare(
+    "UPDATE instance_node_migration SET error = 'rollback' WHERE instance_id = 'line-a'",
+  ).run();
+  erroredDb.prepare(
+    "UPDATE instance SET node_migration_error = 'rollback' WHERE id = 'line-a'",
+  ).run();
+  assert.throws(
+    () => errored.finishOwnerlessPendingManualExact(
+      'line-a', 'tx-c43-error', 'rollback', 'system',
+    ),
+    /pending|CAS|变化|事务/i,
+  );
+  assert.equal(errored.nodeMigration('line-a')?.phase, 'pending_start_verification');
+
+  const { repo: requestedError } = makePending('tx-c43-requested-error');
+  assert.throws(
+    () => requestedError.finishOwnerlessPendingManualExact(
+      'line-a', 'tx-c43-requested-error', 'compensation' as 'rollback', 'system',
+    ),
+    /错误码|rollback/i,
+  );
+  assert.equal(requestedError.nodeMigration('line-a')?.error, 'none');
+});
+
+test('C43 ownerless pending manual finalizer rolls journal and projection back when audit insert fails', () => {
+  const db = openDb(':memory:');
+  const repo = new InstanceRepo(db, KEY);
+  const txId = 'tx-c43-audit-rollback';
+  const owner = 'owner-c43-before-pending';
+  repo.create(rec(), [], cred());
+  repo.beginNodeMigration(migrationBegin('line-a', txId, {
+    executionOwner: owner,
+    executionLeaseExpiresAt: 10_000,
+  }));
+  repo.parkNodeMigrationPendingStartExact('line-a', txId, owner, 1_000, 'preparing');
+  db.exec(`CREATE TRIGGER reject_c43_manual_audit
+    BEFORE INSERT ON audit
+    WHEN NEW.action = 'manual-node-migration'
+    BEGIN SELECT RAISE(ABORT, 'C43 audit rejected'); END;`);
+
+  assert.throws(
+    () => repo.finishOwnerlessPendingManualExact(
+      'line-a', txId, 'rollback', 'system',
+    ),
+    /C43 audit rejected/,
+  );
+  assert.equal(repo.nodeMigration('line-a')?.phase, 'pending_start_verification');
+  assert.equal(repo.nodeMigration('line-a')?.error, 'none');
+  assert.equal(repo.nodeMigration('line-a')?.executionOwner, '');
+  assert.equal(repo.nodeRuntime('line-a')?.migrationState, 'pending_start_verification');
+  assert.equal(repo.nodeRuntime('line-a')?.migrationError, 'none');
+});
+
+test('same-image compensation manual fence is atomic and never replaces a migration journal', () => {
+  const db = openDb(':memory:');
+  const repo = new InstanceRepo(db, KEY);
+  repo.create(rec(), [], cred());
+  db.exec(`CREATE TRIGGER reject_rebuild_manual_audit
+    BEFORE INSERT ON audit
+    WHEN NEW.action = 'same-image-rebuild-manual'
+    BEGIN SELECT RAISE(ABORT, 'manual audit rejected'); END;`);
+  assert.throws(() => repo.fenceSameImageRebuildFailure('line-a', 'system'), /manual audit rejected/);
+  assert.equal(repo.nodeRuntime('line-a')?.migrationState, 'idle');
+  db.exec('DROP TRIGGER reject_rebuild_manual_audit');
+
+  repo.fenceSameImageRebuildFailure('line-a', 'system');
+  assert.equal(repo.nodeRuntime('line-a')?.migrationState, 'manual_required');
+  assert.equal(repo.nodeRuntime('line-a')?.migrationError, 'compensation');
+  assert.equal(repo.nodeMigration('line-a'), undefined);
+
+  const withJournal = fresh();
+  withJournal.create(rec(), [], cred());
+  withJournal.beginNodeMigration(migrationBegin('line-a', 'tx-existing-journal'));
+  assert.throws(
+    () => withJournal.fenceSameImageRebuildFailure('line-a', 'system'),
+    /已有迁移日志/,
+  );
+  assert.equal(withJournal.nodeMigration('line-a')?.phase, 'preparing');
+});
+
+test('C33 exact same-image fence advances committed and rolled_back journals atomically', () => {
+  for (const terminal of ['committed', 'rolled_back'] as const) {
+    const repo = fresh();
+    const txId = `tx-fence-${terminal}`;
+    const owner = `owner-fence-${terminal}-0001`;
+    repo.create(rec(), [], cred());
+    repo.beginNodeMigration(migrationBegin('line-a', txId, {
+      executionOwner: owner,
+      executionLeaseExpiresAt: 10_000,
+    }));
+    if (terminal === 'committed') {
+      repo.transitionNodeMigrationExact(
+        'line-a', txId, owner, 1_000, ['preparing'], 'verifying',
+      );
+      repo.commitNodeMigrationExact(
+        'line-a', txId, owner, 1_000, 'verifying',
+        PLATFORM_NODE_PACKAGE.version, 'admin',
+      );
+    } else {
+      repo.transitionNodeMigrationExact(
+        'line-a', txId, owner, 1_000, ['preparing'], 'rolling_back', 'rollback',
+      );
+      repo.finishNodeMigrationRollbackExact(
+        'line-a', txId, owner, 1_000, 'rolling_back', 'rolled_back', 'admin',
+      );
+    }
+
+    repo.fenceSameImageRebuildFailureExact(
+      'line-a', txId, terminal, 'system',
+    );
+
+    assert.equal(repo.nodeMigration('line-a')?.phase, 'manual_required', terminal);
+    assert.equal(repo.nodeMigration('line-a')?.error, 'compensation', terminal);
+    assert.equal(repo.nodeMigration('line-a')?.executionOwner, '', terminal);
+    assert.equal(repo.nodeRuntime('line-a')?.migrationState, 'manual_required', terminal);
+    assert.equal(repo.nodeRuntime('line-a')?.migrationError, 'compensation', terminal);
+  }
+});
+
+test('C33 exact fence rejects active or stale journals and audit failure rolls back both terminal rows', () => {
+  const active = fresh();
+  active.create(rec(), [], cred());
+  active.beginNodeMigration(migrationBegin('line-a', 'tx-fence-active'));
+  assert.throws(
+    () => active.fenceSameImageRebuildFailureExact(
+      'line-a', 'tx-fence-active', 'committed', 'system',
+    ),
+    /终态|phase|状态|CAS/i,
+  );
+  assert.equal(active.nodeMigration('line-a')?.phase, 'preparing');
+
+  const db = openDb(':memory:');
+  const repo = new InstanceRepo(db, KEY);
+  const txId = 'tx-fence-audit';
+  const owner = 'owner-fence-audit-0001';
+  repo.create(rec(), [], cred());
+  repo.beginNodeMigration(migrationBegin('line-a', txId, {
+    executionOwner: owner,
+    executionLeaseExpiresAt: 10_000,
+  }));
+  repo.transitionNodeMigrationExact('line-a', txId, owner, 1_000, ['preparing'], 'verifying');
+  repo.commitNodeMigrationExact(
+    'line-a', txId, owner, 1_000, 'verifying', PLATFORM_NODE_PACKAGE.version, 'admin',
+  );
+  db.exec(`CREATE TRIGGER reject_exact_rebuild_fence_audit
+    BEFORE INSERT ON audit
+    WHEN NEW.action = 'same-image-rebuild-manual'
+    BEGIN SELECT RAISE(ABORT, 'exact rebuild fence audit rejected'); END;`);
+
+  assert.throws(
+    () => repo.fenceSameImageRebuildFailureExact('line-a', txId, 'committed', 'system'),
+    /exact rebuild fence audit rejected/,
+  );
+  assert.equal(repo.nodeMigration('line-a')?.phase, 'committed');
+  assert.equal(repo.nodeRuntime('line-a')?.migrationState, 'committed');
+  assert.throws(
+    () => repo.fenceSameImageRebuildFailureExact('line-a', 'tx-stale', 'committed', 'system'),
+    /终态|phase|状态|CAS/i,
+  );
+});
+
+test('C35 claims pending owner and verifying phase/projection in one atomic transaction', () => {
+  const db = openDb(':memory:');
+  const repo = new InstanceRepo(db, KEY);
+  const txId = 'tx-pending-verifying';
+  const parkedOwner = 'owner-pending-verifying-park';
+  const startOwner = 'owner-pending-verifying-start';
+  repo.create(rec(), [], cred());
+  repo.beginNodeMigration(migrationBegin('line-a', txId, {
+    executionOwner: parkedOwner,
+    executionLeaseExpiresAt: 10_000,
+  }));
+  repo.parkNodeMigrationPendingStartExact(
+    'line-a', txId, parkedOwner, 1_000, 'preparing',
+  );
+
+  const claimed = repo.claimPendingStartVerifyingExact(
+    'line-a', txId, startOwner, 2_000, 1_000,
+  );
+  assert.equal(claimed?.phase, 'verifying');
+  assert.equal(claimed?.executionOwner, startOwner);
+  assert.equal(claimed?.executionLeaseExpiresAt, 3_000);
+  assert.equal(repo.nodeRuntime('line-a')?.migrationState, 'verifying');
+  assert.equal(
+    repo.claimPendingStartVerifyingExact(
+      'line-a', txId, 'owner-pending-verifying-peer', 2_100, 1_000,
+    ),
+    undefined,
+  );
+  assert.equal(
+    repo.claimPendingStartVerifyingExact(
+      'line-a', txId, startOwner, 2_500, 1_000,
+    )?.executionLeaseExpiresAt,
+    3_500,
+  );
+  assert.equal(
+    repo.claimPendingStartVerifyingExact(
+      'line-a', txId, startOwner, 3_500, 1_000,
+    ),
+    undefined,
+  );
+});
+
+test('C35 verifying claim rolls journal back when projection CAS aborts', () => {
+  const db = openDb(':memory:');
+  const repo = new InstanceRepo(db, KEY);
+  const txId = 'tx-pending-verifying-atomic';
+  const parkedOwner = 'owner-pending-verifying-atomic';
+  repo.create(rec(), [], cred());
+  repo.beginNodeMigration(migrationBegin('line-a', txId, {
+    executionOwner: parkedOwner,
+    executionLeaseExpiresAt: 10_000,
+  }));
+  repo.parkNodeMigrationPendingStartExact(
+    'line-a', txId, parkedOwner, 1_000, 'preparing',
+  );
+  db.exec(`CREATE TRIGGER reject_pending_verifying_projection
+    BEFORE UPDATE OF node_migration_state ON instance
+    WHEN NEW.node_migration_state = 'verifying'
+    BEGIN SELECT RAISE(ABORT, 'pending verifying projection rejected'); END;`);
+
+  assert.throws(
+    () => repo.claimPendingStartVerifyingExact(
+      'line-a', txId, 'owner-pending-verifying-claim', 2_000, 1_000,
+    ),
+    /pending verifying projection rejected/,
+  );
+  assert.equal(repo.nodeMigration('line-a')?.phase, 'pending_start_verification');
+  assert.equal(repo.nodeMigration('line-a')?.executionOwner, '');
+  assert.equal(repo.nodeMigration('line-a')?.executionLeaseExpiresAt, 0);
+  assert.equal(repo.nodeRuntime('line-a')?.migrationState, 'pending_start_verification');
 });

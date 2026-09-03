@@ -11,10 +11,18 @@ import type { FastifyInstance } from 'fastify';
 import httpProxy from '@fastify/http-proxy';
 import { AuthService } from '../../core/auth/service.ts';
 import { canInstance } from '../../core/auth/authz.ts';
+import { InstanceBusyError } from '../../core/instance/operation-gate.ts';
+import type { ProxyWebSocketSession } from '../../core/instance/proxy-session-registry.ts';
 import type { HttpContext } from '../context.ts';
 
 export function registerProxy(app: FastifyInstance, ctx: HttpContext): void {
-  const { config, repo, upstreamFor, currentUser, instanceIdFromUrl, users } = ctx;
+  const {
+    config, repo, upstreamFor, currentUser, instanceIdFromUrl, users,
+    operationGate, proxySessions,
+  } = ctx;
+  const websocketInstances = new WeakMap<object, string>();
+  const upgradeReleases = new WeakMap<object, () => void>();
+  const sessionUnregisters = new WeakMap<object, () => void>();
 
   // 浏览器看到的源。CSP 的 source 表达式必须带 host，不能只写路径
   const origin = new URL(config.externalUrl).origin;
@@ -55,6 +63,25 @@ export function registerProxy(app: FastifyInstance, ctx: HttpContext): void {
     // 与 prefix 相同：保留完整路径前缀，绝不重写
     rewritePrefix: `${config.basePath}/red`,
     websocket: true,
+    wsHooks: {
+      onConnect: (_hookContext, source) => {
+        const rawSocket = (source as unknown as { _socket?: object })._socket;
+        const id = rawSocket ? websocketInstances.get(rawSocket) : undefined;
+        if (!rawSocket || !id) {
+          // An untracked bidirectional channel would bypass the migration fence.
+          source.close(1011, 'instance operation lease missing');
+          return;
+        }
+        const unregister = proxySessions.register(id, source as ProxyWebSocketSession);
+        sessionUnregisters.set(source, unregister);
+        // Registration must become visible before migration can acquire the gate.
+        upgradeReleases.get(rawSocket)?.();
+      },
+      onDisconnect: (_hookContext, source) => {
+        sessionUnregisters.get(source)?.();
+        sessionUnregisters.delete(source);
+      },
+    },
     replyOptions: {
       getUpstream: (req) => {
         const id = instanceIdFromUrl(req.url ?? '');
@@ -148,6 +175,86 @@ export function registerProxy(app: FastifyInstance, ctx: HttpContext): void {
             : writing
               ? `只读授权：对实例 ${id} 只能查看，不能改动流程`
               : `无权访问实例 ${id}`,
+        });
+        return;
+      }
+
+      if (writing && upgrading) {
+        /*
+         * 握手只持有 lease 到 wsHooks.onConnect 把 source WebSocket 登记完成。
+         * 先释放会留下一个窗口：迁移已取得 gate、快照已开始，而刚通过鉴权
+         * 的 WebSocket 还没进入可 drain 的登记表。
+         */
+        void operationGate.run(id, 'proxy-write', async () => {
+          await new Promise<void>((release) => {
+            const rawSocket = req.raw.socket;
+            let released = false;
+            const finish = () => {
+              if (released) return;
+              released = true;
+              rawSocket.off('close', finish);
+              rawSocket.off('error', finish);
+              reply.raw.off('finish', finish);
+              reply.raw.off('close', finish);
+              reply.raw.off('error', finish);
+              upgradeReleases.delete(rawSocket);
+              websocketInstances.delete(rawSocket);
+              release();
+            };
+            websocketInstances.set(rawSocket, id);
+            upgradeReleases.set(rawSocket, finish);
+            rawSocket.once('close', finish);
+            rawSocket.once('error', finish);
+            // Covers a rejected/failed upgrade and Fastify injection tests.
+            reply.raw.once('finish', finish);
+            reply.raw.once('close', finish);
+            reply.raw.once('error', finish);
+            done();
+          });
+        }).catch((error: unknown) => {
+          if (reply.sent) return;
+          reply
+            .code(error instanceof InstanceBusyError ? 409 : 500)
+            .send({
+              error: (error as Error).message,
+              ...(error instanceof InstanceBusyError ? { code: error.code } : {}),
+            });
+        });
+        return;
+      }
+
+      if (writing) {
+        /*
+         * 代理请求在 preHandler 之后才真正发往实例，所以闸门工作函数必须先
+         * 调 done() 放行代理、再等待响应终止。只包住 preHandler 会在上游真正
+         * 改完之前释放 lease，让迁移快照与仍在飞行的 POST 发生竞态。
+         */
+        void operationGate.run(id, 'proxy-write', async () => {
+          await new Promise<void>((release) => {
+            let released = false;
+            const finish = () => {
+              if (released) return;
+              released = true;
+              reply.raw.off('finish', finish);
+              reply.raw.off('close', finish);
+              reply.raw.off('error', finish);
+              req.raw.off('aborted', finish);
+              release();
+            };
+            reply.raw.once('finish', finish);
+            reply.raw.once('close', finish);
+            reply.raw.once('error', finish);
+            req.raw.once('aborted', finish);
+            done();
+          });
+        }).catch((error: unknown) => {
+          if (reply.sent) return;
+          reply
+            .code(error instanceof InstanceBusyError ? 409 : 500)
+            .send({
+              error: (error as Error).message,
+              ...(error instanceof InstanceBusyError ? { code: error.code } : {}),
+            });
         });
         return;
       }

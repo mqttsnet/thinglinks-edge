@@ -21,6 +21,7 @@ import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, rmSync, 
 import { join, dirname } from 'node:path';
 import { untar } from '../archive/tar.ts';
 import { assertModuleName, NodePolicyError } from './policy.ts';
+import { PLATFORM_COMMON_PACKAGE, PLATFORM_NODE_PACKAGE } from './platform-contract.ts';
 
 /** 从 tgz 里读出来的包元数据 */
 export interface PackageMeta {
@@ -35,6 +36,8 @@ export interface PackageMeta {
   types: string[];
   /** 有 `node-red.nodes` 才算节点包；它的依赖们没有这个键 */
   isNodeRedNode: boolean;
+  /** package.json 是否声明了 node-red 键；空 nodes 也算声明过 */
+  hasNodeRedMetadata: boolean;
   /** 运行期依赖，原样透传进 packument —— npm 靠它解析依赖闭包 */
   dependencies: Record<string, string>;
   /**
@@ -163,6 +166,7 @@ export function readPackage(tgz: Buffer): Omit<PackageMeta, 'updatedAt'> {
     keywords: Array.isArray(kw) ? kw.filter((k): k is string => typeof k === 'string') : [],
     types,
     isNodeRedNode: types.length > 0,
+    hasNodeRedMetadata: nr !== undefined,
     dependencies: strMap(pkg['dependencies']),
     optionalDependencies: strMap(pkg['optionalDependencies']),
     peerDependencies: strMap(pkg['peerDependencies']),
@@ -206,6 +210,11 @@ export class NodeStore {
   add(tgz: Buffer): PackageMeta {
     const meta = readPackage(tgz);
     const file = this.#pathOf(meta.name, meta.version);
+    const fixed = [PLATFORM_NODE_PACKAGE, PLATFORM_COMMON_PACKAGE]
+      .some((pin) => pin.name === meta.name && pin.version === meta.version);
+    if (fixed && existsSync(file)) {
+      throw new NodePolicyError(`固定平台包禁止覆盖：${meta.name}@${meta.version}`);
+    }
     mkdirSync(dirname(file), { recursive: true });
     writeFileSync(file, tgz);
     return { ...meta, updatedAt: statSync(file).mtime.toISOString() };
@@ -224,6 +233,11 @@ export class NodeStore {
   /** 删除某个版本。返回是否真的删掉了 */
   remove(module: string, version: string): boolean {
     const file = this.#pathOf(module, version);
+    const fixed = [PLATFORM_NODE_PACKAGE, PLATFORM_COMMON_PACKAGE]
+      .some((pin) => pin.name === module && pin.version === version);
+    if (fixed) {
+      throw new NodePolicyError(`固定平台包禁止删除：${module}@${version}`);
+    }
     if (!existsSync(file)) return false;
     rmSync(file);
     return true;

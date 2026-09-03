@@ -72,6 +72,7 @@ run "云对接整条链路"      scripts/verify-cloud-link.mjs
 run "远程诊断导出"        scripts/verify-diag.mjs
 run "流程模板导入套用"    scripts/verify-template.mjs
 run "节点白名单与私有源"  scripts/verify-nodes.mjs
+MANAGER_IMAGE="${MANAGER_IMAGE:-}" run "平台 npm 节点迁移" scripts/verify-platform-nodes.mjs
 run "云对接 TLS 证书"      scripts/verify-cloud-tls.mjs
 run "首次设置"            scripts/verify-setup.mjs
 run "系统设置与两步验证"  scripts/verify-2fa.mjs

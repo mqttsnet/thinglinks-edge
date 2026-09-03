@@ -343,6 +343,66 @@ const MIGRATIONS: string[] = [
     created_by TEXT    NOT NULL DEFAULT ''
   );
   `,
+  /*
+   * v13 —— Node-RED 平台节点运行模式与可恢复迁移日志。
+   *
+   * instance 上的状态只是列表/UI 投影；instance_node_migration 才是崩溃恢复依据。
+   * 两者的每次推进必须在同一事务中完成，启动时发现不一致就转人工处理，不能猜。
+   */
+  `
+  ALTER TABLE instance ADD COLUMN node_runtime_mode TEXT NOT NULL DEFAULT 'legacy'
+    CHECK (node_runtime_mode IN ('legacy', 'npm'));
+  ALTER TABLE instance ADD COLUMN platform_node_version TEXT NOT NULL DEFAULT '';
+  ALTER TABLE instance ADD COLUMN node_migration_state TEXT NOT NULL DEFAULT 'idle'
+    CHECK (node_migration_state IN (
+      'idle','preparing','checkpointed','staged','cutover','verifying',
+      'pending_start_verification','rolling_back','committed',
+      'rolled_back','rolled_back_dirty','manual_required'
+    ));
+  ALTER TABLE instance ADD COLUMN node_migration_error TEXT NOT NULL DEFAULT 'none'
+    CHECK (node_migration_error IN (
+      'none','preflight','checkpoint','install','cutover','verification',
+      'rollback','compensation','state-inconsistent'
+    ));
+
+  CREATE TABLE instance_node_migration (
+    instance_id TEXT PRIMARY KEY REFERENCES instance(id) ON DELETE CASCADE,
+    tx_id TEXT NOT NULL UNIQUE,
+    operation_kind TEXT NOT NULL CHECK (operation_kind IN ('bootstrap','migration')),
+    phase TEXT NOT NULL CHECK (phase IN (
+      'preparing','checkpointed','staged','cutover','verifying',
+      'pending_start_verification','rolling_back','committed',
+      'rolled_back','rolled_back_dirty','manual_required'
+    )),
+    original_running INTEGER NOT NULL CHECK (original_running IN (0,1)),
+    staged_before INTEGER NOT NULL CHECK (staged_before IN (0,1)),
+    mode_before TEXT NOT NULL,
+    image_id_before TEXT NOT NULL,
+    target_integrity TEXT NOT NULL,
+    checkpoint_dir TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    started_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    execution_owner TEXT NOT NULL DEFAULT '',
+    execution_lease_expires_at INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT 'none' CHECK (error IN (
+      'none','preflight','checkpoint','install','cutover','verification',
+      'rollback','compensation','state-inconsistent'
+    )),
+    CHECK (
+      (execution_owner = '' AND execution_lease_expires_at = 0)
+      OR (
+        operation_kind = 'migration'
+        AND length(execution_owner) BETWEEN 16 AND 128
+        AND substr(execution_owner, 1, 1) GLOB '[A-Za-z0-9]'
+        AND execution_owner NOT GLOB '*[^A-Za-z0-9._-]*'
+        AND typeof(execution_lease_expires_at) = 'integer'
+        AND execution_lease_expires_at > 0
+      )
+    )
+  );
+  `,
 ];
 export function openDb(file: string): Db {
   if (file !== ':memory:') mkdirSync(dirname(file), { recursive: true });
@@ -353,13 +413,17 @@ export function openDb(file: string): Db {
   return db;
 }
 
-export function migrate(db: Db): number {
+export function migrate(db: Db, targetVersion = MIGRATIONS.length): number {
+  if (!Number.isInteger(targetVersion) || targetVersion < 0 || targetVersion > MIGRATIONS.length) {
+    throw new Error(`无效的数据库迁移目标版本 ${targetVersion}，应为 0..${MIGRATIONS.length} 的整数`);
+  }
   db.exec('CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)');
   const row = db.prepare('SELECT version FROM schema_version LIMIT 1').get() as { version: number } | undefined;
   let current = row?.version ?? 0;
   if (row === undefined) db.prepare('INSERT INTO schema_version (version) VALUES (0)').run();
 
-  for (let v = current; v < MIGRATIONS.length; v++) {
+  // targetVersion 只供测试构造旧库，不是降级入口。库比目标新时原样返回。
+  for (let v = current; v < targetVersion; v++) {
     const sql = MIGRATIONS[v];
     if (sql === undefined) continue;
     db.transaction(() => {
