@@ -960,7 +960,9 @@ export async function authorizeDockerProxyRequest(request, env, adapters) {
     if (networkMutation[2] === 'connect') {
       policyKeys(value, ['Container', 'EndpointConfig']);
       const endpoint = policyRecord(value.EndpointConfig, 'network Manager endpoint');
-      policyKeys(endpoint, ['Aliases']);
+      policyKeys(endpoint, ['Aliases'], ['GwPriority']);
+      policy(endpoint.GwPriority === undefined || endpoint.GwPriority === -1,
+        'network Manager gateway priority');
       policy(
         Array.isArray(endpoint.Aliases)
           && endpoint.Aliases.length === 1
@@ -1286,7 +1288,7 @@ export async function runProxyPolicySelfTests() {
   const allowedBefore = { forwarded, mutations };
   const managerConnectBody = {
     Container: fixture.managerId,
-    EndpointConfig: { Aliases: [env.managerName] },
+    EndpointConfig: { Aliases: [env.managerName], GwPriority: -1 },
   };
 
   const maliciousCreates = [
@@ -1349,6 +1351,10 @@ export async function runProxyPolicySelfTests() {
   }
 
   const deniedConnectBodies = [
+    ...[0, 1, '-1'].map((priority) => [`unsafe gateway priority ${priority}`, {
+      Container: fixture.managerId,
+      EndpointConfig: { Aliases: [env.managerName], GwPriority: priority },
+    }]),
     ['missing Manager alias', { Container: fixture.managerId }],
     ['foreign Manager alias', {
       Container: fixture.managerId,
@@ -1490,6 +1496,13 @@ export async function runProxyPolicySelfTests() {
     body: Buffer.from(JSON.stringify(managerConnectBody)),
   });
   assert.equal(connect.status, 200);
+  const legacyConnect = await dispatch({
+    method: 'POST', url: `/networks/${fixture.networkId}/connect`,
+    body: Buffer.from(JSON.stringify({
+      Container: fixture.managerId, EndpointConfig: { Aliases: [env.managerName] },
+    })),
+  });
+  assert.equal(legacyConnect.status, 200);
   const archiveWrite = await dispatch({
     method: 'PUT', url: `/containers/${fixture.ownedContainerId}/archive?path=%2Fdata`,
     body: Buffer.from('safe-verifier-tar'),
@@ -1524,7 +1537,7 @@ export async function runProxyPolicySelfTests() {
   assert.ok(networkUpstreamFilters.label.includes(`${RUN_LABEL}=${env.runId}`));
 
   const passed = 8 + maliciousCreates.length + networkCreates.length
-    + deniedConnectBodies.length + deniedRequests.length + 13;
+    + deniedConnectBodies.length + deniedRequests.length + 14;
   return { passed, total: passed };
 }
 

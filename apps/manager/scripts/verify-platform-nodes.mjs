@@ -29,6 +29,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import Database from 'better-sqlite3';
 import Docker from 'dockerode';
 import { runProxyPolicySelfTests } from './verify-platform-manager-entry.mjs';
+import { probeFreshHttpStatus, transportDiagnostics } from './_transport-diagnostics.mjs';
 
 import {
   assertSafeCreateOptions,
@@ -878,6 +879,9 @@ class PlatformVerifier {
   }
 
   fixtureDefinitions() {
+    if (this.stoppedStageOnly) {
+      return [{ label: 'rs-stage', id: this.id('rs-stage'), running: false, driftEnvironment: false }];
+    }
     const running = [
       'runok', 'sameok', 'samethrow', 'staged', 'rset',
       'rr-prep', 'rr-check', 'rr-stage', 'rr-cut', 'rr-verify', 'rr-roll',
@@ -963,7 +967,9 @@ class PlatformVerifier {
     for (const fixture of this.fixtures) await this.createFixture(fixture);
     const running = this.fixtures.filter((fixture) => fixture.running);
     await Promise.all(running.map((fixture) => this.waitFixtureReady(fixture)));
-    await this.hotStagePreexistingFixture('staged');
+    if (this.fixtures.some((fixture) => fixture.label === 'staged')) {
+      await this.hotStagePreexistingFixture('staged');
+    }
     if (this.fixtures.some((fixture) => fixture.label === 'staged-rb')) {
       await this.hotStagePreexistingFixture('staged-rb');
     }
@@ -1455,7 +1461,7 @@ console.log('TLE_PROXY_RESULT:'+JSON.stringify({status:response.statusCode,body:
       );
       assert.equal(removedNetworkRead.status, 404, removedNetworkRead.body);
       this.proxyPolicyEvidence = {
-        static: '87/87',
+        static: this.proxyPolicyStatic,
         liveDenied: maliciousNetworks.length + 1 + malicious.length + 1 + denied.length + 1,
       };
       this.proxyPolicyEvidence.denialLogCount = (await this.proxyDenialLines()).length;
@@ -1558,6 +1564,7 @@ console.log('TLE_PROXY_RESULT:'+JSON.stringify({status:response.statusCode,body:
   }
 
   async api(path, options = {}) {
+    const started = Date.now();
     const headers = { accept: 'application/json', ...(options.headers ?? {}) };
     if (options.body !== undefined) headers['content-type'] = 'application/json';
     if (options.auth !== false && this.session) {
@@ -1578,7 +1585,7 @@ console.log('TLE_PROXY_RESULT:'+JSON.stringify({status:response.statusCode,body:
       try { body = text ? JSON.parse(text) : undefined; } catch { body = text; }
       return { status: response.status, body, headers: response.headers };
     } catch (error) {
-      return { status: 0, error };
+      return { status: 0, error, diagnostics: transportDiagnostics(error, Date.now() - started) };
     }
   }
 
@@ -1856,7 +1863,22 @@ console.log('TLE_PROXY_RESULT:'+JSON.stringify({status:response.statusCode,body:
       },
     });
     if (operation.response.status !== 201) {
-      throw new Error(`new instance API ${operation.response.status}: ${JSON.stringify(operation.response.body)}`
+      let state;
+      if (operation.response.status === 0) {
+        state = await raw.getContainer(this.managerId).inspect().then((info) => ({
+          status: info.State.Status, oomKilled: info.State.OOMKilled,
+          restartCount: info.RestartCount,
+          networkCount: Object.keys(info.NetworkSettings.Networks).length,
+          controlGateway: info.NetworkSettings.Networks[this.controlNetworkName]?.Gateway,
+          controlPriority: info.NetworkSettings.Networks[this.controlNetworkName]?.GwPriority,
+        })).catch((error) => ({ inspectFailure: transportDiagnostics(error, 0) }));
+        try { state.pendingBarriers = this.readyFiles().filter((file) => !this.knownReady.has(file)).length; }
+        catch (error) { state.barrierReadFailure = transportDiagnostics(error, 0); }
+        state.freshHealth = await probeFreshHttpStatus(`http://127.0.0.1:${this.hostPort}/healthz`);
+      }
+      throw new Error(`new instance API ${operation.response.status}: ${JSON.stringify(
+        operation.response.diagnostics ?? operation.response.body,
+      )}; state=${JSON.stringify(state)}; barriers=${JSON.stringify(operation.events)}`
         + `; proxy=${await this.proxyDenialDiagnostics()}`);
     }
     assert.equal(operation.response.status, 201, JSON.stringify(operation.response.body));
@@ -2239,7 +2261,26 @@ console.log('TLE_PROXY_RESULT:'+JSON.stringify({status:response.statusCode,body:
   async assertRolledBack(label, originalRunning) {
     const fixture = this.fixture(label);
     const status = await this.migrationStatus(fixture.id);
-    assert.equal(status.phase, 'rolled_back', `${label} phase`);
+    if (status.phase !== 'rolled_back') {
+      const db = this.database();
+      try {
+        const journal = db.prepare(
+          `SELECT phase, error, execution_owner AS owner,
+                  execution_lease_expires_at AS expiresAt
+           FROM instance_node_migration WHERE instance_id = ?`,
+        ).get(fixture.id);
+        const projection = db.prepare(
+          'SELECT node_migration_state AS phase FROM instance WHERE id = ?',
+        ).get(fixture.id);
+        assert.fail(`${label} phase: ${JSON.stringify({
+          actual: status.phase, expected: 'rolled_back', projection,
+          journalPhase: journal?.phase, journalError: journal?.error,
+          ownerChanged: this.crashedOwners?.has(fixture.id)
+            ? journal?.owner !== this.crashedOwners.get(fixture.id) : undefined,
+          leaseRemainingMs: journal ? journal.expiresAt - Date.now() : undefined,
+        })}`);
+      } finally { db.close(); }
+    }
     assert.equal(status.runtimeMode, 'legacy', `${label} mode`);
     assert.equal(status.error, 'none', `${label} error`);
     await this.assertFixtureSnapshot(fixture.id, originalRunning);
@@ -2406,6 +2447,13 @@ console.log('TLE_PROXY_RESULT:'+JSON.stringify({status:response.statusCode,body:
     const operation = await this.migrateFixture(label, decide);
     assert.equal(operation.response.status, 0, `${label} crash request did not disconnect`);
     assert.equal((await raw.getContainer(this.managerId).inspect()).State.Running, false);
+    const db = this.database();
+    try {
+      this.crashedOwners ??= new Map();
+      this.crashedOwners.set(this.fixture(label).id, db.prepare(
+        'SELECT execution_owner AS owner FROM instance_node_migration WHERE instance_id = ?',
+      ).get(this.fixture(label).id)?.owner);
+    } finally { db.close(); }
     return operation.events;
   }
 
@@ -3169,9 +3217,10 @@ function installBoundedSignalCleanup(verifier) {
 async function main() {
   const args = process.argv.slice(2);
   assert.ok(args.length === 0 || (
-    args.length === 1 && args[0] === '--proxy-policy-test'
-  ), 'usage: verify-platform-nodes.mjs [--proxy-policy-test]');
+    args.length === 1 && ['--proxy-policy-test', '--stopped-stage-recovery-test'].includes(args[0])
+  ), 'usage: verify-platform-nodes.mjs [--proxy-policy-test | --stopped-stage-recovery-test]');
   const proxyOnly = args[0] === '--proxy-policy-test';
+  const stoppedStageOnly = args[0] === '--stopped-stage-recovery-test';
   const inventoryPolicy = runInventoryStabilitySelfTests();
   assert.equal(inventoryPolicy.passed, inventoryPolicy.total);
   process.stdout.write(
@@ -3181,6 +3230,8 @@ async function main() {
   assert.equal(proxyPolicy.passed, proxyPolicy.total);
   process.stdout.write(`  PASS proxy-policy-self-test ${proxyPolicy.passed}/${proxyPolicy.total}\n`);
   const verifier = new PlatformVerifier();
+  verifier.proxyPolicyStatic = `${proxyPolicy.passed}/${proxyPolicy.total}`;
+  verifier.stoppedStageOnly = stoppedStageOnly;
   const removeSignalHandlers = installBoundedSignalCleanup(verifier);
   let before;
   let protectedBefore;
@@ -3205,6 +3256,11 @@ async function main() {
       assert.equal(db.prepare('SELECT version FROM schema_version').get().version, 13);
       db.close();
       pass('manager-bootstrap', { schema: 13, auth: true, csrf: true });
+      if (stoppedStageOnly) {
+        await verifier.crashAt('rs-stage', verifier.phaseCrashDecision('staged'));
+        await verifier.recoverNormalAndReturnToBarrier();
+        await verifier.assertRolledBack('rs-stage', false);
+      } else {
       await verifier.createNewInstanceSuccess();
       await verifier.createNewInstanceCompensation();
       await verifier.verifyLegacySuccesses();
@@ -3213,6 +3269,7 @@ async function main() {
       await verifier.verifyRunningRecovery();
       await verifier.verifyStoppedRecovery();
       await verifier.verifyAllowlistAndRealFlow();
+      }
       completed = true;
     }
   } catch (error) {
@@ -3248,6 +3305,10 @@ async function main() {
   if (cleanupError) throw cleanupError;
   if (proxyOnlyComplete) {
     process.stdout.write(`proxy-policy-live:${verifier.proxyPolicyEvidence.liveDenied} denied PASS · cleanup PASS\n`);
+    return;
+  }
+  if (stoppedStageOnly) {
+    process.stdout.write('stopped-stage-recovery: 1/1 通过 · cleanup PASS\n');
     return;
   }
   for (const phase of phases) {

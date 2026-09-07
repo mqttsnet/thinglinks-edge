@@ -292,9 +292,14 @@ export class DockerClient {
   ): Docker.NetworkConnectOptions & { abortSignal?: AbortSignal } {
     const alias = this.opts.managerContainer;
     if (!alias) throw new Error('Manager container alias is unavailable');
+    // Keep the permanent control network (priority 0) ahead of disposable
+    // instance/probe networks. Gateway selection also owns published-port NAT;
+    // detaching a disposable gateway can invalidate host-side connections.
+    // GwPriority is supported by Engine 28+; older engines lack this preference.
+    const endpointConfig = { Aliases: [alias], GwPriority: -1 };
     return {
       Container: containerId,
-      EndpointConfig: { Aliases: [alias] },
+      EndpointConfig: endpointConfig,
       ...(signal ? { abortSignal: signal } : {}),
     };
   }

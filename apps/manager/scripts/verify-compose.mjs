@@ -21,6 +21,9 @@ import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { basename, dirname, join } from 'node:path';
 import Docker from 'dockerode';
+import { reconcileAbsentResources } from './_resource-ledger.mjs';
+import { probeFreshHttpStatus, transportDiagnostics } from './_transport-diagnostics.mjs';
+import { chooseVerifierSubnet } from './_verifier-subnet.mjs';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const RUN_ID = randomUUID().replaceAll('-', '').slice(0, 12);
@@ -220,7 +223,15 @@ async function createRunRoot() {
   await mkdir(TEST_EDGE_ROOT, { mode: 0o700 });
   await chmod(TEST_EDGE_ROOT, 0o777);
   writeFileSync(OWNER_FILE, RUN_ID, { flag: 'wx', mode: 0o600 });
+  // Only this verifier's control network gets explicit IPAM. Two production
+  // instance networks still use Docker's default pool; unrelated host networks
+  // need not be deleted just to reserve a third default-pool slot for the test.
+  const occupiedSubnets = (await raw.listNetworks()).flatMap((network) => (
+    network.IPAM?.Config ?? []
+  )).map((config) => config.Subnet).filter(Boolean);
+  const controlSubnet = chooseVerifierSubnet(occupiedSubnets);
   writeFileSync(overrideFile, `${JSON.stringify({
+    networks: { 'edge-docker': { ipam: { config: [{ subnet: controlSubnet }] } } },
     services: {
       'init-data': {
         command: [
@@ -460,6 +471,15 @@ async function cleanup() {
     assert.deepEqual(await verifyNetworks(), []);
   });
   await attempt('resource ledgers', async () => {
+    for (const [ledger, getResource, kind] of [
+      [immutableContainerIds, (id) => raw.getContainer(id), 'container'],
+      [immutableNetworkIds, (id) => raw.getNetwork(id), 'network'],
+    ]) {
+      await reconcileAbsentResources(ledger, {
+        inspectById: (id) => inspectOrAbsent(getResource(id)),
+        inspectByName: (name) => inspectOrAbsent(getResource(name)),
+      }, kind);
+    }
     assert.equal(immutableContainerIds.size, 0);
     assert.equal(immutableNetworkIds.size, 0);
   });
@@ -478,6 +498,8 @@ async function main() {
     resolveImage(PROXY_IMAGE, 'PROXY_IMAGE'),
     resolveImage(NODE_IMAGE, 'NODE_IMAGE'),
   ]);
+  const [apiMajor, apiMinor] = (await raw.version()).ApiVersion.split('.').map(Number);
+  const gatewayPrioritySupported = apiMajor > 1 || (apiMajor === 1 && apiMinor >= 48);
   // The reviewed Manager image is Alpine-based, has no ENTRYPOINT override,
   // and is already pinned. Reuse it for the one-shot init service without pulling another tag.
   initImageId = managerImageId;
@@ -556,6 +578,10 @@ async function main() {
   const info = await captureContainer(MGR, {
     [COMPOSE_PROJECT_LABEL]: PROJECT, [COMPOSE_SERVICE_LABEL]: 'manager',
   });
+  const controlNetwork = await raw.getNetwork(`${PREFIX}-docker`).inspect();
+  const overrides = JSON.parse(await readFile(overrideFile, 'utf8'));
+  assert.deepEqual(controlNetwork.IPAM.Config.map((entry) => entry.Subnet),
+    [overrides.networks['edge-docker'].ipam.config[0].subnet]);
   check('compose Manager 使用显式不可变镜像 ID', info.Image === managerImageId);
   check('只读根文件系统已生效', info.HostConfig.ReadonlyRootfs === true);
   check('已禁止提权（no-new-privileges）',
@@ -639,6 +665,15 @@ async function main() {
   const netInfo = await captureNetwork(`${NET}-${ID}`, {
     [MANAGED_LABEL]: 'true', [INSTANCE_LABEL]: ID,
   });
+  if (gatewayPrioritySupported) {
+    const managerEndpoints = (await raw.getContainer(info.Id).inspect()).NetworkSettings.Networks;
+    check('Manager 临时网络不取代控制网的网关优先级',
+      managerEndpoints[`${NET}-${BROKEN_ID}`]?.GwPriority === -1
+        && managerEndpoints[`${NET}-${ID}`]?.GwPriority === -1
+        && managerEndpoints[`${PREFIX}-docker`]?.GwPriority > -1);
+  } else {
+    console.log('  · Engine API < 1.48：未验证 GwPriority 偏好，仍验证完整 HTTP 生命周期');
+  }
   const attached = Object.values(netInfo.Containers ?? {}).map((c) => c.Name);
   check('MANAGER_CONTAINER 生效：Manager 接入了实例网络', attached.includes(MGR), attached.join(' + '));
   const healthyRegistry = probeInstanceRegistry(healthyContainer.Id, info.Id, netInfo);
@@ -874,8 +909,43 @@ async function main() {
   const restartedH = {
     cookie: restartedCookie, 'x-csrf-token': restartedCsrf, 'content-type': 'application/json',
   };
-  const brokenDeleted = await fetch(`${B}/api/instances/${BROKEN_ID}`, { method: 'DELETE', headers: restartedH });
-  const healthyDeleted = await fetch(`${B}/api/instances/${ID}`, { method: 'DELETE', headers: restartedH });
+  const deleteInstance = async (id, phase) => {
+    const started = Date.now();
+    try {
+      return await fetch(`${B}/api/instances/${id}`, {
+        method: 'DELETE', headers: restartedH, signal: AbortSignal.timeout(30_000),
+      });
+    } catch (error) {
+      const diagnostic = transportDiagnostics(error, Date.now() - started);
+      const managerId = immutableContainerIds.get(MGR);
+      const manager = managerId ? await inspectOrAbsent(raw.getContainer(managerId)).catch((failure) => {
+        diagnostic.inspectFailure = transportDiagnostics(failure, 0);
+      }) : undefined;
+      if (manager) {
+        diagnostic.manager = {
+          status: manager.State.Status, oomKilled: manager.State.OOMKilled,
+          health: manager.State.Health?.Status,
+          restartCount: manager.RestartCount,
+          networks: Object.entries(manager.NetworkSettings.Networks).map(([name, endpoint]) => ({
+            name, address: endpoint.IPAddress, gateway: endpoint.Gateway, priority: endpoint.GwPriority,
+          })),
+        };
+        try { diagnostic.routes = sh(['exec', managerId, 'cat', '/proc/net/route']).trim(); }
+        catch { diagnostic.routes = 'unavailable'; }
+        try {
+          diagnostic.internalHealth = sh(['exec', managerId, 'node', '-e',
+            "require('node:http').get('http://127.0.0.1:19100/healthz',"
+            + "{agent:false,signal:AbortSignal.timeout(2000)},r=>{r.resume();"
+            + "r.on('end',()=>console.log(r.statusCode))}).on('error',()=>console.log(0))",
+          ], { timeout: 5_000 }).trim();
+        } catch { diagnostic.internalHealth = 'unavailable'; }
+      }
+      diagnostic.freshHealth = await probeFreshHttpStatus(`${B}/healthz`);
+      throw new Error(`${phase}: ${JSON.stringify(diagnostic)}`, { cause: error });
+    }
+  };
+  const brokenDeleted = await deleteInstance(BROKEN_ID, 'delete broken instance');
+  const healthyDeleted = await deleteInstance(ID, 'delete healthy instance');
   check('删除健康实例返回 204', healthyDeleted.status === 204,
         `HTTP ${healthyDeleted.status}`);
 

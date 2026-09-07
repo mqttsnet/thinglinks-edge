@@ -7,6 +7,7 @@ import {
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -127,6 +128,7 @@ function fixture({
   const checksummed = [
     'images.tar', 'docker-compose.yml', 'docker-compose.offline.yml',
     'install.sh', 'README.md', 'manifest.json', '.env.example',
+    ...(hardlinkEnv ? ['0-env-source'] : []),
   ].filter((name) => name !== omitChecksumFor);
   const checksumLines = checksummed
     .map((name) => `${sha(join(stage, name))}  ${name}`);
@@ -136,7 +138,14 @@ function fixture({
   writeFileSync(join(stage, 'SHA256SUMS'), `${checksumLines.join('\n')}\n`);
 
   const bundle = join(root, 'bundle.tar.gz');
-  assert.equal(spawnSync('/usr/bin/tar', ['-czf', bundle, '-C', root, '--', packageName]).status, 0);
+  // GNU tar and BSD tar traverse directories differently. The first inode member
+  // stores the bytes; put its source first so .env.example is always the hardlink.
+  // List every file exactly once instead of adding the directory recursively.
+  const outerMembers = hardlinkEnv
+    ? ['0-env-source', ...readdirSync(stage).filter((name) => name !== '0-env-source').sort()]
+      .map((name) => `${packageName}/${name}`)
+    : [packageName];
+  assert.equal(spawnSync('/usr/bin/tar', ['-czf', bundle, '-C', root, '--', ...outerMembers]).status, 0);
 
   const docker = join(bin, 'docker');
   writeFileSync(docker, `#!/bin/sh

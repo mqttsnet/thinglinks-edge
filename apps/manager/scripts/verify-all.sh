@@ -268,6 +268,9 @@ test_summary "真实实例夹具契约" node --test \
   scripts/verify-core-resource-ownership.test.mjs \
   scripts/verify-cloud-resource-ownership.test.mjs \
   scripts/verify-offline.test.mjs \
+  scripts/resource-ledger.test.mjs \
+  scripts/transport-diagnostics.test.mjs \
+  scripts/verifier-subnet.test.mjs \
   scripts/verifier-temp-lifecycle.test.mjs
 echo ""
 

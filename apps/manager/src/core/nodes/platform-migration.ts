@@ -223,6 +223,8 @@ export interface PlatformMigrationServiceOptions {
 
 export interface PlatformMigrationExecutionRuntime {
   now(): number;
+  /** Optional test clock; real waiting budgets must survive wall-clock corrections. */
+  monotonicNow?: (() => number) | undefined;
   sleep(ms: number): Promise<void>;
   startHeartbeat(intervalMs: number, task: () => void): () => void;
   executionOwner(): string;
@@ -1700,7 +1702,21 @@ export class PlatformMigrationService {
         current.executionLeaseExpiresAt - now,
         this.executionRuntime.leaseDurationMs,
       );
-      await this.executionRuntime.sleep(waitMs);
+      // Timers may wake just before the wall-clock lease deadline. A single
+      // sleep can leave the CAS ineligible and let startup publish readiness
+      // with the old phase still active. Wait until the original deadline;
+      // never chase a live owner's subsequent lease renewals.
+      const waitUntil = now + waitMs;
+      const monotonicNow = this.executionRuntime.monotonicNow ?? (() => performance.now());
+      const budgetUntil = monotonicNow() + waitMs;
+      let remaining = waitMs;
+      while (remaining > 0) {
+        await this.executionRuntime.sleep(Math.ceil(remaining));
+        remaining = Math.min(
+          waitUntil - this.executionRuntime.now(),
+          budgetUntil - monotonicNow(),
+        );
+      }
       current = this.o.repo.nodeMigration(scanned.instanceId);
       if (!current || current.txId !== scanned.txId || current.phase !== scanned.phase) return undefined;
     }

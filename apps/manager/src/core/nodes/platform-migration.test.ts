@@ -67,6 +67,7 @@ function deferred<T>() {
 
 class ManualMigrationTime {
   nowMs = 1_000;
+  monotonicNow?: (() => number) | undefined;
   readonly sleeps: number[] = [];
   private readonly heartbeatTasks = new Set<() => void>();
   private readonly sleepers: Array<{ wakeAt: number; resolve: () => void }> = [];
@@ -1203,6 +1204,7 @@ function migrationFixture(options: FixtureOptions = {}) {
       txId: typeof txId === 'string' ? () => txId : txId,
       executionRuntime: {
         now: time.now,
+        monotonicNow: time.monotonicNow,
         sleep: time.sleep,
         startHeartbeat: time.startHeartbeat,
         executionOwner: () => executionOwner,
@@ -1312,6 +1314,7 @@ function reopenMigrationFixture(
     } : {}),
     executionRuntime: {
       now: f.time.now,
+      monotonicNow: f.time.monotonicNow,
       sleep: f.time.sleep,
       startHeartbeat: f.time.startHeartbeat,
       executionOwner: () => 'owner-reopened-recovery-0001',
@@ -5850,6 +5853,124 @@ test('active migration heartbeat renews ownership while paused and still fences 
   assert.equal(f.admin.installCalls, 1);
   peerDb.close();
 });
+
+test('startup recovery retries an early lease wake before rolling back a stopped staged migration', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  await interruptedMigration(
+    f,
+    'tx-startup-early-wake',
+    'staged',
+    { owner: 'owner-crashed-early-wake-0001', expiresAt: 2_000 },
+    false,
+  );
+  // The crashed owner has no heartbeat; emulate the first timer resolving 1 ms early.
+  f.time.sleep = async (ms: number) => {
+    f.time.sleeps.push(ms);
+    f.time.advance(f.time.sleeps.length === 1 ? ms - 1 : ms);
+  };
+  const reopened = reopenMigrationFixture(f);
+
+  try {
+    const recovered = await reopened.service.recoverInterrupted();
+
+    assert.deepEqual(recovered.map((result) => result.phase), ['rolled_back']);
+    assert.deepEqual(f.time.sleeps, [1_000, 1]);
+    assert.equal(f.time.now(), 2_000);
+    assert.equal(reopened.repo.nodeMigration('line-a')?.phase, 'rolled_back');
+    assert.equal(f.docker.inspection.running, false);
+    assert.equal(f.docker.runtimeCalls.includes('start'), false);
+    assert.equal(f.admin.installCalls, 0);
+    assert.equal(f.admin.uninstallCalls, 0);
+  } finally {
+    reopened.db.close();
+  }
+});
+
+test('startup recovery keeps its original wait budget when a live owner renews during sleep', async () => {
+  const f = migrationFixture({ originalRunning: false });
+  const txId = 'tx-startup-live-renewal';
+  const owner = 'owner-live-startup-renewal-0001';
+  const waitDeadline = f.time.now() + 1_000;
+  await interruptedMigration(f, txId, 'staged', { owner, expiresAt: waitDeadline }, false);
+  let exceededWaitBudget = false;
+  f.time.sleep = async (ms: number) => {
+    f.time.sleeps.push(ms);
+    if (f.time.now() + ms > waitDeadline || f.time.sleeps.length > 2) {
+      exceededWaitBudget = true;
+      throw new Error('startup recovery exceeded its original lease wait budget');
+    }
+    f.time.advance(ms - 1);
+    // This renewal is valid because it occurs before the current owner's expiry.
+    reopened.repo.renewNodeMigrationExecution('line-a', txId, owner, ['staged'], f.time.now(), 1_000);
+    f.time.advance(1);
+  };
+  const reopened = reopenMigrationFixture(f);
+
+  try {
+    const recovered = await reopened.service.recoverInterrupted();
+
+    assert.equal(exceededWaitBudget, false);
+    assert.ok(f.time.now() <= waitDeadline);
+    assert.ok(f.time.sleeps.length > 0);
+    assert.deepEqual(recovered.map((result) => result.phase), ['staged']);
+    const journal = reopened.repo.nodeMigration('line-a')!;
+    assert.equal(journal.executionOwner, owner);
+    assert.ok(journal.executionLeaseExpiresAt > waitDeadline);
+    assert.equal(journal.phase, 'staged');
+    assert.deepEqual(f.docker.runtimeCalls, []);
+    assert.equal(f.events.includes('checkpoint:restore'), false);
+    assert.equal(await f.checkpoint.readyExists('line-a', txId), true);
+    assert.equal(f.admin.installCalls, 0);
+    assert.equal(f.admin.uninstallCalls, 0);
+  } finally {
+    reopened.db.close();
+  }
+});
+
+for (const clockChange of [
+  { name: 'freezes', nowMs: 1_000 },
+  { name: 'moves backwards', nowMs: 500 },
+]) {
+  test(`startup recovery bounds lease waiting when wall clock ${clockChange.name}`, async () => {
+    const f = migrationFixture({ originalRunning: false });
+    const txId = 'tx-startup-clock-change';
+    const owner = 'owner-startup-clock-change-0001';
+    await interruptedMigration(f, txId, 'staged', { owner, expiresAt: 2_000 }, false);
+    let monotonicMs = 5_000;
+    let exceededWaitBudget = false;
+    f.time.monotonicNow = () => monotonicMs;
+    f.time.sleep = async (ms: number) => {
+      f.time.sleeps.push(ms);
+      if (f.time.sleeps.length > 1) {
+        exceededWaitBudget = true;
+        throw new Error('startup recovery requested another wait after its monotonic budget');
+      }
+      monotonicMs += ms;
+      f.time.nowMs = clockChange.nowMs;
+    };
+    const reopened = reopenMigrationFixture(f);
+
+    try {
+      const recovered = await reopened.service.recoverInterrupted();
+
+      assert.deepEqual(f.time.sleeps, [1_000], 'the monotonic wait budget allows no second sleep');
+      assert.equal(exceededWaitBudget, false);
+      assert.equal(monotonicMs, 6_000);
+      assert.deepEqual(recovered.map((result) => result.phase), ['staged']);
+      const journal = reopened.repo.nodeMigration('line-a')!;
+      assert.equal(journal.executionOwner, owner);
+      assert.equal(journal.executionLeaseExpiresAt, 2_000);
+      assert.equal(journal.phase, 'staged');
+      assert.deepEqual(f.docker.runtimeCalls, []);
+      assert.equal(f.events.includes('checkpoint:restore'), false);
+      assert.equal(await f.checkpoint.readyExists('line-a', txId), true);
+      assert.equal(f.admin.installCalls, 0);
+      assert.equal(f.admin.uninstallCalls, 0);
+    } finally {
+      reopened.db.close();
+    }
+  });
+}
 
 test('two recovery workers waiting on one expired owner produce exactly one rollback effect set', async () => {
   const f = migrationFixture();

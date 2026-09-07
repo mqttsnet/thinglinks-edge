@@ -274,7 +274,7 @@ test('stopped probe restores only immutable checkpoint files and owns exact cont
   assert.equal(networkOptions?.['Internal'], true);
   assert.deepEqual(connectOptions, {
     Container: 'manager-id',
-    EndpointConfig: { Aliases: ['manager-ref'] },
+    EndpointConfig: { Aliases: ['manager-ref'], GwPriority: -1 },
   });
   assert.equal(started, 1);
 
@@ -420,7 +420,7 @@ test('bootstrap Manager attach uses captured network ID and never a same-name re
   assert.equal(foreignConnects, 0);
   assert.deepEqual(connectOptions, {
     Container: 'manager-immutable-id',
-    EndpointConfig: { Aliases: ['manager-ref'] },
+    EndpointConfig: { Aliases: ['manager-ref'], GwPriority: -1 },
   });
 });
 
@@ -451,7 +451,45 @@ test('reconnect Manager registers its stable registry alias on every owned insta
 
   assert.deepEqual(connectOptions, {
     Container: 'manager-immutable-id',
-    EndpointConfig: { Aliases: ['manager-ref'] },
+    EndpointConfig: { Aliases: ['manager-ref'], GwPriority: -1 },
+  });
+});
+
+test('reconnect Manager keeps instance gateway priority below its control network with immutable identity and alias', async () => {
+  const f = fixture({ managerContainer: 'manager-ref' });
+  const raw = rawOf(f.docker);
+  const signal = new AbortController().signal;
+  let connectOptions: Record<string, unknown> | undefined;
+  let connectedNetworkId: string | undefined;
+  raw.getContainer = (ref: string) => ({
+    inspect: async () => {
+      assert.equal(ref, 'manager-ref');
+      return { Id: 'manager-immutable-id' };
+    },
+  });
+  raw.getNetwork = (ref: string) => ({
+    inspect: async () => {
+      assert.equal(ref, 'test-edge-line-a');
+      return {
+        Id: 'owned-network-id',
+        Name: 'test-edge-line-a',
+        Labels: { [MANAGED_LABEL]: 'true', [instanceLabel]: 'line-a' },
+        Containers: {},
+      };
+    },
+    connect: async (options: Record<string, unknown>) => {
+      connectedNetworkId = ref;
+      connectOptions = options;
+    },
+  });
+
+  await f.docker.reconnectManager('line-a', signal);
+
+  assert.equal(connectedNetworkId, 'owned-network-id');
+  assert.deepEqual(connectOptions, {
+    Container: 'manager-immutable-id',
+    EndpointConfig: { Aliases: ['manager-ref'], GwPriority: -1 },
+    abortSignal: signal,
   });
 });
 
