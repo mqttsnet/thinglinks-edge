@@ -53,9 +53,10 @@ import {
   readProxySettings, proxyConfigured, proxyEnvFor, proxyHasCredentials, missingInternalNoProxy,
 } from './core/proxy.ts';
 import { recordAudit } from './core/db.ts';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { restoreBackup } from './core/archive/backup.ts';
+import { assertNoRestoreTransaction, recoverRestoreTransaction } from './core/archive/restore-transaction.ts';
 import { existsSync } from 'node:fs';
 import { hostname } from 'node:os';
 
@@ -252,14 +253,27 @@ function resolveMetricsIntervalSec(): number {
  * 恢复子命令：`node dist/index.js restore <备份文件> [--force]`
  *
  * 刻意做成 CLI 而不是在线接口：恢复要覆盖正被 Manager 打开的库，
- * 在线做等于自找损坏。正确姿势是停服务 → 恢复 → 再启动。
+ * 在线做等于自找损坏。正确姿势是停止 Manager 和全部目标实例 → 恢复 → 再启动。
  */
 async function runRestore(argv: string[]): Promise<void> {
-  const file = argv.find((a) => !a.startsWith('--'));
-  if (!file) throw new Error('用法：node dist/index.js restore <备份文件> [--force]');
+  const usage = '用法：node dist/index.js restore <备份文件> [--force] 或 restore --recover';
+  const files = argv.filter((arg) => !arg.startsWith('--'));
+  const recover = argv.includes('--recover');
+  if (argv.some((arg) => arg.startsWith('--') && !['--force', '--recover'].includes(arg))
+    || (recover ? argv.length !== 1 : files.length !== 1)) throw new Error(usage);
   const config = loadConfig();
+  if (resolve(config.dataDir) !== resolve(config.dataRoot, 'manager')
+    || resolve(config.instanceDataRoot) !== resolve(config.dataRoot, 'instances')) {
+    throw new Error('恢复要求 DATA_DIR 和 INSTANCE_DATA_ROOT 使用 EDGE_DATA_ROOT 下的标准布局');
+  }
+  if (recover) {
+    await recoverRestoreTransaction(config.dataRoot);
+    console.log('[restore] 中断事务已处理；未提交事务已回滚，已提交事务已清理。');
+    return;
+  }
+  await assertNoRestoreTransaction(config.dataRoot);
   const key = deriveKey(requireMasterKey(), 'thinglinks-edge:instance-cred');
-  const archive = await readFile(file);
+  const archive = await readFile(files[0]!);
 
   const manifest = await restoreBackup({
     archive, dataRoot: config.dataRoot, key,
@@ -342,8 +356,9 @@ function requireStartupPhase<T>(value: T | undefined, phase: string): T {
 
 export async function main(overrides: InternalManagerOverrides = {}): Promise<void> {
   await startManagerRuntime<ProductionManagerStartupContext, ReturnType<typeof buildServer>>({
-    initializeData: () => {
+    initializeData: async () => {
       const config = loadConfig();
+      await assertNoRestoreTransaction(config.dataRoot);
       const db = openDb(join(config.dataDir, 'edge.db'));
       const nodeStore = new NodeStore(join(config.dataDir, 'npm'));
       const nodeCatalog = new NodeCatalog(db);

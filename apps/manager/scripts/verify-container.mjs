@@ -37,6 +37,12 @@ const INSTANCE_NETWORK = `${NET}-${ID}`;
 const GID_HELPER = `tle-cgid-${RUN_ID}`;
 const RESTORE_OK = `tle-crestore-${RUN_ID}`;
 const RESTORE_BAD = `tle-cbadrestore-${RUN_ID}`;
+// Restored data remains private (0700 directories / 0600 files). On native Linux,
+// use the non-root verifier's uid/gid so host assertions and run-root cleanup can
+// access their own fixtures. Docker Desktop and a root host retain image USER node.
+const RESTORE_USER_ARGS = process.platform === 'linux' && process.getuid() !== 0
+  ? ['--user', `${process.getuid()}:${process.getgid()}`]
+  : [];
 const ADMIN_PW = `Aa1!${randomBytes(20).toString('base64url')}`;
 const ADMIN_NEXT_PW = `Aa1!${randomBytes(20).toString('base64url')}`;
 const MASTER_KEY = randomBytes(48).toString('base64url');
@@ -630,50 +636,81 @@ async function main() {
   // ── 备份与异机恢复演练（T4.3）──
   /*
    * 真正的验收是「**异机**恢复」：把备份搬到一台什么都没有的机器上，
-   * 恢复完能不能把实例带回来。这里用「全新数据根 + 全新 Manager 容器」模拟另一台机器。
+   * 恢复完能不能把实例带回来。这里用「隔离数据根 + 全新 Manager 容器」模拟另一台机器，
+   * 同时放入旧数据，证明恢复替换快照而不把新旧实例文件混在一起。
    */
   const bkRes = await fetch(`${B}/api/backup`, { method: 'POST', headers: H });
   const bkBuf = Buffer.from(await bkRes.arrayBuffer());
   const backupType = bkRes.headers.get('content-type') ?? '';
-  check('备份可下载且是 tar', bkRes.status === 200 &&
-        backupType.includes('x-tar') && bkBuf.length > 1024,
+  const { deriveKey } = await import('../dist/core/auth/crypto.js');
+  const { isEncryptedBackup, readManifest } = await import('../dist/core/archive/backup.js');
+  const backupKey = deriveKey(MASTER_KEY, 'thinglinks-edge:instance-cred');
+  check('备份可下载且是认证加密封装', bkRes.status === 200 &&
+        backupType.includes('vnd.thinglinks-edge.backup') && isEncryptedBackup(bkBuf) && bkBuf.length > 1024,
         `HTTP ${bkRes.status} ${backupType || '(no type)'} · ${bkBuf.length} 字节`
           + (bkRes.status === 200 ? '' : ` · ${bkBuf.toString('utf8').slice(0, 180)}`));
 
-  const { readManifest } = await import('../dist/core/archive/backup.js');
-  const bkManifest = readManifest(bkBuf);
+  const bkManifest = readManifest(bkBuf, backupKey);
   check('备份清单含实例与 MASTER_KEY 指纹',
         bkManifest.instances.some((i) => i.id === ID) &&
         typeof bkManifest.masterKeyFingerprint === 'string' &&
         bkManifest.masterKeyFingerprint.length === 16,
         `${bkManifest.instances.length} 个实例 · 指纹 ${bkManifest.masterKeyFingerprint}`);
 
-  // 「另一台机器」：全新数据根，把备份文件放进去
+  // 「另一台机器」：任务拥有的数据根内放入旧快照与必须保留的 Manager 本地文件。
   const otherRoot = join(RUN_ROOT, 'restore-data');
   await mkdir(`${otherRoot}/manager`, { recursive: true, mode: 0o777 });
   await mkdir(`${otherRoot}/instances`, { recursive: true, mode: 0o777 });
   await chmod(otherRoot, 0o777);
   await chmod(`${otherRoot}/manager`, 0o777);
   await chmod(`${otherRoot}/instances`, 0o777);
-  await writeFile(`${otherRoot}/backup.tar`, bkBuf, { mode: 0o644 });
-  sh('docker', ['run', '--name', RESTORE_OK,
+  await mkdir(join(otherRoot, 'instances', ID));
+  await mkdir(join(otherRoot, 'instances', 'obsolete-instance'));
+  await chmod(join(otherRoot, 'instances', ID), 0o777);
+  await chmod(join(otherRoot, 'instances', 'obsolete-instance'), 0o777);
+  await mkdir(join(otherRoot, 'manager', 'npm'));
+  const staleFlow = `stale-flow-${RUN_ID}`;
+  await writeFile(join(otherRoot, 'instances', ID, 'flows.json'), staleFlow);
+  await writeFile(join(otherRoot, 'instances', ID, 'removed.json'), 'stale-context');
+  await writeFile(join(otherRoot, 'instances', 'obsolete-instance', 'flows.json'), 'stale-instance');
+  await writeFile(join(otherRoot, 'manager', 'edge.db-wal'), 'stale-wal');
+  await writeFile(join(otherRoot, 'manager', 'edge.db-shm'), 'stale-shm');
+  await writeFile(join(otherRoot, 'manager', 'npm', 'verifier-sentinel'), 'keep-npm-cache');
+  await writeFile(join(otherRoot, 'manager', 'verifier-config.json'), '{"keep":"local-config"}');
+  await writeFile(`${otherRoot}/backup.tle-backup`, bkBuf, { mode: 0o644 });
+  sh('docker', ['run', '--name', RESTORE_OK, ...RESTORE_USER_ARGS,
       '--label', `${RUN_LABEL}=${RUN_ID}`, '--label', `${INSTANCE_LABEL}=${ID}`,
       '--label', `${ROLE_LABEL}=restore`, '--read-only', '--cap-drop', 'ALL',
       '--security-opt', 'no-new-privileges:true', '--tmpfs', '/tmp:rw,noexec,nosuid,size=32m',
       '-v', `${otherRoot}:${otherRoot}`,
       '-e', `EXTERNAL_URL=${B}`, '-e', `MASTER_KEY=${MASTER_KEY}`,
       '-e', `EDGE_DATA_ROOT=${otherRoot}`,
-      IMAGE, 'node', 'dist/index.js', 'restore', `${otherRoot}/backup.tar`]);
+      IMAGE, 'node', 'dist/index.js', 'restore', `${otherRoot}/backup.tle-backup`]);
   await captureContainer(RESTORE_OK, directLabels('restore'));
   await removeExactContainer(RESTORE_OK, (info) => {
     assert.ok(hasLabels(info.Config?.Labels, directLabels('restore')));
   });
 
+  // Check before opening SQLite: openDb itself can create new WAL/SHM files.
+  for (const path of [
+    'manager/edge.db-wal', 'manager/edge.db-shm', `instances/${ID}/removed.json`,
+    'instances/obsolete-instance', '.restore-transaction',
+  ]) await requirePathAbsent(join(otherRoot, path), `restore stale path ${path}`);
+  let restoredFlow;
+  try {
+    restoredFlow = await readFile(join(otherRoot, 'instances', ID, 'flows.json'), 'utf8');
+  } catch (error) {
+    if (!isFsNotFound(error)) throw error;
+  }
+  check('恢复清除旧流程、已删除文件、旧实例和 WAL/SHM', restoredFlow !== staleFlow);
+  check('恢复保留非备份范围的 Manager npm 与本地配置',
+    await readFile(join(otherRoot, 'manager', 'npm', 'verifier-sentinel'), 'utf8') === 'keep-npm-cache'
+      && await readFile(join(otherRoot, 'manager', 'verifier-config.json'), 'utf8') === '{"keep":"local-config"}');
+
   const { openDb } = await import('../dist/core/db.js');
-  const { deriveKey } = await import('../dist/core/auth/crypto.js');
   const { InstanceRepo } = await import('../dist/core/instance/repo.js');
   const restoredDb = openDb(`${otherRoot}/manager/edge.db`);
-  const restoredRepo = new InstanceRepo(restoredDb, deriveKey(MASTER_KEY, 'thinglinks-edge:instance-cred'));
+  const restoredRepo = new InstanceRepo(restoredDb, backupKey);
   check('异机恢复后实例记录回来了',
         restoredRepo.get(ID) !== undefined, restoredRepo.list().map((i) => i.id).join(' '));
   check('异机恢复后实例凭据仍能解开（MASTER_KEY 一致）',
@@ -684,6 +721,72 @@ async function main() {
   check('实例的流程文件也跟着回来',
         (await lstat(`${otherRoot}/instances/${ID}/settings.js`)).isFile());
 
+  // Reuse the already removed, run-labeled restore container name. This extra
+  // process has no Docker socket or network and can only write this task's root.
+  const safetyRoot = join(RUN_ROOT, 'restore-safety');
+  await mkdir(safetyRoot, { mode: 0o777 });
+  await chmod(safetyRoot, 0o777);
+  await writeFile(join(safetyRoot, 'backup.tle-backup'), bkBuf, { mode: 0o644 });
+  const safetyScript = `
+    import assert from 'node:assert/strict';
+    import { mkdir, writeFile, readFile, symlink, lstat } from 'node:fs/promises';
+    import { join } from 'node:path';
+    import { spawnSync } from 'node:child_process';
+    import { deriveKey } from './dist/core/auth/crypto.js';
+    import { restoreBackup } from './dist/core/archive/backup.js';
+    const root = process.env.VERIFY_RESTORE_ROOT;
+    const id = process.env.VERIFY_INSTANCE_ID;
+    const archive = await readFile(join(root, 'backup.tle-backup'));
+    const key = deriveKey(process.env.MASTER_KEY, 'thinglinks-edge:instance-cred');
+    for (const kind of ['file', 'directory', 'root']) {
+      const target = join(root, kind + '-target');
+      const outside = join(root, kind + '-outside');
+      const sentinel = kind === 'root'
+        ? join(outside, 'instances', id, 'settings.js')
+        : join(outside, 'settings.js');
+      await mkdir(join(sentinel, '..'), { recursive: true });
+      await writeFile(sentinel, 'outside-sentinel');
+      const link = kind === 'root' ? target : kind === 'directory'
+        ? join(target, 'instances', id) : join(target, 'instances', id, 'settings.js');
+      await mkdir(join(link, '..'), { recursive: true });
+      await symlink(kind === 'file' ? sentinel : outside, link);
+      let refused = false;
+      try {
+        await restoreBackup({ archive, dataRoot: target, key });
+      } catch (error) {
+        assert.match(error.message, /symbolic|symlink|trusted|符号|目录/i);
+        refused = true;
+      }
+      if (kind === 'root') assert.equal(refused, true, 'symlink data root must be rejected');
+      assert.equal(await readFile(sentinel, 'utf8'), 'outside-sentinel');
+    }
+    const interrupted = join(root, 'interrupted');
+    await mkdir(join(interrupted, '.restore-transaction'), { recursive: true, mode: 0o700 });
+    const startup = spawnSync(process.execPath, ['dist/index.js'], {
+      env: { ...process.env, EDGE_DATA_ROOT: interrupted },
+      encoding: 'utf8', timeout: 15000,
+    });
+    assert.equal(startup.error, undefined);
+    assert.equal(startup.status, 1);
+    assert.match(startup.stderr, /restore --recover/);
+    await assert.rejects(lstat(join(interrupted, 'manager', 'edge.db')), { code: 'ENOENT' });
+    console.log('restore safety checks passed');
+  `;
+  sh('docker', ['run', '--name', RESTORE_OK, ...RESTORE_USER_ARGS,
+      '--label', `${RUN_LABEL}=${RUN_ID}`, '--label', `${INSTANCE_LABEL}=${ID}`,
+      '--label', `${ROLE_LABEL}=restore`, '--read-only', '--cap-drop', 'ALL',
+      '--network', 'none', '--security-opt', 'no-new-privileges:true',
+      '--tmpfs', '/tmp:rw,noexec,nosuid,size=32m', '-v', `${safetyRoot}:${safetyRoot}`,
+      '-e', `EXTERNAL_URL=${B}`, '-e', `MASTER_KEY=${MASTER_KEY}`,
+      '-e', `VERIFY_RESTORE_ROOT=${safetyRoot}`, '-e', `VERIFY_INSTANCE_ID=${ID}`,
+      IMAGE, 'node', '--input-type=module', '-e', safetyScript]);
+  await captureContainer(RESTORE_OK, directLabels('restore'));
+  await removeExactContainer(RESTORE_OK, (info) => {
+    assert.ok(hasLabels(info.Config?.Labels, directLabels('restore')));
+  });
+  check('恢复目标文件、目录与数据根符号链接不越界写入', true);
+  check('未完成恢复事务阻止 Manager 启动且不创建数据库', true);
+
   // 密钥不对时必须当场失败，而不是恢复出「能启动但实例全起不来」的系统
   const wrongRoot = join(RUN_ROOT, 'wrong-key-data');
   await mkdir(`${wrongRoot}/manager`, { recursive: true, mode: 0o777 });
@@ -691,25 +794,25 @@ async function main() {
   await chmod(wrongRoot, 0o777);
   await chmod(`${wrongRoot}/manager`, 0o777);
   await chmod(`${wrongRoot}/instances`, 0o777);
-  await writeFile(`${wrongRoot}/backup.tar`, bkBuf, { mode: 0o644 });
+  await writeFile(`${wrongRoot}/backup.tle-backup`, bkBuf, { mode: 0o644 });
   let keyRefused = false;
   try {
-    sh('docker', ['run', '--name', RESTORE_BAD,
+    sh('docker', ['run', '--name', RESTORE_BAD, ...RESTORE_USER_ARGS,
         '--label', `${RUN_LABEL}=${RUN_ID}`, '--label', `${INSTANCE_LABEL}=${ID}`,
         '--label', `${ROLE_LABEL}=wrong-restore`, '--read-only', '--cap-drop', 'ALL',
         '--security-opt', 'no-new-privileges:true', '--tmpfs', '/tmp:rw,noexec,nosuid,size=32m',
         '-v', `${wrongRoot}:${wrongRoot}`,
         '-e', `EXTERNAL_URL=${B}`, '-e', `MASTER_KEY=${WRONG_MASTER_KEY}`,
         '-e', `EDGE_DATA_ROOT=${wrongRoot}`,
-        IMAGE, 'node', 'dist/index.js', 'restore', `${wrongRoot}/backup.tar`], { stdio: 'pipe' });
+        IMAGE, 'node', 'dist/index.js', 'restore', `${wrongRoot}/backup.tle-backup`], { stdio: 'pipe' });
   } catch (e) {
-    keyRefused = /MASTER_KEY 与备份不符/.test(String(e.stderr ?? e.stdout ?? e.message));
+    keyRefused = /备份解密失败/.test(String(e.stderr ?? e.stdout ?? e.message));
   }
   await captureContainer(RESTORE_BAD, directLabels('wrong-restore'));
   await removeExactContainer(RESTORE_BAD, (info) => {
     assert.ok(hasLabels(info.Config?.Labels, directLabels('wrong-restore')));
   });
-  check('MASTER_KEY 不符时拒绝恢复并说清原因', keyRefused);
+  check('MASTER_KEY 不符时认证解密拒绝恢复', keyRefused);
 
   // ── 网络回收 ──
   const del = await fetch(`${B}/api/instances/${ID}`, { method: 'DELETE', headers: H });

@@ -5,8 +5,7 @@
  * 界面只做**备份**，不做在线恢复 —— 恢复要覆盖正被 Manager 打开的库，
  * 在线做等于自找损坏。所以这里把恢复步骤写清楚，让运维照着敲。
  *
- * 现场最容易栽的是 `MASTER_KEY`：异机恢复时密钥不对，系统能启动、能登录，
- * 但**所有实例凭据都解不开**，表现是「实例起不来」而不是「密钥错了」。
+ * 备份文件本身使用认证加密：异机恢复时密钥不对会在写入任何数据前失败。
  * 页面把指纹显出来，就是为了让人在恢复前能核对。
  */
 import { ref, onMounted } from 'vue';
@@ -88,8 +87,8 @@ onMounted(refresh);
               <p>下面是<b>现在</b>执行备份会打进包里的内容，每次打开本页实时算一遍。</p>
               <p>备份的是数据目录：管理台的 <code>edge.db</code> 与每个实例的
                 <code>&lt;数据根&gt;/instances/&lt;实例id&gt;/</code>。</p>
-              <p class="fh-warn">包里含<b>实例凭据</b>（已加密，但仍是敏感物），
-                请按敏感文件保管，不要放进代码仓或公共网盘。</p>
+              <p class="fh-warn">下载的是经过认证加密的备份文件，包内含<b>实例凭据</b>。
+                <code>MASTER_KEY</code> 不会写入备份；文件仍须按敏感资料保管，不要放进代码仓或公共网盘。</p>
             </FieldHelp>
           </h3>
           <NButton size="small" quaternary :loading="loading" @click="refresh">刷新</NButton>
@@ -105,9 +104,8 @@ onMounted(refresh);
               <FieldHelp>
                 <p><code>MASTER_KEY</code> 派生出来的指纹，<b>不含密钥本身</b>。</p>
                 <p>恢复到另一台机器时，那台的 <code>MASTER_KEY</code> 必须能算出同一个指纹。</p>
-                <p class="fh-warn">密钥不对时，系统照样能启动、能登录，
-                  但<b>所有实例凭据都解不开</b> —— 现场看到的是「实例起不来」，
-                  很难联想到是密钥问题。恢复前先核对这一串。</p>
+                <p class="fh-warn">密钥不对或文件被改动时，恢复会在解密阶段拒绝，
+                  不会写入一份“能启动但实例凭据解不开”的半成品数据。恢复前先核对这一串。</p>
               </FieldHelp>
             </span>
             <span class="mono">{{ info?.manifest.masterKeyFingerprint ?? '—' }}</span>
@@ -133,7 +131,7 @@ onMounted(refresh);
           <FieldHelp>
             <p>恢复<b>没有做成界面按钮</b>，这是有意的：恢复要覆盖正被管理台打开的数据库，
               在线做会把库写坏。</p>
-            <p>正确顺序是 <b>停服务 → 恢复 → 再启动</b>。</p>
+            <p>正确顺序是 <b>停止所有目标实例和管理台 → 恢复 → 再启动</b>。</p>
           </FieldHelp>
         </h3>
 
@@ -142,19 +140,24 @@ onMounted(refresh);
             把备份文件拷到目标机器，确认那台的 <code class="mono">MASTER_KEY</code>
             与备份时一致（对上面的密钥指纹）。
           </li>
-          <li>停掉管理台：<code class="mono">docker compose stop manager</code></li>
+          <li>先停止所有目标 Node-RED 实例和其他数据写入程序，再停掉管理台：
+            <code class="mono">docker compose stop manager</code>。实例是独立容器，只停管理台不会停实例。</li>
           <li>
             执行恢复：
             <pre class="cmd">docker compose run --rm --entrypoint node manager \
-  dist/index.js restore /path/to/备份文件.tar</pre>
-            <span class="hint">加 <code class="mono">--force</code> 可覆盖已有数据；不加时目标非空会拒绝执行。</span>
+  dist/index.js restore /path/to/备份文件.tle-backup</pre>
+            <span class="hint"><code class="mono">--force</code> 只用于历史明文备份的密钥指纹不匹配场景；无法绕过加密备份的解密校验。</span>
           </li>
-          <li>启动：<code class="mono">docker compose up -d</code></li>
+          <li>若恢复中断，保持管理台与实例停止，执行
+            <code class="mono">docker compose run --rm --entrypoint node manager dist/index.js restore --recover</code>。
+            未完成的恢复会回滚，已完成的恢复会清理事务；处理成功后可重新恢复备份。</li>
+          <li>恢复成功后启动：<code class="mono">docker compose up -d</code></li>
         </ol>
 
         <NAlert type="warning" :bordered="false" style="margin-top: 6px">
-          恢复会<b>覆盖</b>目标机器上的现有数据。异机恢复前请先确认密钥指纹一致，
-          否则实例凭据无法解密，实例将起不来。
+          恢复会<b>替换数据库和整个实例目录</b>，移除备份中不存在的旧实例和文件。
+          管理台的其他配置和缓存保留。异机恢复前请先确认密钥指纹一致；
+          不一致或文件被改动时，认证加密会拒绝恢复。
         </NAlert>
       </NCard>
     </NSpin>

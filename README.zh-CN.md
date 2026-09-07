@@ -183,6 +183,8 @@ cd apps/manager && pnpm verify
 
 ## 文档
 
+备份范围、离线恢复和中断恢复步骤见 [备份与离线恢复](docs/backup-restore.md)。
+
 部署指南、接口说明与架构文档见 [mqttsnet.com](https://mqttsnet.com)。
 
 第一次接手这个代码库？先读[贡献指南](CONTRIBUTING.md) —— 那里的开发纪律

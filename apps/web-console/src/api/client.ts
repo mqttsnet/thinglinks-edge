@@ -293,7 +293,7 @@ export const api = {
   /**
    * 下载备份。
    *
-   * 不能走 `request`：它用 `res.text()` 读响应，会把 tar 里的二进制按 UTF-8
+   * 不能走 `request`：它用 `res.text()` 读响应，会把加密备份的二进制按 UTF-8
    * 解码而损坏内容 —— 且**下下来的包看着正常，恢复时才炸**。这里直接取 blob。
    */
   downloadBackup: async (): Promise<{ blob: Blob; filename: string }> => {
@@ -309,7 +309,7 @@ export const api = {
       throw new ApiError(res.status, message);
     }
     const disp = res.headers.get('content-disposition') ?? '';
-    const filename = filenameFrom(disp, 'thinglinks-edge-backup.tar');
+    const filename = filenameFrom(disp, 'thinglinks-edge-backup.tle-backup');
     return { blob: await res.blob(), filename };
   },
 

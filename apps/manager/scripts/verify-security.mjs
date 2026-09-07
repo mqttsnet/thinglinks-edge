@@ -14,6 +14,7 @@
  */
 import { join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { mkdir, writeFile } from 'node:fs/promises';
 
 import { openDb } from '../dist/core/db.js';
 import { requireMasterKey, deriveKey, CryptoError } from '../dist/core/auth/crypto.js';
@@ -23,7 +24,7 @@ import { InstanceService } from '../dist/core/instance/service.js';
 import { DockerClient } from '../dist/core/instance/docker-client.js';
 import { UserRepo } from '../dist/core/auth/user-repo.js';
 import { buildServer } from '../dist/http/app.js';
-import { createBackup, restoreBackup } from '../dist/core/archive/backup.js';
+import { createBackup, isEncryptedBackup, restoreBackup } from '../dist/core/archive/backup.js';
 import { assertValidSpec, buildCreateOptions, assertSafeCreateOptions }
   from '../dist/core/instance/container-spec.js';
 import { redact, assertNoSecrets } from '../dist/core/diag/redact.js';
@@ -265,17 +266,26 @@ async function main() {
 
   // ══ 10. 备份在无密钥情况下解不出凭据 ════════════════
   {
+    // These repository-only instances have no Docker data directories. Supply
+    // real fixture data inside this verifier's owned area; missing data must now
+    // fail backup instead of silently producing a database-only archive.
+    const instanceDataRoot = join(dataDir, 'backup-instances');
+    const instances = repo.list().map((i) => ({ id: i.id, name: i.name, imageTag: i.imageTag }));
+    for (const instance of instances) {
+      await mkdir(join(instanceDataRoot, instance.id), { recursive: true });
+      await writeFile(join(instanceDataRoot, instance.id, 'flows.json'), '[]');
+    }
     const schemaVersion = db.prepare('SELECT version FROM schema_version LIMIT 1').get().version;
     const tar = await createBackup({
-      db, key, instanceDataRoot: TEST_DATA_ROOT,
-      instances: repo.list().map((i) => ({ id: i.id, name: i.name, imageTag: i.imageTag })),
+      db, key, instanceDataRoot, instances,
       schemaVersion,
     });
 
     // 10a：备份文件里搜不到明文凭据
     const raw = tar.toString('utf8');
     const leaked = ['nr-pass-secret-1', 'nr-pass-secret-2', MASTER].filter((s) => raw.includes(s));
-    check(10, '备份文件中搜不到明文凭据与主密钥', leaked.length === 0,
+    check(10, '备份使用认证加密，文件中搜不到明文凭据与主密钥',
+      isEncryptedBackup(tar) && leaked.length === 0,
       leaked.length ? '泄漏：' + leaked.join(' ') : '3 项均未出现');
 
     // 10b：换一把密钥恢复必须失败，而不是恢复出一堆解不开的凭据
