@@ -7,6 +7,12 @@ import { COMMAND_SCHEMA } from './schema.ts';
 import { validateBinding, validateDownlink, validatePoll, validateResult } from './validation.ts';
 import { CommandError, type CommandCloud, type CommandLimits, type CommandRecord, type CommandStatus, type LeasedCommand } from './types.ts';
 const DEFAULT_LIMITS: CommandLimits = { maxPending: 1000, maxResults: 1000, maxBindings: 1000, maxGateways: 32, bindingTtlMs: 60000, queueMs: 60000, leaseMs: 30000 };
+const COUNT_QUERIES = {
+    bindings: 'SELECT COUNT(*) AS n FROM cloud_command_binding',
+    gateways: 'SELECT COUNT(*) AS n FROM cloud_command_gateway',
+    pending: "SELECT COUNT(*) AS n FROM cloud_command WHERE status IN ('queued','leased')",
+    completed: 'SELECT COUNT(*) AS n FROM cloud_command WHERE completed_at IS NOT NULL',
+} as const;
 interface Row {
     id: string;
     gateway_id: string;
@@ -84,7 +90,7 @@ export class CommandBridge {
         this.#db.transaction(() => {
             this.#db.prepare('DELETE FROM cloud_command_binding WHERE last_seen < ?').run(now - this.#limits.bindingTtlMs);
             const exists = this.#db.prepare('SELECT 1 FROM cloud_command_binding WHERE instance_id=? AND consumer_id=? AND node_id=? AND service_code=?').get(instanceId, binding.consumerId, binding.nodeId, binding.serviceCode);
-            if (!exists && this.#count('cloud_command_binding') >= this.#limits.maxBindings)
+            if (!exists && this.#count('bindings') >= this.#limits.maxBindings)
                 throw new CommandError('命令绑定数量超过上限', 503);
             this.#db.prepare(`INSERT INTO cloud_command_binding(instance_id,consumer_id,node_id,service_code,commands_json,last_seen) VALUES (?,?,?,?,?,?)
     ON CONFLICT(instance_id,consumer_id,node_id,service_code) DO UPDATE SET commands_json=excluded.commands_json,last_seen=excluded.last_seen`)
@@ -108,7 +114,7 @@ export class CommandBridge {
                 retired_mid: string;
             } | undefined;
             if (!ledger) {
-                if (this.#count('cloud_command_gateway') >= this.#limits.maxGateways)
+                if (this.#count('gateways') >= this.#limits.maxGateways)
                     throw new CommandError('网关去重账本数量超过上限', 503);
                 this.#db.prepare('INSERT INTO cloud_command_gateway(gateway_id) VALUES (?)').run(command.gatewayId);
                 ledger = { retired_mid: '0' };
@@ -136,7 +142,7 @@ export class CommandBridge {
                 modelChecked = true;
                 error = validateModelCommand(model, body.serviceCode, body.cmd, body.params).join('；');
             }
-            if (!error && this.#count('cloud_command', "status IN ('queued','leased')") >= this.#limits.maxPending)
+            if (!error && this.#count('pending') >= this.#limits.maxPending)
                 error = '命令等待队列已满，未执行';
             this.#db.prepare(`INSERT INTO cloud_command(id,gateway_id,mid,instance_id,consumer_id,device_id,service_code,cmd,params_json,status,error,created_at,completed_at,queue_deadline,reply_pending,product_id,version_no,model_checked)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(randomUUID(), command.gatewayId, mid, binding?.instance_id ?? '', binding?.consumer_id ?? '', body.deviceId, body.serviceCode, body.cmd, JSON.stringify(body.params), error ? 'rejected' : 'queued', error, now, error ? now : null, now + this.#limits.queueMs, error ? 1 : 0, body.productIdentification, body.versionNo, modelChecked ? 1 : 0);
@@ -217,7 +223,7 @@ export class CommandBridge {
         return rows.map(toRecord);
     }
     async tick(): Promise<void> { this.#db.transaction(() => { this.#expire(); this.#prune(); })(); await this.#flushReplies(); }
-    #count(table: string, where = '1=1'): number { return (this.#db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE ${where}`).get() as {
+    #count(query: keyof typeof COUNT_QUERIES): number { return (this.#db.prepare(COUNT_QUERIES[query]).get() as {
         n: number;
     }).n; }
     #targets(device: string, service: string, cmd: string): Binding[] { return (this.#db.prepare('SELECT * FROM cloud_command_binding WHERE node_id=? AND service_code=? AND last_seen>=?').all(device, service, this.#now() - this.#limits.bindingTtlMs) as Binding[]).filter(binding => (JSON.parse(binding.commands_json) as {
@@ -230,7 +236,7 @@ export class CommandBridge {
         }
     }
     #prune(): void {
-        const excess = this.#count('cloud_command', 'completed_at IS NOT NULL') - this.#limits.maxResults;
+        const excess = this.#count('completed') - this.#limits.maxResults;
         if (excess <= 0)
             return;
         for (const row of this.#db.prepare('SELECT * FROM cloud_command WHERE completed_at IS NOT NULL ORDER BY completed_at,rowid LIMIT ?').all(excess) as Row[]) {

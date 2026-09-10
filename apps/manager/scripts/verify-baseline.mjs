@@ -26,7 +26,9 @@ import {
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import { gzipSync } from 'node:zlib';
+import { pathToFileURL } from 'node:url';
 import Fastify from 'fastify';
+import ts from 'typescript';
 
 import { openDb } from '../dist/core/db.js';
 import { deriveKey } from '../dist/core/auth/crypto.js';
@@ -69,8 +71,104 @@ const walk = (dir, out = []) => {
   }
   return out;
 };
-const sources = walk(MGR);
 const readAll = (files) => files.map((f) => ({ f, text: readFileSync(f, 'utf8') }));
+
+/**
+ * 只检查该路由的 handler AST，不能用后续路由、注释或字符串中的鉴权字样补位。
+ * 这是源码覆盖检查，不替代接口的运行期鉴权测试，也不证明分支的可达性。
+ */
+export function scanRouteAuthentication(text, filename) {
+  filename = resolve(filename);
+  const source = ts.createSourceFile(filename, text, ts.ScriptTarget.Latest, true);
+  if (source.parseDiagnostics.length > 0) throw new Error(`无法解析路由源码：${filename}`);
+  // 只绑定本文件的符号，不读取依赖或执行源码。符号身份可排除同名的局部替身。
+  const options = { noLib: true, noResolve: true };
+  const program = ts.createProgram([filename], options, {
+    ...ts.createCompilerHost(options),
+    getSourceFile: (name) => resolve(name) === filename ? source : undefined,
+  });
+  const checker = program.getTypeChecker();
+  const isIngestHelper = (callee) => ts.isIdentifier(callee)
+    && checker.getSymbolAtLocation(callee)?.declarations?.some((declaration) => {
+      if (!ts.isImportSpecifier(declaration) || declaration.isTypeOnly
+        || (declaration.propertyName ?? declaration.name).text !== 'ingestInstance') return false;
+      const clause = declaration.parent.parent;
+      const imported = clause.parent;
+      return !clause.isTypeOnly && ts.isImportDeclaration(imported)
+        && ts.isStringLiteral(imported.moduleSpecifier)
+        && imported.moduleSpecifier.text.startsWith('.')
+        && resolve(dirname(filename), imported.moduleSpecifier.text)
+          === join(MGR, 'http/edge/ingest-auth.ts');
+    });
+  const routePath = (node) => {
+    if (ts.isStringLiteralLike(node)) return node.text;
+    if (!ts.isTemplateExpression(node)) return undefined;
+    // 忽略首个 basePath 插值，保留路由后续的动态 action 等片段用于定位。
+    return node.head.text + node.templateSpans.map((span, index) =>
+      (index === 0 && node.head.text === '' ? '' : `\${${span.expression.getText(source)}}`)
+      + span.literal.text).join('');
+  };
+  const handlerAuth = (handler) => {
+    const names = new Set();
+    let ingest = false;
+    const visit = (node) => {
+      // 未执行的函数体不算 handler 鉴权；调用已有包装函数仍由其调用名识别。
+      if (ts.isFunctionLike(node)) return;
+      if (ts.isCallExpression(node)) {
+        const callee = node.expression;
+        if (ts.isIdentifier(callee)) names.add(callee.text);
+        else if (ts.isPropertyAccessExpression(callee)) names.add(callee.name.text);
+        if (isIngestHelper(callee)) ingest = true;
+      }
+      ts.forEachChild(node, visit);
+    };
+    if (handler && (ts.isArrowFunction(handler) || ts.isFunctionExpression(handler))) {
+      visit(handler.body);
+    }
+    if ([...names].some((name) => /[Gg]uard$/.test(name))) return 'guard';
+    if (names.has('authed') || ingest) return 'token';
+    if (names.has('currentUser') && names.has('canInstance')) return 'manual';
+    return 'none';
+  };
+  const routes = [];
+  const visit = (node) => {
+    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
+      const { expression: owner, name } = node.expression;
+      if (ts.isIdentifier(owner) && ['api', 'app', 'scope'].includes(owner.text)
+        && ['get', 'post', 'put', 'delete', 'patch', 'head', 'options'].includes(name.text)
+        && node.arguments.length > 0) {
+        const path = routePath(node.arguments[0]);
+        if (path !== undefined) routes.push({ method: name.text, path, auth: handlerAuth(node.arguments.at(-1)) });
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return routes;
+}
+const ANON = new Map([
+  ['GET /api/product', '登录页需要在鉴权之前显示品牌信息；此 GET 只返回专用公开品牌配置，'
+    + '不含凭据或任意环境变量，也不查询远端发布信息。该例外不覆盖写接口或 releases 子路径'],
+  ['/healthz', '存活探针：compose/K8s 要在没有凭据时能问「你活着吗」，不回任何环境信息'],
+  ['/api/login', '登录入口本身：它就是获取会话的地方，失败计数与锁定在服务端'],
+  ['/api/login/2fa', '登录第二步：凭第一步下发的一次性票据，不接受任意输入'],
+  ['/api/setup', '首次认领：这台设备还没有任何账号，有账号后立刻 409'],
+  ['/api/me', '读当前会话：未登录返回 401，不泄漏任何环境信息'],
+  ['/api/logout', '登出：未登录时也该能安全调用，不因为没会话而报错'],
+  ['/api/change-password', '改密自身。guard 会拦住「未改初始口令」的用户，'
+    + '改密路由若也走 guard，用户就被锁进无法改密的死循环（见 http/context.ts 的 allowPending）'],
+  ['/npm/-/catalogue.json', '私有源的节点目录：由现场浏览器里的 Node-RED 编辑器前端取。'
+    + '内容是**已批准的公开 npm 包**的名字与说明，不含任何机密'],
+  ['/npm/*', '私有源的 packument 与包体：由实例容器里的 npm 取。npm 只能靠 .npmrc 的 '
+    + '_authToken 鉴权，而**装包前那次 npm info 读不到实例的 .npmrc**（那次调用不带 cwd，'
+    + '继承 /usr/src/node-red，实测已确认）—— 加了鉴权恰恰是「一开白名单就什么都装不上」。'
+    + '权衡后放开只读：源里只有已批准的公开包，能访问到它的前提是已在 Manager 的网络里'],
+]);
+
+export function anonymousRouteReason({ path, method }) {
+  return ANON.get(`${method?.toUpperCase()} ${path}`) ?? ANON.get(path);
+}
+
 const BASELINE_PLATFORM_KEYWORDS = Object.freeze(['node-red', 'thinglinks']);
 
 const normalizeExactKeywords = (keywords) => {
@@ -198,6 +296,7 @@ async function catalogueTrustBoundary(root, db) {
 }
 
 async function main() {
+  const sources = walk(MGR);
   let dbDir;
   let db;
   let operationError;
@@ -268,51 +367,34 @@ async function main() {
     // ── 3. 鉴权与越权 ──────────────────────────────────────
     const G3 = '3 鉴权越权';
     /*
-     * 逐条路由核对：每个注册点后面若干行里必须出现 guard(，否则要在白名单里。
+     * 逐条路由核对：鉴权调用必须位于本条 handler 内，否则要在白名单里。
      * 白名单**带理由**，加一条就得写一句为什么它可以匿名 —— 这是评审留痕。
      */
-    const ANON = new Map([
-      ['/healthz', '存活探针：compose/K8s 要在没有凭据时能问「你活着吗」，不回任何环境信息'],
-      ['/api/login', '登录入口本身：它就是获取会话的地方，失败计数与锁定在服务端'],
-      ['/api/login/2fa', '登录第二步：凭第一步下发的一次性票据，不接受任意输入'],
-      ['/api/setup', '首次认领：这台设备还没有任何账号，有账号后立刻 409'],
-      ['/api/me', '读当前会话：未登录返回 401，不泄漏任何环境信息'],
-      ['/api/logout', '登出：未登录时也该能安全调用，不因为没会话而报错'],
-      ['/api/change-password', '改密自身。guard 会拦住「未改初始口令」的用户，'
-        + '改密路由若也走 guard，用户就被锁进无法改密的死循环（见 http/context.ts 的 allowPending）'],
-      ['/npm/-/catalogue.json', '私有源的节点目录：由现场浏览器里的 Node-RED 编辑器前端取。'
-        + '内容是**已批准的公开 npm 包**的名字与说明，不含任何机密'],
-      ['/npm/*', '私有源的 packument 与包体：由实例容器里的 npm 取。npm 只能靠 .npmrc 的 '
-        + '_authToken 鉴权，而**装包前那次 npm info 读不到实例的 .npmrc**（那次调用不带 cwd，'
-        + '继承 /usr/src/node-red，实测已确认）—— 加了鉴权恰恰是「一开白名单就什么都装不上」。'
-        + '权衡后放开只读：源里只有已批准的公开包，能访问到它的前提是已在 Manager 的网络里'],
-    ]);
-    const routeRe = /\b(?:api|app)\.(get|post|put|delete)\(\s*`?\$\{[^}]*\}([^`'"]*)/g;
+
     const unguarded = [];
     const tokenAuthed = [];
     const manualAuthed = [];
     for (const { f, text } of readAll(walk(join(MGR, 'http')))) {
-      for (const m of text.matchAll(routeRe)) {
-        const path = m[2] ?? '';
-        const body = text.slice(m.index, m.index + 700);
+      for (const route of scanRouteAuthentication(text, f)) {
+        const { path, auth } = route;
         // 大小写都算：fieldGuard() 之类的包装同样是过了 guard
-        if (/[Gg]uard\(/.test(body)) continue;
+        if (auth === 'guard') continue;
         /*
          * 节点接入通道走的是**每实例独立令牌**，不是管理会话 ——
          * 实例是长期运行的自动化流程，没有「登录」这一说。
          * 它自成一条鉴权路径，下面单独断言其关键性质。
          */
-        if (/\bauthed\(/.test(body)) { tokenAuthed.push(path); continue; }
+        if (auth === 'token') { tokenAuthed.push(path); continue; }
         /*
          * 免密跳转与反代不是 JSON API，走不了 guard 那套（要下发 HTML、要接管升级），
          * 但它们**必须**自己判到实例级 —— 这两条是全平台最大的越权面。
          * 认「同时出现 currentUser + canInstance」为合格，并在下面单独断言。
          */
-        if (/currentUser\(/.test(body) && /canInstance\(/.test(body)) {
+        if (auth === 'manual') {
           manualAuthed.push(path);
           continue;
         }
-        if ([...ANON.keys()].some((a) => path === a)) continue;
+        if (anonymousRouteReason(route)) continue;
         unguarded.push(`${f.replace(REPO + '/', '')} ${path}`);
       }
     }
@@ -332,7 +414,7 @@ async function main() {
           && !/instanceId\s*=\s*\(?req\.body/.test(ingestSrc),
           tokenAuthed.slice(0, 3).join(' '));
     /*
-     * 私有源是全平台唯一匿名可读的**数据**端点，所以它的边界要单独钉死：
+     * 私有源的匿名读取边界要单独钉死：
      * 只读、且只服务已批准的包。哪天有人给它加一条写路由，这里当场红。
      */
     const registrySrc = readFileSync(join(MGR, 'http/nodes/registry.ts'), 'utf8');
@@ -448,6 +530,8 @@ async function main() {
   }
 }
 
-main()
-  .then((ok) => { process.exitCode = ok ? 0 : 1; })
-  .catch((e) => { console.error('\n验证异常：', e.stack ?? e.message); process.exitCode = 1; });
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main()
+    .then((ok) => { process.exitCode = ok ? 0 : 1; })
+    .catch((e) => { console.error('\n验证异常：', e.stack ?? e.message); process.exitCode = 1; });
+}

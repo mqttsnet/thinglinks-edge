@@ -133,6 +133,24 @@ const GENERIC_FIXTURE_PACKAGES = Object.freeze([
   URLDEP_PKG,
   URLDEP_LIB,
 ]);
+
+/** Completed phases are explicit inputs, never inferred from whatever is in the store. */
+export function verifierStoreMatches(store, importedFixtures = GENERIC_FIXTURE_PACKAGES) {
+  const fixtures = [...importedFixtures];
+  for (const name of fixtures) {
+    if (!GENERIC_FIXTURE_PACKAGES.includes(name)) throw new Error(`unknown verifier fixture: ${name}`);
+  }
+  if (new Set(fixtures).size !== fixtures.length) throw new Error('duplicate verifier fixture');
+  const expected = [
+    `${PLATFORM_NODE_PACKAGE.name}@${PLATFORM_NODE_PACKAGE.version}`,
+    `${PLATFORM_COMMON_PACKAGE.name}@${PLATFORM_COMMON_PACKAGE.version}`,
+    ...fixtures.map((name) => `${name}@1.0.0`),
+  ].sort();
+  const modules = store.modules();
+  if (modules.length !== fixtures.length + 2) return false;
+  const actual = modules.flatMap((name) => store.versions(name).map((version) => `${name}@${version}`)).sort();
+  return JSON.stringify(actual) === JSON.stringify(expected);
+}
 /** 容器里解析不了的主机名：npm 一旦去连它就必然失败 —— 这正是我们要的 */
 const UNREACHABLE = `https://tle-nodes-verify.invalid/${URLDEP_LIB}-1.0.0.tgz`;
 
@@ -732,6 +750,7 @@ let server;
 let upstreamServer;
 let nodeStore;
 let protectedDigests;
+const importedFixtures = new Set();
 async function main() {
   const reviewedManagerImageId = await resolveReviewedManagerImage();
   [PORT, NR_PORT, UPSTREAM_PORT] = await Promise.all([
@@ -909,6 +928,7 @@ async function main() {
       imported.response.status === 200 && imported.body.package?.name === name,
       imported.response.status === 200
         ? '' : `HTTP ${imported.response.status} ${JSON.stringify(imported.body).slice(0, 140)}`);
+    importedFixtures.add(name);
   }
 
   const listedResponse = await fetchJson(
@@ -939,6 +959,7 @@ async function main() {
 
   const urlDep = await importRaw(fixture(URLDEP_PKG, '1.0.0', { [URLDEP_LIB]: UNREACHABLE }));
   check('导入依赖写成 URL 的节点包', urlDep.status === 200, `HTTP ${urlDep.status}`);
+  importedFixtures.add(URLDEP_PKG);
   // 依赖缺口按**名字**报 —— 不管声明写的是版本范围还是一个 URL
   check('URL 依赖没导进来时照样报成缺口（写法不影响判断）',
     urlDep.body.missingDeps?.includes(URLDEP_LIB),
@@ -946,6 +967,7 @@ async function main() {
 
   const urlLib = await importRaw(plainLib(URLDEP_LIB));
   check('导入那个被 URL 指向的依赖包', urlLib.status === 200, `HTTP ${urlLib.status}`);
+  importedFixtures.add(URLDEP_LIB);
 
   const packumentResponse = await fetchJson(`${B}/npm/${URLDEP_PKG}`, {}, '读取 URL 依赖 packument');
   check('读取 URL 依赖 packument', packumentResponse.response.status === 200,
@@ -1197,6 +1219,7 @@ async function main() {
   check('**下载的包顺手入库了**（下次即离线可用）',
     afterStore.packages?.some((p) => p.module === UPSTREAM_PKG),
     (afterStore.packages ?? []).map((p) => p.module).join(', '));
+  importedFixtures.add(UPSTREAM_PKG);
 
   // ── 从控制台直接装到实例 ──
   const viaConsole = await fetch(`${B}/api/instances/${ID}/nodes`, {
@@ -1390,6 +1413,8 @@ async function main() {
     body: JSON.stringify({ module: 'whatever' }),
   });
   check('改批准清单要过 CSRF', noCsrf.status === 403, `HTTP ${noCsrf.status}`);
+  check('完整验证的 store 精确包含两个固定根与全部五个夹具及其版本',
+    verifierStoreMatches(store));
 }
 
 if (
@@ -1412,13 +1437,10 @@ if (
       });
       if (nodeStore) {
         try {
-          const expectedModules = [
-            PLATFORM_NODE_PACKAGE.name,
-            PLATFORM_COMMON_PACKAGE.name,
-            ...GENERIC_FIXTURE_PACKAGES,
-          ].sort();
-          check('随机 store 只含两个固定根与五个精确命名夹具',
-            JSON.stringify(nodeStore.modules()) === JSON.stringify(expectedModules));
+          // 前置条件失败可能尚未执行回源下载；不能要求未到达阶段的夹具已存在。
+          // 仍按明确完成的导入阶段逐项精确比较，不能从实际包库反推允许清单。
+          check('随机 store 精确匹配两个固定根与已完成阶段的夹具及其版本',
+            verifierStoreMatches(nodeStore, importedFixtures));
           check('固定 Edge/common 信任根字节在验证前后保持不变',
             [PLATFORM_NODE_PACKAGE, PLATFORM_COMMON_PACKAGE].every((pin) => {
               const bytes = nodeStore.tarball(pin.name, pin.version);

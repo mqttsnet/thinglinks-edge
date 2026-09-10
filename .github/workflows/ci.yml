@@ -66,10 +66,21 @@ jobs:
           apps/manager/scripts/real-instance-fixture.test.mjs
           apps/manager/scripts/verify-api.test.mjs
           apps/manager/scripts/verify-compose.test.mjs
+          apps/manager/scripts/verify-nodes.test.mjs
+          apps/manager/scripts/verify-baseline.test.mjs
           apps/manager/scripts/verify-core-resource-ownership.test.mjs
           apps/manager/scripts/verify-cloud-resource-ownership.test.mjs
           apps/manager/scripts/verify-offline.test.mjs
           apps/manager/scripts/verifier-temp-lifecycle.test.mjs
+
+      - name: 协议与串口工具自测
+        # 固定包闭包、资源归属与串口帧契约；不操作任何真实实例。
+        run: >-
+          node --experimental-strip-types --test
+          scripts/prepare-protocol-seed.test.mjs
+          scripts/verify-protocol-components.test.mjs
+          scripts/protocol-fixtures/*.test.mjs
+          scripts/protocol-wire-lab/serial/*.test.cjs
 
   verify:
     name: 真容器回归

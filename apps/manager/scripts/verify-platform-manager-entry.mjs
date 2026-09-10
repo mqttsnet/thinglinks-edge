@@ -694,9 +694,11 @@ function validateEnvironment(entries, identity, env) {
     'TZ', 'TLE_INSTANCE_ID', 'TLE_ADMIN_ROOT', 'TLE_INGEST_TOKEN', 'TLE_MANAGER_URL',
     'NPM_CONFIG_REGISTRY', 'NPM_CONFIG_STRICT_SSL', 'NPM_CONFIG_AUDIT',
     'NPM_CONFIG_FUND', 'NPM_CONFIG_UPDATE_NOTIFIER',
+    'XDG_CONFIG_HOME',
   ];
   policy(values.size === names.length && names.every((name) => values.has(name)), 'environment keys');
   policy(values.get('TZ') === 'UTC', 'timezone');
+  policy(values.get('XDG_CONFIG_HOME') === '/data/.config', 'config home');
   policy(values.get('TLE_INSTANCE_ID') === identity.instanceId, 'instance environment');
   policy(values.get('TLE_ADMIN_ROOT') === `/red/${identity.instanceId}/`, 'admin root');
   policy(/^[A-Za-z0-9_-]{24,128}$/.test(values.get('TLE_INGEST_TOKEN')), 'ingest token shape');
@@ -1162,6 +1164,7 @@ function staticProxyFixture() {
       `NPM_CONFIG_REGISTRY=http://${env.managerName}:19100/npm/`,
       'NPM_CONFIG_STRICT_SSL=false', 'NPM_CONFIG_AUDIT=false',
       'NPM_CONFIG_FUND=false', 'NPM_CONFIG_UPDATE_NOTIFIER=false',
+      'XDG_CONFIG_HOME=/data/.config',
     ],
     Labels: { [MANAGED_LABEL]: 'true', [INSTANCE_LABEL]: instanceId },
     ExposedPorts: {},
@@ -1318,6 +1321,16 @@ export async function runProxyPolicySelfTests() {
     ['wrong Manager URL', (value) => { value.Env[4] = 'TLE_MANAGER_URL=http://foreign:19100'; }],
     ['wrong registry', (value) => { value.Env[5] = 'NPM_CONFIG_REGISTRY=https://registry.npmjs.org/'; }],
     ['duplicate env', (value) => { value.Env.push(value.Env[1]); }],
+    ['missing config home', (value) => {
+      value.Env = value.Env.filter((entry) => !entry.startsWith('XDG_CONFIG_HOME='));
+    }],
+    ...['', '/tmp/.config', '/data/.config/../escape', '${HOME}/.config', '/data/.config/']
+      .map((path) => [`wrong config home ${path || '<empty>'}`, (value) => {
+        value.Env = value.Env.map((entry) => entry.startsWith('XDG_CONFIG_HOME=')
+          ? `XDG_CONFIG_HOME=${path}` : entry);
+      }]),
+    ['duplicate config home', (value) => { value.Env.push('XDG_CONFIG_HOME=/data/.config'); }],
+    ['unknown env key', (value) => { value.Env.push('UNAPPROVED_CONFIG_HOME=/data/.config'); }],
     ['wrong name', (value) => { value.name = 'tle-nr-vpolicy-other'; }],
     ['wrong label', (value) => { value.Labels[INSTANCE_LABEL] = 'vpolicy-other'; }],
   ];

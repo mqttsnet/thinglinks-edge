@@ -265,6 +265,8 @@ test_summary "真实实例夹具契约" node --test \
   scripts/real-instance-fixture.test.mjs \
   scripts/verify-api.test.mjs \
   scripts/verify-compose.test.mjs \
+  scripts/verify-nodes.test.mjs \
+  scripts/verify-baseline.test.mjs \
   scripts/verify-core-resource-ownership.test.mjs \
   scripts/verify-cloud-resource-ownership.test.mjs \
   scripts/verify-offline.test.mjs \
@@ -272,6 +274,13 @@ test_summary "真实实例夹具契约" node --test \
   scripts/transport-diagnostics.test.mjs \
   scripts/verifier-subnet.test.mjs \
   scripts/verifier-temp-lifecycle.test.mjs
+test_summary "协议与串口工具契约" sh -c '
+  cd "$1" && node --experimental-strip-types --test \
+    scripts/prepare-protocol-seed.test.mjs \
+    scripts/verify-protocol-components.test.mjs \
+    scripts/protocol-fixtures/*.test.mjs \
+    scripts/protocol-wire-lab/serial/*.test.cjs
+' _ "$REPO_ROOT"
 echo ""
 
 image_id() {
