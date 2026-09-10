@@ -234,7 +234,9 @@ async function withReadEvidence<T>(
   reads: string[],
   action: () => Promise<T>,
 ): Promise<T> {
-  const trustedRoot = resolve(root);
+  // Installed-file checks use realpath; macOS temporary directories may have an alias.
+  // Record both spellings so Linux and macOS observe the same complete preflight.
+  const trustedRoots = [...new Set([resolve(root), fs.realpathSync(root)])];
   const originalReadFile = fs.promises.readFile;
   const observedPath = (path: unknown): string => {
     if (typeof path === 'string') return resolve(path);
@@ -245,8 +247,9 @@ async function withReadEvidence<T>(
   fs.promises.readFile = (async (path: unknown, ...args: unknown[]) => {
     const absolute = observedPath(path);
     if (absolute) {
-      const candidate = relative(trustedRoot, absolute);
-      if (candidate && candidate !== '..' && !candidate.startsWith(`..${sep}`) && !isAbsolute(candidate)) {
+      const candidate = trustedRoots.map((trustedRoot) => relative(trustedRoot, absolute))
+        .find((path) => path && path !== '..' && !path.startsWith(`..${sep}`) && !isAbsolute(path));
+      if (candidate) {
         reads.push(candidate);
       }
     }
@@ -5068,12 +5071,30 @@ test('every running failure boundary restores checkpoint bytes, legacy ownership
   }
 });
 
-function completedRunningStagedDirectReads(): string[] {
-  // The installed-file verifier's captured callback is proven separately by corrupting
-  // its Edge manifest, lock entry, and SRI. This list pins every surrounding direct read.
+test('read evidence includes logical and canonical fixture paths', async () => {
+  const f = migrationFixture({ preexisting: true });
+  const alias = join(f.root, 'read-evidence-alias');
+  symlinkSync(f.instanceRoot, alias, 'dir');
+  const outside = join(f.root, 'outside-read.txt');
+  writeFileSync(outside, 'outside the observed instance');
+  const reads: string[] = [];
+  await withReadEvidence(alias, reads, async () => {
+    await fs.promises.readFile(join(alias, 'package.json'), 'utf8');
+    await fs.promises.readFile(join(fs.realpathSync(alias), 'package-lock.json'), 'utf8');
+    await fs.promises.readFile(outside, 'utf8');
+  });
+  assert.deepEqual(reads.sort(), ['package-lock.json', 'package.json']);
+});
+
+function completedRunningStagedReads(): string[] {
+  // Pin both direct reads and the installed-file verifier's canonical-path reads.
+  // Package files are read again when capturing their checkpoint facts.
   return [
     ...Object.keys(LEGACY_PLATFORM_FILES).map((path) => join('nodes', path)),
     'flows.json',
+    'package.json', 'package-lock.json',
+    join('node_modules', ...PLATFORM_NODE_PACKAGE.name.split('/'), 'package.json'),
+    join('node_modules', ...PLATFORM_COMMON_PACKAGE.name.split('/'), 'package.json'),
     'settings.js', 'flows.json', 'flows_cred.json', 'package.json', 'package-lock.json',
   ].sort();
 }
@@ -5144,7 +5165,7 @@ test('running stagedBefore stop retry follows every complete read-only preflight
   assert.equal(f.packages.calls, 1);
   assert.equal(f.admin.installedModulesCalls, 1);
   assert.equal(f.admin.currentFlowsCalls, 1);
-  assert.deepEqual(reads.sort(), completedRunningStagedDirectReads());
+  assert.deepEqual(reads.sort(), completedRunningStagedReads());
 });
 
 test('running stagedBefore rejects before same-image environment repair', async () => {
@@ -5186,7 +5207,7 @@ test('running stagedBefore rejects before same-image environment repair', async 
   assert.equal(f.packages.calls, 1);
   assert.equal(f.admin.installedModulesCalls, 1);
   assert.equal(f.admin.currentFlowsCalls, 1);
-  assert.deepEqual(reads.sort(), completedRunningStagedDirectReads());
+  assert.deepEqual(reads.sort(), completedRunningStagedReads());
 });
 
 test('running stagedBefore package manifest lock and SRI corruption win before stop retry', async () => {
