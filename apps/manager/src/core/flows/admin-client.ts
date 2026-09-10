@@ -15,6 +15,8 @@
  * 实测 5.0.4：`POST /flows` 成功返回的是 **204** 而不是 200（验收标准里的
  * 「200」是宽泛说法）。所以判断成功要看 2xx，写死 200 会把正常部署判成失败。
  */
+import { parseFlows } from './parse.ts';
+import type { FlowNode } from './types.ts';
 import { authTokenKeyFor } from '../config.ts';
 import { PLATFORM_NODE_TYPES } from '../nodes/platform-contract.ts';
 
@@ -122,6 +124,61 @@ export async function getFlows(
   }
 }
 
+export interface FlowSnapshot { rev: string; flows: FlowNode[] }
+
+/** v2 revision is mandatory here: omitting it would force an editor overwrite. */
+export async function getFlowSnapshot(
+  t: AdminTarget,
+  fetchImpl: FetchLike = fetch,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+): Promise<FlowSnapshot> {
+  const headers = await authHeaders(t, fetchImpl, timeoutMs);
+  const { signal, done } = withTimeout(timeoutMs);
+  try {
+    const response = await fetchImpl(`${t.upstream}${t.adminRoot}flows`, {
+      headers: { ...headers, accept: 'application/json', 'Node-RED-API-Version': 'v2' }, signal,
+    });
+    if (!response.ok) throw new AdminApiError(`读取实例流程失败（HTTP ${response.status}）`, response.status);
+    const value = await response.json() as { rev?: unknown; flows?: unknown } | null;
+    if (!value || typeof value.rev !== 'string' || value.rev === '') {
+      throw new AdminApiError('实例未返回流程版本 revision，无法安全追加；请确认 Node-RED Admin API 支持 v2');
+    }
+    return { rev: value.rev, flows: parseFlows(value.flows) };
+  } catch (error) {
+    if (error instanceof AdminApiError) throw error;
+    throw new AdminApiError(`读取实例流程失败：${(error as Error).message}`);
+  } finally { done(); }
+}
+
+/** Revision conflict is returned once. The caller must obtain a new preview. */
+export async function setFlowSnapshot(
+  t: AdminTarget,
+  snapshot: FlowSnapshot,
+  deploymentType: 'flows' | 'full',
+  fetchImpl: FetchLike = fetch,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+): Promise<{ status: number }> {
+  if (typeof snapshot.rev !== 'string' || !snapshot.rev) throw new AdminApiError('部署必须带有流程版本 revision');
+  const headers = await authHeaders(t, fetchImpl, timeoutMs);
+  const { signal, done } = withTimeout(timeoutMs);
+  try {
+    const response = await fetchImpl(`${t.upstream}${t.adminRoot}flows`, {
+      method: 'POST',
+      headers: {
+        ...headers, 'content-type': 'application/json',
+        'Node-RED-API-Version': 'v2', 'Node-RED-Deployment-Type': deploymentType,
+      },
+      body: JSON.stringify(snapshot), signal,
+    });
+    if (response.status === 409) throw new AdminApiError('实例流程已被编辑器或其他操作修改，请重新预览后部署', 409);
+    if (!response.ok) throw new AdminApiError(`部署流程失败（HTTP ${response.status}）`, response.status);
+    return { status: response.status };
+  } catch (error) {
+    if (error instanceof AdminApiError) throw error;
+    throw new AdminApiError(`部署流程失败：${(error as Error).message}`);
+  } finally { done(); }
+}
+
 /** 读取实例已安装的全部节点类型，用于套用前的兼容性比对 */
 export async function getInstalledTypes(
   t: AdminTarget,
@@ -154,6 +211,8 @@ export interface InstalledNodeSet {
   version: string;
   types: string[];
   enabled: boolean;
+  /** Present only when older/malformed API output omitted the enabled flag. */
+  enabledKnown?: false;
   err: string;
   file?: string;
   /** Node-RED 5 返回的实际字段；缺失时不猜测其安装来源。 */
@@ -203,6 +262,7 @@ function asNodeSet(value: unknown, fallbackModule = '', fallbackVersion = ''): I
     version: typeof set.version === 'string' ? set.version : fallbackVersion,
     types: Array.isArray(set.types) ? set.types.filter((type): type is string => typeof type === 'string').sort() : [],
     enabled: set.enabled !== false,
+    ...(typeof set.enabled !== 'boolean' ? { enabledKnown: false as const } : {}),
     err: typeof set.err === 'string' ? set.err : '',
     ...(typeof set.file === 'string' ? { file: set.file } : {}),
     ...(typeof set.local === 'boolean' ? { local: set.local } : {}),

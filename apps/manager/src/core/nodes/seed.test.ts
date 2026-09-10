@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  chmodSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, readdirSync, readFileSync,
+  chmodSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, readdirSync, readFileSync, lstatSync, realpathSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,6 +11,7 @@ import { spawnSync } from 'node:child_process';
 import { tarArchive } from '../archive/tar.ts';
 import { NodeStore } from './store.ts';
 import { seedFromDir, describeSeed } from './seed.ts';
+import { PROTOCOL_PACKAGE_PINS } from '../protocols/catalog.ts';
 
 const pack = (name: string, version: string) => gzipSync(tarArchive([{
   name: 'package/package.json',
@@ -299,12 +300,31 @@ test('pack-nodes 有 expectation 时拒绝闭包中的额外包', () => {
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
-const productionSeed = {
+const platformSeed = {
   'mqttsnet-thinglinks-edge-nodes-0.0.1.tgz':
     'sha512-NKsIKyUHNyB+xuXNpCrOqzEYbYflEFeXqC/IgjM2/+AzktSTb7+TZFBWHoqp9FjLDX2crpoah6gn8n+Uy32AkA==',
   'mqttsnet-thinglinks-node-red-common-0.0.1.tgz':
     'sha512-T6QN9RlBF0qbvujaAKNY81BjrcIdbqeqFkLfQsGuKHI8UY2cgad9prF8xUC5n4BbHbNJ7ftBmSBkj+IEZvTJWQ==',
 } as const;
+
+const protocolLockBytes = readFileSync(join(import.meta.dirname, '../../../../../scripts/protocol-seed/package-lock.json'));
+const protocolLock = JSON.parse(protocolLockBytes.toString()) as {
+  packages: Record<string, { name?: string; version: string; integrity: string; dependencies?: Record<string, string> }>;
+};
+const protocolSeed: Record<string, string> = {};
+for (const [path, item] of Object.entries(protocolLock.packages)) {
+  if (!path) continue;
+  const name = item.name ?? path.slice(path.lastIndexOf('node_modules/') + 13);
+  const file = `${name.replace(/^@/, '').replaceAll('/', '-')}-${item.version}.tgz`;
+  assert.match(file, /^[A-Za-z0-9_][A-Za-z0-9_.-]*\.tgz$/);
+  if (protocolSeed[file]) assert.equal(protocolSeed[file], item.integrity);
+  protocolSeed[file] = item.integrity;
+}
+for (const pin of PROTOCOL_PACKAGE_PINS) {
+  assert.equal(protocolLock.packages['']?.dependencies?.[pin.module], pin.version);
+  assert.equal(protocolLock.packages[`node_modules/${pin.module}`]?.integrity, pin.integrity);
+}
+const productionSeed: Record<string, string> = { ...platformSeed, ...protocolSeed };
 
 test('Docker builder 带 bash、curl 与精确生产种子', {
   skip: process.env['TLE_PLATFORM_BUILDER_IMAGE'] ? false : '仅发布制品门禁运行',
@@ -318,8 +338,7 @@ test('Docker builder 带 bash、curl 与精确生产种子', {
   const lines = r.stdout.trim().split('\n').sort();
   assert.deepEqual(lines, [
     '/bin/bash',
-    '/out/npm-seed/mqttsnet-thinglinks-edge-nodes-0.0.1.tgz',
-    '/out/npm-seed/mqttsnet-thinglinks-node-red-common-0.0.1.tgz',
+    ...Object.keys(productionSeed).map(file => `/out/npm-seed/${file}`),
     '/usr/bin/curl',
   ].sort());
 });
@@ -385,7 +404,7 @@ test('Docker runtime 只有精确生产种子、保留 raw bundle 且没有 bash
   assert.equal(observed.curl, 'ENOENT');
 });
 
-test('离线包 manifest SRI 与 SHA256SUMS 精确覆盖两个生产 tarball', {
+test('离线包 manifest SRI 与 SHA256SUMS 精确覆盖平台及协议依赖闭包', {
   skip: process.env['TLE_PLATFORM_OFFLINE_BUNDLE'] ? false : '仅发布制品门禁运行',
 }, () => {
   const bundle = process.env['TLE_PLATFORM_OFFLINE_BUNDLE']!;
@@ -393,15 +412,35 @@ test('离线包 manifest SRI 与 SHA256SUMS 精确覆盖两个生产 tarball', {
   assert.equal(listed.status, 0, listed.stderr);
   const entries = listed.stdout.trim().split('\n');
   const entry = (suffix: string) => {
-    const found = entries.find((candidate) => candidate.endsWith(suffix));
-    assert.ok(found, `离线包缺 ${suffix}`);
-    return found;
+    const found = entries.filter((candidate) => candidate.endsWith(suffix));
+    assert.equal(found.length, 1, `离线包缺失或重复 ${suffix}`);
+    const value = found[0]!;
+    assert.ok(/^[A-Za-z0-9_./-]+$/.test(value) && !value.startsWith('/') && !value.split('/').includes('..'));
+    return value;
   };
-  const readEntry = (suffix: string): Buffer => {
-    const r = spawnSync('tar', ['-xOzf', bundle, entry(suffix)]);
-    assert.equal(r.status, 0, String(r.stderr));
-    return r.stdout;
-  };
+  // Scan and extract the requested regular members once: hundreds of node archives must not
+  // decompress the large images.tar-containing distribution once per package.
+  const suffixes = ['/manifest.json', '/SHA256SUMS', '/node-seed/protocol-seed-manifest.json',
+    ...Object.keys(productionSeed).map(file => `/node-seed/${file}`)];
+  const selected = suffixes.map(entry);
+  const listing = spawnSync('tar', ['-tvzf', bundle], { encoding: 'utf8' });
+  assert.equal(listing.status, 0, listing.stderr);
+  const lines = listing.stdout.split('\n');
+  for (const member of selected) {
+    const matches = lines.filter(line => line.endsWith(` ${member}`));
+    assert.equal(matches.length, 1, `tar member is not unique: ${member}`);
+    assert.equal(matches[0]![0], '-', `tar member is not a regular file: ${member}`);
+  }
+  const scratch = realpathSync(mkdtempSync(join(tmpdir(), 'tle-production-seed-')));
+  try {
+    const extracted = spawnSync('tar', ['-xzf', bundle, '-C', scratch, '--', ...selected]);
+    assert.equal(extracted.status, 0, String(extracted.stderr));
+    const readEntry = (suffix: string): Buffer => {
+      const file = join(scratch, entry(suffix));
+      assert.ok(lstatSync(file).isFile() && !lstatSync(file).isSymbolicLink());
+      assert.equal(realpathSync(file), file);
+      return readFileSync(file);
+    };
 
   const manifest = JSON.parse(readEntry('/manifest.json').toString()) as {
     nodeSeed: string[];
@@ -410,10 +449,18 @@ test('离线包 manifest SRI 与 SHA256SUMS 精确覆盖两个生产 tarball', {
   assert.deepEqual(manifest.nodeSeed, Object.keys(productionSeed).sort());
   assert.deepEqual(manifest.nodeSeedIntegrity, productionSeed);
 
+  const protocolManifest = JSON.parse(readEntry('/node-seed/protocol-seed-manifest.json').toString()) as {
+    lockSha256: string; packages: { file: string; integrity: string }[];
+  };
+  assert.equal(protocolManifest.lockSha256, createHash('sha256').update(protocolLockBytes).digest('hex'));
+  assert.deepEqual(Object.fromEntries(protocolManifest.packages.map(item => [item.file, item.integrity])), protocolSeed);
+
   const sums = readEntry('/SHA256SUMS').toString();
   for (const file of Object.keys(productionSeed)) {
     const tarball = readEntry(`/node-seed/${file}`);
+    assert.equal(sri(tarball), productionSeed[file]);
     const sha256 = createHash('sha256').update(tarball).digest('hex');
     assert.match(sums, new RegExp(`^${sha256}  node-seed/${file.replaceAll('.', '\\.')}$`, 'm'));
   }
+  } finally { rmSync(scratch, { recursive: true, force: true }); }
 });

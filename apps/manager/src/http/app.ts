@@ -32,6 +32,7 @@ import { registerProxy } from './instance/proxy.ts';
 import { registerConsole } from './console.ts';
 import { registerNpmRegistry } from './nodes/registry.ts';
 import { registerNodeCatalog } from './nodes/catalog.ts';
+import { registerProtocols } from './protocols/catalog.ts';
 
 export type { ServerDeps } from './context.ts';
 
@@ -87,6 +88,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
      * /api/nodes/** 是管理面（node:view / node:manage）。
      */
     if (deps.nodeStore && deps.nodeCatalog) {
+      registerProtocols(api, ctx, { store: deps.nodeStore, catalog: deps.nodeCatalog });
       registerNpmRegistry(api, ctx, {
         store: deps.nodeStore,
         catalog: deps.nodeCatalog,

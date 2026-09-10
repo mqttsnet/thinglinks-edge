@@ -242,6 +242,24 @@ test('optionalDependencies 与 peerDependenciesMeta 一并读出来', () => {
   assert.deepEqual(meta.peerDependenciesMeta, { 'supports-color': { optional: true } });
 });
 
+test('安装生命周期、bin 与平台约束从原始包安全保留', () => {
+  const meta = readPackage(pack({ name: 'native-fixture', version: '1.0.0',
+    scripts: { preinstall: 'node pre.js', install: 'node-gyp-build', postinstall: 'node post.js', test: 'not-installed', build: 42 },
+    bin: { 'node-gyp-build': './bin.js', invalid: false },
+    os: ['linux', 123], cpu: ['arm64'], libc: ['musl'],
+  }));
+  assert.deepEqual(meta.scripts, { preinstall: 'node pre.js', install: 'node-gyp-build', postinstall: 'node post.js' });
+  assert.deepEqual(meta.bin, { 'node-gyp-build': './bin.js' });
+  assert.deepEqual(meta.os, ['linux']);
+  assert.deepEqual(meta.cpu, ['arm64']);
+  assert.deepEqual(meta.libc, ['musl']);
+  assert.equal(readPackage(pack({name:'single-bin',version:'1.0.0',bin:'./cli.js'})).bin, './cli.js');
+  const absent = readPackage(pack({name:'plain',version:'1.0.0',scripts:[],bin:42,os:'linux'}));
+  assert.equal(absent.scripts, undefined);
+  assert.equal(absent.bin, undefined);
+  assert.equal(absent.os, undefined);
+});
+
 test('可选依赖的缺口单独报，不和必需依赖混在一起', () => {
   const dir = tmp();
   try {

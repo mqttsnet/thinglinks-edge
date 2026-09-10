@@ -208,6 +208,8 @@ export function buildCreateOptions(
        * 表现是 502 或探针不通，而代理日志里只有一串解析不了的主机名。
        */
       ...(opts.proxyEnv ?? []),
+      // OPC UA 等协议库遵循 XDG；默认 HOME 位于只读镜像，配置必须写入受管数据目录。
+      'XDG_CONFIG_HOME=/data/.config',
     ],
     Labels: {
       'com.mqttsnet.thinglinks-edge.managed': 'true',
@@ -338,6 +340,7 @@ export function assertSafeCreateOptions(
   // 容器不会报错、只是退回 UTC —— 定时流程和时间戳整体偏移且毫无症状。
   // 类型系统在这里指望不上：测试文件被 tsconfig 排除，不参与类型检查。
   const env = (options['Env'] ?? []) as unknown[];
+  assertConfigDirectory(env);
   const tz = env.find((e) => typeof e === 'string' && e.startsWith('TZ='));
   const zone = typeof tz === 'string' ? tz.slice(3) : '';
   // 用运行时自带的时区库做真校验，而不是拿正则猜格式：
@@ -352,6 +355,13 @@ export function assertSafeCreateOptions(
   const pb = (hc['PortBindings'] ?? {}) as Record<string, unknown>;
   if (Object.keys(pb).some((k) => k.startsWith('1880/'))) {
     throw new SpecError('实例 1880 端口不得映射到宿主 —— 唯一入口必须是 Manager 反代');
+  }
+}
+
+function assertConfigDirectory(env: unknown[]): void {
+  const entries=env.filter((value)=>typeof value==='string' && value.startsWith('XDG_CONFIG_HOME='));
+  if (entries.length!==1 || entries[0]!=='XDG_CONFIG_HOME=/data/.config') {
+    throw new SpecError('协议库配置目录必须唯一固定为 /data/.config');
   }
 }
 
@@ -377,6 +387,7 @@ export function assertSafeMigrationProbeOptions(
   if (options['User'] !== 'node-red' || host['ReadonlyRootfs'] !== true) {
     throw new SpecError('probe 必须以只读根非 root 运行');
   }
+  assertConfigDirectory((options['Env'] ?? []) as unknown[]);
   for (const key of FORBIDDEN_HOST_CONFIG) {
     if (host[key] !== undefined) throw new SpecError(`probe 命中禁用项 HostConfig.${key}`);
   }

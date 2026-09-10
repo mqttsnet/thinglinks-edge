@@ -50,8 +50,30 @@ function safeArchiveEntry(entry) {
     && !entry.split('/').includes('..');
 }
 
-function assertTarRegular(archive, member, compressed, label) {
+/** Both listings preserve header order; avoid parsing owner/date/name columns that differ by tar implementation. */
+function outerTarMemberTypes(archive, entries) {
+  const listing = command('tar', ['-tvzf', archive]).trim().split('\n').filter(Boolean);
+  assert.equal(listing.length, entries.length, 'outer tar name/type listing counts must match');
+  const types = new Map();
+  for (const [index, line] of listing.entries()) {
+    const type = line[0];
+    // Reject links and special files globally, before extracting even the required files.
+    assert.ok(type === '-' || type === 'd',
+      `outer tar member type must be regular or directory: ${entries[index]}`);
+    const previous = types.get(entries[index]) ?? [];
+    types.set(entries[index], [...previous, type]);
+  }
+  return types;
+}
+
+function assertTarRegular(archive, member, compressed, label, indexedTypes) {
   assert.ok(safeArchiveEntry(member), `${label} has unsafe archive path: ${member}`);
+  if (indexedTypes) {
+    const types = indexedTypes.get(member) ?? [];
+    assert.equal(types.length, 1, `${label} must have exactly one tar header`);
+    assert.equal(types[0], '-', `${label} must be a regular tar member`);
+    return;
+  }
   const mode = compressed ? '-tvzf' : '-tvf';
   const listing = command('tar', [mode, archive, '--', member]).trim().split('\n').filter(Boolean);
   assert.equal(listing.length, 1, `${label} must have exactly one tar header`);
@@ -239,9 +261,11 @@ export function verifyOfflineBundle(bundleArg, expectedManagerTag, expectedManag
         assert.equal(dirname(selected[name]), packageRootEntry, name);
       }
     });
+    let memberTypes;
     check('关键 tar 成员均为普通文件', () => {
+      memberTypes = outerTarMemberTypes(bundle, entries);
       for (const name of REQUIRED) {
-        assertTarRegular(bundle, selected[name], true, name);
+        assertTarRegular(bundle, selected[name], true, name, memberTypes);
       }
     });
 
@@ -275,7 +299,7 @@ export function verifyOfflineBundle(bundleArg, expectedManagerTag, expectedManag
     const extraEntries = summedEntries.filter((entry) => !Object.values(selected).includes(entry));
     check('SHA256SUMS tar 成员均为普通文件', () => {
       for (const entry of extraEntries) {
-        assertTarRegular(bundle, entry, true, entry);
+        assertTarRegular(bundle, entry, true, entry, memberTypes);
       }
     });
     if (extraEntries.length > 0) {

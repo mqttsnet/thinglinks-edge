@@ -2,6 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   AdminApiError,
+  getFlowSnapshot,
+  setFlowSnapshot,
   getInstalledModules,
   getInstalledNodeSets,
   getModuleDetail,
@@ -98,4 +100,36 @@ test('uninstall rejects Node-RED error responses instead of reporting success', 
     () => uninstallModule(target, 'missing-node', fakeFetch({ code: 'not_found' }, 404)),
     (error: unknown) => error instanceof AdminApiError && error.status === 404,
   );
+});
+
+
+test('revision-aware flow read and append write use Node-RED v2 without restarting unchanged flows', async () => {
+  const requests: { headers: Headers; body: unknown }[] = [];
+  const fetcher = (async (url: string, init?: RequestInit) => {
+    if (url.endsWith('auth/token')) return new Response('{"access_token":"t"}');
+    requests.push({ headers: new Headers(init?.headers), body: init?.body ? JSON.parse(String(init.body)) : null });
+    return new Response(JSON.stringify(init?.method === 'POST' ? { rev: 'two' } : { rev: 'one', flows: [{ id: 'a', type: 'tab' }] }));
+  }) as typeof fetch;
+  const snapshot = await getFlowSnapshot(target, fetcher);
+  assert.equal(snapshot.rev, 'one');
+  assert.deepEqual(snapshot.flows, [{ id: 'a', type: 'tab' }]);
+  await setFlowSnapshot(target, snapshot, 'flows', fetcher);
+  assert.equal(requests[0]?.headers.get('node-red-api-version'), 'v2');
+  assert.equal(requests[1]?.headers.get('node-red-api-version'), 'v2');
+  assert.equal(requests[1]?.headers.get('node-red-deployment-type'), 'flows');
+  assert.deepEqual(requests[1]?.body, { rev: 'one', flows: [{ id: 'a', type: 'tab' }] });
+});
+
+test('revision-aware calls reject unsupported snapshots and report stale revision without retry', async () => {
+  await assert.rejects(() => getFlowSnapshot(target, fakeFetch([])), /版本|revision/);
+  await assert.rejects(() => getFlowSnapshot(target, fakeFetch({ flows: [] })), /版本|revision/);
+  let writes = 0;
+  const fetcher = (async (url: string) => {
+    if (url.endsWith('auth/token')) return new Response('{"access_token":"t"}');
+    writes += 1;
+    return new Response('{"code":"version_mismatch"}', { status: 409 });
+  }) as typeof fetch;
+  await assert.rejects(() => setFlowSnapshot(target, { rev: 'stale', flows: [] }, 'flows', fetcher),
+    (error: unknown) => error instanceof AdminApiError && error.status === 409 && /重新预览/.test(error.message));
+  assert.equal(writes, 1);
 });

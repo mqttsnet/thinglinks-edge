@@ -37,6 +37,8 @@ COPY apps/manager apps/manager
 COPY apps/web-console apps/web-console
 COPY packages packages
 COPY scripts/pack-nodes.sh scripts/pack-nodes.sh
+COPY scripts/prepare-protocol-seed.mjs scripts/prepare-protocol-seed.mjs
+COPY scripts/protocol-seed/package-lock.json scripts/protocol-seed/package-lock.json
 RUN pnpm --filter @thinglinks-edge/manager build
 # 控制台按相对路径构建（base: './'），挂载前缀由 Manager 运行期注入 <base href>
 RUN pnpm --filter @thinglinks-edge/web-console build
@@ -65,6 +67,12 @@ RUN bash ./scripts/pack-nodes.sh \
       --expect '@mqttsnet/thinglinks-edge-nodes@0.0.1=sha512-NKsIKyUHNyB+xuXNpCrOqzEYbYflEFeXqC/IgjM2/+AzktSTb7+TZFBWHoqp9FjLDX2crpoah6gn8n+Uy32AkA==' \
       --expect '@mqttsnet/thinglinks-node-red-common@0.0.1=sha512-T6QN9RlBF0qbvujaAKNY81BjrcIdbqeqFkLfQsGuKHI8UY2cgad9prF8xUC5n4BbHbNJ7ftBmSBkj+IEZvTJWQ==' \
       '@mqttsnet/thinglinks-edge-nodes@0.0.1'
+
+# 协议组件只随 Manager 提供离线安装包；不自动批准，也不装入每台实例。
+# 完整锁文件包含可选原生依赖，准备器逐个校验原始 tarball。
+RUN node --experimental-strip-types scripts/prepare-protocol-seed.mjs --out /out/protocol-seed
+RUN cp /out/protocol-seed/*.tgz /out/npm-seed/ && \
+    cp /out/protocol-seed/protocol-seed-manifest.json /out/npm-seed/
 
 # 使用者变更说明（vX.Y.Z.zh-CN.md）随镜像走：升级后控制台要弹一次。
 # 刻意放在所有 RUN **之后**：没有任何构建步骤读它，而发版前改文案是常事 ——

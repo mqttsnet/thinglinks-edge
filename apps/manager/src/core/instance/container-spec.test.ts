@@ -57,6 +57,18 @@ test('生成的配置默认安全：非 root、只读根、能力全裁、配额
   guard(o);
 });
 
+test('协议库配置目录固定在受管 data，不能缺失、越界或重复覆盖', () => {
+  const options=build(spec());
+  assert.ok((options['Env'] as string[]).includes('XDG_CONFIG_HOME=/data/.config'));
+  guard(options);
+  for (const entries of [[], ['XDG_CONFIG_HOME=/root/.config'],
+    ['XDG_CONFIG_HOME=/data/.config','XDG_CONFIG_HOME=/tmp/config']]) {
+    const invalid=build(spec());
+    invalid['Env']=[...(invalid['Env'] as string[]).filter((value)=>!value.startsWith('XDG_CONFIG_HOME=')),...entries];
+    assert.throws(()=>guard(invalid),/配置目录/);
+  }
+});
+
 test('bootstrap container gets the exact tx owner label while ordinary rebuilds never do', () => {
   const ordinary = build(spec());
   assert.equal((ordinary['Labels'] as Record<string, unknown>)[BOOTSTRAP_TX_LABEL], undefined);

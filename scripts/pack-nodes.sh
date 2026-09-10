@@ -32,12 +32,16 @@
 set -euo pipefail
 
 OUT_DIR="dist-nodes"
+LOCK_FILE=""
+DOWNLOAD_CACHE=""
 PKGS=()
 EXPECT_KEYS=()
 EXPECT_INTEGRITIES=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --out) shift; OUT_DIR="${1:?--out 后面要跟目录}" ;;
+    --lock-file) shift; LOCK_FILE="${1:?--lock-file 后面要跟固定 package-lock.json}" ;;
+    --download-cache) shift; DOWNLOAD_CACHE="${1:?--download-cache 后面要跟已下载档案目录}" ;;
     --expect)
       shift
       spec="${1:?--expect 后面要跟 name@version=integrity}"
@@ -61,12 +65,16 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-[ ${#PKGS[@]} -gt 0 ] || {
-  echo "用法：$0 [--out 目录] [--expect name@version=integrity] <包名>..." >&2
+[ ${#PKGS[@]} -gt 0 ] || [ -n "$LOCK_FILE" ] || {
+  echo "用法：$0 [--out 目录] [--lock-file package-lock.json] [--expect name@version=integrity] <包名>..." >&2
   exit 2
 }
 
-command -v npm >/dev/null || { echo "✗ 需要 npm" >&2; exit 1; }
+if [ -z "$LOCK_FILE" ]; then
+  command -v npm >/dev/null || { echo "✗ 需要 npm" >&2; exit 1; }
+else
+  [ -f "$LOCK_FILE" ] || { echo "✗ 固定 lock 文件不存在：$LOCK_FILE" >&2; exit 1; }
+fi
 command -v curl >/dev/null || { echo "✗ 需要 curl（按 lock 里的 resolved 地址取包体）" >&2; exit 1; }
 
 WORK="$(mktemp -d)"
@@ -100,16 +108,19 @@ DOWNLOAD_DIR="$WORK/downloads"
 mkdir -p "$DOWNLOAD_DIR"
 
 echo "── 解析依赖闭包 ──"
-printf '  %s\n' "${PKGS[@]}"
+[ ${#PKGS[@]} -eq 0 ] || printf '  %s\n' "${PKGS[@]}"
 echo
 
 # 1) 先装一遍，让 npm 自己把闭包解出来。
 #    --ignore-scripts：我们只要清单，不要在打包机上跑陌生包的安装脚本
-echo '{"name":"tle-node-seed","version":"1.0.0","private":true}' > "$WORK/package.json"
-( cd "$WORK" && npm install --cache "$WORK/npm-cache" --omit=dev --ignore-scripts --no-audit --no-fund \
-    --loglevel=error -- "${PKGS[@]}" ) || { echo "✗ 依赖解析失败" >&2; exit 1; }
-
-LOCK="$WORK/node_modules/.package-lock.json"
+if [ -n "$LOCK_FILE" ]; then
+  LOCK="$LOCK_FILE"
+else
+  echo '{"name":"tle-node-seed","version":"1.0.0","private":true}' > "$WORK/package.json"
+  ( cd "$WORK" && npm install --cache "$WORK/npm-cache" --omit=dev --ignore-scripts --no-audit --no-fund \
+      --loglevel=error -- "${PKGS[@]}" ) || { echo "✗ 依赖解析失败" >&2; exit 1; }
+  LOCK="$WORK/node_modules/.package-lock.json"
+fi
 [ -f "$LOCK" ] || { echo "✗ npm 没有生成 $LOCK —— 无法确定闭包" >&2; exit 1; }
 
 # 2) 从 lock 文件里列出闭包：每行 `<name>\t<version>\t<resolved>\t<integrity>`。
@@ -185,7 +196,9 @@ while IFS="$(printf '\t')" read -r name version url integrity; do
   # 与 npm pack 同款文件名：去掉 scope 的 @、把斜杠换成连字符
   file="$(printf '%s' "$name" | sed 's|^@||; s|/|-|g')-${version}.tgz"
   target="${DOWNLOAD_DIR}/${file}"
-  if ! curl -fsSL --retry 2 -o "$target" -- "$url"; then
+  if [ -n "$DOWNLOAD_CACHE" ] && [ -f "$DOWNLOAD_CACHE/$file" ]; then
+    cp -- "$DOWNLOAD_CACHE/$file" "$target" || { FAIL=$((FAIL + 1)); continue; }
+  elif ! curl -fsSL --retry 2 -o "$target" -- "$url"; then
     echo "  ✗ ${name}@${version}  取不到： $url" >&2
     rm -f "$target"
     FAIL=$((FAIL + 1))

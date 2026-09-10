@@ -53,6 +53,10 @@ function fixture({
   extraInnerTag = false,
   omitChecksumFor = '',
   duplicateChecksum = '',
+  extraFiles = 0,
+  extraType = 'regular',
+  duplicateExtra = false,
+  corruptExtra = false,
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'tle-offline-contract-test-'));
   const bin = join(root, 'bin');
@@ -125,17 +129,38 @@ function fixture({
   writeFileSync(join(stage, 'install.sh'), '#!/bin/sh\nset -e\n');
   writeFileSync(join(stage, 'README.md'), '# Offline fixture\n');
 
+  const extraNames = Array.from({ length: extraFiles }, (_, index) => `nodes/protocol ${index}.tgz`);
+  if (extraNames.length) {
+    mkdirSync(join(stage, 'nodes'));
+    for (const name of extraNames) writeFileSync(join(stage, name), `protocol archive fixture ${name}\n`);
+    if (extraType === 'symlink') {
+      rmSync(join(stage, extraNames[0]));
+      writeFileSync(join(root, 'outside-package'), 'outside fixture\n');
+      symlinkSync('../../outside-package', join(stage, extraNames[0]));
+    } else if (extraType === 'hardlink') {
+      assert.ok(extraNames.length >= 2);
+      rmSync(join(stage, extraNames[1]));
+      linkSync(join(stage, extraNames[0]), join(stage, extraNames[1]));
+    } else if (extraType === 'fifo') {
+      rmSync(join(stage, extraNames[0]));
+      assert.equal(spawnSync('mkfifo', [join(stage, extraNames[0])]).status, 0);
+    }
+  }
+
   const checksummed = [
     'images.tar', 'docker-compose.yml', 'docker-compose.offline.yml',
     'install.sh', 'README.md', 'manifest.json', '.env.example',
     ...(hardlinkEnv ? ['0-env-source'] : []),
+    ...extraNames,
   ].filter((name) => name !== omitChecksumFor);
   const checksumLines = checksummed
-    .map((name) => `${sha(join(stage, name))}  ${name}`);
+    .map((name) => `${extraType !== 'regular' && name === extraNames[0]
+      ? '0'.repeat(64) : sha(join(stage, name))}  ${name}`);
   if (duplicateChecksum) {
     checksumLines.push(`${sha(join(stage, duplicateChecksum))}  ${duplicateChecksum}`);
   }
   writeFileSync(join(stage, 'SHA256SUMS'), `${checksumLines.join('\n')}\n`);
+  if (corruptExtra) writeFileSync(join(stage, extraNames[0]), 'changed after checksum\n');
 
   const bundle = join(root, 'bundle.tar.gz');
   // GNU tar and BSD tar traverse directories differently. The first inode member
@@ -145,7 +170,19 @@ function fixture({
     ? ['0-env-source', ...readdirSync(stage).filter((name) => name !== '0-env-source').sort()]
       .map((name) => `${packageName}/${name}`)
     : [packageName];
+  if (duplicateExtra) outerMembers.push(`${packageName}/${extraNames[0]}`);
   assert.equal(spawnSync('/usr/bin/tar', ['-czf', bundle, '-C', root, '--', ...outerMembers]).status, 0);
+
+  const tarLog = join(root, 'tar-calls.jsonl');
+  writeFileSync(join(bin, 'tar'), `#!/usr/bin/env node
+const fs = require('node:fs');
+const { spawnSync } = require('node:child_process');
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(tarLog)}, JSON.stringify(args) + '\\n');
+const result = spawnSync('/usr/bin/tar', args, { stdio: 'inherit' });
+process.exit(result.status ?? 1);
+`);
+  chmodSync(join(bin, 'tar'), 0o755);
 
   const docker = join(bin, 'docker');
   writeFileSync(docker, `#!/bin/sh
@@ -157,6 +194,8 @@ printf '%s\\n' '{"services":{"manager":{"image":"${composeManager}","pull_policy
 
   return {
     root,
+    bundle,
+    tarCalls() { return readFileSync(tarLog, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)); },
     run() {
       return spawnSync(process.execPath, [VERIFY, bundle, MANAGER, MANAGER_ID], {
         encoding: 'utf8',
@@ -182,6 +221,40 @@ test('exact bundle 的 RepoTags、manifest、env 与 compose config 构成同一
     assert.doesNotMatch(result.stdout, /0\/0 通过/);
   } finally {
     bed.cleanup();
+  }
+});
+
+test('many extra delivery files use one outer verbose tar scan, including paths with spaces', () => {
+  const bed = fixture({ extraFiles: 24, packageName: 'offline package with spaces' });
+  try {
+    const result = bed.run();
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    const verboseScans = bed.tarCalls().filter(args => args[0] === '-tvzf' && args[1] === bed.bundle);
+    assert.equal(verboseScans.length, 1, 'outer member types must be read once, not by rescanning for each package');
+  } finally { bed.cleanup(); }
+});
+
+for (const extraType of ['symlink', 'hardlink', 'fifo']) {
+  test(`extra checksum member ${extraType} is rejected before extraction`, () => {
+    const bed = fixture({ extraFiles: 2, extraType });
+    try {
+      const result = bed.run();
+      assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
+      assert.match(result.stderr, /普通文件|regular tar member|member type/);
+      assert.equal(bed.tarCalls().some(args => args[0] === '-xzf'
+        && args.some(arg => arg.endsWith('/nodes/protocol 0.tgz') || arg.endsWith('/nodes/protocol 1.tgz'))), false);
+    } finally { bed.cleanup(); }
+  });
+}
+
+test('duplicate extra archive paths and changed extra bytes still fail the bundle contract', () => {
+  for (const option of [{ duplicateExtra: true }, { corruptExtra: true }]) {
+    const bed = fixture({ extraFiles: 2, ...option });
+    try {
+      const result = bed.run();
+      assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
+      assert.match(result.stderr, option.duplicateExtra ? /duplicate paths|路径唯一/ : /SHA256SUMS|checksum|FAILED/);
+    } finally { bed.cleanup(); }
   }
 });
 

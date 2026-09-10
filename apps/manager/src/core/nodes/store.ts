@@ -53,6 +53,12 @@ export interface PackageMeta {
   peerDependenciesMeta: Record<string, { optional?: boolean }>;
   /** package.json 的 engines，npm 的 --engine-strict 会看 */
   engines: Record<string, string>;
+  /** npm 安装阶段读取的公开元数据；遗漏 install/bin 会把自带预编译包误送进 node-gyp。 */
+  scripts?: Record<string, string>;
+  bin?: string | Record<string, string>;
+  os?: string[];
+  cpu?: string[];
+  libc?: string[];
   /** 文件字节数 */
   size: number;
   /** sha1，十六进制。npm 老字段，仍在用 */
@@ -159,6 +165,14 @@ export function readPackage(tgz: Buffer): Omit<PackageMeta, 'updatedAt'> {
   };
 
   const kw = pkg['keywords'];
+  const installScripts = Object.fromEntries(Object.entries(strMap(pkg['scripts']))
+    .filter(([name]) => ['preinstall', 'install', 'postinstall'].includes(name)));
+  const bin = typeof pkg['bin'] === 'string' ? pkg['bin']
+    : pkg['bin'] && typeof pkg['bin'] === 'object' && !Array.isArray(pkg['bin']) ? strMap(pkg['bin']) : undefined;
+  const platforms: { os?: string[]; cpu?: string[]; libc?: string[] } = {};
+  for (const field of ['os', 'cpu', 'libc'] as const) {
+    if (Array.isArray(pkg[field])) platforms[field] = pkg[field].filter((value): value is string => typeof value === 'string');
+  }
   return {
     name,
     version,
@@ -172,6 +186,9 @@ export function readPackage(tgz: Buffer): Omit<PackageMeta, 'updatedAt'> {
     peerDependencies: strMap(pkg['peerDependencies']),
     peerDependenciesMeta: metaMap(pkg['peerDependenciesMeta']),
     engines: strMap(pkg['engines']),
+    ...(Object.keys(installScripts).length > 0 ? { scripts: installScripts } : {}),
+    ...(bin !== undefined ? { bin } : {}),
+    ...platforms,
     size: tgz.length,
     shasum: createHash('sha1').update(tgz).digest('hex'),
     integrity: `sha512-${createHash('sha512').update(tgz).digest('base64')}`,

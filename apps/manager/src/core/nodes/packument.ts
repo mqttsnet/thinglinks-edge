@@ -31,6 +31,11 @@ interface VersionManifest {
   peerDependencies: Record<string, string>;
   peerDependenciesMeta: Record<string, { optional?: boolean }>;
   engines: Record<string, string>;
+  scripts?: Record<string, string>;
+  bin?: string | Record<string, string>;
+  os?: string[];
+  cpu?: string[];
+  libc?: string[];
   dist: { tarball: string; shasum: string; integrity: string };
 }
 
@@ -159,6 +164,11 @@ function manifest(store: NodeStore, meta: PackageMeta, base: string): VersionMan
     // 少了它，本来标着 optional 的 peer 会被 npm 当成硬依赖去装
     peerDependenciesMeta: meta.peerDependenciesMeta,
     engines: meta.engines,
+    ...(meta.scripts !== undefined ? { scripts: meta.scripts } : {}),
+    ...(meta.bin !== undefined ? { bin: meta.bin } : {}),
+    ...(meta.os !== undefined ? { os: meta.os } : {}),
+    ...(meta.cpu !== undefined ? { cpu: meta.cpu } : {}),
+    ...(meta.libc !== undefined ? { libc: meta.libc } : {}),
     dist: {
       tarball: tarballUrl(base, meta.name, meta.version),
       shasum: meta.shasum,

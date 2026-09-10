@@ -151,6 +151,23 @@ test('optionalDependencies 与 peerDependenciesMeta 进 packument', () => {
   });
 });
 
+test('私有源保留原始安装脚本、可执行入口与平台约束，不能触发默认 node-gyp rebuild', () => {
+  withStore((store) => {
+    store.add(pack({name:'native-fixture',version:'1.0.0',
+      scripts:{install:'node-gyp-build'},bin:{'node-gyp-build':'bin.js'},os:['linux'],cpu:['arm64'],libc:['musl']}));
+    const manifest=buildPackument(store,'native-fixture','http://private/')!.versions['1.0.0']!;
+    assert.deepEqual(manifest.scripts,{install:'node-gyp-build'});
+    assert.deepEqual(manifest.bin,{'node-gyp-build':'bin.js'});
+    assert.deepEqual(manifest.os,['linux']);
+    assert.deepEqual(manifest.cpu,['arm64']);
+    assert.deepEqual(manifest.libc,['musl']);
+    store.add(pack({name:'single-bin',version:'1.0.0',bin:'./cli.js'}));
+    assert.equal(buildPackument(store,'single-bin','http://private/')!.versions['1.0.0']!.bin,'./cli.js');
+    store.add(pack({name:'plain',version:'1.0.0'}));
+    assert.equal(buildPackument(store,'plain','http://private/')!.versions['1.0.0']!.scripts,undefined);
+  });
+});
+
 test('URL 里写明版本时按它取，而不是一律取库里最新的', () => {
   withStore((store) => {
     // 库里同时存着两版是常态：不同节点包各要一版

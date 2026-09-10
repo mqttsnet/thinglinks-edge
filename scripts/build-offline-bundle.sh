@@ -154,6 +154,11 @@ if [ -n "$NODE_SEED_DIR" ]; then
   [ "$SEED_COUNT" -gt 0 ] || { echo "✗ $NODE_SEED_DIR 里没有 .tgz —— 先跑 scripts/pack-nodes.sh" >&2; exit 1; }
   mkdir -p "${STAGE}/node-seed"
   find "$NODE_SEED_DIR" -maxdepth 1 -name '*.tgz' -exec cp {} "${STAGE}/node-seed/" \;
+  if [ -f "$NODE_SEED_DIR/protocol-seed-manifest.json" ]; then
+    # This directory also contains the separately pinned platform seed and may contain private packages.
+    node --experimental-strip-types scripts/prepare-protocol-seed.mjs --out "${STAGE}/node-seed" --verify-only --allow-additional-archives
+    cp "$NODE_SEED_DIR/protocol-seed-manifest.json" "${STAGE}/node-seed/protocol-seed-manifest.json"
+  fi
   echo
   echo "  ✓ 预置节点包 ${SEED_COUNT} 个（来自 ${NODE_SEED_DIR}）"
 fi
@@ -190,7 +195,7 @@ rm -f "$IMAGE_INDEX"
 ( cd "$STAGE" && shasum -a 256 images.tar docker-compose.yml docker-compose.offline.yml \
     install.sh README.md manifest.json .env.example \
     $(find changelogs -type f 2>/dev/null | sort) \
-    $(find node-seed -name '*.tgz' 2>/dev/null | sort) \
+    $(find node-seed -type f \( -name '*.tgz' -o -name 'protocol-seed-manifest.json' \) 2>/dev/null | sort) \
     > SHA256SUMS )
 
 # 6) 打包
