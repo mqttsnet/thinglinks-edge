@@ -185,3 +185,35 @@ test('close 之后回到未配置且客户端已关', async () => {
   assert.equal(runtime.state, 'unconfigured');
   assert.equal(clients[0]!.ended, true);
 });
+
+test('command listeners survive reconfiguration and responses cannot cross gateway identity', async () => {
+  const { buildEnvelope, parseEnvelopeFull } = await import('./envelope.ts');
+  const { runtime, last } = harness();
+  const mids: (number|string)[] = [];
+  runtime.onCommand((command) => mids.push(command.mid));
+  for (const gatewayId of ['gateway-a', 'gateway-b']) {
+    const current = config({ deviceIdentification: gatewayId });
+    await runtime.apply(current); last().goOnline();
+    last().emit('message', `/v1/devices/${gatewayId}/command`, Buffer.from(JSON.stringify(buildEnvelope({ cmd: 'set' }, current.cipher, { mid: 77 }))));
+  }
+  assert.deepEqual(mids, [77, 77]);
+  await assert.rejects(() => runtime.publishCommandResponse(77, {}, 'gateway-a'), /网关/);
+  await runtime.publishCommandResponse(77, {}, 'gateway-b');
+  assert.equal(parseEnvelopeFull(last().published.at(-1)!.payload, config().cipher).head.mid, 77);
+  await runtime.close();
+});
+
+test('only complete matching models enter a bounded cache which resets with cloud configuration',async()=>{
+ const {buildEnvelope,parseEnvelopeFull}=await import('./envelope.ts');const {runtime,last}=harness();
+ await runtime.apply(config());last().goOnline();
+ const fetch=async(filtered=false)=>{
+  const pending=runtime.fetchModel({productIdentification:'product',versionNo:'version',...(filtered?{serviceCodes:['env']}: {})});
+  const mid=parseEnvelopeFull(last().published.at(-1)!.payload,config().cipher).head.mid;
+  last().emit('message','/v1/devices/edge-gw-01/model/queryResponse',Buffer.from(JSON.stringify(buildEnvelope({statusCode:0,statusDesc:'success',versionNo:'version',model:{productIdentification:'product',services:[{serviceCode:'env'}]}},config().cipher,{mid}))));
+  await pending;
+ };
+ await fetch(true);assert.equal(runtime.getCachedModel('product','version'),undefined);
+ await fetch();const cached=runtime.getCachedModel('product','version');assert.equal(cached?.services?.[0]?.serviceCode,'env');
+ cached!.services=[];assert.equal(runtime.getCachedModel('product','version')?.services?.length,1);
+ await runtime.apply(config({enabled:false}));assert.equal(runtime.getCachedModel('product','version'),undefined);await runtime.close();
+});

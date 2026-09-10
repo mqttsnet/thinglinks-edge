@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createCipheriv } from 'node:crypto';
 import {
-  buildEnvelope, parseEnvelope, validateEnvelope, dataSignOf, nextMid, EnvelopeError,
+  buildEnvelope, parseEnvelope, parseEnvelopeFull, serializeEnvelope, validateEnvelope, dataSignOf, nextMid, EnvelopeError,
   type CipherParams,
 } from './envelope.ts';
 
@@ -18,6 +18,49 @@ const AES128: CipherParams = {
   encryptKey: '0123456789abcdef', encryptVector: 'abcdef0123456789',
 };
 const BODY = { services: [{ serviceId: 'env', data: { t: 21.5 } }] };
+
+test('Snowflake and signed Long mids round-trip as exact unquoted wire integers without changing business numbers', () => {
+  const params={cipherFlag:0 as const,signKey:SIGN_KEY};
+  for(const mid of ['480000000000000001','480000000000000002','9223372036854775807']) {
+    const raw=`{"head":{"cipherFlag":0,"mid":${mid},"timeStamp":${TS}},"dataBody":{"value":9007199254740993},"dataSign":"${dataSignOf(TS,SIGN_KEY)}"}`;
+    const parsed=parseEnvelopeFull<{value:number}>(raw,params);
+    assert.equal(parsed.head.mid,mid);
+    assert.equal(typeof parsed.body.value,'number');
+    assert.equal(parsed.body.value,JSON.parse('{"value":9007199254740993}').value);
+    const reply=serializeEnvelope(buildEnvelope({ok:true},params,{mid:parsed.head.mid,timeStamp:TS}));
+    assert.ok(reply.includes(`"mid":${mid},`));
+    assert.ok(!reply.includes(`"mid":"${mid}"`));
+    assert.equal(parseEnvelopeFull(reply,params).head.mid,mid);
+  }
+});
+
+test('wire mid rejects quoted, fractional, exponent, out-of-long-range and ambiguous duplicate tokens', () => {
+  const params={cipherFlag:0 as const,signKey:SIGN_KEY};
+  for(const token of ['"480000000000000001"','0','-1','1.5','1e3','9223372036854775808','99999999999999999999']) {
+    assert.throws(()=>parseEnvelopeFull(`{"head":{"mid":${token},"timeStamp":1,"cipherFlag":0},"dataBody":{},"dataSign":""}`,params),EnvelopeError,token);
+  }
+  assert.throws(()=>parseEnvelopeFull('{"head":{"mid":1,"mid":2,"timeStamp":1,"cipherFlag":0},"dataSign":""}',params),EnvelopeError);
+  const tricky=JSON.stringify({dataBody:{head:{mid:99},text:'"mid":33'},head:{mid:42,timeStamp:1,cipherFlag:0},dataSign:''})
+    .replace('"mid":42','"mi\\u0064":42');
+  assert.equal(parseEnvelopeFull(tricky,params).head.mid,42);
+  assert.throws(()=>parseEnvelopeFull('{"head":{"mid":1},"head":{"mid":2,"timeStamp":1,"cipherFlag":0},"dataSign":""}',params),EnvelopeError);
+});
+
+test('MID token extraction skips deeply nested business values without recursive parsing or numeric rewriting',()=>{
+  const nested='['.repeat(5000)+'0'+']'.repeat(5000);
+  const raw=`{"dataBody":${nested},"h\\u0065ad":{"mid":480000000000000001,"timeStamp":1,"cipherFlag":0},"dataSign":""}`;
+  assert.equal(parseEnvelopeFull(raw,{cipherFlag:0,signKey:SIGN_KEY}).head.mid,'480000000000000001');
+});
+
+test('large MID serialization preserves AES and SM4 payload encryption and signatures',()=>{
+  for(const cipherFlag of [1,2] as const) {
+    const params={...AES128,cipherFlag};
+    const raw=serializeEnvelope(buildEnvelope(BODY,params,{mid:'9223372036854775807',timeStamp:TS}));
+    const parsed=parseEnvelopeFull(raw,params);
+    assert.equal(parsed.head.mid,'9223372036854775807');
+    assert.deepEqual(parsed.body,BODY);
+  }
+});
 
 test('dataSign 与 JDK SHA-256 逐字节一致', () => {
   assert.equal(dataSignOf(TS, SIGN_KEY),

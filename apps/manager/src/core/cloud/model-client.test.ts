@@ -122,3 +122,29 @@ test('空模型不炸', () => {
   assert.equal(indexProperties({}).size, 0);
   assert.equal(indexProperties({ services: [] }).size, 0);
 });
+
+test('successful response must contain a coherent model and matching explicit version/product',async()=>{
+ for(const body of [
+  {statusCode:0,statusDesc:'success'},
+  {statusCode:0,statusDesc:'success',versionNo:'wrong',model:{productIdentification:'p',services:[]}},
+  {statusCode:0,statusDesc:'success',versionNo:'v',model:{productIdentification:'other',services:[]}},
+ ])await assert.rejects(()=>fetchModel(async()=>body,{productIdentification:'p',versionNo:'v'}),/模型|版本|产品/);
+});
+
+test('outer and model product identities must both match an explicit request on every page', async () => {
+  for (const identities of [
+    { productIdentification: 'requested', modelProduct: 'different' },
+    { productIdentification: 'different', modelProduct: 'requested' },
+  ]) {
+    await assert.rejects(() => fetchModel(async () => ({ statusCode: 0, statusDesc: 'ok', versionNo: 'v',
+      productIdentification: identities.productIdentification, model: { productIdentification: identities.modelProduct, services: [] } }),
+    { productIdentification: 'requested', versionNo: 'v' }), /产品/);
+  }
+  let page = 0;
+  await assert.rejects(() => fetchModel(async () => ({ statusCode: 0, statusDesc: 'ok', versionNo: 'v', productIdentification: 'requested',
+    model: { productIdentification: page++ === 0 ? 'requested' : 'different', services: [svc(`service-${page}`)] }, hasMore: page === 1 }),
+  { productIdentification: 'requested', versionNo: 'v' }), /产品/);
+  const valid = await fetchModel(async () => ({ statusCode: 0, statusDesc: 'ok', versionNo: 'v', productIdentification: 'requested',
+    model: { productIdentification: 'requested', services: [] } }), { productIdentification: 'requested', versionNo: 'v' });
+  assert.equal(valid.model.productIdentification, 'requested');
+});

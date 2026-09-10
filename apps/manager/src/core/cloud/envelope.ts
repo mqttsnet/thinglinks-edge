@@ -17,13 +17,14 @@
  *   · 密钥与向量取字符串的 **UTF-8 字节**，CBC + PKCS5Padding，输出**小写 HEX**
  */
 import { createHash, createCipheriv, createDecipheriv } from 'node:crypto';
+import { normalizeMid, midKey, midFromValidatedEnvelopeJson, type ProtocolMid } from './mid.ts';
 
 /** 0 明文 · 1 SM4 · 2 AES */
 export type CipherFlag = 0 | 1 | 2;
 
 export interface EnvelopeHead {
   cipherFlag: CipherFlag;
-  mid: number;
+  mid: ProtocolMid;
   timeStamp: number;
 }
 
@@ -128,10 +129,10 @@ function decryptHex(hex: string, params: CipherParams): string {
 export function buildEnvelope(
   payload: unknown,
   params: CipherParams,
-  opts: { mid?: number; timeStamp?: number } = {},
+  opts: { mid?: ProtocolMid; timeStamp?: number } = {},
 ): Envelope {
   const timeStamp = opts.timeStamp ?? Date.now();
-  const mid = opts.mid ?? nextMid();
+  const mid = normalizeMid(opts.mid ?? nextMid());
   const json = JSON.stringify(payload);
 
   return {
@@ -152,10 +153,20 @@ export function validateEnvelope(value: unknown): value is Envelope {
   const head = v['head'];
   if (typeof head !== 'object' || head === null) return false;
   const h = head as Record<string, unknown>;
-  const mid = Number(h['mid']);
+  try { normalizeMid(h['mid']); } catch { return false; }
   const ts = Number(h['timeStamp']);
   const flag = Number(h['cipherFlag']);
-  return mid > 0 && ts > 0 && Number.isInteger(flag) && flag >= 0 && flag <= 2;
+  return ts > 0 && Number.isInteger(flag) && flag >= 0 && flag <= 2;
+}
+
+/** Wire MID is always an unquoted integer token, even when represented internally as a string. */
+export function serializeEnvelope(envelope: Envelope): string {
+  if (!validateEnvelope(envelope)) throw new EnvelopeError('报文不符合信封结构');
+  const timeStamp=Number(envelope.head.timeStamp);
+  if (!Number.isFinite(timeStamp)) throw new EnvelopeError('timeStamp必须为有限数值');
+  const head=`{"cipherFlag":${Number(envelope.head.cipherFlag)},"mid":${midKey(envelope.head.mid)},"timeStamp":${timeStamp}}`;
+  const rest=JSON.stringify({dataBody:envelope.dataBody,dataSign:envelope.dataSign});
+  return `{"head":${head},${rest.slice(1)}`;
 }
 
 /**
@@ -169,11 +180,17 @@ export function parseEnvelopeFull<T = unknown>(
   params: CipherParams,
 ): { head: EnvelopeHead; body: T } {
   let value: unknown;
+  const text=typeof raw === 'string' ? raw : raw.toString('utf8');
   try {
-    value = JSON.parse(typeof raw === 'string' ? raw : raw.toString('utf8'));
+    value = JSON.parse(text);
   } catch {
     throw new EnvelopeError('报文不是合法 JSON');
   }
+  try {
+    const mid=midFromValidatedEnvelopeJson(text);
+    const parsed=value as {head:Record<string,unknown>};
+    parsed.head['mid']=mid;
+  } catch { throw new EnvelopeError('head.mid必须为正的有界Long整数token'); }
   if (!validateEnvelope(value)) throw new EnvelopeError('报文不符合信封结构');
 
   const { head, dataBody, dataSign } = value;
@@ -185,7 +202,7 @@ export function parseEnvelopeFull<T = unknown>(
   const flag = Number(head.cipherFlag) as CipherFlag;
   const normalizedHead: EnvelopeHead = {
     cipherFlag: flag,
-    mid: Number(head.mid),
+    mid: normalizeMid(head.mid),
     timeStamp: Number(head.timeStamp),
   };
 

@@ -16,9 +16,12 @@
  *   3. `connect()` 的 promise 被拒**不代表放弃**：mqtt.js 仍在按 reconnectPeriod
  *      重试。所以拒绝只记录成 lastError，不拆连接。
  */
-import { CloudGateway, type GatewayState, type GatewayOptions } from './gateway.ts';
+import { CloudGateway, type GatewayState, type GatewayOptions, type DownlinkCommand } from './gateway.ts';
+import type { ProtocolMid } from './mid.ts';
 import { isTlsScheme, type TlsMode } from './tls.ts';
+import type { ModelQueryRequest, ProductModel } from './model-client.ts';
 import type { CloudConfig } from './config-repo.ts';
+import type { SubDeviceStatus } from './topo.ts';
 
 /** 对外的连接状态。比 GatewayState 多两档，用来区分「没配」和「配了但关着」 */
 export type CloudState = GatewayState | 'unconfigured' | 'disabled';
@@ -59,6 +62,9 @@ export interface CloudRuntimeOptions {
 
 export class CloudRuntime {
   #gateway: CloudGateway | undefined;
+  #models = new Map<string, ProductModel>();
+  #commandHandlers = new Set<(command: DownlinkCommand) => void>();
+  #stateHandlers = new Set<(state: CloudState) => void>();
   #config: CloudConfig | undefined;
   #opts: CloudRuntimeOptions;
   #lastError = '';
@@ -90,6 +96,7 @@ export class CloudRuntime {
    * 不 await 连接结果 —— 见文件头第 1 点。返回的 promise 只表示「拆旧建新做完了」。
    */
   async apply(config: CloudConfig | undefined): Promise<void> {
+    this.#models.clear();
     await this.#teardown();
     this.#config = config;
     this.#lastError = '';
@@ -121,6 +128,9 @@ export class CloudRuntime {
       this.#emit(s, `云连接 ${s}`);
     });
 
+    gateway.onCommand((command) => {
+      if (this.#gateway === gateway) for (const handler of this.#commandHandlers) handler(command);
+    });
     this.#gateway = gateway;
     this.#connecting = gateway.connect().catch((e: unknown) => {
       // 连不上不是致命错误：客户端仍在后台重试，这里只留痕
@@ -173,6 +183,66 @@ export class CloudRuntime {
     }
   }
 
+  onCommand(handler: (command: DownlinkCommand) => void): () => void {
+    this.#commandHandlers.add(handler);
+    return () => this.#commandHandlers.delete(handler);
+  }
+
+  onStateChange(handler: (state: CloudState) => void): () => void {
+    this.#stateHandlers.add(handler);
+    return () => this.#stateHandlers.delete(handler);
+  }
+
+  publishCommandResponse(mid: ProtocolMid, body: unknown, expectedGatewayId?: string): Promise<void> {
+    if (!this.#gateway) return Promise.reject(new Error('云连接未配置'));
+    if (expectedGatewayId !== undefined && this.#config?.deviceIdentification !== expectedGatewayId) {
+      return Promise.reject(new Error('命令归属网关与当前云连接不一致，回执保留待重连'));
+    }
+    return this.#gateway.publishCommandResponse(mid, body);
+  }
+
+  async fetchModel(request: ModelQueryRequest) {
+    const gateway = this.#gateway;
+    if (!gateway) throw new Error('云连接未配置');
+    const response = await gateway.fetchModel(request);
+    if (this.#gateway !== gateway) throw new Error('云连接在模型查询期间发生变化，请重新查询');
+    if (request.productIdentification && request.versionNo && !request.serviceCodes?.length && !request.serviceOffset
+        && Buffer.byteLength(JSON.stringify(response.model)) <= 2 * 1024 * 1024) {
+      const key = JSON.stringify([request.productIdentification, request.versionNo]);
+      this.#models.delete(key);
+      this.#models.set(key, structuredClone(response.model));
+      if (this.#models.size > 16) this.#models.delete(this.#models.keys().next().value!);
+    }
+    return response;
+  }
+
+  async querySubDevices(deviceIds: string[], expectedGatewayId: string, signal?: AbortSignal): Promise<unknown> {
+    const gateway = this.#presenceGateway(expectedGatewayId);
+    const response = await gateway.querySubDevices(deviceIds, signal);
+    if (this.#gateway !== gateway) throw new Error('子设备查询期间云连接已变更');
+    return response;
+  }
+
+  async updateSubDeviceStatus(statuses: { deviceId: string; status: SubDeviceStatus }[], expectedGatewayId: string, signal?: AbortSignal): Promise<unknown> {
+    const gateway = this.#presenceGateway(expectedGatewayId);
+    const response = await gateway.updateSubDeviceStatus(statuses, signal);
+    if (this.#gateway !== gateway) throw new Error('子设备状态更新期间云连接已变更');
+    return response;
+  }
+
+  /** Surfaces background synchronization failures through the existing Cloud diagnostics. */
+  recordPresenceError(message: string): void { this.#recordError(`子设备状态：${message}`); }
+
+  #presenceGateway(expectedGatewayId: string): CloudGateway {
+    if (!this.#gateway || this.#config?.deviceIdentification !== expectedGatewayId) throw new Error('子设备归属网关与当前云连接不一致');
+    return this.#gateway;
+  }
+
+  getCachedModel(productIdentification: string, versionNo: string): ProductModel | undefined {
+    const model = this.#models.get(JSON.stringify([productIdentification, versionNo]));
+    return model ? structuredClone(model) : undefined;
+  }
+
   status(): CloudStatus {
     const c = this.#config;
     return {
@@ -195,6 +265,7 @@ export class CloudRuntime {
   }
 
   async close(): Promise<void> {
+    this.#models.clear();
     await this.#teardown();
     this.#config = undefined;
   }
@@ -214,5 +285,6 @@ export class CloudRuntime {
 
   #emit(state: CloudState, detail: string): void {
     this.#opts.onStateChange?.(state, detail);
+    for (const handler of this.#stateHandlers) handler(state);
   }
 }

@@ -11,15 +11,16 @@
  */
 import mqtt, { type MqttClient, type IClientOptions } from 'mqtt';
 import {
-  buildEnvelope, parseEnvelopeFull, nextMid, type CipherParams, type CipherFlag,
+  buildEnvelope, parseEnvelopeFull, serializeEnvelope, nextMid, type CipherParams, type CipherFlag,
 } from './envelope.ts';
+import { normalizeMid, midKey, type ProtocolMid } from './mid.ts';
 import {
   fetchModel, type ModelQueryRequest, type ModelQueryResponse, type ProductModel,
 } from './model-client.ts';
 import { tlsConnectOptions, DEFAULT_TLS, type TlsConfig } from './tls.ts';
 import { connectionOptions, DEFAULT_CONNECTION, type ConnectionOptions } from './connection.ts';
 import {
-  buildAddPayload, buildUpdatePayload, buildDeletePayload, chunk, summarizeAddResult,
+  buildAddPayload, buildQueryPayload, buildUpdatePayload, buildDeletePayload, chunk, summarizeAddResult,
   DEFAULT_BATCH_SIZE, TopoError,
   type SubDeviceInfo, type SubDeviceStatus, type TopoAddResult, type TopoOperationResult,
 } from './topo.ts';
@@ -79,6 +80,7 @@ export function topicsFor(version: string, deviceId: string) {
     topoDelete: `${base}/topo/delete`,
     topoDeleteResponse: `${base}/topo/deleteResponse`,
     topoQuery: `${base}/topo/query`,
+    topoQueryResponse: `${base}/topo/queryResponse`,
     modelQuery: `${base}/model/query`,
     modelQueryResponse: `${base}/model/queryResponse`,
   } as const;
@@ -86,6 +88,8 @@ export function topicsFor(version: string, deviceId: string) {
 
 export interface DownlinkCommand {
   topic: string;
+  mid: ProtocolMid;
+  gatewayId: string;
   /** 已验签并解密后的业务报文 */
   body: unknown;
 }
@@ -98,7 +102,7 @@ export class CloudGateway {
   #handlers = new Set<(cmd: DownlinkCommand) => void>();
   #stateHandlers = new Set<(s: GatewayState) => void>();
   /** mid → 等待中的请求。云侧响应沿用源 mid，这是关联的唯一依据 */
-  #pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>();
+  #pending = new Map<string, { topic: string; resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout; cleanup: () => void }>();
 
   constructor(options: GatewayOptions) {
     this.#o = options;
@@ -137,6 +141,8 @@ export class CloudGateway {
       // 会话队列有上限且不可控，断网一小时那种场景靠它兜不住。
       // 这一条**不做成可配**：打开会话保持等于同时开了两套续传，同一条数据发两遍
       clean: true,
+      // Presence requests use QoS0; never enqueue an old state for reconnect.
+      queueQoSZero: false,
       resubscribe: true,
       // 版本 / 心跳 / 超时 / 重连，全部来自落库的连接参数
       ...connectionOptions(this.#o.connection ?? DEFAULT_CONNECTION),
@@ -156,7 +162,7 @@ export class CloudGateway {
       // 响应 topic 必须在连上时就订阅：请求发出后再订阅会漏掉先到的响应
       client.subscribe(
         [this.topics.command, this.topics.topoAddResponse,
-         this.topics.topoUpdateResponse, this.topics.topoDeleteResponse,
+         this.topics.topoUpdateResponse, this.topics.topoDeleteResponse, this.topics.topoQueryResponse,
          this.topics.modelQueryResponse],
         { qos: this.#o.qos ?? 1 },
       );
@@ -179,9 +185,14 @@ export class CloudGateway {
   }
 
   #dispatch(topic: string, payload: Buffer): void {
-    let head: { mid: number };
+    if (payload.length > 256 * 1024) return;
+    let head: { mid: ProtocolMid };
     let body: unknown;
     try {
+      if (topic === this.topics.command || topic === this.topics.topoQueryResponse || topic === this.topics.topoUpdateResponse) {
+        const raw = JSON.parse(payload.toString('utf8')) as { dataSign?: unknown };
+        if (typeof raw?.dataSign !== 'string' || raw.dataSign.length !== 64) return;
+      }
       ({ head, body } = parseEnvelopeFull(payload, this.#o.cipher));
     } catch (e) {
       // 拆不开就丢弃并留痕：静默吞掉会让「云端发了但现场没反应」无从查起
@@ -190,15 +201,17 @@ export class CloudGateway {
     }
 
     // 先看是不是某次请求的响应；是就兑现，不再当成命令派发
-    const waiter = this.#pending.get(head.mid);
-    if (waiter) {
-      this.#pending.delete(head.mid);
-      clearTimeout(waiter.timer);
+    const key=midKey(head.mid);
+    const waiter = this.#pending.get(key);
+    if (waiter && waiter.topic === topic) {
+      this.#pending.delete(key);
+      waiter.cleanup();
       waiter.resolve(body);
       return;
     }
 
-    for (const fn of this.#handlers) fn({ topic, body });
+    if (topic !== this.topics.command) return;
+    for (const fn of this.#handlers) fn({ topic, mid: head.mid, gatewayId: this.#o.credentials.deviceIdentification, body });
   }
 
   /**
@@ -207,24 +220,40 @@ export class CloudGateway {
    * 靠 `mid` 关联 —— 云侧 `buildResponse(src, ...)` 沿用源 mid。
    * 超时必须报错而不是静默挂着：注册失败要能被上层看见并重试。
    */
-  async #request<T>(topic: string, payload: unknown): Promise<T> {
+  async #request<T>(topic: string, payload: unknown, opts: { signal?: AbortSignal | undefined; ephemeral?: boolean } = {}): Promise<T> {
     const client = this.#client;
     if (!client || this.#state !== 'online') {
       throw new Error(`网关未连接（当前 ${this.#state}），请求未发出`);
     }
+    if (opts.signal?.aborted) throw new Error('请求已取消');
+    if (this.#pending.size >= 64) throw new Error('云端请求队列已满');
     const mid = nextMid();
+    const key=midKey(mid);
     const envelope = buildEnvelope(payload, this.#o.cipher, { mid });
     const timeoutMs = this.#o.requestTimeoutMs ?? 15_000;
 
     const waited = new Promise<T>((resolve, reject) => {
+      const cancel = () => {
+        const pending = this.#pending.get(key);
+        if (!pending) return;
+        this.#pending.delete(key); pending.cleanup(); pending.reject(new Error('请求已取消'));
+      };
       const timer = setTimeout(() => {
-        this.#pending.delete(mid);
+        this.#pending.delete(key); cleanup();
         reject(new Error(`请求超时（${timeoutMs}ms）：${topic} mid=${mid}`));
       }, timeoutMs);
-      this.#pending.set(mid, { resolve: resolve as (v: unknown) => void, reject, timer });
+      const cleanup = () => { clearTimeout(timer); opts.signal?.removeEventListener('abort', cancel); };
+      this.#pending.set(key, { topic: `${topic}Response`, resolve: resolve as (v: unknown) => void, reject, timer, cleanup });
+      opts.signal?.addEventListener('abort', cancel, { once: true });
     });
 
-    await client.publishAsync(topic, JSON.stringify(envelope), { qos: this.#o.qos ?? 1 });
+    // Presence is retried by its coordinator after rechecking live evidence and ownership. QoS1's
+    // outgoing store would replay an obsolete ONLINE even after this request's waiter timed out.
+    void client.publishAsync(topic, serializeEnvelope(envelope), { qos: opts.ephemeral ? 0 : (this.#o.qos ?? 1) }).catch((error: unknown) => {
+      const pending = this.#pending.get(key);
+      this.#pending.delete(key);
+      if (pending) { pending.cleanup(); pending.reject(error as Error); }
+    });
     return waited;
   }
 
@@ -260,13 +289,19 @@ export class CloudGateway {
     return { ok: failed.length === 0, succeeded, failed };
   }
 
+  /** Ownership verification uses the official query topic and explicit candidate IDs. */
+  querySubDevices(deviceIds: string[], signal?: AbortSignal): Promise<unknown> {
+    return this.#request(this.topics.topoQuery, buildQueryPayload(deviceIds), { signal, ephemeral: true });
+  }
+
   /** 上报子设备在线状态 */
   updateSubDeviceStatus(
     statuses: { deviceId: string; status: SubDeviceStatus }[],
+    signal?: AbortSignal,
   ): Promise<TopoOperationResult> {
     const gatewayId = this.#o.credentials.deviceIdentification;
     return this.#request<TopoOperationResult>(
-      this.topics.topoUpdate, buildUpdatePayload(gatewayId, statuses));
+      this.topics.topoUpdate, buildUpdatePayload(gatewayId, statuses), { signal, ephemeral: true });
   }
 
   /**
@@ -299,7 +334,21 @@ export class CloudGateway {
       ? this.#o.cipher
       : { ...this.#o.cipher, cipherFlag: opts.cipherFlag };
     const envelope = buildEnvelope(payload, cipher);
-    await client.publishAsync(topic, JSON.stringify(envelope), { qos: this.#o.qos ?? 1 });
+    await client.publishAsync(topic, serializeEnvelope(envelope), { qos: this.#o.qos ?? 1 });
+  }
+
+  /** Cloud command acknowledgements must reuse the incoming mid, never generate a new one. */
+  async publishCommandResponse(mid: ProtocolMid, body: unknown): Promise<void> {
+    const normalizedMid=normalizeMid(mid);
+    if (!this.#client || this.#state !== 'online') throw new Error('网关未连接，命令回执未发送');
+    const envelope = buildEnvelope(body, this.#o.cipher, { mid:normalizedMid });
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        this.#client.publishAsync(this.topics.commandResponse, serializeEnvelope(envelope), { qos: this.#o.qos ?? 1 }),
+        new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error('命令回执MQTT发布确认超时')), this.#o.requestTimeoutMs ?? 15_000); }),
+      ]);
+    } finally { if (timer) clearTimeout(timer); }
   }
 
   /** 上报点位数据 */
@@ -310,7 +359,7 @@ export class CloudGateway {
   async close(): Promise<void> {
     // 挂着的请求要显式失败，否则调用方会一直 await 到永远
     for (const [, w] of this.#pending) {
-      clearTimeout(w.timer);
+      w.cleanup();
       w.reject(new Error('网关已关闭'));
     }
     this.#pending.clear();

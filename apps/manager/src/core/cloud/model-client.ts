@@ -46,6 +46,27 @@ export interface ModelProperty {
   description?: string;
 }
 
+export interface ModelCommandParameter {
+  parameterCode: string;
+  parameterName?: string;
+  parameterDescription?: string;
+  datatype?: string;
+  required?: string | number | boolean;
+  min?: string | number;
+  max?: string | number;
+  maxlength?: string | number;
+  enumlist?: string;
+  description?: string;
+}
+
+export interface ModelCommand {
+  commandCode: string;
+  commandName?: string;
+  description?: string;
+  requests?: ModelCommandParameter[];
+  responses?: ModelCommandParameter[];
+}
+
 export interface ModelService {
   serviceCode: string;
   serviceName?: string;
@@ -53,7 +74,7 @@ export interface ModelService {
   serviceStatus?: number;
   description?: string;
   properties?: ModelProperty[];
-  commands?: unknown[];
+  commands?: ModelCommand[];
 }
 
 export interface ProductModel {
@@ -127,6 +148,20 @@ export async function fetchModel(
     }
 
     const page = res.model;
+    if (!page || typeof page !== 'object' || Array.isArray(page) || (page.services !== undefined && !Array.isArray(page.services))) {
+      throw new ModelQueryError(-1, '云端成功响应缺少有效物模型');
+    }
+    const product = res.productIdentification ?? page.productIdentification ?? merged?.productIdentification;
+    if (req.productIdentification && (product !== req.productIdentification
+      || [res.productIdentification, page.productIdentification].some(identity => identity !== undefined && identity !== req.productIdentification))) {
+      throw new ModelQueryError(-1, '返回产品与请求不一致');
+    }
+    if (req.versionNo && res.versionNo !== req.versionNo) throw new ModelQueryError(-1, '返回物模型版本与请求不一致');
+    if (versionNo !== undefined && res.versionNo !== undefined && versionNo !== res.versionNo) throw new ModelQueryError(-1, '物模型分片版本发生变化');
+    if ((page.services?.length ?? 0) + services.length > 10000) throw new ModelQueryError(-1, '物模型服务数量超过上限');
+    if (page.services?.some(service => !service || typeof service.serviceCode !== 'string' || services.some(existing => existing.serviceCode === service.serviceCode))) {
+      throw new ModelQueryError(-1, '物模型服务缺少编码或分片重复');
+    }
     if (!merged) {
       // 只留产品级字段，services 由各片累加而来
       const { services: _ignored, ...productLevel } = page ?? {};

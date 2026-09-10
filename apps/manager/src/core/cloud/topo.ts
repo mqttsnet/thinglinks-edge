@@ -152,3 +152,12 @@ export function summarizeAddResult(result: TopoAddResult): {
     failed,
   };
 }
+
+/** Cloud TopoQueryDeviceParam takes an explicit list; it is not a list-all operation. */
+export function buildQueryPayload(deviceIds: string[]): { deviceIds: string[] } {
+  if (!deviceIds.length || deviceIds.length > DEFAULT_BATCH_SIZE) throw new TopoError('查询设备数量必须为 1..100');
+  if (deviceIds.some(id => typeof id !== 'string' || !id.trim() || id.length > 128) || new Set(deviceIds).size !== deviceIds.length) {
+    throw new TopoError('查询设备标识为空、过长或重复');
+  }
+  return { deviceIds };
+}
