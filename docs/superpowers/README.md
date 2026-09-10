@@ -33,3 +33,4 @@ Specs and plans are planning artifacts. Their existence, status, or checked boxe
 | Version | Topic | Spec | Plan | Current meaning |
 |---|---|---|---|---|
 | 1.0.2 | Node-RED published package migration | [Design](specs/v1.0.2-node-red-published-package-migration-design.md) | [Implementation plan](plans/v1.0.2-node-red-published-package-migration.md) | Planning context only; not implementation or verification proof |
+| 1.0.3 | Protocol components and acquisition templates | [Design](specs/v1.0.3-protocol-templates-design.md) | [Implementation plan](plans/v1.0.3-protocol-templates.md) | Implementation scope and contracts; acceptance requires separate test evidence |
