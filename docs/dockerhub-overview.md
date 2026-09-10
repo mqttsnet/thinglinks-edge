@@ -75,7 +75,6 @@ Point the compose stack at the rootless socket in `.env`:
 
 ```bash
 DOCKER_SOCK=/run/user/1000/docker.sock
-DOCKER_GID=1000
 ```
 
 Find the socket your Docker actually uses with:
@@ -98,23 +97,22 @@ Pre-release tags (`1.1.0-rc1`) never move `1.0`, `1.1` or `latest`.
 
 ## Quick start
 
-This image is **not meant to be run on its own with `docker run`**. The Manager creates
-Node-RED instances as *sibling containers*, so it needs a Docker endpoint and a host data
-directory wired up correctly. Compose does that wiring for you:
+The image contains the complete Manager and web console. Use this release's
+`docker-compose.yml` to prepare its restricted Docker endpoint, persistent data and default Node-RED image automatically.
+
+1. Download the matching `docker-compose.yml` into a dedicated directory.
+2. Fill in the access URL and a chosen administrator password (at least 12 characters) at the top.
+3. Run:
 
 ```bash
-git clone https://github.com/mqttsnet/thinglinks-edge.git
-cd thinglinks-edge
-cp .env.example .env         # at minimum set EXTERNAL_URL and MASTER_KEY
 docker compose up -d
-docker compose logs manager | grep '\[init\]'   # the initial password is printed once
 ```
 
-Then open `EXTERNAL_URL` in a browser. The console is served by the Manager itself —
-there is no second container to deploy and no separate web server to configure.
-
-Only `docker-compose.yml` and `.env` are actually needed at runtime; the clone is just
-the most convenient way to get them.
+Open the configured URL and log in as **admin** with that password. No source checkout,
+Node.js installation, `.env`, manual key generation, Docker group lookup or separate Node-RED pull is needed.
+A new deployment without a valid password does not open the listener; existing accounts are not reset during upgrades.
+Put the password in the quoted `x-initial-password` scalar; escape `$` as `$$` according to Compose syntax.
+Keep the configuration file private.
 
 ### Upgrading
 
@@ -131,22 +129,24 @@ just because the management console is being upgraded.
 
 ## Configuration
 
-Set these in `.env`. Only the first two are required — the process **refuses to start**
-without them rather than falling back to a guess or a default secret.
+These are optional advanced overrides in `.env`. Ordinary deployments edit only the URL and initial password at the top of the Compose file. Existing `.env` settings are preserved.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `EXTERNAL_URL` | — **required** | The address users reach this box at, e.g. `http://192.168.10.20:19100`. Every outward-facing URL, redirect and cookie policy is derived from it; the process never infers its own address from request headers. Include the path when it sits behind a corporate reverse proxy at a sub-path. |
-| `MASTER_KEY` | — **required** | Encryption key for stored instance credentials. Generate with `openssl rand -hex 32`. **Back it up with your data directory** — losing it makes stored credentials unrecoverable. |
+| `EXTERNAL_URL` | `http://localhost:19100` in Compose | The address users reach this box at, e.g. `http://192.168.10.20:19100`. Every outward-facing URL, redirect and cookie policy is derived from it; the process never infers its own address from request headers. Include the path when it sits behind a corporate reverse proxy at a sub-path. |
+| `MASTER_KEY` | *(empty)* | Legacy environment key. New deployments automatically generate a private key file; existing values preserve the encryption identity. |
+| `MASTER_KEY_FILE` | `<EDGE_DATA_ROOT>/.master.key` | Persistent private key, generated only for a fresh deployment. Store it separately and securely; business backups exclude it. |
+| `INITIAL_PASSWORD` | *(empty)* | Optional legacy environment override for the chosen initial admin password. New accounts require at least 12 characters; existing accounts are unchanged. |
+| `ADMIN_SETUP_MODE` | `password` in Compose | Refuses fresh startup without the chosen password. `browser` retains legacy local/trusted-network browser setup. |
 | `EDGE_DATA_ROOT` | `/data01/mqttsnet/thinglinks-edge` | Host persistence root. The Manager database and every instance's `/data` live under it — one directory to back up, one to look at when troubleshooting. |
 | `TZ` | `Asia/Shanghai` | Timezone for the Manager **and** every instance it creates. Node-RED's official image defaults to UTC; leaving this unset silently skews scheduled flows, shift logic and log timestamps. |
-| `HOST_PORT` / `BIND_ADDR` | `19100` / `127.0.0.1` | Published port. Loopback-only by default — set `BIND_ADDR=0.0.0.0` to expose it directly, or put a reverse proxy in front. |
+| `HOST_PORT` / `BIND_ADDR` | `19100` / `0.0.0.0` | Published port. Set `BIND_ADDR=127.0.0.1` when using a host reverse proxy. |
 | `INSTANCE_PORT_MIN` / `MAX` | `30000` / `30999` | Host port range allocated to instances |
 | `ALLOWED_IMAGE_TAGS` | `5.0.7-24-minimal,5.0.4-24-minimal,4.1.13-22-minimal` | Node-RED image tags instances may use — an allowlist, not a suggestion |
 | `EDGE_METRICS_INTERVAL_SEC` | `10` | Health-trend sampling interval; `0` disables it. Samples are kept **in memory only** so the box's SD/eMMC card isn't written to every 10 seconds. |
 | `ALLOWED_ORIGINS` | *(empty)* | Extra WebSocket/CORS origins, comma-separated |
 | `UPDATE_CHECK_URL` | *(empty)* | Update checking is **off by default and never phones home**. Many sites have no internet, and industrial customers care about outbound connections. Set it explicitly to opt in. |
-| `DOCKER_GID` | `0` | GID of `docker.sock`, used only by the restricted proxy. Find it with `stat -c '%g' /var/run/docker.sock`. |
+| `NODE_RED_BOOTSTRAP_IMAGE` | `nodered/node-red:5.0.7-24-minimal` | Image automatically prepared by Compose before Manager starts; offline packages select an image actually present in the bundle. |
 
 ---
 

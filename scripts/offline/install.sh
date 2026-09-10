@@ -8,7 +8,7 @@
 # 它做五件事，每件都先检查再动手：
 #   1. 校验包完整（U 盘拷贝坏一半的包，load 时报的是 unexpected EOF，看不出是文件坏了）
 #   2. 把镜像 load 进本机 docker
-#   3. 备好 .env（MASTER_KEY 现场生成，绝不预置在包里）
+#   3. 备好访问地址与初始管理员密码（加密主密钥由 Manager 自动持久化）
 #   4. 把随包的预置节点包放进数据目录（包里带了才做）
 #   5. 起服务，并等到健康检查通过才算成功
 #
@@ -53,16 +53,9 @@ if [ ! -f .env ]; then
   say "  已从模板生成 .env"
 fi
 
-# MASTER_KEY 必须现场生成：预置在包里等于所有客户共用一把密钥，
-# 那还不如不加密 —— 它保护的是实例凭据与备份
-if ! grep -q '^MASTER_KEY=.\+' .env; then
-  KEY="$(openssl rand -hex 32 2>/dev/null || head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-  [ -n "$KEY" ] || die "生成 MASTER_KEY 失败：本机既没有 openssl 也读不到 /dev/urandom"
-  # BSD 与 GNU 的 sed -i 参数不同，直接重写整行更省事
-  grep -v '^MASTER_KEY=' .env > .env.tmp && printf 'MASTER_KEY=%s\n' "$KEY" >> .env.tmp && mv .env.tmp .env
-  chmod 600 .env
-  say "  ✓ 已生成 MASTER_KEY（在 .env 里，请与数据目录一起备份，丢了实例凭据解不开）"
-fi
+# Manager 首次启动生成并持久化独立密钥文件；升级时沿用原文件或旧 MASTER_KEY。
+# 安装器不能看到 .env 留空就另造一把密钥，否则会破坏已部署系统的加密身份。
+chmod 600 .env
 
 if ! grep -q '^EXTERNAL_URL=.\+' .env; then
   if [ "$ASSUME_YES" = "1" ]; then
@@ -75,6 +68,14 @@ if ! grep -q '^EXTERNAL_URL=.\+' .env; then
   read -r URL
   [ -n "$URL" ] || die "EXTERNAL_URL 不能为空 —— 所有对外链接、跳转与 Cookie 策略都由它派生"
   grep -v '^EXTERNAL_URL=' .env > .env.tmp && printf 'EXTERNAL_URL=%s\n' "$URL" >> .env.tmp && mv .env.tmp .env
+fi
+
+if [ "$ASSUME_YES" = "0" ] && ! grep -q '^INITIAL_PASSWORD=.\+' .env && [ -z "${INITIAL_PASSWORD:-}" ]; then
+  say "  首次部署请设置至少 12 位初始管理员密码；已有账号的升级可直接回车。"
+  IFS= read -r -s -p '  初始管理员密码：' INITIAL_PASSWORD || die "未读取到初始密码"
+  say ""
+  # 仅传给本次 Compose 启动；不输出到日志，也不另存一份明文密码文件。
+  export INITIAL_PASSWORD
 fi
 
 # ── 4. 预置节点包（01 号文 5.7）─────────────────────────
@@ -114,19 +115,21 @@ docker compose -f docker-compose.yml -f docker-compose.offline.yml up -d
 
 say ""
 printf '  等待健康检查'
+HEALTHY=0
 for _ in $(seq 1 60); do
   state="$(docker compose ps --format '{{.Name}} {{.Status}}' 2>/dev/null | grep manager || true)"
   case "$state" in
-    *healthy*) say ""; say "  ✓ ${state}"; break ;;
+    *"(healthy)"*) HEALTHY=1; say ""; say "  ✓ ${state}"; break ;;
   esac
   printf '.'
   sleep 2
 done
+[ "$HEALTHY" = "1" ] || die "Manager 未就绪，请检查访问地址、初始密码和 docker compose logs manager"
 
 say ""
 say "── 完成 ──"
 say "  控制台： $(grep '^EXTERNAL_URL=' .env | cut -d= -f2-)"
-say "  首次打开会让你设置管理员账号与口令。"
+say "  首次部署请使用 admin 和刚才配置的密码登录；已有账号保持不变。"
 say ""
 if [ -d node-seed ]; then
   # 不在这里逐个列名字：一个节点包连着十几个依赖包，列出来是几十行噪音。

@@ -102,6 +102,7 @@ export function createInvocationIdentity({
     managerName: `${prefix}-manager`,
     proxyName: `${prefix}-docker-proxy`,
     initName: `${prefix}-init-data`,
+    nodeRedImageName: `${prefix}-node-red-image`,
     instanceName: `tle-nr-${instanceId}`,
     seedPackage: `${SEED_BASE}-${scope}`,
     fakeImages: Object.freeze({
@@ -388,6 +389,7 @@ export function expectedDockerResources(identity) {
     composeContainer(identity.managerName, 'manager', 20),
     composeContainer(identity.proxyName, 'docker-proxy', 21),
     composeContainer(identity.initName, 'init-data', 22),
+    composeContainer(identity.nodeRedImageName, 'node-red-image', 23),
     {
       kind: 'container', name: identity.instanceName, cleanupOrder: 10,
       labels: { [MANAGED_LABEL]: 'true', [INSTANCE_LABEL]: identity.instanceId },
@@ -673,11 +675,12 @@ export async function runVerification() {
     writeFileSync(join(installArea.path, '.env'), [
       `EXTERNAL_URL=${baseUrl}`,
       `MASTER_KEY=${randomBytes(32).toString('hex')}`,
+      `INITIAL_PASSWORD=${SETUP_PW}`,
       `MANAGER_IMAGE=${envTemplate.get('MANAGER_IMAGE')}`,
       `PROXY_IMAGE=${envTemplate.get('PROXY_IMAGE')}`,
       `INIT_IMAGE=${envTemplate.get('INIT_IMAGE')}`,
       `NODE_RED_IMAGE_REPO=${nodeRepo}`,
-      'DOCKER_GID=0',
+      `NODE_RED_BOOTSTRAP_IMAGE=${envTemplate.get('NODE_RED_BOOTSTRAP_IMAGE')}`,
       'BIND_ADDR=127.0.0.1',
       `HOST_PORT=${port}`,
       `INSTANCE_NETWORK=${identity.instanceNetworkBase}`,
@@ -700,6 +703,7 @@ export async function runVerification() {
       identity.managerName,
       identity.proxyName,
       identity.initName,
+      identity.nodeRedImageName,
       identity.composeNetwork,
     ]) {
       await captureDockerResource(raw, dockerLedger,
@@ -729,17 +733,24 @@ export async function runVerification() {
     requireCheck('装完 Manager 就绪并可访问', ready, ready ? baseUrl : '超时');
 
     const state = await (await fetch(`${baseUrl}/api/setup`)).json();
-    requireCheck('全新安装进入首次设置状态', state.needed === true);
+    requireCheck('全新安装已配置管理员，不开放匿名首次设置', state.needed === false);
     const setupRes = await fetch(`${baseUrl}/api/setup`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ username: 'admin', password: SETUP_PW }),
     });
-    const cookie = (setupRes.headers.getSetCookie?.() ?? [])
+    requireCheck('离线安装也拒绝匿名抢先创建管理员', setupRes.status === 409);
+    const loginRes = await fetch(`${baseUrl}/api/login`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: SETUP_PW }),
+    });
+    const loginBody = await loginRes.json();
+    const cookie = (loginRes.headers.getSetCookie?.() ?? [])
       .map((value) => value.split(';')[0]).join('; ');
     const csrf = /tle_csrf=([^;]+)/.exec(cookie)?.[1] ?? '';
-    requireCheck('设置管理员后直接拿到会话', setupRes.status === 200 && Boolean(csrf),
-      `HTTP ${setupRes.status}`);
+    requireCheck('初始密码直接登录且不要求重复改密',
+      loginRes.status === 200 && Boolean(csrf) && loginBody.user?.mustChangePassword === false,
+      `HTTP ${loginRes.status}`);
     const headers = { cookie, 'x-csrf-token': csrf, 'content-type': 'application/json' };
 
     const store = await (await fetch(`${baseUrl}/api/nodes/store`, { headers })).json();

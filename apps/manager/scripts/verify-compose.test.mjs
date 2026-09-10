@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
@@ -63,4 +65,27 @@ test('init-data 不创建无用的 Compose default network', () => {
   const initBlock = compose.slice(compose.indexOf('  init-data:'), compose.indexOf('\n  manager:'));
   assert.match(initBlock, /network_mode:\s*none/);
   assert.doesNotMatch(initBlock, /\n\s+networks:/);
+});
+
+test('顶部自选密码经过真实 Compose 解析后保持特殊字符且关闭匿名认领', () => {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'tle-compose-password-'));
+  try {
+    const password = 'fixture}-$HOME-${VALUE}-#-:-"-password';
+    const source = readFileSync(join(dirname(SCRIPT), '../../../docker-compose.yml'), 'utf8');
+    const edited = source.replace(/^x-initial-password: &initial-password ""$/m,
+      () => `x-initial-password: &initial-password ${JSON.stringify(password.replaceAll('$', () => '$$'))}`);
+    assert.notEqual(edited, source, 'the password is edited as a quoted scalar, not inside interpolation syntax');
+    const file = join(root, 'compose.yml');
+    const envFile = join(root, 'empty.env');
+    writeFileSync(file, edited, { mode: 0o600 });
+    writeFileSync(envFile, '', { mode: 0o600 });
+    const parsed = JSON.parse(execFileSync('docker', [
+      'compose', '-f', file, '--env-file', envFile, 'config', '--format', 'json',
+    ], { encoding: 'utf8', env: { PATH: process.env.PATH } }));
+    // Normalized Compose output escapes dollars for round-trip serialization.
+    // verify-compose.mjs also logs in with a literal special-character password.
+    assert.equal(parsed.services.manager.environment.COMPOSE_INITIAL_PASSWORD.replaceAll('$$', '$'), password);
+    assert.equal(parsed.services.manager.environment.INITIAL_PASSWORD, '');
+    assert.equal(parsed.services.manager.environment.ADMIN_SETUP_MODE, 'password');
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

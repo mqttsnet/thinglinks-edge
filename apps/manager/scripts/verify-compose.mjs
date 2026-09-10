@@ -35,7 +35,7 @@ const COMPOSE_PROJECT_LABEL = 'com.docker.compose.project';
 const COMPOSE_SERVICE_LABEL = 'com.docker.compose.service';
 const REVIEWED_MANAGER_IMAGE = process.env.MANAGER_IMAGE?.trim() ?? '';
 const PROXY_IMAGE = process.env.PROXY_IMAGE?.trim() || 'wollomatic/socket-proxy:1.13.1';
-const NODE_IMAGE = 'nodered/node-red:5.0.4-24-minimal';
+const NODE_IMAGE = 'nodered/node-red:5.0.7-24-minimal';
 const PROJECT = `tle-compose-${RUN_ID}`;
 /*
  * 用独立的名字前缀，好让验证能在「现场栈正开着」时照跑。
@@ -46,14 +46,13 @@ const PREFIX = `tle-cv-${RUN_ID}`;
 const MGR = `${PREFIX}-manager`;
 const PROXY = `${PREFIX}-docker-proxy`;
 const INIT = `${PREFIX}-init-data`;
-const GID_HELPER = `${PREFIX}-socket-gid`;
+const NODE_PREPARE = `${PREFIX}-node-red-image`;
 const NET = `tle-cv-net-${RUN_ID}`;
 /** 首次设置时现场指定的口令。这一串**不该出现在任何日志里** */
-const SETUP_PW = `Aa1!${randomBytes(20).toString('base64url')}`;
-const MASTER_KEY = randomBytes(48).toString('base64url');
+const SETUP_PW = `Aa1!}-$HOME-#-:"-${randomBytes(20).toString('base64url')}`;
 const ID = `cva${RUN_ID}`;
 const BROKEN_ID = `cvb${RUN_ID}`;
-const TAG = '5.0.4-24-minimal';
+const TAG = '5.0.7-24-minimal';
 const CANONICAL_TMP_PARENT = realpathSync(existsSync('/private/tmp') ? '/private/tmp' : '/tmp');
 assert.ok(CANONICAL_TMP_PARENT === '/private/tmp' || CANONICAL_TMP_PARENT === '/tmp');
 
@@ -65,6 +64,7 @@ let TEST_EDGE_ROOT;
 let TEST_DATA_ROOT;
 let envFile;
 let overrideFile;
+let composeFile;
 let managerImageId;
 let proxyImageId;
 let initImageId;
@@ -114,7 +114,8 @@ function probeInstanceRegistry(instanceContainerId, managerContainerId, network)
 const composeEnvironment = () => {
   const env = { ...process.env };
   for (const key of [
-    'EXTERNAL_URL', 'MASTER_KEY', 'DOCKER_GID', 'BIND_ADDR', 'HOST_PORT',
+    'EXTERNAL_URL', 'MASTER_KEY', 'MASTER_KEY_FILE', 'DOCKER_GID', 'BIND_ADDR', 'HOST_PORT',
+    'INITIAL_PASSWORD', 'COMPOSE_INITIAL_PASSWORD', 'ADMIN_SETUP_MODE', 'SETUP_WINDOW_MIN', 'NODE_RED_BOOTSTRAP_IMAGE',
     'INSTANCE_NETWORK', 'ALLOWED_IMAGE_TAGS', 'EDGE_DATA_ROOT', 'EDGE_NAME_PREFIX',
     'INSTANCE_PORT_MIN', 'INSTANCE_PORT_MAX', 'EDGE_NODE_INSTALL_POLICY',
     'EDGE_NPM_UPSTREAM', 'NODE_RED_IMAGE_REPO',
@@ -123,32 +124,30 @@ const composeEnvironment = () => {
   if (managerImageId) env.MANAGER_IMAGE = managerImageId;
   if (proxyImageId) env.PROXY_IMAGE = proxyImageId;
   if (initImageId) env.INIT_IMAGE = initImageId;
+  if (nodeImageId) env.NODE_RED_BOOTSTRAP_IMAGE = nodeImageId;
   return env;
 };
 const compose = (...args) => sh(
   [
     'compose', '-p', PROJECT,
-    '-f', 'docker-compose.yml', '-f', overrideFile,
+    '-f', composeFile, '-f', overrideFile,
     '--env-file', envFile, ...args,
   ],
   { stdio: 'pipe', env: composeEnvironment() },
 );
 
-async function socketGid() {
-  const gid = sh([
-    'run', '--name', GID_HELPER,
-    '--label', `${RUN_LABEL}=${RUN_ID}`, '--label', `${INSTANCE_LABEL}=${ID}`,
-    '--label', `${ROLE_LABEL}=socket-gid`, '--user', '0:0', '--read-only',
-    '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true',
-    '-v', '/var/run/docker.sock:/var/run/docker.sock:ro',
-    managerImageId, 'stat', '-c', '%g', '/var/run/docker.sock',
-  ]).trim();
-  await captureContainer(GID_HELPER, verifyLabels('socket-gid', ID));
-  await removeExactContainer(GID_HELPER, (info) => {
-    assert.ok(hasLabels(info.Config?.Labels, verifyLabels('socket-gid', ID)));
-  });
-  assert.match(gid, /^\d+$/);
-  return gid;
+function keyProof() {
+  return JSON.parse(sh(['exec', MGR, 'node', '--input-type=module', '-e', `
+    import {statSync} from 'node:fs';
+    import {createHash} from 'node:crypto';
+    import {loadMasterKey} from '/app/dist/core/auth/master-key.js';
+    const key=loadMasterKey();
+    console.log(JSON.stringify({
+      digest:createHash('sha256').update(key).digest('hex'),
+      mode:statSync(process.env.MASTER_KEY_FILE).mode & 511,
+      environmentKey:Boolean(process.env.MASTER_KEY)
+    }));
+  `]).trim());
 }
 
 const isDockerNotFound = (error) => error?.statusCode === 404;
@@ -218,6 +217,8 @@ async function createRunRoot() {
   OWNER_FILE = join(RUN_ROOT, '.verifier-owner');
   envFile = join(RUN_ROOT, '.env');
   overrideFile = join(RUN_ROOT, 'compose.verify.json');
+  composeFile = join(RUN_ROOT, 'docker-compose.yml');
+  writeFileSync(composeFile, await readFile(join(REPO, 'docker-compose.yml')), { flag: 'wx', mode: 0o600 });
   TEST_EDGE_ROOT = join(RUN_ROOT, 'edge-data');
   TEST_DATA_ROOT = join(TEST_EDGE_ROOT, 'instances');
   await mkdir(TEST_EDGE_ROOT, { mode: 0o700 });
@@ -383,7 +384,7 @@ async function cleanupItems(items, kind, verifyOwnership) {
 }
 
 async function captureComposeResources() {
-  const expected = new Map([[MGR, 'manager'], [PROXY, 'docker-proxy'], [INIT, 'init-data']]);
+  const expected = new Map([[MGR, 'manager'], [PROXY, 'docker-proxy'], [INIT, 'init-data'], [NODE_PREPARE, 'node-red-image']]);
   for (const [name, service] of expected) {
     await captureContainer(name, {
       [COMPOSE_PROJECT_LABEL]: PROJECT, [COMPOSE_SERVICE_LABEL]: service,
@@ -397,7 +398,7 @@ async function captureComposeResources() {
 }
 
 async function assertComposeOwnership() {
-  const services = new Map([[MGR, 'manager'], [PROXY, 'docker-proxy'], [INIT, 'init-data']]);
+  const services = new Map([[MGR, 'manager'], [PROXY, 'docker-proxy'], [INIT, 'init-data'], [NODE_PREPARE, 'node-red-image']]);
   for (const [name, service] of services) {
     const id = immutableContainerIds.get(name);
     const info = id ? await inspectOrAbsent(raw.getContainer(id)) : undefined;
@@ -423,7 +424,7 @@ async function cleanup() {
     await cleanupItems(await composeContainers(), 'container', (info) => {
       const service = info.Config?.Labels?.[COMPOSE_SERVICE_LABEL];
       assert.equal(info.Config?.Labels?.[COMPOSE_PROJECT_LABEL], PROJECT);
-      assert.ok(['manager', 'docker-proxy', 'init-data'].includes(service));
+      assert.ok(['manager', 'docker-proxy', 'init-data', 'node-red-image'].includes(service));
       assert.equal(info.Name, `/${PREFIX}-${service}`);
     });
     assert.deepEqual(await composeContainers(), []);
@@ -513,40 +514,22 @@ async function main() {
   assert.deepEqual(await managedContainers(), []);
   assert.deepEqual(await managedNetworks(), []);
 
-  /*
-   * 必填变量缺失时必须拒绝，而不是带空值起来。
-   *
-   * 一次只留空一个变量、逐个验：compose 只报**它先撞上的那一个**，
-   * 而遍历顺序不稳定 —— 两个都留空时约四分之一的运行会报 MASTER_KEY 而非
-   * EXTERNAL_URL。断言写死其中一个名字就会随机翻绿翻红。
-   */
-  const refusalFor = (missing) => {
-    const lines = ['EXTERNAL_URL=http://127.0.0.1:1', 'MASTER_KEY=x']
-      .filter((l) => !l.startsWith(`${missing}=`));
-    writeFileSync(envFile, lines.join('\n') + `\n${missing}=\n`, { mode: 0o600 });
-    try {
-      compose('config', '--quiet');
-      return null;                                  // 竟然通过了校验
-    } catch (e) {
-      return String(e.stderr ?? e.message).trim();
-    }
-  };
+  // Fresh deployment requires neither a hand-written key nor Docker group lookup.
+  writeFileSync(envFile, '', { mode: 0o600 });
+  const defaults = JSON.parse(compose('config', '--format', 'json')).services;
+  check('没有 .env 配置也能解析，密钥采用持久化文件模式',
+    defaults.manager.environment.MASTER_KEY === ''
+      && defaults.manager.environment.MASTER_KEY_FILE.endsWith('/.master.key')
+      && defaults.manager.environment.EXTERNAL_URL === 'http://localhost:19100');
+  check('默认实例镜像由 Compose 准备并阻止 Manager 提前启动',
+    defaults['node-red-image'].image === nodeImageId
+      && defaults.manager.depends_on['node-red-image'].condition === 'service_completed_successfully');
 
-  for (const v of ['EXTERNAL_URL', 'MASTER_KEY']) {
-    const msg = refusalFor(v);
-    check(`缺 ${v} 时 compose 拒绝启动并指名`,
-          msg !== null && msg.includes(v),
-          msg === null ? '竟然通过了校验' : msg.split('\n')[0].slice(0, 64));
-  }
-
-  const dockerGid = await socketGid();
   writeFileSync(envFile, [
     `EXTERNAL_URL=${B}`,
-    `MASTER_KEY=${MASTER_KEY}`,
     `MANAGER_IMAGE=${managerImageId}`,
     `PROXY_IMAGE=${proxyImageId}`,
     `INIT_IMAGE=${initImageId}`,
-    `DOCKER_GID=${dockerGid}`,
     'BIND_ADDR=127.0.0.1',
     `HOST_PORT=${PORT}`,
     `INSTANCE_NETWORK=${NET}`,
@@ -560,8 +543,27 @@ async function main() {
     'EDGE_NPM_UPSTREAM=',
   ].join('\n') + '\n', { mode: 0o600 });
 
+  compose('up', '-d', '--no-build');
+  await captureComposeResources();
+  let passwordRefused = false;
+  for (let attempt = 0; attempt < 40 && !passwordRefused; attempt++) {
+    await sleep(250);
+    passwordRefused = compose('logs', '--tail', '30', 'manager').includes('首次部署需要初始管理员密码');
+  }
+  const exposedWithoutPassword = await fetch(`${B}/healthz`).then((r) => r.ok).catch(() => false);
+  check('首次未填密码时拒绝启动，不开放匿名管理员认领', passwordRefused && !exposedWithoutPassword);
+  const unconfiguredManagerId = immutableContainerIds.get(MGR);
+  compose('stop', 'manager');
+
+  const deployment = await readFile(composeFile, 'utf8');
+  const configured = deployment.replace(/^x-initial-password: &initial-password ""$/m,
+    () => `x-initial-password: &initial-password ${JSON.stringify(SETUP_PW.replaceAll('$', () => '$$'))}`);
+  assert.notEqual(configured, deployment);
+  writeFileSync(composeFile, configured, { mode: 0o600 });
   console.log('  · docker compose up -d --no-build（固定已审查镜像）…');
   compose('up', '-d', '--no-build');
+  await requireDockerAbsent(raw.getContainer(unconfiguredManagerId), 'unconfigured Manager');
+  immutableContainerIds.delete(MGR);
   await captureComposeResources();
 
   let ready = false;
@@ -583,6 +585,18 @@ async function main() {
   assert.deepEqual(controlNetwork.IPAM.Config.map((entry) => entry.Subnet),
     [overrides.networks['edge-docker'].ipam.config[0].subnet]);
   check('compose Manager 使用显式不可变镜像 ID', info.Image === managerImageId);
+  const firstKey = keyProof();
+  check('首次自动生成私有密钥，恢复命令可读取且密钥未进入容器环境',
+    /^[a-f0-9]{64}$/.test(firstKey.digest) && firstKey.mode === 0o600 && !firstKey.environmentKey);
+  const preparedNode = await raw.getContainer(NODE_PREPARE).inspect();
+  check('Node-RED 准备容器成功退出且没有运行实例或挂载数据',
+    preparedNode.Image === nodeImageId && preparedNode.State.Status === 'exited'
+      && preparedNode.State.ExitCode === 0 && preparedNode.HostConfig.NetworkMode === 'none'
+      && preparedNode.Mounts.length === 0);
+  const automaticProxy = await raw.getContainer(PROXY).inspect();
+  check('代理无需手工配置 Docker 组，且无额外 capabilities 或宿主端口',
+    automaticProxy.Config.User === '0:0' && automaticProxy.HostConfig.CapDrop.includes('ALL')
+      && Object.keys(automaticProxy.HostConfig.PortBindings ?? {}).length === 0);
   check('只读根文件系统已生效', info.HostConfig.ReadonlyRootfs === true);
   check('已禁止提权（no-new-privileges）',
         (info.HostConfig.SecurityOpt ?? []).some((o) => /no-new-privileges/.test(o)));
@@ -611,17 +625,24 @@ async function main() {
         /\[init\]/.test(logs) ? '有 [init] 行但不含口令' : '');
 
   const state = await (await fetch(`${B}/api/setup`)).json();
-  check('全新部署上匿名读得到「需要首次设置」', state.needed === true, JSON.stringify(state));
+  check('服务器首次启动已创建管理员，不开放匿名认领', state.needed === false);
 
   const setupRes = await fetch(`${B}/api/setup`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ username: 'admin', password: SETUP_PW }),
   });
-  const cookie = (setupRes.headers.getSetCookie?.() ?? []).map((c) => c.split(';')[0]).join('; ');
+  check('匿名请求不能抢先创建管理员', setupRes.status === 409);
+  const loginRes = await fetch(`${B}/api/login`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'admin', password: SETUP_PW }),
+  });
+  const loginBody = await loginRes.json();
+  const cookie = (loginRes.headers.getSetCookie?.() ?? []).map((c) => c.split(';')[0]).join('; ');
   const csrf = /tle_csrf=([^;]+)/.exec(cookie)?.[1] ?? '';
-  check('设置完直接带着会话进去，不必再登录一次',
-        setupRes.status === 200 && cookie.includes('tle_sid') && Boolean(csrf),
-        `HTTP ${setupRes.status}`);
+  check('配置的密码直接登录，不再要求重复改密',
+        loginRes.status === 200 && cookie.includes('tle_sid') && Boolean(csrf)
+          && loginBody.user?.mustChangePassword === false,
+        `HTTP ${loginRes.status}`);
   const H = { cookie, 'x-csrf-token': csrf, 'content-type': 'application/json' };
 
   /*
@@ -828,6 +849,7 @@ async function main() {
     recreatedReady = await fetch(`${B}/healthz`).then((r) => r.ok).catch(() => false);
   }
   check('只重建 Manager 后仍就绪', recreatedReady);
+  check('重建 Manager 后复用原密钥文件', keyProof().digest === firstKey.digest);
 
   await requireDockerAbsent(raw.getContainer(managerBeforeRecreate), 'replaced Manager id');
   immutableContainerIds.delete(MGR);
@@ -991,9 +1013,20 @@ async function main() {
     assert.equal(current.Labels?.[MANAGED_LABEL], 'false');
   });
 
+  // Only this disposable deployment loses its key. It must fail closed with its DB intact.
+  sh(['exec', MGR, 'node', '-e', "require('node:fs').unlinkSync(process.env.MASTER_KEY_FILE)"]);
+  compose('restart', 'manager');
+  let missingKeyRefused = false;
+  for (let attempt = 0; attempt < 40 && !missingKeyRefused; attempt++) {
+    await sleep(250);
+    missingKeyRefused = compose('logs', '--tail', '30', 'manager').includes('已有数据但密钥文件缺失');
+  }
+  check('已有数据库丢失密钥时明确拒绝启动且不生成替代密钥',
+    missingKeyRefused && !existsSync(join(TEST_EDGE_ROOT, '.master.key')));
+
   await assertComposeOwnership();
   compose('down', '-v');
-  for (const name of [MGR, PROXY, INIT]) {
+  for (const name of [MGR, PROXY, INIT, NODE_PREPARE]) {
     const id = immutableContainerIds.get(name);
     assert.ok(id);
     await requireDockerAbsent(raw.getContainer(id), `compose container ${id}`);

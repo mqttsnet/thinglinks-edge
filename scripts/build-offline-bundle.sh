@@ -122,6 +122,7 @@ upsert_env MANAGER_IMAGE "$MANAGER_IMAGE" "${STAGE}/.env.example"
 upsert_env PROXY_IMAGE "$PROXY_IMAGE" "${STAGE}/.env.example"
 upsert_env INIT_IMAGE "$INIT_IMAGE" "${STAGE}/.env.example"
 upsert_env NODE_RED_IMAGE_REPO "$NODE_RED_REPO" "${STAGE}/.env.example"
+upsert_env NODE_RED_BOOTSTRAP_IMAGE "${IMAGES[3]}" "${STAGE}/.env.example"
 upsert_env ALLOWED_IMAGE_TAGS "$ALLOWED_IMAGE_TAGS" "${STAGE}/.env.example"
 cat > "${STAGE}/docker-compose.offline.yml" <<'YAML'
 # 离线覆盖：任何服务都不许去网上拉镜像。
@@ -133,6 +134,8 @@ services:
   docker-proxy:
     pull_policy: never
   init-data:
+    pull_policy: never
+  node-red-image:
     pull_policy: never
   manager:
     pull_policy: never

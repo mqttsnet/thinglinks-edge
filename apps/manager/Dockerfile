@@ -129,6 +129,9 @@ COPY --from=builder /out/npm-seed ./npm-seed
 # @thinglinks 节点集：创建实例时整份拷进实例数据目录，由 nodesDir 加载
 COPY --from=builder /repo/packages/thinglinks-nodes ./nodes
 COPY --from=builder /repo/changelogs ./changelogs
+# 与镜像一起交付准确匹配的部署文件，现场不需要克隆源码或另找下载地址。
+# docker run --rm --entrypoint cat mqttsnet/thinglinks-edge:1.0.1 /app/docker-compose.yml
+COPY docker-compose.yml ./docker-compose.yml
 
 # 非 root 运行（04-安全设计 第 96 行）。node 镜像自带 uid/gid 1000 的 node 用户。
 # 访问宿主 docker.sock 另需把容器加入 socket 所属组（compose 里的 group_add），

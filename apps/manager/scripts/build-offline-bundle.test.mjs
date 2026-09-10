@@ -133,12 +133,14 @@ test('bundle 写入实际镜像配置且 images.tar RepoTags 可供 compose 寻�
       PROXY_IMAGE: env.PROXY_IMAGE,
       INIT_IMAGE: env.INIT_IMAGE,
       NODE_RED_IMAGE_REPO: env.NODE_RED_IMAGE_REPO,
+      NODE_RED_BOOTSTRAP_IMAGE: env.NODE_RED_BOOTSTRAP_IMAGE,
       ALLOWED_IMAGE_TAGS: env.ALLOWED_IMAGE_TAGS,
     }, {
       MANAGER_IMAGE: MANAGER,
       PROXY_IMAGE: PROXY,
       INIT_IMAGE: INIT,
       NODE_RED_IMAGE_REPO: NODE_REPO,
+      NODE_RED_BOOTSTRAP_IMAGE: `${NODE_REPO}:${TAGS}`,
       ALLOWED_IMAGE_TAGS: TAGS,
     });
     const manifest = JSON.parse(spawnSync('/usr/bin/tar', [

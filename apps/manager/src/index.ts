@@ -6,7 +6,9 @@
  */
 import { loadConfig } from './core/config.ts';
 import { openDb } from './core/db.ts';
-import { requireMasterKey, deriveKey } from './core/auth/crypto.ts';
+import { deriveKey } from './core/auth/crypto.ts';
+import { loadMasterKey } from './core/auth/master-key.ts';
+import { initializeAdministrator } from './core/auth/initialization.ts';
 import { AuthService } from './core/auth/service.ts';
 import { InstanceRepo } from './core/instance/repo.ts';
 import { allowedNodeRedImageTags } from './core/instance/image-policy.ts';
@@ -275,7 +277,7 @@ async function runRestore(argv: string[]): Promise<void> {
     return;
   }
   await assertNoRestoreTransaction(config.dataRoot);
-  const key = deriveKey(requireMasterKey(), 'thinglinks-edge:instance-cred');
+  const key = deriveKey(loadMasterKey(), 'thinglinks-edge:instance-cred');
   const archive = await readFile(files[0]!);
 
   const manifest = await restoreBackup({
@@ -339,6 +341,7 @@ async function runPreflightCli(argv: string[]): Promise<void> {
 
 interface ProductionManagerStartupContext {
   config: ReturnType<typeof loadConfig>;
+  key: Buffer;
   db: ReturnType<typeof openDb>;
   nodeStore: NodeStore;
   nodeCatalog: NodeCatalog;
@@ -362,6 +365,11 @@ export async function main(overrides: InternalManagerOverrides = {}): Promise<vo
     initializeData: async () => {
       const config = loadConfig();
       await assertNoRestoreTransaction(config.dataRoot);
+      // Resolve before openDb: a missing key must never be replaced after data exists.
+      const key = deriveKey(loadMasterKey(process.env, {
+        databasePath: join(config.dataDir, 'edge.db'),
+        instanceDataRoot: config.instanceDataRoot,
+      }), 'thinglinks-edge:instance-cred');
       const db = openDb(join(config.dataDir, 'edge.db'));
       const nodeStore = new NodeStore(join(config.dataDir, 'npm'));
       const nodeCatalog = new NodeCatalog(db);
@@ -371,7 +379,7 @@ export async function main(overrides: InternalManagerOverrides = {}): Promise<vo
         const line = describeSeed(seedDir, seedFromDir(nodeStore, seedDir));
         if (line) console.log(`[nodes] ${line}`);
       }
-      return { config, db, nodeStore, nodeCatalog };
+      return { config, key, db, nodeStore, nodeCatalog };
     },
     bootstrapTrust: (context) => {
       context.platformNodeServices = assemblePlatformNodeServices({
@@ -380,8 +388,7 @@ export async function main(overrides: InternalManagerOverrides = {}): Promise<vo
       });
     },
     constructServices: async (context) => {
-  const { config, db, nodeStore, nodeCatalog } = context;
-  const key = deriveKey(requireMasterKey(), 'thinglinks-edge:instance-cred');
+  const { config, key, db, nodeStore, nodeCatalog } = context;
   const platformNodeServices = requireStartupPhase(
     context.platformNodeServices, 'bootstrapTrust',
   );
@@ -405,12 +412,12 @@ export async function main(overrides: InternalManagerOverrides = {}): Promise<vo
    * 那样口令会跟着日志跑：进日志聚合、进备份、进随手截的一张图 ——
    * 诊断包的脱敏模块里专门为它留了一条规则，就是这个原因。
    */
-  const initialPassword = process.env['INITIAL_PASSWORD']?.trim();
-  if (initialPassword) {
-    if (auth.ensureInitialUser('admin', initialPassword)) {
-      console.log('[init] 已按 INITIAL_PASSWORD 创建初始账号 admin，首次登录后必须改密。');
-    }
-  } else if (auth.needsSetup()) {
+  const administrator = initializeAdministrator(auth);
+  if (administrator === 'configured') {
+    console.log('[init] 已创建管理员 admin，请使用部署时配置的密码登录。');
+  } else if (administrator === 'initial') {
+    console.log('[init] 已按 INITIAL_PASSWORD 创建初始账号 admin，首次登录后必须改密。');
+  } else if (administrator === 'browser') {
     console.log(`[init] 这台设备还没有账号，请打开 ${config.externalUrl} 设置管理员账号与口令。`);
   }
 

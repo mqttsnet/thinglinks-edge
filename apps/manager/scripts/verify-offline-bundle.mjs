@@ -180,6 +180,7 @@ function cleanComposeEnvironment() {
     'PROXY_IMAGE',
     'INIT_IMAGE',
     'NODE_RED_IMAGE_REPO',
+    'NODE_RED_BOOTSTRAP_IMAGE',
     'ALLOWED_IMAGE_TAGS',
     'COMPOSE_FILE',
     'COMPOSE_PROFILES',
@@ -348,6 +349,7 @@ export function verifyOfflineBundle(bundleArg, expectedManagerTag, expectedManag
       assert.equal(env.get('MANAGER_IMAGE'), manifest.images[0].image);
       assert.equal(env.get('PROXY_IMAGE'), manifest.images[1].image);
       assert.equal(env.get('INIT_IMAGE'), manifest.images[2].image);
+      assert.equal(env.get('NODE_RED_BOOTSTRAP_IMAGE'), imageRefs[3]);
       assert.deepEqual(allowedTags.map((tag) => `${nodeRepo}:${tag}`), imageRefs.slice(3));
     });
 
@@ -363,7 +365,8 @@ export function verifyOfflineBundle(bundleArg, expectedManagerTag, expectedManag
       assert.equal(services.manager?.image, manifest.images[0].image);
       assert.equal(services['docker-proxy']?.image, manifest.images[1].image);
       assert.equal(services['init-data']?.image, manifest.images[2].image);
-      for (const service of ['manager', 'docker-proxy', 'init-data']) {
+      assert.equal(services['node-red-image']?.image, imageRefs[3]);
+      for (const service of ['manager', 'docker-proxy', 'init-data', 'node-red-image']) {
         assert.ok(repoTags.has(services[service]?.image), service);
         assert.equal(services[service]?.pull_policy, 'never', `${service} pull_policy`);
       }

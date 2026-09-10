@@ -91,45 +91,37 @@ The Manager image is published on Docker Hub as
 `linux/amd64` and `linux/arm64`, so an x86 industrial PC and an ARM edge box run the
 exact same command. Nothing is compiled on the site machine; it only needs Docker.
 
+1. Download this release's [docker-compose.yml](docker-compose.yml) into a dedicated directory.
+2. Fill in the two fields at the top: your access URL and a chosen administrator password of at least 12 characters. Put the password inside the quotes of `x-initial-password`; write `$` as `$$` in Compose.
+3. Run in that directory:
+
 ```bash
-cp .env.example .env        # at minimum, set EXTERNAL_URL and MASTER_KEY
 docker compose up -d
 ```
 
-Open `EXTERNAL_URL` in a browser — the console is served by the Manager itself. On a fresh
-deployment it asks you to **create the administrator account right there**: you choose the
-username and password, and the password never touches the logs.
+Open that address and log in as **admin** with your chosen password, then create a Node-RED instance. A fresh deployment without a valid password does not open the listener. Upgrades with existing accounts neither require an initial password nor reset accounts.
+No source checkout, Node.js installation, `.env`, manual encryption key, Docker group lookup, or separate default Node-RED pull is required.
+Compose prepares the data directory and pulls all required images, including Node-RED 5.0.7.
 
-There is **no time limit** on that first-run step by default: the console binds to
-`127.0.0.1` out of the box, so only the host itself can reach it, and being interrupted
-mid-installation is normal on site. If you deliberately expose the console (changing
-`BIND_ADDR`, or fronting it with a reverse proxy), set `SETUP_WINDOW_MIN` to close the
-claim window after N minutes — restarting the Manager reopens it.
+The dedicated data root defaults to `/data01/mqttsnet/thinglinks-edge`. On first startup,
+Manager creates `<data root>/.master.key` with mode 0600 and reuses it after restarts and upgrades.
+**Keep the key file separately and securely; business backups do not contain it.** If data already exists
+but its key is missing, startup fails instead of generating a replacement.
 
-For unattended provisioning set `INITIAL_PASSWORD` instead — the account is created at boot
-with the password you supplied, and setup is skipped.
+Port 19100 is published by default. Keep the configuration file private because it contains the initial password.
+Use [.env.example](.env.example) only for advanced settings such as a reverse proxy, rootless Docker,
+custom paths or offline operation. Existing `.env` files and `MASTER_KEY` values remain valid and keep
+the same encryption identity. Other Node-RED versions still need their corresponding images prepared.
 
-### Locked out?
+`EXTERNAL_URL` remains the source of truth for external URLs and cookie policy; it is not inferred from request headers.
+To upgrade, explicitly select the new `MANAGER_IMAGE`, then run `docker compose pull && docker compose up -d`.
+Existing Node-RED instances are independent containers and are not automatically restarted with Manager.
 
-The initial password is printed **once**, on the very first boot, and `ensureInitialUser`
-only fires when the user table is completely empty — so once any account exists, deleting
-`admin` and restarting will not recreate it. Recover from the host instead:
+If you lose administrator access, use the existing host-side recovery tool:
 
 ```bash
 node apps/manager/scripts/reset-admin.mjs admin
 ```
-
-It writes a fresh one-time password (printed to the terminal, never to a file) and flags
-the account so the next login must change it. Point `EDGE_DATA_ROOT` at your data root if
-it is not the default. Anyone who can run this already has filesystem access to the
-database, so it grants nothing new — it just avoids rebuilding the deployment to get back in.
-`EXTERNAL_URL` is the single source of truth for every outward-facing URL, redirect
-and cookie policy; the process never guesses its own external address.
-
-To upgrade, point `MANAGER_IMAGE` in `.env` at the new tag, then
-`docker compose pull && docker compose up -d`. Running Node-RED instances are **not**
-interrupted — they are sibling containers, not children of the Manager. A production
-line should never have to stop collecting data to upgrade the management console.
 
 ### Development
 
@@ -210,7 +202,7 @@ cd apps/manager && pnpm verify
 - **One network per instance** — instances cannot reach each other or the proxy
 - Container creation passes a **hard whitelist**: no privileged mode, no host
   namespaces, only platform-managed named volumes, instance port never published
-- A missing `MASTER_KEY` **refuses to start** rather than falling back to a default
+- A unique private key is generated on first start; existing data without its key refuses to start instead of changing encryption identity
 
 See the [security baseline](CONTRIBUTING.md) for the incident behind each of these rules.
 

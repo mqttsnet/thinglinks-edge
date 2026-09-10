@@ -110,6 +110,7 @@ function fixture({
     `PROXY_IMAGE=${PROXY}`,
     `INIT_IMAGE=${INIT}`,
     `NODE_RED_IMAGE_REPO=${NODE_REPO}`,
+    `NODE_RED_BOOTSTRAP_IMAGE=${NODE_IMAGE}`,
     `ALLOWED_IMAGE_TAGS=${NODE_TAG}`,
     'EXTERNAL_URL=http://127.0.0.1:19100',
     'MASTER_KEY=',
@@ -188,7 +189,7 @@ process.exit(result.status ?? 1);
   writeFileSync(docker, `#!/bin/sh
 set -e
 [ "$1" = compose ] || exit 91
-printf '%s\\n' '{"services":{"manager":{"image":"${composeManager}","pull_policy":"never","environment":{"NODE_RED_IMAGE_REPO":"${NODE_REPO}","ALLOWED_IMAGE_TAGS":"${NODE_TAG}"}},"docker-proxy":{"image":"${PROXY}","pull_policy":"never"},"init-data":{"image":"${INIT}","pull_policy":"never"}}}'
+printf '%s\\n' '{"services":{"manager":{"image":"${composeManager}","pull_policy":"never","environment":{"NODE_RED_IMAGE_REPO":"${NODE_REPO}","ALLOWED_IMAGE_TAGS":"${NODE_TAG}"}},"docker-proxy":{"image":"${PROXY}","pull_policy":"never"},"init-data":{"image":"${INIT}","pull_policy":"never"},"node-red-image":{"image":"${NODE_IMAGE}","pull_policy":"never"}}}'
 `);
   chmodSync(docker, 0o755);
 

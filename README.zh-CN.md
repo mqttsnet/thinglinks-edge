@@ -84,29 +84,30 @@ Manager 镜像已发布在 Docker Hub：[`mqttsnet/thinglinks-edge`](https://hub
 是覆盖 `linux/amd64` 与 `linux/arm64` 的多架构清单 —— x86 工控机和 ARM 边缘盒子敲同一条命令，
 docker 自己挑对应那一份。现场机器**不编译任何东西**，装了 docker 就够。
 
+1. 下载本版本的 [docker-compose.yml](docker-compose.yml)，放进一个独立目录。
+2. 填写文件顶部两项：实际访问地址（例如 `http://192.168.10.20:19100`）和自选初始管理员密码（至少 12 位）。密码填写在 `x-initial-password` 的引号中；包含 `$` 时写成 `$$`。
+3. 在该目录运行：
+
 ```bash
-cp .env.example .env        # 至少填 EXTERNAL_URL 与 MASTER_KEY
 docker compose up -d
-# 然后打开 EXTERNAL_URL —— 全新部署会让你当场设置管理员账号与口令
 ```
 
-浏览器打开 `EXTERNAL_URL` 即是控制台，前端由 Manager 自己托管。全新部署会先让你
-**当场设置管理员账号与口令** —— 口令由你自己定，不会出现在日志里。
+打开配置的地址，用 **admin** 和刚才填写的密码登录，再创建 Node-RED 实例即可。新部署未填密码或密码过短时不会开放控制台；已有管理员的升级不要求重新填写，也不会重置账号。
+**无需克隆源码、安装 Node.js、创建 `.env`、手动生成密钥、查询 Docker 组 ID 或提前拉取默认 Node-RED 镜像。**
+Compose 自动拉取 Manager、受限 Docker 代理、初始化镜像和默认 Node-RED 5.0.7 镜像，并准备数据目录。
 
-这一步**默认不限时**：`BIND_ADDR` 默认是 `127.0.0.1`，控制台只有宿主本机够得到，
-没人能抢先认领；而装完机被叫走、回来再接着设置，本来就是现场的常态。
+默认数据根为 `/data01/mqttsnet/thinglinks-edge`，必须专用于 Edge。首次启动会生成
+`<数据根>/.master.key`（权限 0600），后续重启或升级始终复用。**密钥文件要单独安全保管，业务备份不包含它。**
+已有数据却丢失密钥时系统拒绝启动，不会生成新密钥掩盖问题。
 
-只有当你**主动把控制台暴露**到厂区网或公网（改了 `BIND_ADDR`、或挂了反代）时，
-「谁先打开谁是管理员」才成立 —— 那种部署用 `SETUP_WINDOW_MIN` 开启限时，过期重启 Manager 即可重开。
+服务器默认发布 19100 端口，配置文件中含初始密码，请妥善保管。已有反向代理、rootless Docker、
+自定义数据目录或离线要求时，使用 [.env.example](.env.example) 中的高级配置；
+**已有 `.env` 和 `MASTER_KEY` 保持原样，新版本会沿用原加密身份。**
+其它 Node-RED 版本需准备对应镜像后再选择，默认 5.0.7 由 Compose 自动准备。
 
-无人值守批量装机改用 `INITIAL_PASSWORD`：账号在启动时按你给的口令建好，跳过首次设置。
-
-`EXTERNAL_URL` 是所有对外链接、跳转与 Cookie 策略的**唯一真源** —— 程序绝不猜自己的外部地址。
-现场「装到客户那儿打不开」的问题，根因几乎都是程序试图猜，而现场恰好有一层它没料到的东西。
-
-升级时把 `.env` 里的 `MANAGER_IMAGE` 指向新 tag，然后
-`docker compose pull && docker compose up -d`。正在跑的 Node-RED 实例**不会中断** ——
-它们是兄弟容器而不是 Manager 的子进程。产线不该为了升级管理台而停止采集。
+`EXTERNAL_URL` 仍是对外链接和 Cookie 策略的唯一来源，不从请求头猜测。
+升级时明确修改 `MANAGER_IMAGE` 的版本，再执行 `docker compose pull && docker compose up -d`。
+Node-RED 实例独立运行，更新 Manager 不会自动重启采集实例。
 
 ### 本地开发
 
@@ -177,7 +178,7 @@ cd apps/manager && pnpm verify
 - Manager **不挂载宿主 Docker socket**，只能通过按 HTTP 方法逐条白名单的代理访问 Docker
 - **一实例一网络** —— 实例之间、实例与代理之间都不可达
 - 容器创建走**硬白名单**：禁特权、禁宿主命名空间、只允许平台具名卷，实例端口绝不映射宿主
-- 缺 `MASTER_KEY` **拒绝启动**，不静默回落默认值
+- 首次生成独立随机密钥；已有数据缺密钥时拒绝启动，不静默更换加密身份
 
 每条规则背后都对应一次真实事故，见[贡献指南](CONTRIBUTING.md)的开发纪律。
 
