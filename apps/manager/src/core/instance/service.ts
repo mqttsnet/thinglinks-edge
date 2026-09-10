@@ -521,8 +521,8 @@ export class InstanceService {
     return results;
   }
 
-  async list(): Promise<InstanceView[]> {
-    const statuses = new Map((await this.o.docker.list()).map((s) => [s.id, s]));
+  async list(signal?: AbortSignal): Promise<InstanceView[]> {
+    const statuses = new Map((await this.o.docker.list(signal)).map((s) => [s.id, s]));
     return this.o.repo.list().map((r) => ({
       id: r.id, name: r.name, imageTag: r.imageTag,
       memLimit: r.memLimit, cpuLimit: r.cpuLimit, adminRoot: r.adminRoot,

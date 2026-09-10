@@ -107,6 +107,11 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
       tokens = repo.allIngestTokens();
       id = tokens.get(token);
     }
+    // A cache hit must still belong to a current token; deleted/rotated instances cannot assert presence.
+    if (id !== undefined && repo.ingestToken(id) !== token) {
+      tokens = repo.allIngestTokens();
+      id = tokens.get(token);
+    }
     return id;
   };
 
@@ -161,6 +166,9 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
     const { online } = (req.body ?? {}) as { online?: boolean };
     try {
       registry.setDeviceOnline(instanceId, nodeId, online === true);
+      if (online === false && registry.devices(instanceId).some(device => device.nodeId === nodeId)) {
+        ctx.presence?.observeOffline(instanceId, nodeId);
+      }
       return reply.code(204).send();
     } catch (e) { return fail(reply, e); }
   });
@@ -216,6 +224,7 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
 
     try {
       const accepted = registry.recordValues(instanceId, values);
+      if (accepted > 0) ctx.presence?.observeUplink(instanceId, nodeId);
 
       /*
        * 上行队列满了就当场回 503，**不收下再说**。

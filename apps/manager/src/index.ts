@@ -28,6 +28,8 @@ import { Spool, type FullPolicy } from './core/spool/spool.ts';
 import { SpoolDrainer } from './core/spool/drainer.ts';
 import { CloudConfigRepo } from './core/cloud/config-repo.ts';
 import { CloudRuntime } from './core/cloud/runtime.ts';
+import { CommandBridge } from './core/cloud/commands/bridge.ts';
+import { PresenceSynchronizer } from './core/cloud/presence/synchronizer.ts';
 import { OutageLog } from './core/cloud/outage.ts';
 import { runPreflight, renderReport, adaptDocker } from './core/preflight/run.ts';
 import { readHostStats } from './core/health/host-stats.ts';
@@ -779,6 +781,11 @@ export async function main(overrides: InternalManagerOverrides = {}): Promise<vo
     },
   });
   drainerRef = drainer;
+  const commandBridge = new CommandBridge({ db, cloud });
+  const presence = new PresenceSynchronizer({
+    db, cloud, listInstances: signal => service.list(signal),
+    onError: message => { cloud.recordPresenceError(message); console.warn(`[presence] ${message}`); },
+  });
 
   context.reconcileNetworks = reconcileNetworks;
   context.recoverInterrupted = async () => {
@@ -790,6 +797,8 @@ export async function main(overrides: InternalManagerOverrides = {}): Promise<vo
       }
     };
   context.startBackground = async () => {
+      commandBridge.start();
+      presence.start();
       startMetrics();
       try {
         await cloud.apply(cloudConfig.get());
@@ -806,7 +815,7 @@ export async function main(overrides: InternalManagerOverrides = {}): Promise<vo
         config, db, auth, repo, service, operationGate, migrationService, proxySessions,
         upstreamFor: instanceUpstreamFor,
         spool, metrics, drainer, outages,
-        cloud, cloudConfig,
+        cloud, cloudConfig, commandBridge, presence,
         cloudSink: (payload) => cloud.publish(payload),
         webRoot: process.env['WEB_ROOT']?.trim() || undefined,
         nodeStore, nodeCatalog, valueHistory, nodeUpstream, nodeSources,

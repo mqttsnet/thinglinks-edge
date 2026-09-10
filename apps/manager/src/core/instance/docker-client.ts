@@ -1394,10 +1394,11 @@ export class DockerClient {
   }
 
   /** 只列举带平台标签的容器，避免误操作宿主上的其它容器 */
-  async list(): Promise<InstanceStatus[]> {
+  async list(signal?: AbortSignal): Promise<InstanceStatus[]> {
     const items = await this.docker.listContainers({
       all: true,
       filters: { label: [`${MANAGED_LABEL}=true`] },
+      ...(signal ? { abortSignal: signal } : {}),
     });
     return items.map((c) => ({
       id: c.Labels['com.mqttsnet.thinglinks-edge.instance'] ?? '',

@@ -15,6 +15,8 @@ import type { Spool } from '../core/spool/spool.ts';
 import type { SpoolDrainer } from '../core/spool/drainer.ts';
 import type { OutageLog } from '../core/cloud/outage.ts';
 import type { CloudRuntime } from '../core/cloud/runtime.ts';
+import type { CommandBridge } from '../core/cloud/commands/bridge.ts';
+import type { PresenceSynchronizer } from '../core/cloud/presence/synchronizer.ts';
 import type { CloudConfigRepo } from '../core/cloud/config-repo.ts';
 import { UserRepo } from '../core/auth/user-repo.ts';
 import { can, canInstance, isInstanceScoped, type Action } from '../core/auth/authz.ts';
@@ -63,6 +65,8 @@ export interface ServerDeps {
    * 配置可以热改，cloudSink 是个恒定的转发闭包，判断不了当前配没配。
    */
   cloud?: CloudRuntime | undefined;
+  commandBridge?: CommandBridge | undefined;
+  presence?: PresenceSynchronizer | undefined;
   /** 云对接参数仓储。留空表示这个部署不提供云配置界面（如单测装配） */
   cloudConfig?: CloudConfigRepo | undefined;
   /**
@@ -112,6 +116,7 @@ export interface HttpContext {
   config: EdgeConfig;
   cloudSink: ((payload: unknown) => Promise<void>) | undefined;
   cloud: CloudRuntime | undefined;
+  presence: PresenceSynchronizer | undefined;
   cloudConfig: CloudConfigRepo | undefined;
   spool: Spool | undefined;
   drainer: SpoolDrainer | undefined;
@@ -182,6 +187,7 @@ export function createContext(deps: ServerDeps): HttpContext {
     can: (user, action) => can(user.role, action),
     cloudSink: deps.cloudSink,
     cloud: deps.cloud,
+    presence: deps.presence,
     cloudConfig: deps.cloudConfig,
     spool: deps.spool,
     drainer: deps.drainer,

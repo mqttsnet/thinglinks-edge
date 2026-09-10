@@ -18,6 +18,8 @@ import { registerIngest } from './edge/ingest.ts';
 import { registerField } from './edge/field.ts';
 import { registerBackup } from './archive/backup.ts';
 import { registerCloud } from './cloud/config.ts';
+import { registerCloudModel } from './cloud/model.ts';
+import { registerEdgeCommands } from './edge/commands.ts';
 import { registerDiag } from './diag/index.ts';
 import { registerTemplates } from './instance/templates.ts';
 import { registerFlows } from './instance/flows.ts';
@@ -70,6 +72,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     registerField(api, ctx);
     registerBackup(api, ctx);
     registerCloud(api, ctx);
+    registerCloudModel(api, ctx);
+    if (deps.commandBridge) registerEdgeCommands(api, ctx, deps.commandBridge);
     registerDiag(api, ctx);
     registerTemplates(api, ctx);
     registerFlows(api, ctx);
@@ -99,6 +103,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   });
 
   registerProxy(app, ctx);
+  if (deps.commandBridge) app.addHook('onClose', async () => { await deps.commandBridge!.close(); });
+  if (deps.presence) app.addHook('onClose', async () => { await deps.presence!.close(); });
 
   /*
    * 存活探针。带前缀的那个是给外层反代/负载均衡探的。
