@@ -11,7 +11,11 @@
 import type { FastifyInstance } from 'fastify';
 import { recordAudit } from '../../core/db.ts';
 import { TemplateRepo } from '../../core/flows/repo.ts';
+import { normalizeTemplateMetadata } from '../../core/flows/metadata.ts';
+import { listBuiltinTemplates, getBuiltinTemplate, renderBuiltinTemplate, isBuiltinTemplateId } from '../../core/flows/templates/catalog.ts';
 import { getFlows } from '../../core/flows/admin-client.ts';
+import { checkCachedTemplateModelMappings } from '../../core/flows/templates/model-mapping.ts';
+import type { FlowTemplateWithContent } from '../../core/flows/types.ts';
 import type { HttpContext } from '../context.ts';
 import { targetFor, failTemplate as fail } from './flows-target.ts';
 
@@ -23,22 +27,36 @@ export function registerTemplates(api: FastifyInstance, ctx: HttpContext): void 
 
   api.get(`${config.basePath}/api/templates`, async (req, reply) => {
     if (!guard(req, reply, { csrf: false, need: 'template:view' })) return;
-    return reply.send({ templates: templates.list() });
+    return reply.send({ templates: [...listBuiltinTemplates(), ...templates.list()] });
   });
 
   api.get(`${config.basePath}/api/templates/:tid`, async (req, reply) => {
     if (!guard(req, reply, { csrf: false, need: 'template:view' })) return;
     const { tid } = req.params as { tid: string };
-    const t = templates.getWithContent(tid);
+    const t = getBuiltinTemplate(tid) ?? templates.getWithContent(tid);
     if (!t) return reply.code(404).send({ error: '模板不存在' });
     return reply.send({ template: t });
+  });
+
+  /** Pure render: authentication/CSRF still apply, but no asset or instance is mutated. */
+  api.post(`${config.basePath}/api/templates/:tid/render`, async (req, reply) => {
+    if (!guard(req, reply, { csrf: true, need: 'template:view' })) return;
+    const { tid } = req.params as { tid: string };
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    try {
+      const template = renderBuiltinTemplate(tid, body['parameters']);
+      if (!template) return reply.code(404).send({ error: '内置模板不存在' });
+      const modelChecked = checkCachedTemplateModelMappings(template.parameterValues, template.parameters ?? [],
+        (product, version) => ctx.cloud?.getCachedModel(product, version));
+      return reply.send({ template, modelChecked });
+    } catch (error) { return fail(reply, error); }
   });
 
   /** 下载成文件，便于跨项目复用 —— 这正是「模板」这个东西存在的理由 */
   api.get(`${config.basePath}/api/templates/:tid/download`, async (req, reply) => {
     if (!guard(req, reply, { csrf: false, need: 'template:view' })) return;
     const { tid } = req.params as { tid: string };
-    const t = templates.getWithContent(tid);
+    const t = getBuiltinTemplate(tid) ?? templates.getWithContent(tid);
     if (!t) return reply.code(404).send({ error: '模板不存在' });
 
     /*
@@ -66,7 +84,9 @@ export function registerTemplates(api: FastifyInstance, ctx: HttpContext): void 
   });
 
   /**
-   * 建模板。两种来源：
+   * 建模板。上传/实例导出保留旧接口；内置副本必须由服务端渲染并保留依赖。
+   *   · `builtinTemplateId` + `parameters` —— 配置后保存为自定义副本
+   * 其他来源：
    *   · `instanceId` —— 从运行中的实例现导
    *   · `content`    —— 直接给流程 JSON（上传的文件、别处拷来的）
    */
@@ -82,6 +102,18 @@ export function registerTemplates(api: FastifyInstance, ctx: HttpContext): void 
     try {
       let content: unknown = b['content'];
       let source = 'upload';
+      let configured: FlowTemplateWithContent | undefined;
+      let modelChecked = false;
+      if (b['builtinTemplateId'] !== undefined) {
+        if (typeof b['builtinTemplateId'] !== 'string' || !b['builtinTemplateId']
+            || b['content'] !== undefined || b['instanceId'] !== undefined) {
+          return reply.code(400).send({ error: 'builtinTemplateId 必须是内置模板 ID，且不能与 content 或 instanceId 同时使用' });
+        }
+        configured = renderBuiltinTemplate(b['builtinTemplateId'], b['parameters']);
+        if (!configured) return reply.code(404).send({ error: '内置模板不存在' });
+        modelChecked = checkCachedTemplateModelMappings(configured.parameterValues, configured.parameters ?? [],
+          (product, version) => ctx.cloud?.getCachedModel(product, version));
+      }
 
       if (instanceId !== '') {
         /*
@@ -94,18 +126,21 @@ export function registerTemplates(api: FastifyInstance, ctx: HttpContext): void 
         content = await getFlows(t);
         source = instanceId;
       }
-      if (content === undefined) {
-        return reply.code(400).send({ error: '需要 content 或 instanceId 之一' });
+      if (content === undefined && !configured) {
+        return reply.code(400).send({ error: '需要 content、instanceId 或 builtinTemplateId 之一' });
       }
 
-      const saved = templates.save({ name, description, content, source }, user.username);
+      const metadata = normalizeTemplateMetadata({ category: b['category'], protocols: b['protocols'] }, configured);
+      const saved = configured
+        ? templates.saveConfiguredBuiltin(configured, { name, description, ...metadata }, user.username)
+        : templates.save({ name, description, content, source, ...metadata }, user.username);
       recordAudit(db, {
         actor: user.username, action: 'template-create', target: saved.name,
         detail: `${saved.nodeCount} 节点 · 来源 ${saved.source}`
           + (saved.warnings.length ? ` · ${saved.warnings.length} 处疑似内联凭据` : ''),
         result: 'ok',
       });
-      return reply.code(201).send({ template: saved });
+      return reply.code(201).send({ template: saved, modelChecked });
     } catch (e) { return fail(reply, e); }
   });
 
@@ -113,12 +148,14 @@ export function registerTemplates(api: FastifyInstance, ctx: HttpContext): void 
     const user = guard(req, reply, { csrf: true, need: 'template:manage' });
     if (!user) return;
     const { tid } = req.params as { tid: string };
+    if (isBuiltinTemplateId(tid)) return reply.code(403).send({ error: '内置模板不可修改，请创建配置副本' });
     const b = (req.body ?? {}) as Record<string, unknown>;
     try {
       const t = templates.rename(
         tid,
         typeof b['name'] === 'string' ? b['name'] : '',
         typeof b['description'] === 'string' ? b['description'] : '',
+        { category: b['category'], protocols: b['protocols'] },
       );
       if (!t) return reply.code(404).send({ error: '模板不存在' });
       recordAudit(db, { actor: user.username, action: 'template-rename', target: t.name, result: 'ok' });
@@ -130,6 +167,7 @@ export function registerTemplates(api: FastifyInstance, ctx: HttpContext): void 
     const user = guard(req, reply, { csrf: true, need: 'template:manage' });
     if (!user) return;
     const { tid } = req.params as { tid: string };
+    if (isBuiltinTemplateId(tid)) return reply.code(403).send({ error: '内置模板不可删除，请管理自定义副本' });
     const existing = templates.get(tid);
     if (!templates.remove(tid)) return reply.code(404).send({ error: '模板不存在' });
     recordAudit(db, {
