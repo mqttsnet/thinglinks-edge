@@ -9,6 +9,7 @@ const routes: RouteRecordRaw[] = [
     component: () => import('./layout/AppShell.vue'),
     children: [
       { path: '', redirect: '/instances' },
+      { path: 'about', name: 'about', component: () => import('./views/about/AboutView.vue') },
       { path: 'instances', name: 'instances', component: () => import('./views/instance/InstancesView.vue') },
       { path: 'health', name: 'health', component: () => import('./views/health/HealthView.vue') },
       {

@@ -25,6 +25,7 @@ import { registerUsers } from './auth/users.ts';
 import { registerSettings } from './auth/settings.ts';
 import { registerSetup } from './auth/setup.ts';
 import { registerVersion } from './version.ts';
+import { registerProduct } from './product.ts';
 import { registerProxy } from './instance/proxy.ts';
 import { registerConsole } from './console.ts';
 import { registerNpmRegistry } from './nodes/registry.ts';
@@ -74,6 +75,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     registerFlows(api, ctx);
     registerUsers(api, ctx);
     registerVersion(api, ctx);
+    registerProduct(api, ctx);
 
     /*
      * 节点管理（01 号文 5.7）。没配私有源就整套不挂 —— 见 ServerDeps.nodeStore。

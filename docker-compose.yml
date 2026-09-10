@@ -115,6 +115,19 @@ services:
       INSTANCE_PORT_MAX: ${INSTANCE_PORT_MAX:-30999}
       NODE_RED_IMAGE_REPO: ${NODE_RED_IMAGE_REPO:-nodered/node-red}
       ALLOWED_IMAGE_TAGS: ${ALLOWED_IMAGE_TAGS:-5.0.7-24-minimal,5.0.4-24-minimal,4.1.13-22-minimal}
+      # Public product identity. These values are independent of device/business configuration.
+      PRODUCT_NAME: ${PRODUCT_NAME-ThingLinks Edge}
+      PRODUCT_TAGLINE: ${PRODUCT_TAGLINE-边缘计算网关}
+      PRODUCT_DESCRIPTION: ${PRODUCT_DESCRIPTION-连接现场设备，编排采集流程，与云端协同运行。}
+      PRODUCT_LOGO_URL: ${PRODUCT_LOGO_URL-product-logo.svg}
+      PRODUCT_COPYRIGHT_START_YEAR: ${PRODUCT_COPYRIGHT_START_YEAR-2019}
+      PRODUCT_COPYRIGHT_OWNER: ${PRODUCT_COPYRIGHT_OWNER-MqttsNet}
+      PRODUCT_COMMUNITY_NAME: ${PRODUCT_COMMUNITY_NAME-MqttsNet 社区}
+      PRODUCT_COMMUNITY_URL: ${PRODUCT_COMMUNITY_URL-https://mqttsnet.com}
+      PRODUCT_GITHUB_REPOSITORY: ${PRODUCT_GITHUB_REPOSITORY-mqttsnet/thinglinks-edge}
+      PRODUCT_DOCS_URL: ${PRODUCT_DOCS_URL-auto}
+      PRODUCT_LICENSE: ${PRODUCT_LICENSE-Apache-2.0}
+      PRODUCT_RELEASES_ENABLED: ${PRODUCT_RELEASES_ENABLED-true}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
       # 宿主持久化根。Manager 自己的库与全部实例数据都在这下面，排障只看这一处。
       # 必须与下面 volumes 的挂载点同名 —— Manager 用容器内视角 mkdir，

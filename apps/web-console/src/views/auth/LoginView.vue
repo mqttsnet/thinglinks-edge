@@ -4,10 +4,14 @@ import { useRouter, useRoute } from 'vue-router';
 import { NCard, NForm, NFormItem, NInput, NButton, NAlert, useMessage } from 'naive-ui';
 import type { SetupState } from '../../api/types';
 import { api, ApiError } from '../../api/client';
+import ProductLogo from '../../product/ProductLogo.vue';
+import ProductCopyright from '../../product/ProductCopyright.vue';
+import { useProduct } from '../../product/useProduct';
 
 const router = useRouter();
 const route = useRoute();
 const message = useMessage();
+const { product, loadProduct } = useProduct();
 
 const username = ref('admin');
 const password = ref('');
@@ -45,6 +49,7 @@ const setupLeftMin = computed(() =>
   (setup.value && setup.value.expiresInSec > 0 ? Math.ceil(setup.value.expiresInSec / 60) : 0));
 
 onMounted(async () => {
+  void loadProduct();
   // 先问要不要首次设置：全新部署上连登录表单都不该出现
   try {
     setup.value = await api.setupState();
@@ -153,15 +158,10 @@ async function submitChange() {
   <div class="wrap">
     <NCard class="card" :bordered="false">
       <div class="brand">
-        <span class="logo">
-          <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.1" stroke-linecap="round">
-            <circle cx="6" cy="12" r="2.4" /><circle cx="18" cy="6.5" r="2.4" /><circle cx="18" cy="17.5" r="2.4" />
-            <path d="M8.4 11 15.6 7.2M8.4 13l7.2 3.8" />
-          </svg>
-        </span>
+        <ProductLogo :size="52" />
         <div>
-          <h1>ThingLinks Edge</h1>
-          <span class="sub">边缘计算网关 · 控制台</span>
+          <h1>{{ product?.name || '控制台' }}</h1>
+          <span class="sub">{{ product?.tagline }}</span>
         </div>
       </div>
 
@@ -235,7 +235,7 @@ async function submitChange() {
         </NForm>
       </template>
 
-      <p class="copy">Copyright © 2024-present mqttsnet All Rights Reserved.</p>
+      <div class="copy"><ProductCopyright /></div>
     </NCard>
   </div>
 </template>
@@ -247,14 +247,9 @@ async function submitChange() {
 }
 .card { width: 100%; max-width: 404px; border-radius: var(--r); box-shadow: var(--shadow); }
 .brand { display: flex; align-items: center; gap: 12px; }
-.logo {
-  width: 40px; height: 40px; border-radius: 12px; display: grid; place-items: center; flex: none;
-  background: linear-gradient(135deg, var(--primary), var(--secondary));
-  box-shadow: 0 6px 16px rgba(var(--primary-glow), .32);
-}
-.logo svg { width: 21px; height: 21px; }
-.brand h1 { margin: 0; font-size: 18px; font-weight: 650; }
+.brand > div { min-width: 0; }
+.brand h1 { margin: 0; font-size: 18px; font-weight: 650; overflow-wrap: anywhere; }
 .brand .sub { font-size: 11.5px; color: var(--muted); }
 .form { margin-top: 20px; }
-.copy { text-align: center; margin: 22px 0 0; font-size: 11px; color: var(--muted); }
+.copy { display: flex; justify-content: center; text-align: center; margin: 22px 0 0; font-size: 11px; color: var(--text-2); }
 </style>

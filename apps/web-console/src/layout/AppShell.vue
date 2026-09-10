@@ -5,11 +5,16 @@ import { NButton, NModal, NAlert, useMessage } from 'naive-ui';
 import { api } from '../api/client';
 import { can, clearPermissions, loadPermissions } from '../api/permissions';
 import ReleaseNotes from '../components/ReleaseNotes.vue';
+import ProductLogo from '../product/ProductLogo.vue';
+import ProductCopyright from '../product/ProductCopyright.vue';
+import GithubIcon from '../product/GithubIcon.vue';
+import { useProduct } from '../product/useProduct';
 
 const router = useRouter();
 const route = useRoute();
 const message = useMessage();
 const username = ref('');
+const { product, loadProduct } = useProduct();
 
 /**
  * 窄屏降级为图标栏，绝不隐藏导航 ——
@@ -104,6 +109,7 @@ const showNotes = ref(false);
 const update = ref<{ outdated?: boolean; latest?: string; url?: string } | null>(null);
 
 onMounted(async () => {
+  void loadProduct();
   try { username.value = (await api.me()).user.username; } catch { /* 守卫已处理 */ }
   await loadPermissions();
 
@@ -148,15 +154,10 @@ async function signOut() {
             <path d="M12 5l-5 5 5 5" />
           </svg>
         </button>
-        <span class="logo">
-          <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.1" stroke-linecap="round">
-            <circle cx="6" cy="12" r="2.4" /><circle cx="18" cy="6.5" r="2.4" /><circle cx="18" cy="17.5" r="2.4" />
-            <path d="M8.4 11 15.6 7.2M8.4 13l7.2 3.8" />
-          </svg>
-        </span>
+        <ProductLogo :size="38" />
         <div class="name">
-          <h1>ThingLinks Edge</h1>
-          <span>边缘计算网关</span>
+          <h1>{{ product?.name || '控制台' }}</h1>
+          <span>{{ product?.tagline }}</span>
         </div>
       </div>
 
@@ -172,11 +173,18 @@ async function signOut() {
         </template>
       </nav>
 
+      <div class="product-links" aria-label="产品信息">
+        <a v-if="product?.repositoryUrl" :href="product.repositoryUrl" target="_blank" rel="noopener noreferrer"
+           title="打开 GitHub 项目" aria-label="打开 GitHub 项目"><GithubIcon /><span>GitHub</span></a>
+        <button :class="{ on: route.name === 'about' }" title="关于产品" aria-label="关于产品" @click="router.push({ name: 'about' })">
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="10" cy="10" r="7" /><path d="M10 9v5M10 5.5v1.5" /></svg><span>关于</span>
+        </button>
+      </div>
       <div class="foot">
         <span class="ver mono" :title="update?.outdated ? `有新版本 v${update.latest}` : ''">
           v{{ version || '—' }}<i v-if="update?.outdated" class="dot" />
-        </span><br />
-        © 2024-present mqttsnet<br />All Rights Reserved.
+        </span>
+        <a v-if="product?.communityUrl" :href="product.communityUrl" target="_blank" rel="noopener noreferrer">{{ product.communityName }} ↗</a>
       </div>
     </aside>
 
@@ -187,7 +195,7 @@ async function signOut() {
         <NButton size="small" quaternary @click="signOut">登出</NButton>
       </header>
       <div class="content"><RouterView /></div>
-      <footer>Copyright © 2024-present mqttsnet All Rights Reserved.</footer>
+      <footer><ProductCopyright /></footer>
 
     <NModal v-model:show="showNotes" preset="card" style="max-width: 560px"
             :title="`已更新到 v${version}`" :mask-closable="false" @close="dismissNotes">
@@ -220,12 +228,8 @@ aside {
 .collapse:hover { color: var(--primary); }
 .collapse svg { width: 13px; height: 13px; transition: transform .2s; }
 .mini .collapse svg { transform: rotate(180deg); }
-.logo {
-  width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center; flex: none;
-  background: linear-gradient(135deg, var(--primary), var(--secondary));
-}
-.logo svg { width: 18px; height: 18px; }
-.name h1 { margin: 0; font-size: 15.5px; font-weight: 650; }
+.name { min-width: 0; }
+.name h1 { margin: 0; font-size: 15.5px; font-weight: 650; overflow-wrap: anywhere; }
 .name span { font-size: 11.5px; color: var(--muted); }
 nav { padding: 4px 12px; display: flex; flex-direction: column; gap: 1px; flex: 1; overflow-y: auto; }
 .lab {
@@ -247,19 +251,29 @@ nav { padding: 4px 12px; display: flex; flex-direction: column; gap: 1px; flex: 
   border-radius: 50%; background: var(--warning); vertical-align: 1px;
 }
 .foot {
-  padding: 7px 18px 9px; font-size: 9.5px; line-height: 1.45; color: var(--muted);
-  border-top: 1px solid var(--border);
+  padding: 7px 18px 12px; font-size: 10px; line-height: 1.45; color: var(--muted);
+  display: flex; justify-content: space-between; gap: 8px;
 }
+.foot a { color: var(--muted); text-decoration: none; }
+.foot a:hover { color: var(--primary); }
+.product-links { display: flex; gap: 6px; padding: 10px 12px 0; border-top: 1px solid var(--border); }
+.product-links a, .product-links button { display: flex; align-items: center; justify-content: center; gap: 7px; flex: 1; padding: 7px; border: 0; border-radius: var(--rs); background: none; color: var(--text-2); cursor: pointer; text-decoration: none; font: inherit; font-size: 12px; }
+.product-links svg { width: 17px; height: 17px; flex: none; }
+.product-links a:hover, .product-links button:hover { background: var(--hover); color: var(--primary); }
+.product-links .on { background: var(--l-primary); color: var(--primary); }
+.product-links :focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 main { min-width: 0; display: flex; flex-direction: column; }
 header { padding: 14px 26px 0; display: flex; align-items: center; gap: 12px; }
 .spacer { margin-left: auto; }
 .who { color: var(--text-2); }
 .content { padding: 12px 26px 40px; flex: 1; }
-footer { padding: 0 26px 24px; font-size: 11.5px; color: var(--muted); }
+footer { padding: 0 26px 24px; font-size: 11.5px; color: var(--text-2); }
 
 /* 窄屏：降级为图标栏，不隐藏 */
 .mini { grid-template-columns: 70px 1fr; }
 .mini .name, .mini .foot, .mini .item span { display: none; }
+.mini .product-links { flex-direction: column; padding: 8px 12px; }
+.mini .product-links span { display: none; }
 .mini .head { padding: 15px 0 8px; justify-content: center; }
 .mini nav { padding: 4px 10px; }
 .mini .item { justify-content: center; padding: 8px 0; }
@@ -267,6 +281,8 @@ footer { padding: 0 26px 24px; font-size: 11.5px; color: var(--muted); }
 @media (max-width: 920px) {
   .shell { grid-template-columns: 70px 1fr; }
   .name, .foot, .item span { display: none; }
+  .product-links { flex-direction: column; padding: 8px 12px; }
+  .product-links span { display: none; }
   .head { padding: 15px 0 8px; justify-content: center; }
   .collapse { display: none; }
   .item { justify-content: center; padding: 8px 0; }

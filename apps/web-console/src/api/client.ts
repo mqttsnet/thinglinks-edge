@@ -20,6 +20,7 @@ import type {
   PlatformNodeMigration,
 } from './types';
 import { filenameFrom } from './filename';
+import type { ProductMetadata, ProductReleaseResult } from '../product/types';
 
 /**
  * 控制台挂载前缀，由 Manager 在 index.html 里注入。
@@ -81,6 +82,8 @@ function qs(params: Record<string, string | undefined>): string {
 }
 
 export const api = {
+  product: () => request<{ product: ProductMetadata }>('/api/product'),
+  productReleases: () => request<ProductReleaseResult>('/api/product/releases', { method: 'POST' }),
   /** 匿名可读：登录页要靠它决定显示登录还是首次设置 */
   setupState: () => request<SetupState>('/api/setup'),
 
