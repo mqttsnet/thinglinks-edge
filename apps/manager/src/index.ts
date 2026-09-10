@@ -9,6 +9,7 @@ import { openDb } from './core/db.ts';
 import { requireMasterKey, deriveKey } from './core/auth/crypto.ts';
 import { AuthService } from './core/auth/service.ts';
 import { InstanceRepo } from './core/instance/repo.ts';
+import { allowedNodeRedImageTags } from './core/instance/image-policy.ts';
 import { InstanceService, type InstanceServiceOptions } from './core/instance/service.ts';
 import {
   InstanceOperationGate,
@@ -321,8 +322,8 @@ async function runPreflightCli(argv: string[]): Promise<void> {
     listenPort: config.listenPort,
     dataDir: config.dataDir,
     portRange: config.portRange,
-    images: (process.env['ALLOWED_IMAGE_TAGS'] ?? '5.0.4-24-minimal,4.1.13-22-minimal')
-      .split(',').map((t) => `nodered/node-red:${t.trim()}`).filter(Boolean),
+    images: allowedNodeRedImageTags(process.env['ALLOWED_IMAGE_TAGS'])
+      .map(tag => `nodered/node-red:${tag}`),
     corporateCidrs: (process.env['CORPORATE_CIDRS'] ?? '')
       .split(',').map((c) => c.trim()).filter(Boolean),
     ntpServer: process.env['NTP_SERVER']?.trim() ?? '',
@@ -538,8 +539,7 @@ export async function main(overrides: InternalManagerOverrides = {}): Promise<vo
     pendingStartCompletion,
     basePath: config.basePath,
     portRange: config.portRange,
-    allowedImageTags: (process.env['ALLOWED_IMAGE_TAGS'] ??
-      '5.0.4-24-minimal,4.1.13-22-minimal').split(',').map((s) => s.trim()).filter(Boolean),
+    allowedImageTags: allowedNodeRedImageTags(process.env['ALLOWED_IMAGE_TAGS']),
     /*
      * 传函数不传值：批准清单随时会改，而实例配置是在创建、重置口令、
      * 下发策略这几个时刻各自现算的。传值会让服务一直用着进程启动那一刻的

@@ -114,7 +114,7 @@ services:
       INSTANCE_PORT_MIN: ${INSTANCE_PORT_MIN:-30000}
       INSTANCE_PORT_MAX: ${INSTANCE_PORT_MAX:-30999}
       NODE_RED_IMAGE_REPO: ${NODE_RED_IMAGE_REPO:-nodered/node-red}
-      ALLOWED_IMAGE_TAGS: ${ALLOWED_IMAGE_TAGS:-5.0.4-24-minimal,4.1.13-22-minimal}
+      ALLOWED_IMAGE_TAGS: ${ALLOWED_IMAGE_TAGS:-5.0.7-24-minimal,5.0.4-24-minimal,4.1.13-22-minimal}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
       # 宿主持久化根。Manager 自己的库与全部实例数据都在这下面，排障只看这一处。
       # 必须与下面 volumes 的挂载点同名 —— Manager 用容器内视角 mkdir，

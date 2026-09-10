@@ -142,7 +142,7 @@ without them rather than falling back to a guess or a default secret.
 | `TZ` | `Asia/Shanghai` | Timezone for the Manager **and** every instance it creates. Node-RED's official image defaults to UTC; leaving this unset silently skews scheduled flows, shift logic and log timestamps. |
 | `HOST_PORT` / `BIND_ADDR` | `19100` / `127.0.0.1` | Published port. Loopback-only by default — set `BIND_ADDR=0.0.0.0` to expose it directly, or put a reverse proxy in front. |
 | `INSTANCE_PORT_MIN` / `MAX` | `30000` / `30999` | Host port range allocated to instances |
-| `ALLOWED_IMAGE_TAGS` | `5.0.4-24-minimal,4.1.13-22-minimal` | Node-RED image tags instances may use — an allowlist, not a suggestion |
+| `ALLOWED_IMAGE_TAGS` | `5.0.7-24-minimal,5.0.4-24-minimal,4.1.13-22-minimal` | Node-RED image tags instances may use — an allowlist, not a suggestion |
 | `EDGE_METRICS_INTERVAL_SEC` | `10` | Health-trend sampling interval; `0` disables it. Samples are kept **in memory only** so the box's SD/eMMC card isn't written to every 10 seconds. |
 | `ALLOWED_ORIGINS` | *(empty)* | Extra WebSocket/CORS origins, comma-separated |
 | `UPDATE_CHECK_URL` | *(empty)* | Update checking is **off by default and never phones home**. Many sites have no internet, and industrial customers care about outbound connections. Set it explicitly to opt in. |

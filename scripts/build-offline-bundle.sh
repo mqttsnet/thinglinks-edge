@@ -37,7 +37,7 @@ MANAGER_IMAGE="${MANAGER_IMAGE:-mqttsnet/thinglinks-edge:${VERSION}}"
 PROXY_IMAGE="${PROXY_IMAGE:-wollomatic/socket-proxy:1.13.1}"
 INIT_IMAGE="${INIT_IMAGE:-alpine:3.22}"
 NODE_RED_REPO="${NODE_RED_IMAGE_REPO:-nodered/node-red}"
-ALLOWED_IMAGE_TAGS="${ALLOWED_IMAGE_TAGS:-5.0.4-24-minimal,4.1.13-22-minimal}"
+ALLOWED_IMAGE_TAGS="${ALLOWED_IMAGE_TAGS:-5.0.7-24-minimal,5.0.4-24-minimal,4.1.13-22-minimal}"
 # 预置节点包目录（01 号文 5.7）。留空就不带 —— 绝大多数部署用不上，
 # 而带上一堆用不到的 tgz 只会让本来就要拷 U 盘的包更大。
 # 目录由 scripts/pack-nodes.sh 产出，里面是节点包**连同依赖闭包**的 .tgz。

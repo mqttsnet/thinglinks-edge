@@ -95,7 +95,7 @@ const PROTOCOLS = [
 ];
 
 const emptyForm = () => ({
-  id: '', name: '', imageTag: '5.0.4-24-minimal',
+  id: '', name: '', imageTag: '',
   memoryMb: 512, cpus: 0.5, ports: [] as PortRecord[],
 });
 const form = ref(emptyForm());

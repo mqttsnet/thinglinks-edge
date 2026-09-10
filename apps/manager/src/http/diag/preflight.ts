@@ -12,6 +12,7 @@ import { recordAudit } from '../../core/db.ts';
 import { runPreflight, renderReport, adaptDocker } from '../../core/preflight/run.ts';
 import { readHostStats } from '../../core/health/host-stats.ts';
 import type { HttpContext } from '../context.ts';
+import { allowedNodeRedImageTags } from '../../core/instance/image-policy.ts';
 
 export function registerPreflight(api: FastifyInstance, ctx: HttpContext): void {
   const { config, db, guard, service } = ctx;
@@ -27,8 +28,8 @@ export function registerPreflight(api: FastifyInstance, ctx: HttpContext): void 
       listenPort: config.listenPort,
       dataDir: config.dataDir,
       portRange: config.portRange,
-      images: (process.env['ALLOWED_IMAGE_TAGS'] ?? '5.0.4-24-minimal,4.1.13-22-minimal')
-        .split(',').map((t) => `nodered/node-red:${t.trim()}`).filter(Boolean),
+      images: allowedNodeRedImageTags(process.env['ALLOWED_IMAGE_TAGS'])
+        .map(tag => `nodered/node-red:${tag}`),
       corporateCidrs: (process.env['CORPORATE_CIDRS'] ?? '')
         .split(',').map((c) => c.trim()).filter(Boolean),
       ntpServer: process.env['NTP_SERVER']?.trim() ?? '',
