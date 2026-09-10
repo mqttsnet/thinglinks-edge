@@ -18,6 +18,9 @@ import { NSelect, NSpin, NEmpty, NTag, NButton, NAlert, useMessage } from 'naive
 import { useRouter } from 'vue-router';
 import { api, ApiError } from '../../api/client';
 import TrendChart from '../../components/TrendChart.vue';
+import FieldValue from './components/FieldValue.vue';
+import { fieldDeviceStatus } from './field-status';
+import { createFieldRefreshTask } from './field-refresh';
 import type { TagHistory } from '../../api/types';
 import type {
   Instance, FieldDeviceRecord, FieldTagRecord, FieldSummary, ProbeResult,
@@ -33,6 +36,10 @@ const instances = ref<Instance[]>([]);
 const scope = ref('');
 const summary = ref<FieldSummary | null>(null);
 const devices = ref<FieldDeviceRecord[]>([]);
+const instancesById = computed(() => new Map(instances.value.map((instance) => [instance.id, instance])));
+const deviceStatus = (device: FieldDeviceRecord) =>
+  fieldDeviceStatus(device, instancesById.value.get(device.instanceId));
+const managedOnline = computed(() => devices.value.filter((device) => deviceStatus(device).online).length);
 
 const scopeOptions = computed(() => [
   { label: '全部实例', value: '' },
@@ -56,6 +63,7 @@ const TAG_LIMIT = 200;
 
 async function loadTags(d: FieldDeviceRecord, quiet = false) {
   const k = keyOf(d);
+  if (tagsBusy.value.has(k)) return;
   tagsBusy.value = new Set(tagsBusy.value).add(k);
   try {
     const r = await api.fieldTags(d.instanceId, d.nodeId);
@@ -82,26 +90,38 @@ async function toggle(d: FieldDeviceRecord) {
   await loadTags(d);
 }
 
-async function load(quiet = false) {
-  try {
-    const id = scope.value || undefined;
-    const [s, d] = await Promise.all([api.fieldSummary(id), api.fieldDevices(id)]);
-    summary.value = s;
-    devices.value = d.devices;
+const instanceRefresh = createFieldRefreshTask();
+const deviceRefresh = createFieldRefreshTask();
+function load(quiet = false): Promise<void> {
+  // 两路读取互不阻塞；慢请求由后续轮询复用，失败时保留最近确认的实例状态。
+  void instanceRefresh.run(async (current) => {
+    try {
+      const r = await api.instances();
+      if (current()) instances.value = r.instances;
+    } catch { /* 实例状态读取失败不影响已采集值 */ }
+  });
+  return deviceRefresh.run(async (current) => {
+    try {
+      const id = scope.value || undefined;
+      const [s, d] = await Promise.all([api.fieldSummary(id), api.fieldDevices(id)]);
+      if (!current()) return;
+      summary.value = s;
+      devices.value = d.devices;
 
-    // 展开着的设备跟着一起刷 —— 点位当前值本来就是这一页要盯的东西
-    const alive = new Set(d.devices.map(keyOf));
-    await Promise.all(
-      [...expanded.value].filter((k) => alive.has(k)).map((k) => {
+      // 展开着的设备跟着一起刷 —— 点位当前值本来就是这一页要盯的东西
+      const alive = new Set(d.devices.map(keyOf));
+      for (const k of expanded.value) {
+        if (!alive.has(k)) continue;
         const dev = d.devices.find((x) => keyOf(x) === k);
-        return dev ? loadTags(dev, true) : Promise.resolve();
-      }),
-    );
-  } catch (e) {
-    if (!quiet) message.error(e instanceof ApiError ? e.message : '加载失败');
-  } finally {
-    loading.value = false;
-  }
+        // 点位请求有自己的 busy 守卫；慢点位不占用台账刷新任务。
+        if (dev) void loadTags(dev, true);
+      }
+    } catch (e) {
+      if (current() && !quiet) message.error(e instanceof ApiError ? e.message : '加载失败');
+    } finally {
+      if (current()) loading.value = false;
+    }
+  }, !quiet);
 }
 
 async function onScopeChange(v: string) {
@@ -116,12 +136,15 @@ async function onScopeChange(v: string) {
 }
 
 let timer: number | undefined;
-onMounted(async () => {
-  instances.value = await api.instances().then((r) => r.instances).catch(() => []);
-  await load();
+onMounted(() => {
+  void load();
   timer = window.setInterval(() => void load(true), 10_000);
 });
-onBeforeUnmount(() => { if (timer !== undefined) window.clearInterval(timer); });
+onBeforeUnmount(() => {
+  instanceRefresh.dispose();
+  deviceRefresh.dispose();
+  if (timer !== undefined) window.clearInterval(timer);
+});
 
 // ── 未纳管：南向探测 ─────────────────────────────────────
 
@@ -200,12 +223,6 @@ const trendData = computed(() => {
 
 // ── 展示 ────────────────────────────────────────────────
 
-function fmtValue(v: unknown): string {
-  if (v === null || v === undefined) return '—';
-  if (typeof v === 'number' || typeof v === 'boolean' || typeof v === 'string') return String(v);
-  return JSON.stringify(v);
-}
-
 /** 相对时间。绝对时刻放 title 里，排障时要对日志还是得看准点 */
 function fmtAgo(iso: string | null): string {
   if (!iso) return '从未';
@@ -261,8 +278,8 @@ function qualityBad(q: string): boolean {
           </span>
           <div v-if="summary" class="nums">
             <span><b class="num">{{ summary.managed.devices }}</b> 台设备</span>
-            <span><b class="num" :class="{ warn: summary.managed.online < summary.managed.devices }">
-              {{ summary.managed.online }}</b> 台在线</span>
+            <span><b class="num" :class="{ warn: managedOnline < summary.managed.devices }">
+              {{ managedOnline }}</b> 台在线</span>
             <span><b class="num">{{ summary.managed.tags }}</b> 个点位</span>
           </div>
         </div>
@@ -282,9 +299,12 @@ function qualityBad(q: string): boolean {
           <div v-for="d in devices" :key="keyOf(d)" class="dev">
             <div class="head" @click="toggle(d)">
               <span class="caret" :class="{ open: expanded.has(keyOf(d)) }">›</span>
-              <span class="dot" :class="{ on: d.online }"
-                    :title="d.online ? '在线' : '离线'"></span>
+              <span class="dot" :class="{ on: deviceStatus(d).online }"
+                    :title="deviceStatus(d).label" :aria-label="deviceStatus(d).label"></span>
               <span class="nm">{{ d.name }}</span>
+              <NTag v-if="deviceStatus(d).instanceUnavailable" size="tiny">
+                {{ deviceStatus(d).label }}
+              </NTag>
               <span class="mono id">{{ d.nodeId }}</span>
               <NTag v-if="d.protocol" size="tiny" round>{{ d.protocol }}</NTag>
               <span v-if="d.address" class="mono addr">{{ d.address }}</span>
@@ -293,12 +313,15 @@ function qualityBad(q: string): boolean {
             </div>
 
             <div v-if="expanded.has(keyOf(d))" class="tags">
+              <NAlert v-if="deviceStatus(d).instanceUnavailable" type="default" :bordered="false" class="last-values-note">
+                {{ deviceStatus(d).label }}。以下保留最后一次采集值，可结合更新时间查看。
+              </NAlert>
               <NSpin :show="tagsBusy.has(keyOf(d)) && !tagsOf.has(keyOf(d))" size="small">
                 <NEmpty v-if="(tagsOf.get(keyOf(d)) ?? []).length === 0 && !tagsBusy.has(keyOf(d))"
                         description="这台设备还没有点位" size="small" style="padding: 16px 0" />
                 <table v-else>
                   <thead>
-                    <tr><th>点位</th><th>标识</th><th class="r">当前值</th><th>质量</th><th>更新</th><th></th></tr>
+                    <tr><th>点位</th><th>标识</th><th class="r">{{ deviceStatus(d).instanceUnavailable ? '最后采集值' : '当前值' }}</th><th>质量</th><th>更新</th><th></th></tr>
                   </thead>
                   <tbody>
                     <template v-for="t in (tagsOf.get(keyOf(d)) ?? []).slice(0, TAG_LIMIT)"
@@ -307,7 +330,7 @@ function qualityBad(q: string): boolean {
                       <td>{{ t.name || t.tagId }}</td>
                       <td class="mono muted">{{ t.tagId }}</td>
                       <td class="r">
-                        <b class="val num">{{ fmtValue(t.lastValue) }}</b>
+                        <FieldValue :value="t.lastValue" />
                         <span v-if="t.unit" class="unit">{{ t.unit }}</span>
                       </td>
                       <td>
@@ -485,6 +508,7 @@ function qualityBad(q: string): boolean {
 .seen { margin-left: auto; font-size: 12px; color: var(--muted); white-space: nowrap; }
 
 .tags { padding: 4px 0 14px 26px; }
+.last-values-note { margin-bottom: 10px; }
 .trend > td { padding: 10px 6px 14px; }
 .trend .hint { margin: 8px 0 0; font-size: 12px; color: var(--text-3); line-height: 1.7; }
 .more, .note, .idle { margin: 10px 0 0; font-size: 12px; color: var(--muted); }
@@ -495,7 +519,6 @@ th, td { padding: 6px 10px; text-align: left; border-bottom: 1px solid var(--bor
 thead th { font-size: 11.5px; font-weight: 600; color: var(--text-2); white-space: nowrap; }
 tbody tr:last-child td { border-bottom: none; }
 .r { text-align: right; }
-.val { font-weight: 650; }
 .unit { margin-left: 4px; font-size: 11.5px; color: var(--muted); }
 .muted { color: var(--muted); }
 

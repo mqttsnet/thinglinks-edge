@@ -15,9 +15,9 @@ import type {
   FieldDeviceRecord, FieldTagRecord, FieldSummary, ProbeResult,
   EdgeMetrics, ReplayResult,
   DiagProbeResponse,
-  FlowTemplate, ApplyPreview, ApplyResult,
+  FlowTemplate, FlowTemplateDetail, TemplateMetadataInput, TemplateApplyOptions, ApplyPreview, ApplyResult,
   CatalogEntry, StoreListResult, ImportResult, InstanceInventory, ApplyPolicyResult,
-  PlatformNodeMigration,
+  PlatformNodeMigration, ProtocolComponentStatus, InstanceProtocolStatus, CloudModelQuery, CloudModelQueryResult, EdgeCommandRecord,
 } from './types';
 import { filenameFrom } from './filename';
 import type { ProductMetadata, ProductReleaseResult } from '../product/types';
@@ -359,25 +359,44 @@ export const api = {
 
   // ── 流程模板（T4.6）────────────────────────────────────
 
+  commands: (instanceId: string, nodeId: string) => request<{ commands: EdgeCommandRecord[] }>(
+    `/api/commands${qs({ instanceId, nodeId, limit: '20' })}`),
+
+  queryCloudModel: (body: CloudModelQuery) => request<CloudModelQueryResult>('/api/cloud/model/query', {
+    method: 'POST', body: JSON.stringify(body),
+  }),
+
+  protocols: () => request<{ protocols: ProtocolComponentStatus[] }>('/api/protocols'),
+  instanceProtocols: (instanceId: string) => request<InstanceProtocolStatus>(
+    `/api/instances/${encodeURIComponent(instanceId)}/protocols`),
+
   templates: () => request<{ templates: FlowTemplate[] }>('/api/templates'),
+  template: (id: string) => request<{ template: FlowTemplateDetail }>(`/api/templates/${encodeURIComponent(id)}`),
+  renderTemplate: (id: string, parameters: Record<string, unknown>) =>
+    request<{ template: FlowTemplateDetail }>(`/api/templates/${encodeURIComponent(id)}/render`, {
+      method: 'POST', body: JSON.stringify({ parameters }),
+    }),
 
   /**
    * 建模板。两种来源二选一：
    *   · `instanceId` —— 从运行中的实例现导（要有那台实例的查看授权）
    *   · `content`    —— 直接给流程 JSON（从文件读进来的）
    */
-  createTemplate: (body: {
-    name: string; description?: string; instanceId?: string; content?: unknown;
-  }) => request<{ template: FlowTemplate }>('/api/templates', {
+  createTemplate: (body: TemplateMetadataInput & { instanceId?: string; content?: unknown; builtinTemplateId?: string; parameters?: Record<string, unknown> }) => request<{ template: FlowTemplate }>('/api/templates', {
     method: 'POST', body: JSON.stringify(body),
   }),
 
   renameTemplate: (id: string, name: string, description: string) =>
-    request<{ template: FlowTemplate }>(`/api/templates/${id}`, {
+    request<{ template: FlowTemplate }>(`/api/templates/${encodeURIComponent(id)}`, {
       method: 'PATCH', body: JSON.stringify({ name, description }),
     }),
 
-  deleteTemplate: (id: string) => request<void>(`/api/templates/${id}`, { method: 'DELETE' }),
+  updateTemplate: (id: string, body: TemplateMetadataInput) =>
+    request<{ template: FlowTemplate }>(`/api/templates/${encodeURIComponent(id)}`, {
+      method: 'PATCH', body: JSON.stringify(body),
+    }),
+
+  deleteTemplate: (id: string) => request<void>(`/api/templates/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 
   /**
    * 下载模板文件。
@@ -387,7 +406,7 @@ export const api = {
    * 重新序列化会改掉缩进和键序，跟别处导出的文件对不上 diff。
    */
   downloadTemplate: async (id: string): Promise<{ blob: Blob; filename: string }> => {
-    const res = await fetch(`${basePath}/api/templates/${id}/download`, {
+    const res = await fetch(`${basePath}/api/templates/${encodeURIComponent(id)}/download`, {
       credentials: 'same-origin',
     });
     if (!res.ok) {
@@ -400,13 +419,6 @@ export const api = {
     return { blob: await res.blob(), filename: filenameFrom(disp, 'flows.json') };
   },
 
-  /**
-   * 套用模板到实例。
-   *
-   * `dryRun` 为 true 时只做兼容性检查**不动目标实例**；为 false 才真正
-   * **整体替换**它的全部流程。两个分支返回不同结构，故拆成两个方法，
-   * 免得调用方拿到联合类型还要自己收窄。
-   */
   // ── 节点管理（01 号文 5.7）────────────────────────────
   //
   // 三个清单三条路由，别当成同一份数据的三个视图 —— 见 types.ts 的说明。
@@ -509,6 +521,9 @@ export const api = {
         method: 'POST', body: JSON.stringify({ module, version }),
       }),
 
+  instanceNodeInventory: (instanceId: string) => request<InstanceInventory>(
+    `/api/nodes/inventory/${encodeURIComponent(instanceId)}`),
+
   nodeInventory: () =>
     request<{ instances: InstanceInventory[] }>('/api/nodes/inventory'),
 
@@ -524,13 +539,14 @@ export const api = {
       { method: 'POST' },
     ),
 
-  previewApply: (instanceId: string, templateId: string) =>
+  /** 预览只读；提交携带预览的流程版本，防止覆盖期间的编辑器变更。 */
+  previewApply: (instanceId: string, templateId: string, options: TemplateApplyOptions = {}) =>
     request<ApplyPreview>(`/api/instances/${instanceId}/flows`, {
-      method: 'POST', body: JSON.stringify({ templateId, dryRun: true }),
+      method: 'POST', body: JSON.stringify({ templateId, ...options, dryRun: true }),
     }),
 
-  applyTemplate: (instanceId: string, templateId: string) =>
+  applyTemplate: (instanceId: string, templateId: string, options: TemplateApplyOptions = {}) =>
     request<ApplyResult>(`/api/instances/${instanceId}/flows`, {
-      method: 'POST', body: JSON.stringify({ templateId }),
+      method: 'POST', body: JSON.stringify({ templateId, ...options }),
     }),
 };

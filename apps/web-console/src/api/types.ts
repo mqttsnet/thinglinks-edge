@@ -638,8 +638,48 @@ export interface DiagProbeResponse {
 
 // ── 流程模板（T4.6）──────────────────────────────────────────
 
+export type TemplateCategory = 'industrial' | 'network' | 'building' | 'power' | 'custom';
+export type TemplateDeployMode = 'append' | 'replace';
+export interface TemplateRequirement { module: string; version: string; nodeTypes: string[] }
+export interface TemplateParameter {
+  /** Current capability restriction; an enabled legacy boolean may only be turned off. */
+  disabledReason?: string;
+  group?: 'device' | 'cloud' | 'points' | 'commands' | 'advanced';
+  visibleWhen?: { key: string; value: unknown };
+  key: string;
+  label: string;
+  type: 'text' | 'number' | 'select' | 'boolean' | 'table';
+  required?: boolean;
+  default?: unknown;
+  description?: string;
+  min?: number;
+  max?: number;
+  options?: { label: string; value: string | number }[];
+  columns?: TemplateParameter[];
+}
+export interface TemplateMetadataInput {
+  name: string;
+  description?: string;
+  category?: TemplateCategory;
+  protocols?: string[];
+}
+export interface TemplateApplyOptions {
+  expectedRevision?: string;
+  mode?: TemplateDeployMode;
+  parameters?: Record<string, unknown>;
+}
+
 /** 模板元信息。列表接口只回这些，**不含 flows** —— 一个模板可能几百 KB */
 export interface FlowTemplate {
+  origin?: 'builtin' | 'custom';
+  derivedFrom?: { templateId: string; revision: string };
+  category?: TemplateCategory;
+  protocols?: string[];
+  revision?: string;
+  requirements?: TemplateRequirement[];
+  parameters?: TemplateParameter[];
+  parameterValues?: Record<string, unknown>;
+  notes?: string[];
   id: string;
   name: string;
   description: string;
@@ -655,6 +695,8 @@ export interface FlowTemplate {
   createdBy: string;
   createdAt: string;
 }
+
+export interface FlowTemplateDetail extends FlowTemplate { flows: unknown[] }
 
 /** 套用前的兼容性结论 */
 export interface CompatResult {
@@ -672,6 +714,11 @@ export interface CompatResult {
 
 /** 试算（dryRun）结果：只查不动 */
 export interface ApplyPreview {
+  modelChecked?: boolean;
+  revision?: string;
+  mode?: TemplateDeployMode;
+  deployable?: boolean;
+  dependencyIssues?: string[];
   dryRun: true;
   nodeCount: number;
   tabCount: number;
@@ -683,6 +730,10 @@ export interface ApplyPreview {
 
 /** 真正套用之后的结果 */
 export interface ApplyResult {
+  modelChecked?: boolean;
+  mode?: TemplateDeployMode;
+  deployable?: boolean;
+  dependencyIssues?: string[];
   applied: true;
   deployStatus: number;
   nodeCount: number;
@@ -855,4 +906,96 @@ export interface ApplyPolicyResult {
   /** 实例是否真的重启了 —— 不重启就没生效 */
   restarted: boolean;
   error: string;
+}
+
+// Protocol component catalogue; availability, package policy and runtime loading are distinct evidence.
+export interface ProtocolPackageStatus extends TemplateRequirement {
+  packagePresent: boolean;
+  integrityValid: boolean;
+  approval: 'exact' | 'unrestricted' | 'other' | 'missing';
+  installedVersion: string | null;
+  installation: 'not-inspected' | 'not-observed' | 'version-mismatch' | 'installed';
+  loaded: boolean | null;
+  missingNodeTypes: string[];
+}
+export interface ProtocolComponentStatus {
+  id: string;
+  name: string;
+  category: string;
+  status: 'available' | 'blocked' | 'extension';
+  description: string;
+  notes: string[];
+  requirements: TemplateRequirement[];
+  builtinNodeTypes: string[];
+  packages: ProtocolPackageStatus[];
+  ready: boolean | null;
+  blockers: string[];
+}
+export interface InstanceProtocolStatus {
+  instanceId: string;
+  inspected: boolean;
+  inspectionError?: string;
+  protocols: ProtocolComponentStatus[];
+}
+
+/** Product model values read from ThingLinks; these do not prove a device's bound version. */
+export interface CloudModelParameter {
+  parameterCode: string;
+  parameterName?: string;
+  datatype?: string;
+  required?: string | number | boolean;
+  min?: string | number;
+  max?: string | number;
+}
+export interface CloudModelCommand {
+  commandCode: string;
+  commandName?: string;
+  requests?: CloudModelParameter[];
+  responses?: CloudModelParameter[];
+}
+export interface CloudModelProperty {
+  propertyCode: string;
+  propertyName?: string;
+  datatype?: string;
+  unit?: string;
+  method?: string;
+}
+export interface CloudModelService {
+  serviceCode: string;
+  serviceName?: string;
+  properties?: CloudModelProperty[];
+  commands?: CloudModelCommand[];
+}
+export interface CloudProductModel {
+  productIdentification?: string;
+  productName?: string;
+  services?: CloudModelService[];
+}
+export interface CloudModelQuery {
+  productIdentification?: string;
+  versionNo?: string;
+  serviceCodes?: string[];
+}
+export interface CloudModelQueryResult { model: CloudProductModel; versionNo?: string; pages: number }
+
+/** Device executor evidence and MQTT response delivery remain independent. */
+export interface EdgeCommandRecord {
+  modelChecked?: boolean;
+  id: string | number;
+  mid: number | string;
+  gatewayId: string;
+  instanceId: string;
+  consumerId: string;
+  deviceIdentification: string;
+  serviceCode: string;
+  cmd: string;
+  params: Record<string, unknown>;
+  status: 'queued' | 'leased' | 'succeeded' | 'failed' | 'rejected' | 'unknown';
+  result: Record<string, unknown> | null;
+  error: string;
+  createdAt: string;
+  completedAt: string | null;
+  replyPending: boolean;
+  replyAttempts: number;
+  replyError: string;
 }
