@@ -4,7 +4,7 @@ import Database from 'better-sqlite3';
 import { migrate } from './db.ts';
 import { InstanceRepo } from './instance/repo.ts';
 
-test('v12 database upgrades existing instance and journal to v13 idempotently', () => {
+test('v12 database upgrades instance runtime and journal idempotently through current migrations', () => {
   const db = new Database(':memory:');
   db.pragma('foreign_keys = ON');
   migrate(db, 12);
@@ -15,7 +15,7 @@ test('v12 database upgrades existing instance and journal to v13 idempotently', 
   ).run('line-a', 'Line A', '5.0.4-24-minimal', 512, 0.5,
     '/red/line-a/', 'secret', 'preserve me');
 
-  assert.equal(migrate(db), 13);
+  assert.equal(migrate(db), 17);
   const runtime = new InstanceRepo(db, Buffer.alloc(32, 1)).nodeRuntime('line-a');
   assert.deepEqual(runtime, {
     mode: 'legacy',
@@ -37,7 +37,7 @@ test('v12 database upgrades existing instance and journal to v13 idempotently', 
     { name: 'execution_lease_expires_at', dflt_value: '0', required: 1 },
     { name: 'execution_owner', dflt_value: "''", required: 1 },
   ]);
-  assert.equal(migrate(db), 13);
+  assert.equal(migrate(db), 17);
   const preserved = db.prepare(
     'SELECT name, notes FROM instance WHERE id = ?',
   ).get('line-a') as { name: string; notes: string };
@@ -48,12 +48,12 @@ test('migration target is validated and never downgrades a newer database', () =
   const db = new Database(':memory:');
   assert.throws(() => migrate(db, -1), /目标版本/);
   assert.throws(() => migrate(db, 13.5), /目标版本/);
-  assert.throws(() => migrate(db, 14), /目标版本/);
-  assert.equal(migrate(db), 13);
-  assert.equal(migrate(db, 12), 13);
+  assert.throws(() => migrate(db, 18), /目标版本/);
+  assert.equal(migrate(db), 17);
+  assert.equal(migrate(db, 12), 17);
   assert.equal(
     (db.prepare('SELECT version FROM schema_version').get() as { version: number }).version,
-    13,
+    17,
   );
 });
 
@@ -157,4 +157,30 @@ test('v13 rejects arbitrary migration error text in journal and projection', () 
     'sha256:image-a', 'sha512:a', '.thinglinks-migration/line-a/tx-01',
     JSON.stringify({ version: 1, kind: 'migration' }), 'admin', 'opaque-secret-value',
   ), /CHECK constraint failed/);
+});
+
+
+test('v14 template metadata migration preserves existing content and supplies custom defaults', () => {
+  const db = new Database(':memory:');
+  migrate(db, 13);
+  db.prepare("INSERT INTO flow_template(id,name,content) VALUES ('old','Legacy','[]')").run();
+  migrate(db);
+  assert.deepEqual(db.prepare("SELECT name,content,category,protocols FROM flow_template WHERE id='old'").get(), {
+    name: 'Legacy', content: '[]', category: 'custom', protocols: '[]',
+  });
+  migrate(db);
+  assert.equal((db.prepare('SELECT COUNT(*) AS n FROM flow_template').get() as { n: number }).n, 1);
+  db.close();
+});
+
+
+test('v15 adds trusted copy metadata without changing existing template categories or content', () => {
+  const db = new Database(':memory:');
+  migrate(db, 14);
+  db.prepare("INSERT INTO flow_template(id,name,content,category,protocols) VALUES ('old','Site','[]','network','[\"tcp\"]')").run();
+  migrate(db);
+  assert.deepEqual(db.prepare("SELECT name,content,category,protocols,trusted_metadata FROM flow_template WHERE id='old'").get(), {
+    name: 'Site', content: '[]', category: 'network', protocols: '["tcp"]', trusted_metadata: '{}',
+  });
+  db.close();
 });

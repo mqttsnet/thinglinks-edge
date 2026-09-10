@@ -8,6 +8,8 @@
 import Database from 'better-sqlite3';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { COMMAND_SCHEMA } from './cloud/commands/schema.ts';
+import { PRESENCE_SCHEMA } from './cloud/presence/schema.ts';
 
 export type Db = Database.Database;
 
@@ -403,6 +405,19 @@ const MIGRATIONS: string[] = [
     )
   );
   `,
+  // v14 —— custom template categories and protocol tags; builtins stay versioned in source.
+  `
+  ALTER TABLE flow_template ADD COLUMN category TEXT NOT NULL DEFAULT 'custom';
+  ALTER TABLE flow_template ADD COLUMN protocols TEXT NOT NULL DEFAULT '[]';
+  `,
+  // v15 —— trusted dependency/provenance metadata on configured builtin copies.
+  `
+  ALTER TABLE flow_template ADD COLUMN trusted_metadata TEXT NOT NULL DEFAULT '{}';
+  `,
+  // v16 —— bounded command bindings, delivery leases and execution receipts.
+  COMMAND_SCHEMA,
+  // v17 — confirmed child presence sources, isolated by gateway.
+  PRESENCE_SCHEMA,
 ];
 export function openDb(file: string): Db {
   if (file !== ':memory:') mkdirSync(dirname(file), { recursive: true });

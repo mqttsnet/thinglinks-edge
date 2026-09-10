@@ -3253,9 +3253,9 @@ async function main() {
       await verifier.startManager('barrier');
       await verifier.setupSession();
       const db = verifier.database();
-      assert.equal(db.prepare('SELECT version FROM schema_version').get().version, 13);
+      assert.equal(db.prepare('SELECT version FROM schema_version').get().version, 17);
       db.close();
-      pass('manager-bootstrap', { schema: 13, auth: true, csrf: true });
+      pass('manager-bootstrap', { schema: 17, auth: true, csrf: true });
       if (stoppedStageOnly) {
         await verifier.crashAt('rs-stage', verifier.phaseCrashDecision('staged'));
         await verifier.recoverNormalAndReturnToBarrier();
