@@ -13,11 +13,20 @@
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test",
-    "lint": "pnpm -r lint"
+    "lint": "eslint .",
+    "check": "pnpm lint && pnpm typecheck && pnpm test"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
       "better-sqlite3"
     ]
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^9.39.5",
+    "eslint-plugin-vue": "^10.10.0",
+    "globals": "^17.11.0",
+    "typescript-eslint": "^8.68.0",
+    "vue-eslint-parser": "^10.4.1"
   }
 }

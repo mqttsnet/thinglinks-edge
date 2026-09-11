@@ -1,0 +1,86 @@
+import type { TemplateRecipe } from '../types.ts';
+import {
+  identityFields,
+  hostField,
+  portField,
+  intervalField,
+  pointTable,
+  requirements,
+  notes,
+  integer,
+  host,
+  pipeline,
+  pointsOf,
+} from './common.ts';
+
+export const s7Recipe: TemplateRecipe = {
+  id: 'builtin:s7',
+  name: '西门子 S7 PLC 采集上云',
+  description: '通过 S7 连接读取变量表，支持定时上报与变化上报。',
+  category: 'industrial',
+  protocols: ['s7'],
+  revision: '1.0.0',
+  requirements: requirements('s7'),
+  parameters: [
+    ...identityFields,
+    { ...hostField, required: true, default: '127.0.0.1' },
+    portField(102),
+    { key: 'rack', label: '机架号 Rack', type: 'number', default: 0, min: 0, max: 7 },
+    { key: 'slot', label: '槽号 Slot', type: 'number', default: 1, min: 0, max: 31 },
+    intervalField,
+    { key: 'changesOnly', label: '仅在变量变化时上报', type: 'boolean', default: false },
+    pointTable({ sourceLabel: 'PLC 变量地址', sourceDefault: 'DB1,REAL0' }),
+  ],
+  notes: [
+    ...notes,
+    'S7-1200/1500 需按现场策略允许 PUT/GET，并确认数据块访问方式及地址；本模板不会修改 PLC 配置。',
+  ],
+  build(p) {
+    const remote = host(p.host),
+      port = integer(p.port, '端口');
+    const points = pointsOf(p);
+    return pipeline(
+      p,
+      'S7 PLC 采集',
+      's7',
+      `${remote}:${port}`,
+      [
+        {
+          id: 'connection',
+          type: 's7 endpoint',
+          transport: 'iso-on-tcp',
+          address: remote,
+          port: String(port),
+          rack: String(integer(p.rack, '机架号')),
+          slot: String(integer(p.slot, '槽号')),
+          connmode: 'rack-slot',
+          localtsaphi: '01',
+          localtsaplo: '00',
+          remotetsaphi: '01',
+          remotetsaplo: '00',
+          adapter: '',
+          busaddr: 2,
+          cycletime: Number(p.interval) * 1000,
+          timeout: 3000,
+          name: 'S7 连接',
+          vartable: points.map((point) => ({ name: String(point.property), addr: String(point.source) })),
+        },
+        {
+          id: 'input',
+          type: 's7 in',
+          z: 'tab',
+          name: 'PLC 变量采集',
+          endpoint: 'connection',
+          mode: 'all',
+          variable: '',
+          diff: p.changesOnly,
+          x: 160,
+          y: 160,
+          wires: [['decode']],
+        },
+      ],
+      'json',
+      points.map((point) => ({ ...point, source: point.property })),
+    );
+  },
+};

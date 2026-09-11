@@ -2,6 +2,10 @@ node_modules/
 dist/
 *.log
 
+# TypeScript 增量编译缓存。跟 dist 一样是构建产物，
+# 但它不在 dist/ 目录下，单独忽略容易漏
+*.tsbuildinfo
+
 # 本地数据与凭据 —— 永不提交
 data/
 *.db
@@ -12,10 +16,33 @@ data/
 .env.*
 !.env.example
 
-# 编辑器
+# 离线交付的产出目录。
+#   dist-offline/ —— build-offline-bundle.sh 打出来的安装包（几百 MB 镜像）
+#   dist-nodes/   —— pack-nodes.sh 取下来的节点包 tgz（第三方包体，不该进版本库）
+dist-offline/
+dist-nodes/
+
+# 运行期产出的归档：备份包、诊断包、安装自检报告。
+# 这三样都可能含现场拓扑与日志，即便脱敏过也不该进版本库
+*.tar
+thinglinks-edge-backup-*/
+thinglinks-edge-diag-*.tar
+preflight-report*.json
+
+# 本地 AI 会话、草稿与个人偏好不提交。
+# 仓库级共享规则使用根 AGENTS.md / CLAUDE.md、.github/copilot-instructions.md
+# 与 docs/ 中可复用的产品和开发说明。
+tasks/
+# 旧 AI 输出目录不再纳入公共文档；计划与验收记录统一放 tasks/。
+docs/superpowers/
+docs/verification/
+.claude/
+CLAUDE.local.md
+*.scratch.*
+scratchpad/
+
+# 编辑器与系统
 .idea/
 .vscode/
 .DS_Store
-
-
-.claude
+*.swp

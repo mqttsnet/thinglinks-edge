@@ -65,6 +65,16 @@ export function registerVersion(scope: Parameters<RouteModule>[0], ctx: Paramete
 
     const notes = await readReleaseNotes(VERSION);
 
+    /*
+     * 设置里的开关是**第二道闸**，压在 URL 之上：
+     * URL 是部署期决定的（配了才有得查），开关是运维随时能关的。
+     * 工业现场对「设备自己往外连」很敏感，出了事要能立刻停掉，
+     * 而不是去改 compose 再重启一遍。
+     */
+    if (!ctx.settings.get().updateCheckEnabled) {
+      return reply.send({ version: VERSION, notes, update: { enabled: false } });
+    }
+
     // 未启用时直接回，不引入任何网络等待
     if (!checker.enabled) {
       return reply.send({ version: VERSION, notes, update: { enabled: false } });

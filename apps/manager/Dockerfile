@@ -19,7 +19,9 @@
 # linuxmusl-arm64 / linuxmusl-x64 等各平台 .node，运行期才按当前平台挑。
 FROM --platform=$BUILDPLATFORM node:24.19.0-alpine AS builder
 WORKDIR /repo
-RUN corepack enable
+# pack-nodes.sh 使用 Bash 数组并按 lock 的 resolved 地址下载原始 tarball。
+# 两个工具只属于构建链，不带进 runtime，避免扩大线上镜像的工具面。
+RUN apk add --no-cache bash curl && corepack enable
 
 # 先只拷依赖清单，依赖层可跨代码改动复用
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
@@ -34,6 +36,9 @@ COPY tsconfig.base.json ./
 COPY apps/manager apps/manager
 COPY apps/web-console apps/web-console
 COPY packages packages
+COPY scripts/pack-nodes.sh scripts/pack-nodes.sh
+COPY scripts/prepare-protocol-seed.mjs scripts/prepare-protocol-seed.mjs
+COPY scripts/protocol-seed/package-lock.json scripts/protocol-seed/package-lock.json
 RUN pnpm --filter @thinglinks-edge/manager build
 # 控制台按相对路径构建（base: './'），挂载前缀由 Manager 运行期注入 <base href>
 RUN pnpm --filter @thinglinks-edge/web-console build
@@ -54,6 +59,20 @@ RUN pnpm --filter @thinglinks-edge/manager deploy --legacy --prod --ignore-scrip
 # 按 -path 匹配而不是写死版本号目录，升级 better-sqlite3 时不用回来改这里。
 RUN find /out/node_modules/.pnpm -path '*/better-sqlite3/prebuilds/*.node' \
       ! -name 'linuxmusl-*' -delete
+
+# 固定平台包必须是 registry 发布的原始 tarball，不能从 workspace 重打包。
+# expectation 同时证明依赖闭包包含 Edge/common，并锁死最终进入镜像的字节。
+RUN bash ./scripts/pack-nodes.sh \
+      --out /out/npm-seed \
+      --expect '@mqttsnet/thinglinks-edge-nodes@0.0.1=sha512-NKsIKyUHNyB+xuXNpCrOqzEYbYflEFeXqC/IgjM2/+AzktSTb7+TZFBWHoqp9FjLDX2crpoah6gn8n+Uy32AkA==' \
+      --expect '@mqttsnet/thinglinks-node-red-common@0.0.1=sha512-T6QN9RlBF0qbvujaAKNY81BjrcIdbqeqFkLfQsGuKHI8UY2cgad9prF8xUC5n4BbHbNJ7ftBmSBkj+IEZvTJWQ==' \
+      '@mqttsnet/thinglinks-edge-nodes@0.0.1'
+
+# 协议组件只随 Manager 提供离线安装包；不自动批准，也不装入每台实例。
+# 完整锁文件包含可选原生依赖，准备器逐个校验原始 tarball。
+RUN node --experimental-strip-types scripts/prepare-protocol-seed.mjs --out /out/protocol-seed
+RUN cp /out/protocol-seed/*.tgz /out/npm-seed/ && \
+    cp /out/protocol-seed/protocol-seed-manifest.json /out/npm-seed/
 
 # 使用者变更说明（vX.Y.Z.zh-CN.md）随镜像走：升级后控制台要弹一次。
 # 刻意放在所有 RUN **之后**：没有任何构建步骤读它，而发版前改文案是常事 ——
@@ -84,9 +103,20 @@ RUN apk add --no-cache tzdata
 # 把库文件写到没有挂载的 /data —— 只读根文件系统下直接
 # `unable to open database file`，可写根文件系统下更糟：悄悄落进容器可写层，
 # 容器一删数据就没了，而且测试看不出来。
-ENV NODE_ENV=production \
+# 出网代理（03 号文 2.10）：Node 24 的内置开关，读 HTTP_PROXY/HTTPS_PROXY/NO_PROXY。
+# 常开是安全的 —— 没配那几个变量时它什么都不做，离线部署完全不受影响；
+# 而做成「按需开」就得在启动脚本里判断，反而多一处会配错的地方。
+# NODE_SEED_DIR（01 号文 5.7）：预置节点包的第二个来源。
+# 启动时扫这里的 .tgz 进私有源，目录不存在就静默跳过（见 core/nodes/seed.ts），
+# 所以无条件设上是安全的 —— 它给的是一个**约定好的挂载点**：
+#     -v /path/to/tgz:/app/npm-seed:ro
+# 离线安装包走的是另一条路（install.sh 把包拷进 <dataDir>/npm-seed），
+# 两处都扫，互不影响。
+ENV NODE_USE_ENV_PROXY=1 \
+    NODE_ENV=production \
     WEB_ROOT=/app/web \
     TLE_NODE_PACKAGE_DIR=/app/nodes \
+    NODE_SEED_DIR=/app/npm-seed \
     LISTEN_ADDR=0.0.0.0 \
     LISTEN_PORT=19100
 
@@ -95,9 +125,13 @@ COPY --from=builder /out/node_modules ./node_modules
 COPY --from=builder /out/dist ./dist
 COPY --from=builder /out/package.json ./package.json
 COPY --from=builder /repo/apps/web-console/dist ./web
+COPY --from=builder /out/npm-seed ./npm-seed
 # @thinglinks 节点集：创建实例时整份拷进实例数据目录，由 nodesDir 加载
 COPY --from=builder /repo/packages/thinglinks-nodes ./nodes
 COPY --from=builder /repo/changelogs ./changelogs
+# 与镜像一起交付准确匹配的部署文件，现场不需要克隆源码或另找下载地址。
+# docker run --rm --entrypoint cat mqttsnet/thinglinks-edge:1.0.1 /app/docker-compose.yml
+COPY docker-compose.yml ./docker-compose.yml
 
 # 非 root 运行（04-安全设计 第 96 行）。node 镜像自带 uid/gid 1000 的 node 用户。
 # 访问宿主 docker.sock 另需把容器加入 socket 所属组（compose 里的 group_add），

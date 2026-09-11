@@ -10,17 +10,29 @@ import cookie from '@fastify/cookie';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { createContext, type ServerDeps } from './context.ts';
-import { registerSession } from './session.ts';
-import { registerInstances } from './instances.ts';
-import { registerMetrics } from './metrics.ts';
-import { registerSso } from './sso.ts';
-import { registerIngest } from './ingest.ts';
-import { registerBackup } from './backup.ts';
-import { registerCloud } from './cloud.ts';
-import { registerUsers } from './users.ts';
+import { registerSession } from './auth/session.ts';
+import { registerInstances } from './instance/crud.ts';
+import { registerMetrics } from './health/metrics.ts';
+import { registerSso } from './instance/sso.ts';
+import { registerIngest } from './edge/ingest.ts';
+import { registerField } from './edge/field.ts';
+import { registerBackup } from './archive/backup.ts';
+import { registerCloud } from './cloud/config.ts';
+import { registerCloudModel } from './cloud/model.ts';
+import { registerEdgeCommands } from './edge/commands.ts';
+import { registerDiag } from './diag/index.ts';
+import { registerTemplates } from './instance/templates.ts';
+import { registerFlows } from './instance/flows.ts';
+import { registerUsers } from './auth/users.ts';
+import { registerSettings } from './auth/settings.ts';
+import { registerSetup } from './auth/setup.ts';
 import { registerVersion } from './version.ts';
-import { registerProxy } from './proxy.ts';
+import { registerProduct } from './product.ts';
+import { registerProxy } from './instance/proxy.ts';
 import { registerConsole } from './console.ts';
+import { registerNpmRegistry } from './nodes/registry.ts';
+import { registerNodeCatalog } from './nodes/catalog.ts';
+import { registerProtocols } from './protocols/catalog.ts';
 
 export type { ServerDeps } from './context.ts';
 
@@ -51,18 +63,50 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       }
     });
 
+    registerSetup(api, ctx);
     registerSession(api, ctx);
+    registerSettings(api, ctx);
     registerInstances(api, ctx);
     registerMetrics(api, ctx);
     registerSso(api, ctx);
     registerIngest(api, ctx);
+    registerField(api, ctx);
     registerBackup(api, ctx);
     registerCloud(api, ctx);
+    registerCloudModel(api, ctx);
+    if (deps.commandBridge) registerEdgeCommands(api, ctx, deps.commandBridge);
+    registerDiag(api, ctx);
+    registerTemplates(api, ctx);
+    registerFlows(api, ctx);
     registerUsers(api, ctx);
     registerVersion(api, ctx);
+    registerProduct(api, ctx);
+
+    /*
+     * 节点管理（01 号文 5.7）。没配私有源就整套不挂 —— 见 ServerDeps.nodeStore。
+     * 两组路由分开注册：/npm/** 是给 npm 与编辑器读的（不鉴权，理由见该文件），
+     * /api/nodes/** 是管理面（node:view / node:manage）。
+     */
+    if (deps.nodeStore && deps.nodeCatalog) {
+      registerProtocols(api, ctx, { store: deps.nodeStore, catalog: deps.nodeCatalog });
+      registerNpmRegistry(api, ctx, {
+        store: deps.nodeStore,
+        catalog: deps.nodeCatalog,
+        internalBase: deps.npmRegistryUrl ?? `${ctx.config.basePath}/npm/`,
+        upstream: deps.nodeUpstream,
+        platformPackages: deps.platformPackages,
+      });
+      registerNodeCatalog(api, ctx, {
+        store: deps.nodeStore, catalog: deps.nodeCatalog,
+        migrationService: ctx.migrationService,
+        sources: deps.nodeSources, upstream: deps.nodeUpstream,
+      });
+    }
   });
 
   registerProxy(app, ctx);
+  if (deps.commandBridge) app.addHook('onClose', async () => { await deps.commandBridge!.close(); });
+  if (deps.presence) app.addHook('onClose', async () => { await deps.presence!.close(); });
 
   /*
    * 存活探针。带前缀的那个是给外层反代/负载均衡探的。

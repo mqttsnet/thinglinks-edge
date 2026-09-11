@@ -1,12 +1,17 @@
 # ThingLinks Edge —— 单机部署
 #
-#   cp .env.example .env      # 至少填 EXTERNAL_URL 与 MASTER_KEY
+#   只需填写下面两项：访问地址、自己的初始管理员密码（至少 12 位）。
 #   docker compose up -d
-#   docker compose logs manager | grep '\[init\]'    # 首次启动打印一次初始口令
+#   打开该地址，用 admin 和上述密码登录。无需创建 .env、生成密钥或手动拉 Node-RED。
+#   已有管理员的升级不重置密码，也不要求再次填写初始密码。配置文件请妥善保管。
 #
 # Manager 以**兄弟容器**模式管理 Node-RED 实例：实例是宿主上的独立容器，
 # 不是 Manager 的子进程。升级 Manager（docker compose pull && up -d）
 # 不会中断现场采集 —— 产线不会为了升级管理台而停止采集。
+
+x-external-url: &external-url ${EXTERNAL_URL:-http://localhost:19100}
+# 在引号中填写自己的密码；若密码含 $，在 Compose 中写成 $$。
+x-initial-password: &initial-password ""
 
 # EDGE_NAME_PREFIX 只为「同机并行跑两套」而存在（例如现场栈开着、同时跑验证）。
 # 默认值与固定命名完全一致，生产不需要设置它。
@@ -21,7 +26,9 @@ services:
   # found unknown escape character。行尾的 $$ 是防御写法 —— compose 只在 $ 后面
   # 跟标识符或 { 时才插值（实测 ^abc$FOO 到容器里会变成 ^abc），孤立的行尾 $ 本身安全。
   docker-proxy:
-    image: wollomatic/socket-proxy:1.13.1
+    # 参数化是为了两件事：离线包要把镜像改名后随包发（见 scripts/build-offline-bundle.sh），
+    # 以及现场把镜像同步到内网仓库时不必改这个文件
+    image: ${PROXY_IMAGE:-wollomatic/socket-proxy:1.13.1}
     container_name: ${EDGE_NAME_PREFIX:-thinglinks-edge}-docker-proxy
     restart: unless-stopped
     command:
@@ -35,8 +42,13 @@ services:
       # 不能拉取（images/create 仍未放行）也不能删除。放行它是为了让 Manager
       # 能在建实例前判断镜像在不在 —— 否则只能等 containers/create 回 404
       # 名字里允许 / 与 :（nodered/node-red:5.0.4-…），但必须以 /json 结尾，只能查不能改
+      #
+      # `info` 是安装自检要的：架构匹配与 cgroup 内存限额两项只能从它读。
+      # 它是纯只读的守护进程元信息（版本、架构、cgroup、存储驱动、容器计数），
+      # 敏感度低于已经放行的 containers/json —— 不放行的话那两项在装完之后
+      # 永远报「读不到 docker info」，而现场恰恰要靠它们发现「限额配了不生效」。
       # 「No such image」，那句话对现场人员毫无指导意义。
-      - '-allowGET=^(/v1\.[0-9]+)?/(_ping|version|containers/json|containers/[a-zA-Z0-9][a-zA-Z0-9_.-]*/(json|logs|stats)|images/json|images/[a-zA-Z0-9][a-zA-Z0-9_.:@/-]*/json|volumes/[a-zA-Z0-9][a-zA-Z0-9_.-]*|networks)(\?.*)?$$'
+      - '-allowGET=^(/v1\.[0-9]+)?/(_ping|version|info|containers/json|containers/[a-zA-Z0-9][a-zA-Z0-9_.-]*/(json|logs|stats)|images/json|images/[a-zA-Z0-9][a-zA-Z0-9_.:@/-]*/json|volumes/[a-zA-Z0-9][a-zA-Z0-9_.-]*|networks|networks/[a-zA-Z0-9][a-zA-Z0-9_.-]*)(\?.*)?$$'
       - '-allowPOST=^(/v1\.[0-9]+)?/(containers/create|containers/[a-zA-Z0-9][a-zA-Z0-9_.-]*/(start|stop|restart)|networks/create|networks/[a-zA-Z0-9][a-zA-Z0-9_.-]*/(connect|disconnect)|volumes/create)(\?.*)?$$'
       - '-allowPUT=^(/v1\.[0-9]+)?/containers/[a-zA-Z0-9][a-zA-Z0-9_.-]*/archive(\?.*)?$$'
       - '-allowDELETE=^(/v1\.[0-9]+)?/(containers/[a-zA-Z0-9][a-zA-Z0-9_.-]*|networks/[a-zA-Z0-9][a-zA-Z0-9_.-]*|volumes/[a-zA-Z0-9][a-zA-Z0-9_.-]*)(\?.*)?$$'
@@ -47,10 +59,12 @@ services:
       # 而 docker 会**自动建一个同名空目录**顶上去，于是代理启动后一直连不上，
       # 报错却是「connection refused」，看不出根因是挂错了。
       - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock:ro
-    # 访问 docker.sock 需要加入其属组。查本机取值： stat -c '%g' /var/run/docker.sock
-    # 特权集中在这个十几 MB 的 distroless 小程序上，而不是 Manager 那个 Node 应用
-    group_add:
-      - "${DOCKER_GID:-0}"
+    # 只有受限代理以 socket 所有者 root 运行，免去现场查找 Docker 组 ID。
+    # 无 Linux capabilities、无额外挂载、无宿主端口，API 白名单仍逐条生效。
+    # Manager 与 Node-RED 继续以 uid 1000 运行，均不接触宿主 socket。
+    user: "0:0"
+    cap_drop:
+      - ALL
     networks:
       - edge-docker
     read_only: true
@@ -62,7 +76,7 @@ services:
   # 且表现是「容器起来了但建实例失败」而不是明确的挂载错误。
   # 以 root 跑一次即退出，Manager 等它成功后再起。
   init-data:
-    image: alpine:3.22
+    image: ${INIT_IMAGE:-alpine:3.22}
     container_name: ${EDGE_NAME_PREFIX:-thinglinks-edge}-init-data
     user: "0:0"
     command: >
@@ -72,6 +86,23 @@ services:
     volumes:
       - ${EDGE_DATA_ROOT:-/data01/mqttsnet/thinglinks-edge}:/data-root
     restart: "no"
+    # 只处理本地 bind mount，完全不需要网络；同时避免 Compose 为它
+    # 额外创建一张无用 default bridge，边缘主机的默认地址池很有限。
+    network_mode: none
+
+  # Compose 自动拉取默认 Node-RED 镜像；一次性检查退出后 Manager 才启动。
+  # 这个容器不运行 Node-RED、不挂载实例数据、不连接任何网络。
+  node-red-image:
+    image: ${NODE_RED_BOOTSTRAP_IMAGE:-${NODE_RED_IMAGE_REPO:-nodered/node-red}:5.0.7-24-minimal}
+    container_name: ${EDGE_NAME_PREFIX:-thinglinks-edge}-node-red-image
+    entrypoint: ["node", "-e", "process.exit(0)"]
+    restart: "no"
+    network_mode: none
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
 
   manager:
     # 公开镜像：现场机器只要装了 docker，`docker compose up -d` 就直接拉起来跑 ——
@@ -90,9 +121,17 @@ services:
 
     environment:
       # 唯一真源：所有对外链接、跳转与 Cookie 策略都由它派生，程序绝不猜自己的外部地址
-      EXTERNAL_URL: ${EXTERNAL_URL:?必须设置，例如 http://192.168.10.20:19100}
-      # 实例凭据的加密主密钥。缺失时进程拒绝启动，不会静默回落默认值
-      MASTER_KEY: ${MASTER_KEY:?必须设置，可用 openssl rand -hex 32 生成}
+      EXTERNAL_URL: *external-url
+      # 首次生成独立的 0600 密钥文件；后续启动复用，已有数据时绝不重新生成。
+      # 旧 .env 中的 MASTER_KEY 会保留加密身份并写入文件；不在日志中输出密钥。
+      MASTER_KEY: ${MASTER_KEY:-}
+      MASTER_KEY_FILE: ${MASTER_KEY_FILE:-${EDGE_DATA_ROOT:-/data01/mqttsnet/thinglinks-edge}/.master.key}
+      # 旧 .env 的 INITIAL_PASSWORD 优先；普通用户只编辑顶部的密码即可。
+      INITIAL_PASSWORD: ${INITIAL_PASSWORD:-}
+      COMPOSE_INITIAL_PASSWORD: *initial-password
+      # 默认禁止对网络开放匿名首次认领；无初始密码的新部署不会开始监听。
+      ADMIN_SETUP_MODE: ${ADMIN_SETUP_MODE:-password}
+      SETUP_WINDOW_MIN: ${SETUP_WINDOW_MIN:-0}
       # 显式给容器名，不要依赖回退。Manager 要把自己接入每个实例的独立网络，
       # 未配置时它退回读 hostname；compose 不设 hostname 时那正好是容器短 id，
       # network connect 也认，于是「碰巧能用」—— 但只要这里加了 hostname:，
@@ -102,7 +141,21 @@ services:
       INSTANCE_NETWORK: ${INSTANCE_NETWORK:-thinglinks-edge}
       INSTANCE_PORT_MIN: ${INSTANCE_PORT_MIN:-30000}
       INSTANCE_PORT_MAX: ${INSTANCE_PORT_MAX:-30999}
-      ALLOWED_IMAGE_TAGS: ${ALLOWED_IMAGE_TAGS:-5.0.4-24-minimal,4.1.13-22-minimal}
+      NODE_RED_IMAGE_REPO: ${NODE_RED_IMAGE_REPO:-nodered/node-red}
+      ALLOWED_IMAGE_TAGS: ${ALLOWED_IMAGE_TAGS:-5.0.7-24-minimal,5.0.4-24-minimal,4.1.13-22-minimal}
+      # Public product identity. These values are independent of device/business configuration.
+      PRODUCT_NAME: ${PRODUCT_NAME-ThingLinks Edge}
+      PRODUCT_TAGLINE: ${PRODUCT_TAGLINE-边缘计算网关}
+      PRODUCT_DESCRIPTION: ${PRODUCT_DESCRIPTION-连接现场设备，编排采集流程，与云端协同运行。}
+      PRODUCT_LOGO_URL: ${PRODUCT_LOGO_URL-product-logo.svg}
+      PRODUCT_COPYRIGHT_START_YEAR: ${PRODUCT_COPYRIGHT_START_YEAR-2019}
+      PRODUCT_COPYRIGHT_OWNER: ${PRODUCT_COPYRIGHT_OWNER-MqttsNet}
+      PRODUCT_COMMUNITY_NAME: ${PRODUCT_COMMUNITY_NAME-MqttsNet 社区}
+      PRODUCT_COMMUNITY_URL: ${PRODUCT_COMMUNITY_URL-https://mqttsnet.com}
+      PRODUCT_GITHUB_REPOSITORY: ${PRODUCT_GITHUB_REPOSITORY-mqttsnet/thinglinks-edge}
+      PRODUCT_DOCS_URL: ${PRODUCT_DOCS_URL-auto}
+      PRODUCT_LICENSE: ${PRODUCT_LICENSE-Apache-2.0}
+      PRODUCT_RELEASES_ENABLED: ${PRODUCT_RELEASES_ENABLED-true}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
       # 宿主持久化根。Manager 自己的库与全部实例数据都在这下面，排障只看这一处。
       # 必须与下面 volumes 的挂载点同名 —— Manager 用容器内视角 mkdir，
@@ -113,6 +166,48 @@ services:
       TZ: ${TZ:-Asia/Shanghai}
       # 升级检查。留空即完全不联网（默认）—— 见 .env.example 的说明
       UPDATE_CHECK_URL: ${UPDATE_CHECK_URL:-}
+      # 出网代理（03 号文 2.10）。只有企业代理能出网的现场才需要填；离线部署留空。
+      #
+      # 变量名**刻意加了 EDGE_ 前缀**，不直接读 HTTP_PROXY：
+      # docker compose 的取值顺序是「shell 环境 > .env」，用标准名的话，
+      # 谁在带代理的机器上敲了 `docker compose up`，谁的代理地址就被带进现场容器 ——
+      # 而 .env 里明明写着留空。那种「配了不生效、没配反而生效」最难查。
+      # 加前缀后，这台设备用不用代理只由 .env 决定，与执行者的 shell 无关。
+      HTTP_PROXY: ${EDGE_HTTP_PROXY:-}
+      # 只填了 HTTP 代理时 HTTPS 回落到它：不回落的话 https 请求会绕过代理直连，
+      # 在只有代理能出网的现场表现为「升级检查一直超时」，而代理明明配了
+      HTTPS_PROXY: ${EDGE_HTTPS_PROXY:-${EDGE_HTTP_PROXY:-}}
+      #
+      # NO_PROXY 的内部条目**必须在这里补**，不能只靠部署方填。
+      #
+      # Manager 自己的内部调用也走 Node 的 HTTP 客户端：连受限 docker 代理、
+      # 反代到实例、应用层探针，全是 HTTP。配了 HTTP_PROXY 而 NO_PROXY 没写这些名字，
+      # 它们会被一并送去企业代理 —— 实测表现是「创建实例失败：无法查询镜像…
+      # connect ECONNREFUSED 127.0.0.1:7890」，看起来完全像 docker 端点坏了。
+      #
+      # 固定条目写在前面、部署方那份接在后面：顺序不影响匹配，但这样
+      # NO_PROXY 为空时也不会出现前导逗号。
+      NO_PROXY: localhost,127.0.0.1,::1,${EDGE_NAME_PREFIX:-thinglinks-edge}-manager,${EDGE_NAME_PREFIX:-thinglinks-edge}-docker-proxy,tle-nr-,${INSTANCE_NETWORK:-thinglinks-edge},${EDGE_NO_PROXY:-localhost}
+      # 企业内网网段，供自检比对 Docker 网段冲突（03 号文 2.9）
+      CORPORATE_CIDRS: ${CORPORATE_CIDRS:-}
+      # 节点安装策略（01 号文 5.7）：
+      #   allowlist  只能装控制台批准过的（默认，出厂即最严）；浏览器只加载私有 catalogue
+      #   open       不限制，任何包都能装；浏览器同时加载官方公共 catalogue
+      # 两种模式下实例 npm 下载仍经过 Manager registry，不把 catalogue 当 npm 源。
+      # 这是安全闸门，刻意只放在编排文件里，不做成 Web 开关：改它应当有文件、有版本、有人 review
+      EDGE_NODE_INSTALL_POLICY: ${EDGE_NODE_INSTALL_POLICY:-allowlist}
+      # 私有节点源的上游。**留空 = 纯离线**：库里没有的包一律装不上，不去公网找。
+      # 填了则库里没有时回源下载并顺手入库 —— 第一次装要联网，之后这个包永久离线可用。
+      # 公网填 https://registry.npmjs.org ；内网有私服就填私服地址。
+      # 走企业代理的现场只要配了 EDGE_HTTP_PROXY 即自动生效，这里不必重复配。
+      EDGE_NPM_UPSTREAM: ${EDGE_NPM_UPSTREAM:-}
+      # 点位历史条数上限。0 = 不记历史（最低配设备的退路）。
+      # 按条数而不是天数封顶：边缘盒子的硬约束是磁盘与 SD 卡写入量，
+      # 而同样保留 7 天，10 个点位和 500 个点位差两个数量级 —— 只有条数可预期。
+      EDGE_HISTORY_MAX_ROWS: ${EDGE_HISTORY_MAX_ROWS:-500000}
+      # 值没变时最长多久也留一个采样点（秒）。不留的话，恒定信号在图上是一条
+      # 从远古拉过来的直线，区分不了「一直没变」和「早就没数据了」
+      EDGE_HISTORY_MIN_GAP_SEC: ${EDGE_HISTORY_MIN_GAP_SEC:-300}
       # 健康监测趋势曲线的采样间隔（秒）。0 关闭采样，界面会明说趋势未启用。
       # 历史只存内存：重启即清零，换来的是不去磨盒子的 SD 卡
       EDGE_METRICS_INTERVAL_SEC: ${EDGE_METRICS_INTERVAL_SEC:-10}
@@ -120,9 +215,8 @@ services:
       DOCKER_HOST: tcp://${EDGE_NAME_PREFIX:-thinglinks-edge}-docker-proxy:2375
 
     ports:
-      # 默认只发布到回环：现场要外部可达时改成 "0.0.0.0:19100:19100"，
-      # 或（推荐）由前面的企业反代转发过来
-      - "${BIND_ADDR:-127.0.0.1}:${HOST_PORT:-19100}:19100"
+      # 服务器可直接访问；放在宿主反代后时可用 BIND_ADDR=127.0.0.1。
+      - "${BIND_ADDR:-0.0.0.0}:${HOST_PORT:-19100}:19100"
 
     volumes:
       # 同名挂载：容器内路径 == 宿主路径。Manager 要 mkdir/删除实例数据目录（容器内视角），
@@ -138,6 +232,8 @@ services:
       docker-proxy:
         condition: service_started
       init-data:
+        condition: service_completed_successfully
+      node-red-image:
         condition: service_completed_successfully
 
     # 只读根文件系统：可写的地方只有数据目录与 tmpfs

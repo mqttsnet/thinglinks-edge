@@ -1,14 +1,20 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
+import { ref, computed, onMounted } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
 import { NButton, NModal, NAlert, useMessage } from 'naive-ui';
 import { api } from '../api/client';
+import { can, clearPermissions, loadPermissions } from '../api/permissions';
 import ReleaseNotes from '../components/ReleaseNotes.vue';
+import ProductLogo from '../product/ProductLogo.vue';
+import ProductCopyright from '../product/ProductCopyright.vue';
+import GithubIcon from '../product/GithubIcon.vue';
+import { useProduct } from '../product/useProduct';
 
 const router = useRouter();
 const route = useRoute();
 const message = useMessage();
 const username = ref('');
+const { product, loadProduct } = useProduct();
 
 /**
  * 窄屏降级为图标栏，绝不隐藏导航 ——
@@ -20,10 +26,72 @@ function toggleSide() {
   localStorage.setItem('tle-side', collapsed.value ? '1' : '0');
 }
 
-const NAV = [
-  { name: 'instances', title: '实例', icon: 'M3 5.2C3 4 5 3 8.5 3S14 4 14 5.2 12 7.4 8.5 7.4 3 6.4 3 5.2ZM3 5.2v9.6c0 1.2 2 2.2 5.5 2.2s5.5-1 5.5-2.2V5.2M3 10c0 1.2 2 2.2 5.5 2.2S14 11.2 14 10' },
-  { name: 'health', title: '健康监测', icon: 'M2 9h3l2-5 3 10 2-5h3' },
+/*
+ * 导航按语义分组：「运行」是看现场此刻怎么样，「对接」是配上下游怎么连。
+ * 云对接放进「运行」会让人以为它也是个监控页，实际上它主要是改配置的地方。
+ */
+/** `need` 省略即所有登录者可见；写了就要该动作才显示 */
+interface NavItem { name: string; title: string; icon: string; need?: string }
+interface NavGroup { label: string; items: NavItem[]; need?: string }
+
+const NAV_GROUPS: NavGroup[] = [
+  {
+    label: '运行',
+    items: [
+      { name: 'instances', title: '实例', icon: 'M3 5.2C3 4 5 3 8.5 3S14 4 14 5.2 12 7.4 8.5 7.4 3 6.4 3 5.2ZM3 5.2v9.6c0 1.2 2 2.2 5.5 2.2s5.5-1 5.5-2.2V5.2M3 10c0 1.2 2 2.2 5.5 2.2S14 11.2 14 10' },
+      { name: 'health', title: '健康监测', icon: 'M2 9h3l2-5 3 10 2-5h3' },
+      // 放在实例旁边而不是「系统」组：套模板是产线上的日常动作，
+      // 不是运维配置 —— 现场找它的时候是在找「怎么把这条线的流程复制到那条」
+      { name: 'templates', title: '流程模板', need: 'template:view',
+        icon: 'M4 3h7l3 3v11H4ZM11 3v3h3M6.5 9.5h5M6.5 12.5h5' },
+      // field:view 目前三种角色都有，写出来是为了跟后端的判权一一对上：
+      // 哪天收紧了角色表，这里不用改也会自己收起来
+      { name: 'field', title: '现场设备', need: 'field:view',
+        icon: 'M7 3h6v3h3v8H4V6h3ZM7 6h6M2 8h2M2 12h2M16 8h2M16 12h2M8 9v2M12 9v2' },
+    ],
+  },
+  {
+    label: '对接',
+    items: [
+      { name: 'cloud', title: '云平台', icon: 'M6 15.5a3.5 3.5 0 0 1 .3-6.99A5 5 0 0 1 15.6 8.2 3.4 3.4 0 0 1 15 15.5Z' },
+    ],
+  },
+  {
+    label: '系统',
+    // 只有管得了用户的人才看得到这一项。不是安全措施（后端自己判），
+    // 而是不要把点进去必然 403 的入口摆在别人面前
+    // 逐项判权限而不是整组判：运维能跑备份但管不了用户，
+    // 整组挂 need 会把「备份」也一起藏掉
+    items: [
+      { name: 'users', title: '用户与权限', need: 'user:manage', icon: 'M2.6 16.5a5 5 0 0 1 9.8 0M7.5 8.6a2.9 2.9 0 1 0 0-5.8 2.9 2.9 0 0 0 0 5.8Zm6.2 0a2.4 2.4 0 1 0 0-4.8M14 11.4a4.4 4.4 0 0 1 3.4 5.1' },
+      // 放在「系统」而不是「运行」：这一页的主体是「允许装什么」，
+      // 和用户与权限一样是治理动作，不是产线上的日常操作。
+      // 用 node:view（三种角色都有）—— 排障时要能查这台装了什么
+      { name: 'nodes', title: '节点管理', need: 'node:view',
+        icon: 'M9 2.5 15.5 6v7L9 16.5 2.5 13V6ZM9 2.5V9m0 0 6.5-3M9 9l-6.5-3M9 9v7.5' },
+      // 运维也有 diag:run —— 现场第一响应人就是他们，不能只给管理员
+      { name: 'diag', title: '远程诊断', need: 'diag:run', icon: 'M2 10h3l2.5-6 3.5 12 2.5-6h3' },
+      { name: 'backup', title: '备份', need: 'backup:run', icon: 'M3 5.5C3 4.4 5.5 3.5 9 3.5s6 .9 6 2v7c0 1.1-2.5 2-6 2s-6-.9-6-2ZM3 9c0 1.1 2.5 2 6 2s6-.9 6-2' },
+      // 不挂 need：每个人都要能进去管自己的两步验证。
+      // 页内的「安全策略」那一块对没有 system:manage 的人是只读
+      { name: 'settings', title: '系统设置', icon: 'M9 11.6a2.6 2.6 0 1 0 0-5.2 2.6 2.6 0 0 0 0 5.2Zm6.4-1.3a6.4 6.4 0 0 0-.1-1.1l1.5-1.2-1.5-2.6-1.8.7a6.4 6.4 0 0 0-1.9-1.1L11.3 3H8.3l-.3 1.9a6.4 6.4 0 0 0-1.9 1.1l-1.8-.7-1.5 2.6 1.5 1.2a6.4 6.4 0 0 0 0 2.2l-1.5 1.2 1.5 2.6 1.8-.7a6.4 6.4 0 0 0 1.9 1.1l.3 1.9h3l.3-1.9a6.4 6.4 0 0 0 1.9-1.1l1.8.7 1.5-2.6-1.5-1.2c.06-.36.1-.73.1-1.1Z' },
+    ],
+  },
 ];
+
+/** 当前能看到的导航分组。权限没取到时按「看不到」处理，取到后自动补上 */
+/**
+ * 逐项过滤，再丢掉空组。
+ *
+ * 组级和条目级都要判：组级用于整块只对某类人开放；条目级用于同一组里
+ * 各项权限不同（备份要 backup:run，用户管理要 user:manage，运维只有前者）。
+ * 只判组级会把运维能用的「备份」一起藏掉。
+ */
+const navGroups = computed(() =>
+  NAV_GROUPS
+    .filter((g) => !g.need || can(g.need))
+    .map((g) => ({ ...g, items: g.items.filter((i) => !i.need || can(i.need)) }))
+    .filter((g) => g.items.length > 0));
 
 /**
  * 版本与升级说明。
@@ -41,7 +109,9 @@ const showNotes = ref(false);
 const update = ref<{ outdated?: boolean; latest?: string; url?: string } | null>(null);
 
 onMounted(async () => {
+  void loadProduct();
   try { username.value = (await api.me()).user.username; } catch { /* 守卫已处理 */ }
+  await loadPermissions();
 
   try {
     const info = await api.version();
@@ -69,6 +139,7 @@ function dismissNotes() {
 
 async function signOut() {
   await api.logout().catch(() => undefined);
+  clearPermissions();
   message.success('已登出');
   await router.replace('/login');
 }
@@ -83,33 +154,37 @@ async function signOut() {
             <path d="M12 5l-5 5 5 5" />
           </svg>
         </button>
-        <span class="logo">
-          <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.1" stroke-linecap="round">
-            <circle cx="6" cy="12" r="2.4" /><circle cx="18" cy="6.5" r="2.4" /><circle cx="18" cy="17.5" r="2.4" />
-            <path d="M8.4 11 15.6 7.2M8.4 13l7.2 3.8" />
-          </svg>
-        </span>
+        <ProductLogo :size="38" />
         <div class="name">
-          <h1>ThingLinks Edge</h1>
-          <span>边缘计算网关</span>
+          <h1>{{ product?.name || '控制台' }}</h1>
+          <span>{{ product?.tagline }}</span>
         </div>
       </div>
 
       <nav>
-        <div class="lab">运行</div>
-        <button v-for="n in NAV" :key="n.name" class="item" :class="{ on: route.name === n.name }"
-                :title="n.title" @click="router.push({ name: n.name })">
-          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"
-               stroke-linecap="round" stroke-linejoin="round"><path :d="n.icon" /></svg>
-          <span>{{ n.title }}</span>
-        </button>
+        <template v-for="g in navGroups" :key="g.label">
+          <div class="lab">{{ g.label }}</div>
+          <button v-for="n in g.items" :key="n.name" class="item" :class="{ on: route.name === n.name }"
+                  :title="n.title" @click="router.push({ name: n.name })">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"
+                 stroke-linecap="round" stroke-linejoin="round"><path :d="n.icon" /></svg>
+            <span>{{ n.title }}</span>
+          </button>
+        </template>
       </nav>
 
+      <div class="product-links" aria-label="产品信息">
+        <a v-if="product?.repositoryUrl" :href="product.repositoryUrl" target="_blank" rel="noopener noreferrer"
+           title="打开 GitHub 项目" aria-label="打开 GitHub 项目"><GithubIcon /><span>GitHub</span></a>
+        <button :class="{ on: route.name === 'about' }" title="关于产品" aria-label="关于产品" @click="router.push({ name: 'about' })">
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="10" cy="10" r="7" /><path d="M10 9v5M10 5.5v1.5" /></svg><span>关于</span>
+        </button>
+      </div>
       <div class="foot">
         <span class="ver mono" :title="update?.outdated ? `有新版本 v${update.latest}` : ''">
           v{{ version || '—' }}<i v-if="update?.outdated" class="dot" />
-        </span><br />
-        © 2024-present mqttsnet<br />All Rights Reserved.
+        </span>
+        <a v-if="product?.communityUrl" :href="product.communityUrl" target="_blank" rel="noopener noreferrer">{{ product.communityName }} ↗</a>
       </div>
     </aside>
 
@@ -120,7 +195,7 @@ async function signOut() {
         <NButton size="small" quaternary @click="signOut">登出</NButton>
       </header>
       <div class="content"><RouterView /></div>
-      <footer>Copyright © 2024-present mqttsnet All Rights Reserved.</footer>
+      <footer><ProductCopyright /></footer>
 
     <NModal v-model:show="showNotes" preset="card" style="max-width: 560px"
             :title="`已更新到 v${version}`" :mask-closable="false" @close="dismissNotes">
@@ -153,12 +228,8 @@ aside {
 .collapse:hover { color: var(--primary); }
 .collapse svg { width: 13px; height: 13px; transition: transform .2s; }
 .mini .collapse svg { transform: rotate(180deg); }
-.logo {
-  width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center; flex: none;
-  background: linear-gradient(135deg, var(--primary), var(--secondary));
-}
-.logo svg { width: 18px; height: 18px; }
-.name h1 { margin: 0; font-size: 15.5px; font-weight: 650; }
+.name { min-width: 0; }
+.name h1 { margin: 0; font-size: 15.5px; font-weight: 650; overflow-wrap: anywhere; }
 .name span { font-size: 11.5px; color: var(--muted); }
 nav { padding: 4px 12px; display: flex; flex-direction: column; gap: 1px; flex: 1; overflow-y: auto; }
 .lab {
@@ -180,19 +251,29 @@ nav { padding: 4px 12px; display: flex; flex-direction: column; gap: 1px; flex: 
   border-radius: 50%; background: var(--warning); vertical-align: 1px;
 }
 .foot {
-  padding: 7px 18px 9px; font-size: 9.5px; line-height: 1.45; color: var(--muted);
-  border-top: 1px solid var(--border);
+  padding: 7px 18px 12px; font-size: 10px; line-height: 1.45; color: var(--muted);
+  display: flex; justify-content: space-between; gap: 8px;
 }
+.foot a { color: var(--muted); text-decoration: none; }
+.foot a:hover { color: var(--primary); }
+.product-links { display: flex; gap: 6px; padding: 10px 12px 0; border-top: 1px solid var(--border); }
+.product-links a, .product-links button { display: flex; align-items: center; justify-content: center; gap: 7px; flex: 1; padding: 7px; border: 0; border-radius: var(--rs); background: none; color: var(--text-2); cursor: pointer; text-decoration: none; font: inherit; font-size: 12px; }
+.product-links svg { width: 17px; height: 17px; flex: none; }
+.product-links a:hover, .product-links button:hover { background: var(--hover); color: var(--primary); }
+.product-links .on { background: var(--l-primary); color: var(--primary); }
+.product-links :focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 main { min-width: 0; display: flex; flex-direction: column; }
 header { padding: 14px 26px 0; display: flex; align-items: center; gap: 12px; }
 .spacer { margin-left: auto; }
 .who { color: var(--text-2); }
 .content { padding: 12px 26px 40px; flex: 1; }
-footer { padding: 0 26px 24px; font-size: 11.5px; color: var(--muted); }
+footer { padding: 0 26px 24px; font-size: 11.5px; color: var(--text-2); }
 
 /* 窄屏：降级为图标栏，不隐藏 */
 .mini { grid-template-columns: 70px 1fr; }
 .mini .name, .mini .foot, .mini .item span { display: none; }
+.mini .product-links { flex-direction: column; padding: 8px 12px; }
+.mini .product-links span { display: none; }
 .mini .head { padding: 15px 0 8px; justify-content: center; }
 .mini nav { padding: 4px 10px; }
 .mini .item { justify-content: center; padding: 8px 0; }
@@ -200,6 +281,8 @@ footer { padding: 0 26px 24px; font-size: 11.5px; color: var(--muted); }
 @media (max-width: 920px) {
   .shell { grid-template-columns: 70px 1fr; }
   .name, .foot, .item span { display: none; }
+  .product-links { flex-direction: column; padding: 8px 12px; }
+  .product-links span { display: none; }
   .head { padding: 15px 0 8px; justify-content: center; }
   .collapse { display: none; }
   .item { justify-content: center; padding: 8px 0; }

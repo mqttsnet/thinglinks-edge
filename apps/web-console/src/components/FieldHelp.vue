@@ -12,7 +12,12 @@ import { NTooltip } from 'naive-ui';
 </script>
 
 <template>
-  <NTooltip trigger="hover" placement="top" :style="{ maxWidth: '340px' }">
+  <!--
+    z-index 必须显式给：naive-ui 给弹出层的默认值是 auto，而模态框拿到的是 2000。
+    于是**模态框里的说明气泡会被模态框自己盖住**——文字只露出模态框外的一小截，
+    而构建、类型检查、渲染全部正常。表单里的字段说明恰恰全在模态框里。
+  -->
+  <NTooltip trigger="hover" placement="top" :z-index="3000" :style="{ maxWidth: '340px' }">
     <template #trigger>
       <!-- tabindex 让键盘也能触发，不是只有鼠标用户才看得到说明 -->
       <span class="fh" tabindex="0" role="note" aria-label="字段说明">

@@ -32,6 +32,18 @@ export async function ensureRoot() {
  * （-v 只删具名卷）。不清就会带着上一轮的库开跑 —— 表现是
  * 「初始口令没打印」「登录 401」，而不是一眼可见的脏数据。
  */
+/**
+ * ⚠ **不要在跑套件之前手工 `rm -rf` 这个数据根。**
+ *
+ * 观察到两次：手工删掉再重建，紧接着跑 `pnpm verify`，前面 7 个建实例的脚本
+ * 全部挂在 Docker 的
+ * `error while creating mount source path …: mkdir …: no such file or directory`；
+ * 什么都不清理直接跑则全绿，单跑也全绿。
+ *
+ * 机制没查实 —— 单独测「删根 → 重建 → 挂载子目录」是能成功的，
+ * 所以不是单纯的「删了就坏」，更像是与上一轮容器拆除的时序有关。
+ * 在查清之前按经验办：**让脚本自己管这个目录**，别从外面动它。
+ */
 export async function resetRoot() {
   // 只允许清自己那个前缀下的路径，防手滑
   if (!TEST_EDGE_ROOT.startsWith('/private/tmp/') && !TEST_EDGE_ROOT.startsWith('/tmp/')) {

@@ -33,6 +33,19 @@ export interface SpoolOptions {
    * 不是每条都告警 —— 断网时每秒上千条，逐条告警等于把告警系统打死。
    */
   onFull?: (info: { policy: FullPolicy; bytes: number; maxBytes: number; full: boolean }) => void;
+  /**
+   * 落盘失败告警。
+   *
+   * 与 `onFull` 是**两件不同的事**，早先只有前者，于是出现了一个很难看的不对称：
+   * 「逻辑写满」（超过 maxBytes）会告警加审计，而「物理写不进去」
+   * （ENOSPC、磁盘故障、权限）反而悄无声息 —— 后者明明更严重。
+   *
+   * `phase` 区分是写记录时失败还是 fsync 时失败：前者这条数据没进去，
+   * 后者数据在页缓存里但没落盘，掉电就没了。两种都要报，处置方式不同。
+   */
+  onWriteError?: (info: { phase: 'append' | 'flush'; error: string }) => void;
+  /** 注入 fsync，仅测试用；转交 SegmentLog，理由见那边的说明 */
+  fsyncFn?: (handle: import('node:fs/promises').FileHandle) => Promise<void>;
 }
 
 export interface SpoolMetrics {
@@ -48,6 +61,8 @@ export interface SpoolMetrics {
   droppedNewest: number;
   rejected: number;
   replayed: number;
+  /** 最近一次刷盘失败原因；空串表示落盘正常 */
+  lastFlushError: string;
 }
 
 export class Spool {
@@ -76,6 +91,9 @@ export class Spool {
       dir: opts.dir,
       ...(opts.maxSegmentBytes === undefined ? {} : { maxSegmentBytes: opts.maxSegmentBytes }),
       ...(opts.flushIntervalMs === undefined ? {} : { flushIntervalMs: opts.flushIntervalMs }),
+      // 定时刷盘没有调用方能 catch，必须由这里转成告警
+      onFlushError: (e) => opts.onWriteError?.({ phase: 'flush', error: e.message }),
+      ...(opts.fsyncFn === undefined ? {} : { fsyncFn: opts.fsyncFn }),
     });
     const db = new Database(join(opts.dir, 'index.db'));
     db.pragma('journal_mode = WAL');
@@ -161,7 +179,16 @@ export class Spool {
       this.#signalFull(false, bytes);
     }
 
-    await this.#log.append(body);
+    try {
+      await this.#log.append(body);
+    } catch (e) {
+      /*
+       * 写不进去就是**丢数据**。告警之后照样抛 —— 上层要据此知道这一批没保住，
+       * 不能因为「已经告警过了」就把异常吞掉当成功。
+       */
+      this.#o.onWriteError?.({ phase: 'append', error: (e as Error).message });
+      throw e;
+    }
     this.#bumpPending(1);
     return 'stored';
   }
@@ -237,6 +264,8 @@ export class Spool {
       droppedOldest: this.#stats.droppedOldest,
       droppedNewest: this.#stats.droppedNewest,
       rejected: this.#stats.rejected,
+      /** 最近一次刷盘失败原因，空表示落盘正常。诊断包与控制台据此判断磁盘健康 */
+      lastFlushError: this.#log.lastFlushError ?? '',
       replayed: this.#stats.replayed,
     };
   }

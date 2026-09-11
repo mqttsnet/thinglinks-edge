@@ -1,6 +1,6 @@
 <div align="center">
 
-<a href="https://mqttsnet.com"><img src="./docs/images/logo.png" alt="ThingLinks" width="180"></a>
+<a href="https://mqttsnet.com"><img src="docs/images/brand/logo.png" alt="ThingLinks" width="180"></a>
 
 # ThingLinks Edge
 
@@ -90,21 +90,20 @@ Manager イメージは Docker Hub で [`mqttsnet/thinglinks-edge`](https://hub.
 x86 産業用 PC でも ARM エッジボックスでも同じコマンドが使えます。
 現場のマシンでビルドは一切行われません。Docker さえあれば動きます。
 
+1. この版の [docker-compose.yml](docker-compose.yml) を専用ディレクトリに保存します。
+2. ファイル先頭にアクセス先と初期管理者パスワード（12 文字以上）を設定します。パスワードは `x-initial-password` の引用符内に入力し、`$` は `$$` と記述します。
+3. 次を実行します。
+
 ```bash
-cp .env.example .env        # 最低限 EXTERNAL_URL と MASTER_KEY を設定
 docker compose up -d
-docker compose logs manager | grep '\[init\]'   # 初期パスワードは一度だけ出力されます
 ```
 
-ブラウザで `EXTERNAL_URL` を開くとコンソールが表示されます。フロントエンドは Manager 自身が配信します。
-
-`EXTERNAL_URL` は外部向け URL・リダイレクト・Cookie ポリシーの**唯一の情報源**です。
-プロセスが自分の外部アドレスを推測することは決してありません。
-
-アップグレードは `.env` の `MANAGER_IMAGE` を新しいタグに変更してから
-`docker compose pull && docker compose up -d` を実行します。稼働中の Node-RED
-インスタンスは**中断されません** —— それらは Manager の子プロセスではなく
-兄弟コンテナだからです。管理コンソールの更新のために生産ラインを止める必要はありません。
+そのアドレスを開き、**admin** と設定したパスワードでログインします。`.env` の作成、鍵の手動生成、Docker グループ ID の確認、
+既定の Node-RED イメージの事前取得は不要です。Compose が必要なイメージとデータディレクトリを準備します。
+鍵は `<EDGE_DATA_ROOT>/.master.key` に 0600 で保存され、再起動・更新後も再利用されます。
+業務バックアップには鍵を含めないため、別途安全に保管してください。既存データの鍵がない場合は起動を拒否します。
+既存の `.env` と `MASTER_KEY` は維持してください。新規環境でパスワードが未設定の場合は公開を開始しません。設定ファイルは秘密として保管してください。
+高度な設定は [.env.example](.env.example) を参照してください。
 
 ### 開発
 
@@ -179,7 +178,7 @@ cd apps/manager && pnpm verify
 - **1 インスタンス 1 ネットワーク** —— インスタンス同士もプロキシへも到達不可
 - コンテナ生成は**ハード許可リスト**を通過：特権モード禁止、ホスト名前空間禁止、
   プラットフォーム管理の名前付きボリュームのみ、インスタンスのポートは公開しない
-- `MASTER_KEY` が無い場合は**起動を拒否**し、既定値へ暗黙にフォールバックしない
+- 既存データの暗号鍵がない場合は起動を拒否し、別の鍵を自動生成しない
 
 各ルールの背景にある実際の障害については[コントリビュートガイド](CONTRIBUTING.md)を参照してください。
 

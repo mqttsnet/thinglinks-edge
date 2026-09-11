@@ -1,16 +1,56 @@
 import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router';
 import { api, ApiError, basePath } from './api/client';
+import { can, loadPermissions } from './api/permissions';
 
 const routes: RouteRecordRaw[] = [
-  { path: '/login', name: 'login', component: () => import('./views/LoginView.vue'), meta: { anon: true } },
+  { path: '/login', name: 'login', component: () => import('./views/auth/LoginView.vue'), meta: { anon: true } },
   {
     path: '/',
     component: () => import('./layout/AppShell.vue'),
     children: [
       { path: '', redirect: '/instances' },
-      { path: 'instances', name: 'instances', component: () => import('./views/InstancesView.vue') },
-      { path: 'health', name: 'health', component: () => import('./views/HealthView.vue') },
-      { path: 'instances/:id/logs', name: 'logs', component: () => import('./views/LogsView.vue') },
+      { path: 'about', name: 'about', component: () => import('./views/about/AboutView.vue') },
+      { path: 'instances', name: 'instances', component: () => import('./views/instance/InstancesView.vue') },
+      { path: 'health', name: 'health', component: () => import('./views/health/HealthView.vue') },
+      {
+        path: 'field', name: 'field', component: () => import('./views/edge/FieldView.vue'),
+        meta: { need: 'field:view' },
+      },
+      { path: 'cloud', name: 'cloud', component: () => import('./views/cloud/CloudView.vue') },
+      {
+        path: 'users', name: 'users', component: () => import('./views/auth/UsersView.vue'),
+        meta: { need: 'user:manage' },
+      },
+      {
+        path: 'backup', name: 'backup', component: () => import('./views/archive/BackupView.vue'),
+        meta: { need: 'backup:run' },
+      },      {
+        path: 'diag', name: 'diag', component: () => import('./views/diag/DiagView.vue'),
+        meta: { need: 'diag:run' },
+      },
+      {
+        path: 'templates', name: 'templates',
+        component: () => import('./views/flows/TemplatesView.vue'),
+        // 只要求 view：能看模板的人就该看得到这一页，
+        // 建/删的按钮在页内再按 template:manage 收起来
+        meta: { need: 'template:view' },
+      },
+
+      {
+        path: 'nodes', name: 'nodes', component: () => import('./views/nodes/NodesView.vue'),
+        // 只要求 view：能看清单的人就该看得到这一页（排障要知道装了什么），
+        // 批准与下发的按钮在页内再按 node:manage 收起来
+        meta: { need: 'node:view' },
+      },
+
+      {
+        path: 'settings', name: 'settings',
+        component: () => import('./views/auth/SettingsView.vue'),
+        // 不设 need：每个人都要能进来管自己的两步验证。
+        // 页内的「安全策略」那一块再按 system:manage 收成只读
+      },
+
+      { path: 'instances/:id/logs', name: 'logs', component: () => import('./views/instance/LogsView.vue') },
     ],
   },
 ];
@@ -25,6 +65,25 @@ router.beforeEach(async (to) => {
     const { user } = await api.me();
     if (user.mustChangePassword && to.name !== 'login') {
       return { name: 'login', query: { mustChange: '1' } };
+    }
+    /*
+     * 全站强制两步验证、而这个人还没绑：只放行设置页（绑定就在那儿）。
+     *
+     * 与改密那条的顺序一致 —— 后端 guard 也是先拦改密、再拦绑定，
+     * 两处顺序不一样会让用户在两个页面之间来回弹。
+     * 这同样只是导航体验：后端对其它接口一律回 403 TOTP_ENROLL_REQUIRED。
+     */
+    if (user.mustEnroll2fa && to.name !== 'settings') {
+      return { name: 'settings' };
+    }
+    /*
+     * 权限不够的页面直接送回实例页，而不是让它渲染出来再满屏 403。
+     * 这只是**导航体验**：后端每条路由仍然自己判权，绕过这里也拿不到数据。
+     */
+    const need = to.meta['need'];
+    if (typeof need === 'string') {
+      await loadPermissions();
+      if (!can(need)) return { name: 'instances' };
     }
     return true;
   } catch (e) {

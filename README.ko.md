@@ -1,6 +1,6 @@
 <div align="center">
 
-<a href="https://mqttsnet.com"><img src="./docs/images/logo.png" alt="ThingLinks" width="180"></a>
+<a href="https://mqttsnet.com"><img src="docs/images/brand/logo.png" alt="ThingLinks" width="180"></a>
 
 # ThingLinks Edge
 
@@ -88,21 +88,20 @@ Manager 이미지는 Docker Hub 에 [`mqttsnet/thinglinks-edge`](https://hub.doc
 x86 산업용 PC 와 ARM 엣지 박스에서 동일한 명령을 사용합니다.
 현장 머신에서는 아무것도 빌드하지 않으며, Docker 만 있으면 됩니다.
 
+1. 이 버전의 [docker-compose.yml](docker-compose.yml)을 전용 디렉터리에 저장합니다.
+2. 파일 상단에 접속 주소와 초기 관리자 비밀번호(12자 이상)를 입력합니다. 비밀번호는 `x-initial-password`의 따옴표 안에 넣고 `$`는 `$$`로 작성합니다.
+3. 다음 명령을 실행합니다.
+
 ```bash
-cp .env.example .env        # 최소한 EXTERNAL_URL 과 MASTER_KEY 를 설정
 docker compose up -d
-docker compose logs manager | grep '\[init\]'   # 초기 비밀번호는 한 번만 출력됩니다
 ```
 
-브라우저에서 `EXTERNAL_URL` 을 열면 콘솔이 표시됩니다. 프론트엔드는 Manager 가 직접 제공합니다.
-
-`EXTERNAL_URL` 은 외부 URL·리다이렉트·쿠키 정책의 **유일한 진실 공급원**입니다.
-프로세스가 자신의 외부 주소를 추측하는 일은 결코 없습니다.
-
-업그레이드는 `.env` 의 `MANAGER_IMAGE` 를 새 태그로 바꾼 뒤
-`docker compose pull && docker compose up -d` 를 실행합니다. 실행 중인 Node-RED
-인스턴스는 **중단되지 않습니다** —— Manager 의 자식 프로세스가 아니라
-형제 컨테이너이기 때문입니다. 관리 콘솔을 업그레이드하려고 생산 라인을 멈출 이유는 없습니다.
+설정한 주소를 열어 **admin**과 지정한 비밀번호로 로그인합니다. `.env` 생성, 암호화 키 수동 생성, Docker 그룹 ID 확인,
+기본 Node-RED 이미지 사전 다운로드는 필요하지 않습니다. Compose가 이미지와 데이터 디렉터리를 준비합니다.
+키는 `<EDGE_DATA_ROOT>/.master.key`에 0600 권한으로 저장되며 재시작과 업그레이드 후에도 재사용됩니다.
+업무 백업에는 키가 포함되지 않으므로 별도로 안전하게 보관하세요. 기존 데이터의 키가 없으면 시작을 거부합니다.
+기존 `.env`와 `MASTER_KEY`는 유지하세요. 새 배포에 비밀번호가 없으면 서비스를 공개하지 않습니다. 설정 파일은 안전하게 보관하세요.
+고급 설정은 [.env.example](.env.example)을 참고하세요.
 
 ### 개발
 
@@ -177,7 +176,7 @@ cd apps/manager && pnpm verify
 - **인스턴스당 네트워크 하나** —— 인스턴스 간에도, 프록시로도 접근 불가
 - 컨테이너 생성은 **하드 허용 목록**을 통과: 특권 모드 금지, 호스트 네임스페이스 금지,
   플랫폼 관리 명명 볼륨만 허용, 인스턴스 포트는 호스트에 공개하지 않음
-- `MASTER_KEY` 가 없으면 **기동을 거부**하며 기본값으로 조용히 되돌아가지 않음
+- 기존 데이터의 암호화 키가 없으면 시작을 거부하며 다른 키를 자동 생성하지 않음
 
 각 규칙의 배경이 된 실제 장애는 [기여 가이드](CONTRIBUTING.md)를 참조하세요.
 

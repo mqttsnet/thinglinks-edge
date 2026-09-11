@@ -15,8 +15,28 @@
  *      同一条规则写两遍必然漂移。
  */
 import type { Db } from '../db.ts';
-import { encryptSecret, decryptSecret } from '../crypto.ts';
+import { encryptSecret, decryptSecret } from '../auth/crypto.ts';
 import { validateCipherParams, type CipherFlag, type CipherParams } from './envelope.ts';
+import {
+  normalizeTls, summarizeQuietly, isTlsScheme, TlsConfigError,
+  type TlsConfig, type TlsConfigInput, type TlsMode, type CertSummary,
+} from './tls.ts';
+import {
+  normalizeConnection, DEFAULT_CONNECTION, ConnectionConfigError, type ConnectionOptions,
+} from './connection.ts';
+
+/**
+ * ThingLinks 公有云的默认接入地址。
+ *
+ * 写成常量而不是散在提示文案里：界面的占位符、这里的报错示例、文档里的例子
+ * 必须是同一个值，否则用户照着提示填完连不上，只会怀疑是自己抄错了。
+ * 控制台侧另有一份同名常量（`web-console/src/api/types.ts`），改这里要一起改。
+ */
+export const DEFAULT_BROKER_HOST = 'broker.thinglinks.mqttsnet.com';
+/** 明文 MQTT。内网或已有专线的现场用这个 */
+export const DEFAULT_BROKER_URL = `mqtt://${DEFAULT_BROKER_HOST}:11883`;
+/** TLS 加密。走公网一律用这个 —— 明文口令在公网上等于没有口令 */
+export const DEFAULT_BROKER_URL_TLS = `mqtts://${DEFAULT_BROKER_HOST}:11884`;
 
 export class CloudConfigError extends Error {
   constructor(message: string) {
@@ -34,6 +54,8 @@ export interface CloudConfig {
   username: string;
   password: string;
   cipher: CipherParams;
+  tls: TlsConfig;
+  connection: ConnectionOptions;
   protocolVersion: string;
   qos: 0 | 1 | 2;
   updatedAt: string;
@@ -48,12 +70,32 @@ export interface RedactedCloudConfig {
   deviceIdentification: string;
   username: string;
   cipherFlag: CipherFlag;
+  /**
+   * TLS 部分。证书**不整份回传** —— 界面要的是「传对了没有」，
+   * 那件事看摘要（主体、有效期、指纹）比看一大坨 PEM 清楚得多，
+   * 而且这个响应每 5 秒轮询一次，回几 KB 的链纯属浪费。
+   */
+  tls: {
+    mode: TlsMode;
+    rejectUnauthorized: boolean;
+    servername: string;
+    /** 地址本身是不是加密协议。界面据此决定要不要展开证书那一段 */
+    secure: boolean;
+    ca: CertSummary | null;
+    cert: CertSummary | null;
+  };
+  /** 连接参数里没有秘密，原样回给界面 */
+  connection: ConnectionOptions;
   protocolVersion: string;
   qos: 0 | 1 | 2;
   updatedAt: string;
   updatedBy: string;
   /** 哪些密文字段已有值。界面据此显示「已设置，留空则不变」 */
-  secretsSet: { password: boolean; signKey: boolean; encryptKey: boolean; encryptVector: boolean };
+  secretsSet: {
+    password: boolean; signKey: boolean; encryptKey: boolean; encryptVector: boolean;
+    /** 客户端私钥。与上面几项同级，同样是留空表示不改 */
+    tlsKey: boolean;
+  };
 }
 
 /**
@@ -74,6 +116,10 @@ export interface CloudConfigInput {
   signKey?: string | undefined;
   encryptKey?: string | undefined;
   encryptVector?: string | undefined;
+  /** TLS 部分。整块缺省表示沿用库里已有的设置 */
+  tls?: TlsConfigInput | undefined;
+  /** 连接参数。逐字段缺省表示不改，与 tls 同一套语义 */
+  connection?: Partial<ConnectionOptions> | undefined;
   protocolVersion?: string | undefined;
   qos?: 0 | 1 | 2 | undefined;
 }
@@ -89,10 +135,32 @@ interface Row {
   sign_key_enc: string;
   encrypt_key_enc: string;
   encrypt_vector_enc: string;
+  tls_mode: string;
+  tls_ca: string;
+  tls_cert: string;
+  tls_key_enc: string;
+  tls_reject_unauthorized: number;
+  tls_servername: string;
+  mqtt_version: number;
+  keepalive_sec: number;
+  connect_timeout_sec: number;
+  auto_reconnect: number;
+  reconnect_period_ms: number;
   protocol_version: string;
   qos: number;
   updated_at: string;
   updated_by: string;
+}
+
+/** 一行记录里的连接参数。读路径有两条（get / getRedacted），映射只写一遍 */
+function connectionOf(r: Row): ConnectionOptions {
+  return {
+    mqttVersion: r.mqtt_version as 3 | 4 | 5,
+    keepaliveSec: r.keepalive_sec,
+    connectTimeoutSec: r.connect_timeout_sec,
+    autoReconnect: r.auto_reconnect === 1,
+    reconnectPeriodMs: r.reconnect_period_ms,
+  };
 }
 
 /**
@@ -110,7 +178,9 @@ function assertBrokerUrl(raw: string): string {
   try {
     url = new URL(value);
   } catch {
-    throw new CloudConfigError(`Broker 地址不是合法 URL：${value}（形如 mqtts://iot.example.com:8883）`);
+    throw new CloudConfigError(
+      `Broker 地址不是合法 URL：${value}（形如 ${DEFAULT_BROKER_URL_TLS}）`,
+    );
   }
   if (!SCHEMES.has(url.protocol)) {
     throw new CloudConfigError(
@@ -192,6 +262,15 @@ export class CloudConfigRepo {
         encryptKey: dec(r.encrypt_key_enc) || undefined,
         encryptVector: dec(r.encrypt_vector_enc) || undefined,
       },
+      tls: {
+        mode: (r.tls_mode || 'system') as TlsMode,
+        ca: r.tls_ca,
+        cert: r.tls_cert,
+        key: dec(r.tls_key_enc),
+        rejectUnauthorized: r.tls_reject_unauthorized === 1,
+        servername: r.tls_servername,
+      },
+      connection: connectionOf(r),
       protocolVersion: r.protocol_version,
       qos: r.qos as 0 | 1 | 2,
       updatedAt: r.updated_at,
@@ -210,6 +289,15 @@ export class CloudConfigRepo {
       deviceIdentification: r.device_identification,
       username: r.username,
       cipherFlag: r.cipher_flag as CipherFlag,
+      tls: {
+        mode: (r.tls_mode || 'system') as TlsMode,
+        rejectUnauthorized: r.tls_reject_unauthorized === 1,
+        servername: r.tls_servername,
+        secure: isTlsScheme(r.broker_url),
+        ca: summarizeQuietly(r.tls_ca),
+        cert: summarizeQuietly(r.tls_cert),
+      },
+      connection: connectionOf(r),
       protocolVersion: r.protocol_version,
       qos: r.qos as 0 | 1 | 2,
       updatedAt: r.updated_at,
@@ -219,6 +307,7 @@ export class CloudConfigRepo {
         signKey: r.sign_key_enc !== '',
         encryptKey: r.encrypt_key_enc !== '',
         encryptVector: r.encrypt_vector_enc !== '',
+        tlsKey: r.tls_key_enc !== '',
       },
     };
   }
@@ -234,15 +323,22 @@ export class CloudConfigRepo {
       if (next === undefined) return old;
       return next === '' ? '' : encryptSecret(next, this.#key);
     };
-    const keep = (next: string | undefined, oldEnc: string): string => {
-      if (next !== undefined) return next;
-      return oldEnc === '' ? '' : decryptSecret(oldEnc, this.#key);
-    };
+    const decOld = (oldEnc: string): string => (oldEnc === '' ? '' : decryptSecret(oldEnc, this.#key));
+    const keep = (next: string | undefined, oldEnc: string): string =>
+      (next !== undefined ? next : decOld(oldEnc));
 
     const brokerUrl = assertBrokerUrl(input.brokerUrl);
     const clientId = assertClientId(input.clientId);
     const deviceIdentification = assertDeviceIdentification(input.deviceIdentification);
     const protocolVersion = assertProtocolVersion(input.protocolVersion);
+
+    let connection: ConnectionOptions;
+    try {
+      connection = normalizeConnection(input.connection, prev ? connectionOf(prev) : DEFAULT_CONNECTION);
+    } catch (e) {
+      if (e instanceof ConnectionConfigError) throw new CloudConfigError((e as Error).message);
+      throw e;
+    }
 
     const qos = input.qos ?? 1;
     if (qos !== 0 && qos !== 1 && qos !== 2) {
@@ -252,6 +348,27 @@ export class CloudConfigRepo {
     const cipherFlag = input.cipherFlag;
     if (cipherFlag !== 0 && cipherFlag !== 1 && cipherFlag !== 2) {
       throw new CloudConfigError(`cipherFlag 只能是 0(明文) / 1(SM4) / 2(AES)，收到 ${String(cipherFlag)}`);
+    }
+
+    /*
+     * TLS 同样是「合并后再校验」：私钥留空表示不改，而「证书与私钥配不配对」
+     * 这件事只有拿合并后的两份材料才比得出来。
+     */
+    const prevTls: TlsConfig = {
+      mode: (prev?.tls_mode || 'system') as TlsMode,
+      ca: prev?.tls_ca ?? '',
+      cert: prev?.tls_cert ?? '',
+      key: decOld(prev?.tls_key_enc ?? ''),
+      rejectUnauthorized: prev ? prev.tls_reject_unauthorized === 1 : true,
+      servername: prev?.tls_servername ?? '',
+    };
+    let tls: TlsConfig;
+    try {
+      // 整块不传 = 一个字段都不改，而不是「回到默认」
+      tls = normalizeTls(input.tls ?? {}, brokerUrl, prevTls);
+    } catch (e) {
+      if (e instanceof TlsConfigError) throw new CloudConfigError((e as Error).message);
+      throw e;
     }
 
     // 合并后再校验：只改 cipherFlag 而沿用旧密钥的场景也要被检到
@@ -277,8 +394,10 @@ export class CloudConfigRepo {
       INSERT INTO cloud_config (
         id, enabled, broker_url, client_id, device_identification, username, password_enc,
         cipher_flag, sign_key_enc, encrypt_key_enc, encrypt_vector_enc,
+        tls_mode, tls_ca, tls_cert, tls_key_enc, tls_reject_unauthorized, tls_servername,
+        mqtt_version, keepalive_sec, connect_timeout_sec, auto_reconnect, reconnect_period_ms,
         protocol_version, qos, updated_at, updated_by
-      ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)
+      ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)
       ON CONFLICT(id) DO UPDATE SET
         enabled = excluded.enabled,
         broker_url = excluded.broker_url,
@@ -290,6 +409,17 @@ export class CloudConfigRepo {
         sign_key_enc = excluded.sign_key_enc,
         encrypt_key_enc = excluded.encrypt_key_enc,
         encrypt_vector_enc = excluded.encrypt_vector_enc,
+        tls_mode = excluded.tls_mode,
+        tls_ca = excluded.tls_ca,
+        tls_cert = excluded.tls_cert,
+        tls_key_enc = excluded.tls_key_enc,
+        tls_reject_unauthorized = excluded.tls_reject_unauthorized,
+        tls_servername = excluded.tls_servername,
+        mqtt_version = excluded.mqtt_version,
+        keepalive_sec = excluded.keepalive_sec,
+        connect_timeout_sec = excluded.connect_timeout_sec,
+        auto_reconnect = excluded.auto_reconnect,
+        reconnect_period_ms = excluded.reconnect_period_ms,
         protocol_version = excluded.protocol_version,
         qos = excluded.qos,
         updated_at = datetime('now'),
@@ -305,6 +435,17 @@ export class CloudConfigRepo {
       encryptSecret(signKey, this.#key),
       encryptKey === '' ? '' : encryptSecret(encryptKey, this.#key),
       encryptVector === '' ? '' : encryptSecret(encryptVector, this.#key),
+      tls.mode,
+      tls.ca,
+      tls.cert,
+      tls.key === '' ? '' : encryptSecret(tls.key, this.#key),
+      tls.rejectUnauthorized ? 1 : 0,
+      tls.servername,
+      connection.mqttVersion,
+      connection.keepaliveSec,
+      connection.connectTimeoutSec,
+      connection.autoReconnect ? 1 : 0,
+      connection.reconnectPeriodMs,
       protocolVersion,
       qos,
       actor,

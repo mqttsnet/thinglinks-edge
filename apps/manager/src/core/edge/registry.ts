@@ -11,6 +11,7 @@
  * 只存**当前值**，不存时序。历史数据在云端 TDengine，边缘不做 historian。
  */
 import type { Db } from '../db.ts';
+import { shouldStore, type ValueHistory } from './history.ts';
 
 export interface FieldDeviceInput {
   nodeId: string;
@@ -84,9 +85,16 @@ function assertId(value: string, what: string): string {
 
 export class FieldRegistry {
   private readonly db: Db;
+  /**
+   * 点位历史。留空表示这个部署不记历史 —— 记录入口只有一个（recordValues），
+   * 由它顺手写掉，而不是让调用方记得再调一次。两处写入迟早会漏掉一处，
+   * 而漏掉的表现是「有些点位有趋势、有些没有」，极难查。
+   */
+  private readonly history?: ValueHistory | undefined;
 
-  constructor(db: Db) {
+  constructor(db: Db, history?: ValueHistory | undefined) {
     this.db = db;
+    this.history = history;
   }
 
   /** 注册或更新一台现场设备。重复注册是幂等的 —— flow 重启会重放注册 */
@@ -141,6 +149,14 @@ export class FieldRegistry {
       `UPDATE field_tag SET last_value = ?, quality = ?, last_at = ?
        WHERE instance_id = ? AND node_id = ? AND tag_id = ?`,
     );
+    // 上一条的值 / 质量 / 上次存历史的时刻 —— 一次查表就够，见 history.ts 的说明
+    const prevOf = this.db.prepare(
+      `SELECT last_value AS value, quality, hist_at AS histAt FROM field_tag
+        WHERE instance_id = ? AND node_id = ? AND tag_id = ?`,
+    );
+    const markHist = this.db.prepare(
+      `UPDATE field_tag SET hist_at = ? WHERE instance_id = ? AND node_id = ? AND tag_id = ?`,
+    );
     const touchDevice = this.db.prepare(
       'UPDATE field_device SET online = 1, last_seen = ? WHERE instance_id = ? AND node_id = ?',
     );
@@ -150,15 +166,43 @@ export class FieldRegistry {
         assertId(v.nodeId, 'nodeId');
         assertId(v.tagId, 'tagId');
         const at = v.at ?? nowIso();
+        const encoded = JSON.stringify(v.value ?? null);
+        const quality = v.quality ?? 'good';
         upsertTag.run(instanceId, v.nodeId, v.tagId);
-        setValue.run(JSON.stringify(v.value ?? null), v.quality ?? 'good', at,
-                     instanceId, v.nodeId, v.tagId);
+
+        /*
+         * 历史要在 setValue **之前**判断：setValue 一跑，上一条的值就没了，
+         * 而「变没变」正是要拿它比。顺序反了会让每个采样点都被当成「变了」，
+         * 于是历史表按最大速率增长 —— 而现象只是磁盘悄悄变满。
+         */
+        if (this.history?.enabled) {
+          const prev = prevOf.get(instanceId, v.nodeId, v.tagId) as
+            { value?: string | null; quality?: string | null; histAt?: string | null } | undefined;
+          const store = shouldStore(
+            {
+              value: prev?.value ?? undefined,
+              quality: prev?.quality ?? undefined,
+              histAt: prev?.histAt ?? undefined,
+            },
+            { value: encoded, quality, at },
+            this.history.limits,
+          );
+          if (store) {
+            this.history.append(instanceId, v.nodeId, v.tagId, { at, value: encoded, quality });
+            markHist.run(at, instanceId, v.nodeId, v.tagId);
+          }
+        }
+
+        setValue.run(encoded, quality, at, instanceId, v.nodeId, v.tagId);
         // 有值上来说明设备是活的
         touchDevice.run(at, instanceId, v.nodeId);
       }
       return items.length;
     });
-    return run(values);
+    const n = run(values);
+    // 裁剪放在事务外：它是维护动作，没必要和数据写入绑在一个事务里互相拖
+    this.history?.prune();
+    return n;
   }
 
   devices(instanceId?: string): FieldDeviceRecord[] {

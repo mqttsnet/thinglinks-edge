@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { MicroBatcher, groupPoints, DEFAULT_LIMITS, type UplinkPoint, type DataReportPayload } from './batch.ts';
+import { MicroBatcher, BatchOverflowError, groupPoints, DEFAULT_LIMITS, type UplinkPoint, type DataReportPayload } from './batch.ts';
 
 const pt = (over: Partial<UplinkPoint> = {}): UplinkPoint => ({
   deviceId: 'plc-1', serviceCode: 'env', data: { t: 1 }, eventTime: 1000, ...over,
@@ -27,8 +27,18 @@ function collector() {
   };
 }
 
-test('默认阈值就是 08 号文定的三个数', () => {
-  assert.deepEqual(DEFAULT_LIMITS, { windowMs: 200, maxPoints: 500, maxBytes: 256 * 1024 });
+test('默认阈值就是 08 号文定的三个数，外加一条队列水位上限', () => {
+  assert.deepEqual(DEFAULT_LIMITS, {
+    /*
+     * maxPoints 2026-08-28 从 500 调到 2000，08 号文第 2 节同步更新过。
+     * 依据是实测：分组后一个点约 19 字节，500 点才 9.3 KB，
+     * 而字节预算 256 KB —— 点数限制远早于字节限制触发，白白把上行切成小包。
+     * 上行串行（QoS 1 等 PUBACK），包越小往返越多，吞吐被 RTT 除。
+     */
+    windowMs: 200, maxPoints: 2000, maxBytes: 256 * 1024,
+    // 队列上限不是 08 号文的三个触发条件，是为了不让云端卡住时把内存排爆
+    maxQueuedBatches: 8, maxQueuedBytes: 2 * 1024 * 1024,
+  });
 });
 
 test('时间窗到点才发，未到点不发', async () => {
@@ -169,4 +179,65 @@ test('空批次不产生空消息', async () => {
   await b.flushNow();
   await b.close();
   assert.equal(c.batches.length, 0);
+});
+
+// ── 队列水位（一个实例不能拖垮共享 Manager）──────────────────
+
+test('云端卡住时队列到顶就拒收，而不是无限排队', async () => {
+  let release: (() => void) | undefined;
+  const b = new MicroBatcher({
+    limits: { maxPoints: 1, maxQueuedBatches: 2 },
+    // flush 一直不返回，模拟云端 TCP 卡住（不是断开 —— 断开会立刻抛错）
+    flush: () => new Promise<void>((r) => { release = r; }),
+  });
+
+  b.add(pt());                       // 第 1 批：立刻发，占用一个水位
+  b.add(pt({ eventTime: 2 }));       // 第 2 批：排队
+  assert.equal(b.queued, 2);
+  assert.ok(b.saturated, '到顶了');
+
+  assert.throws(() => b.add(pt({ eventTime: 3 })), BatchOverflowError);
+  assert.equal(b.rejected, 1, '拒收要计数，否则现场查不出数据为什么少了');
+  assert.equal(b.queued, 2, '拒收不占水位');
+
+  release?.();
+});
+
+test('发送完成后水位退回，能继续收', async () => {
+  const b = new MicroBatcher({
+    limits: { maxPoints: 1, maxQueuedBatches: 1 },
+    flush: async () => {},
+  });
+  b.add(pt());
+  await b.flushNow();
+  assert.equal(b.queued, 0);
+  assert.equal(b.saturated, false);
+  b.add(pt({ eventTime: 9 }));       // 不该抛
+});
+
+test('flush 抛错也要退水位，否则队列永久假满', async () => {
+  const errors: Error[] = [];
+  const b = new MicroBatcher({
+    limits: { maxPoints: 1, maxQueuedBatches: 1 },
+    flush: async () => { throw new Error('云端拒绝'); },
+    onFlushError: (e) => errors.push(e),
+  });
+  b.add(pt());
+  await b.flushNow();
+  assert.equal(errors.length, 1);
+  assert.equal(b.queued, 0, '错误路径同样要把水位退回来');
+  assert.equal(b.saturated, false);
+});
+
+test('字节水位也算数：批次大就更早到顶', async () => {
+  let release: (() => void) | undefined;
+  const b = new MicroBatcher({
+    limits: { maxPoints: 1, maxQueuedBatches: 99, maxQueuedBytes: 1 },
+    flush: () => new Promise<void>((r) => { release = r; }),
+  });
+  b.add(pt());
+  assert.ok(b.queuedBytes > 1);
+  assert.ok(b.saturated, '字节数已过线');
+  assert.throws(() => b.add(pt({ eventTime: 5 })), BatchOverflowError);
+  release?.();
 });

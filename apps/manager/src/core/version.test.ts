@@ -37,9 +37,14 @@ test('parseLatest 兼容 GitHub 与自建两种响应', () => {
 });
 
 test('未配置检查地址时彻底不联网', async () => {
-  const c = new UpdateChecker({ url: '' });
-  assert.equal(c.enabled, false);
-  assert.deepEqual(await c.check(), { enabled: false });
+  // 空串、undefined、纯空白都算「没配置」。
+  // 曾经只判 `!== ''`，传 undefined 时被当成已启用并去 fetch(undefined) ——
+  // 「没配置」变成「往外连」，把默认不联网这条承诺破掉了
+  for (const url of ['', '   ', undefined]) {
+    const c = new UpdateChecker({ url });
+    assert.equal(c.enabled, false, `${JSON.stringify(url)} 应视为未配置`);
+    assert.deepEqual(await c.check(), { enabled: false });
+  }
 });
 
 test('检查失败如实回报，不伪装成已是最新', async () => {

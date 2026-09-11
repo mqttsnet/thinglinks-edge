@@ -1,0 +1,6 @@
+{
+  // lint 使用默认的完整 typecheck 项目，测试与 fixtures 也归属其中。
+  // 构建产物范围由 tsconfig.build.json 单独控制。
+  "extends": "./tsconfig.json",
+  "include": ["src/**/*.ts"]
+}

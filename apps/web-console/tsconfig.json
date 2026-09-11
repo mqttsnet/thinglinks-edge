@@ -12,6 +12,11 @@
     "verbatimModuleSyntax": true,
     "skipLibCheck": true,
     "noEmit": true,
+    // 允许 import 时写 .ts 后缀。web-console 原本一律无后缀（Vite 会补），
+    // 但那样 node --test 跑不了 —— node 的 ESM loader 不做扩展名补全。
+    // 纯逻辑模块要能被单测覆盖，就得让两边都认，所以显式写后缀并在此放行。
+    // Vite 与 vue-tsc 都接受显式后缀，无后缀的旧写法也继续有效。
+    "allowImportingTsExtensions": true,
     "types": ["vite/client"]
   },
   "include": ["src/**/*.ts", "src/**/*.vue", "vite.config.ts"]

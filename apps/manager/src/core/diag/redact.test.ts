@@ -31,6 +31,8 @@ test('key=value 形态各种写法都认', () => {
     ['Authorization: Bearer abc.def.ghi', 'abc.def.ghi'],
   ];
   for (const [input, secret] of cases) {
+    assert.ok(input, '每个脱敏用例都必须提供待处理文本');
+    assert.ok(secret, '每个脱敏用例都必须提供待隐藏的秘密');
     const out = redact(input);
     assert.ok(!out.includes(secret), `没抹掉：${input} → ${out}`);
   }
