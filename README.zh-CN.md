@@ -69,15 +69,6 @@ Node-RED 多实例托管是**其中一个能力**，不是产品全部，只是�
 | Node.js | 24 LTS（仅开发需要） |
 | pnpm | 10.32+（仅开发需要） |
 
-> **32 位 ARM 未发布。** 决定性原因在下游：Node-RED 官方镜像 5.x 全系只有
-> `amd64` / `arm64`，所以 `armv7` 上的 Manager 即使能跑，实例也会被永久锁在
-> Node-RED 4.1.x。构建侧还要额外付出代价（`better-sqlite3` 无 32 位 ARM 预编译产物）。
-> 更重要的是**并不适配**：真正只能跑 32 位的那批芯片（i.MX6、AM335x、A20）
-> 典型只有 256MB–1GB 内存，而 Manager 实测常驻 53 MiB、每个实例约 104 MiB。
->
-> **树莓派用户基本不受影响**：Pi 3 / 3B+ / Zero 2 W 的芯片本身都是 64 位的，
-> 只有装 32 位系统才会落进 `armv7`。`uname -m` 显示 `aarch64` 可用，`armv7l` 则不行。
-
 ### 部署
 
 Manager 镜像已发布在 Docker Hub：[`mqttsnet/thinglinks-edge`](https://hub.docker.com/r/mqttsnet/thinglinks-edge)，
