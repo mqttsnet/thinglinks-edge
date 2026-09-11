@@ -31,8 +31,11 @@ preflight-report*.json
 
 # 本地 AI 会话、草稿与个人偏好不提交。
 # 仓库级共享规则使用根 AGENTS.md / CLAUDE.md、.github/copilot-instructions.md
-# 与 docs/superpowers/。
+# 与 docs/ 中可复用的产品和开发说明。
 tasks/
+# 旧 AI 输出目录不再纳入公共文档；计划与验收记录统一放 tasks/。
+docs/superpowers/
+docs/verification/
 .claude/
 CLAUDE.local.md
 *.scratch.*

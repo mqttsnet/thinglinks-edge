@@ -6,7 +6,8 @@ This file is the repository-wide source of truth for coding agents.
 
 - Run `git status --short --branch` before editing. Preserve unrelated, staged, and untracked work.
 - Read the source file, its tests, and one nearby pattern before changing behavior.
-- When a task names a spec or plan, read `docs/superpowers/README.md`, then only the linked documents for that topic.
+- Start with `docs/README.md` for shared documentation; read only the documents relevant to the task.
+- Keep task-specific plans, drafts, and verification reports under ignored `tasks/`, outside the shared docs. Read a local plan only when the task explicitly references it.
 - Treat repository documentation as design context, not proof that code or runtime behavior exists.
 
 ## Project shape
@@ -62,7 +63,8 @@ One layer never proves another. Report skipped or unavailable gates explicitly.
 
 ## Documentation
 
-- Specs define stable intent, scope, constraints, and acceptance criteria.
-- Plans define ordered implementation work and verification commands.
+- `docs/` contains reusable product, deployment, operation, and architecture documentation.
+- Put documentation images in `docs/images/`: `brand/`, `screenshots/`, `architecture/`, and editable `sources/`.
+- Keep reusable configuration and capability boundaries in shared docs; keep dated test results, local paths, and execution checklists in ignored `tasks/`.
 - A plan or checked box is not runtime evidence.
-- Keep task IDs unique, links relative, and dynamic results out of stable design claims.
+- Keep links relative and update every reference when moving a document or image.

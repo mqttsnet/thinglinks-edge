@@ -50,7 +50,7 @@ docker compose run --rm --entrypoint node manager \
 
 ## 尚未覆盖的边界
 
-本安全切片不代表发布可接受。历史 v1 明文 TAR 仍自动兼容，显式 legacy 许可与完整 manifest
+当前恢复机制仍有以下限制：历史 v1 明文 TAR 仍自动兼容，显式 legacy 许可与完整 manifest
 字段校验及严格 TAR 完整性校验尚未落地。备份/恢复仍全包驻留内存。SQLite 使用一致性快照，但运行中实例的跨文件
 一致性尚无保证；文件模式、符号链接及任意空目录也没有完整保真。需要跨文件一致的备份时，
 先停止实例和其他实例文件写入者，再由 Manager 下载备份。

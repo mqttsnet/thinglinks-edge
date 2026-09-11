@@ -1,6 +1,6 @@
 <div align="center">
 
-<a href="https://mqttsnet.com"><img src="./docs/images/logo.png" alt="ThingLinks" width="180"></a>
+<a href="https://mqttsnet.com"><img src="docs/images/brand/logo.png" alt="ThingLinks" width="180"></a>
 
 # ThingLinks Edge
 

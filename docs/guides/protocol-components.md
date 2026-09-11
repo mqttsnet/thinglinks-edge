@@ -76,7 +76,7 @@ HTTP 控制请求按点位源字段构造 JSON，设备需返回 HTTP 200 和确
 
 ## 开发扩展与验证
 
-分层入口见 [模板扩展说明](../apps/manager/src/core/flows/templates/README.md)。协议包清单及完整依赖锁说明见 [离线组件说明](../scripts/protocol-seed/README.md)。
+分层入口见 [模板扩展说明](../../apps/manager/src/core/flows/templates/README.md)。协议包清单及完整依赖锁说明见 [离线组件说明](../../scripts/protocol-seed/README.md)。
 
 ```sh
 pnpm check
@@ -88,4 +88,4 @@ node --experimental-strip-types scripts/verify-protocol-templates.mjs /path/to/s
 node --experimental-strip-types scripts/verify-protocol-components.mjs --cleanup /path/to/state.json
 ```
 
-带 `--commands` 的首批验证器按能力声明执行：Modbus-TCP与兼容OPC UA模板只验证采集，控制明确记录 `unavailable`，不计入控制通过数。tier0安全模板有独立的协议及页面验收记录，不能借用首批脚本的通过结果。验证器仅操作有本轮标签和捕获 ID 的隔离资源。模拟设备测试、物理设备验收、已有实例升级和真实 ThingLinks 云端验收分别记录，不能互相替代。
+带 `--commands` 的首批验证器按能力声明执行：Modbus-TCP与兼容OPC UA模板只验证采集，控制明确记录 `unavailable`，不计入控制通过数。tier0安全模板需要单独验证协议与页面行为，不能借用首批脚本的通过结果。验证器仅操作有本轮标签和捕获 ID 的隔离资源。模拟设备测试、物理设备验收、已有实例升级和真实 ThingLinks 云端验收分别记录，不能互相替代。
