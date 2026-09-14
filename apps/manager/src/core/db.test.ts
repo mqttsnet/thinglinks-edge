@@ -15,7 +15,7 @@ test('v12 database upgrades instance runtime and journal idempotently through cu
   ).run('line-a', 'Line A', '5.0.4-24-minimal', 512, 0.5,
     '/red/line-a/', 'secret', 'preserve me');
 
-  assert.equal(migrate(db), 18);
+  assert.equal(migrate(db), 19);
   const runtime = new InstanceRepo(db, Buffer.alloc(32, 1)).nodeRuntime('line-a');
   assert.deepEqual(runtime, {
     mode: 'legacy',
@@ -37,7 +37,7 @@ test('v12 database upgrades instance runtime and journal idempotently through cu
     { name: 'execution_lease_expires_at', dflt_value: '0', required: 1 },
     { name: 'execution_owner', dflt_value: "''", required: 1 },
   ]);
-  assert.equal(migrate(db), 18);
+  assert.equal(migrate(db), 19);
   const preserved = db.prepare(
     'SELECT name, notes FROM instance WHERE id = ?',
   ).get('line-a') as { name: string; notes: string };
@@ -48,12 +48,12 @@ test('migration target is validated and never downgrades a newer database', () =
   const db = new Database(':memory:');
   assert.throws(() => migrate(db, -1), /目标版本/);
   assert.throws(() => migrate(db, 13.5), /目标版本/);
-  assert.throws(() => migrate(db, 19), /目标版本/);
-  assert.equal(migrate(db), 18);
-  assert.equal(migrate(db, 12), 18);
+  assert.throws(() => migrate(db, 20), /目标版本/);
+  assert.equal(migrate(db), 19);
+  assert.equal(migrate(db, 12), 19);
   assert.equal(
     (db.prepare('SELECT version FROM schema_version').get() as { version: number }).version,
-    18,
+    19,
   );
 });
 
@@ -183,4 +183,14 @@ test('v15 adds trusted copy metadata without changing existing template categori
     name: 'Site', content: '[]', category: 'network', protocols: '["tcp"]', trusted_metadata: '{}',
   });
   db.close();
+});
+
+
+test('v18 adds durable protocol cleanup intents without changing instance data',()=>{
+ const db=new Database(':memory:');migrate(db,18);
+ db.prepare('INSERT INTO editor_origin(instance_id,generation,port) VALUES(?,?,?)').run('preserved','generation',20001);
+ assert.equal(migrate(db),19);
+ assert.equal((db.prepare('SELECT COUNT(*) n FROM editor_origin').get() as {n:number}).n,1);
+ assert.equal((db.prepare('SELECT COUNT(*) n FROM protocol_diagnostic').get() as {n:number}).n,0);
+ db.close();
 });

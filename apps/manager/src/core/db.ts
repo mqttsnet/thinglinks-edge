@@ -1,3 +1,4 @@
+import { PROTOCOL_DIAGNOSTIC_SCHEMA } from './protocols/diagnostics/schema.ts';
 /**
  * SQLite —— 只承担平台元数据。
  *
@@ -426,6 +427,8 @@ const MIGRATIONS: string[] = [
     port INTEGER NOT NULL UNIQUE CHECK (port BETWEEN 1 AND 65535),
     PRIMARY KEY (instance_id, generation)
   );`,
+  // v19 — durable single-read cleanup intents; never replay after restart.
+  PROTOCOL_DIAGNOSTIC_SCHEMA,
 ];
 export function openDb(file: string): Db {
   if (file !== ':memory:') mkdirSync(dirname(file), { recursive: true });
