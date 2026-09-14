@@ -39,6 +39,7 @@ import {
 import { installModule } from '../flows/admin-client.ts';
 import { assertHealthyPlatformModule } from '../nodes/inventory.ts';
 import { verifyInstalledPlatformFiles } from '../nodes/installed-files.ts';
+import { assertInstanceResourceBudget } from './resource-budget.ts';
 import {
   type PlatformNodeOperationBarrier,
 } from '../nodes/platform-operation-barrier.ts';
@@ -115,6 +116,8 @@ export interface CreateInstanceInput {
   imageTag: string;
   memoryMb: number;
   cpus: number;
+  /** Omission preserves generated credentials for automation; explicit values are validated. */
+  editorPassword?: string | undefined;
   /**
    * 端口映射表，一行一条，空数组表示不映射。
    *
@@ -256,6 +259,11 @@ export class InstanceService {
     lease: InstanceOperationLease,
   ): Promise<InstanceView> {
     this.o.gate.assertLease(lease, input.id, ['create-instance']);
+    if (input.editorPassword !== undefined && (
+      typeof input.editorPassword !== 'string' || input.editorPassword.length < 12
+      || !input.editorPassword.trim() || Buffer.byteLength(input.editorPassword, 'utf8') > 72
+      || input.editorPassword.includes('\0')
+    )) throw new ServiceError('编辑器口令至少 12 位，UTF-8 编码最多 72 字节，不能全为空白或包含空字符');
     assertValidId(input.id);
     if (!input.name.trim()) throw new ServiceError('实例名称不能为空');
     if (!this.o.allowedImageTags.includes(input.imageTag)) {
@@ -266,7 +274,8 @@ export class InstanceService {
     if (this.o.repo.get(input.id)) throw new ServiceError(`实例 ${input.id} 已存在`);
 
     // 宿主资源逼近上限时阻止创建，而不是等它把机器压垮
-    const exhausted = isExhausted(await (this.o.readHostStats?.() ?? readHostStats()));
+    const host = await (this.o.readHostStats?.() ?? readHostStats());
+    const exhausted = isExhausted(host);
     if (exhausted.exhausted) {
       throw new ServiceError(`${exhausted.reason}，已阻止创建新实例`);
     }
@@ -296,7 +305,7 @@ export class InstanceService {
     }
 
     const adminRoot = adminRootFor(this.o.basePath, input.id);
-    const password = generatePassword();
+    const password = input.editorPassword ?? generatePassword();
     const credSecret = generatePassword(24);
     // 接入令牌：给实例里的 @thinglinks 节点回报台账用，与管理口令分开
     const ingestToken = generatePassword(32);
@@ -319,7 +328,11 @@ export class InstanceService {
     }
 
     const txId = `bootstrap-${randomUUID()}`;
-    this.o.repo.createWithNodeMigration(
+    // Recheck under the SQLite write transaction: concurrent creates on different
+    // instance gates must not each reserve the same remaining host capacity.
+    this.o.db.transaction(() => {
+      assertInstanceResourceBudget(host, this.o.repo.list(), input);
+      this.o.repo.createWithNodeMigration(
       {
         id: input.id, name: input.name, imageTag: input.imageTag,
         memLimit: input.memoryMb, cpuLimit: input.cpus,
@@ -342,6 +355,7 @@ export class InstanceService {
         actor: input.actor,
       },
     );
+    })();
 
     let failureCode: NodeMigrationErrorCode = 'preflight';
     let failureBoundary: BootstrapFailureBoundary = 'persist-barrier';
@@ -609,7 +623,7 @@ export class InstanceService {
     });
   }
 
-  /** 重置实例账号口令：改仓储 → 重写 settings.js → 重启实例 */
+  /** Preflight first, compensate failures, and return the credential only after runtime acceptance. */
   async resetCredential(id: string, username: string, actor: string): Promise<string> {
     return this.o.gate.run(id, 'reset-credential',
       async (lease) => this.resetCredentialUnderLease(id, lease, username, actor));
@@ -624,15 +638,53 @@ export class InstanceService {
     this.o.gate.assertLease(lease, id, ['reset-credential']);
     const inst = this.o.repo.get(id);
     if (!inst) throw new ServiceError(`实例 ${id} 不存在`);
-
+    const originalCredential = this.o.repo.credentials(id).find(entry => entry.username === username);
+    if (!originalCredential) throw new ServiceError(`实例 ${id} 下没有指定账号`);
+    let before: Awaited<ReturnType<DockerClient['assertRestartable']>>;
+    try { before = await this.o.docker.assertRestartable(id); }
+    catch {
+      throw new ServiceError(`实例 ${id} 不满足安全重启要求，尚未修改口令；请核对运行环境并先完成隔离配置重建`);
+    }
     const password = generatePassword();
-    this.o.repo.resetCredential(id, username, password);
-
-    const settings = this.#renderFor(id);
-    await this.o.docker.writeSettings(id, settings);
-    await this.o.docker.restart(id);
-
-    recordAudit(this.o.db, { actor, action: 'reset-instance-credential', target: `${id}/${username}`, result: 'ok' });
+    const readiness = { timeoutMs: 30_000, intervalMs: 250, username };
+    try {
+      this.o.repo.resetCredential(id, username, password);
+      await this.o.docker.writeSettings(id, this.#renderFor(id));
+      if (before.running) {
+        await this.o.docker.restart(id);
+        await this.o.adminRuntime.waitReady(id, readiness);
+      }
+      recordAudit(this.o.db, {
+        actor, action: 'reset-instance-credential', target: `${id}/${username}`, result: 'ok',
+        detail: JSON.stringify({ applied: before.running ? 'verified-running' : 'next-start' }),
+      });
+    } catch {
+      let recovered = true;
+      // Attempt both parts even if one fails; never leave the new repository
+      // password solely because writing the old settings also failed.
+      try { this.o.repo.resetCredential(id, username, originalCredential.password); }
+      catch { recovered = false; }
+      try {
+        await this.o.docker.writeSettings(id, before.settingsJs);
+        if (before.running) {
+          await this.o.docker.restart(id);
+          await this.o.adminRuntime.waitReady(id, readiness);
+        }
+      } catch { recovered = false; }
+      try {
+        recordAudit(this.o.db, {
+          actor, action: 'reset-instance-credential', target: `${id}/${username}`, result: 'fail',
+          detail: JSON.stringify({ code: recovered ? 'restored-original' : 'manual-recovery-required', originallyRunning: before.running }),
+        });
+      } catch {
+        throw new ServiceError(recovered
+          ? `实例 ${id} 口令重置失败，已恢复原口令和配置，但审计记录无法写入，需要人工核对`
+          : `实例 ${id} 口令重置和自动恢复均未完成，且审计记录无法写入，需要立即人工恢复`);
+      }
+      throw new ServiceError(recovered
+        ? `实例 ${id} 口令重置失败，已恢复原口令、配置和运行状态`
+        : `实例 ${id} 口令重置失败且自动恢复未完成，需要人工恢复；新口令未确认生效`);
+    }
     return password;
   }
 

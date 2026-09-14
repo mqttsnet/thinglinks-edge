@@ -37,7 +37,7 @@ function envRecord(text) {
     }));
 }
 
-function bed({ nullRepoTags = false, manager = MANAGER } = {}) {
+function bed({ nullRepoTags = false, manager = MANAGER, proxy = PROXY } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'tle-offline-build-test-'));
   const bin = join(root, 'bin');
   const out = join(root, 'out');
@@ -104,7 +104,8 @@ cp -R "$2/$5/." "$FAKE_CAPTURE/"
     FAKE_NULL_REPO_TAGS: nullRepoTags ? '1' : '0',
     FAKE_CAPTURE: capture,
     MANAGER_IMAGE: manager,
-    PROXY_IMAGE: PROXY,
+    PROXY_IMAGE: proxy,
+    NETWORK_IMAGE: '',
     INIT_IMAGE: INIT,
     NODE_RED_IMAGE_REPO: NODE_REPO,
     ALLOWED_IMAGE_TAGS: TAGS,
@@ -131,6 +132,7 @@ test('bundle 写入实际镜像配置且 images.tar RepoTags 可供 compose 寻�
     assert.deepEqual({
       MANAGER_IMAGE: env.MANAGER_IMAGE,
       PROXY_IMAGE: env.PROXY_IMAGE,
+      NETWORK_IMAGE: env.NETWORK_IMAGE,
       INIT_IMAGE: env.INIT_IMAGE,
       NODE_RED_IMAGE_REPO: env.NODE_RED_IMAGE_REPO,
       NODE_RED_BOOTSTRAP_IMAGE: env.NODE_RED_BOOTSTRAP_IMAGE,
@@ -138,6 +140,7 @@ test('bundle 写入实际镜像配置且 images.tar RepoTags 可供 compose 寻�
     }, {
       MANAGER_IMAGE: MANAGER,
       PROXY_IMAGE: PROXY,
+      NETWORK_IMAGE: MANAGER,
       INIT_IMAGE: INIT,
       NODE_RED_IMAGE_REPO: NODE_REPO,
       NODE_RED_BOOTSTRAP_IMAGE: `${NODE_REPO}:${TAGS}`,
@@ -184,4 +187,28 @@ test('裸 sha256 MANAGER_IMAGE 在 docker save 前即被拒绝', () => {
   } finally {
     fixture.cleanup();
   }
+});
+
+test('Manager and Docker policy roles share one release image by default and archive tags are deduplicated', () => {
+  const fixture = bed({ proxy: '' });
+  try {
+    const result = fixture.run();
+    assert.equal(result.status, 0, result.stderr);
+    const env = envRecord(readFileSync(join(fixture.capture, '.env.example'), 'utf8'));
+    assert.equal(env.PROXY_IMAGE, MANAGER);
+    const manifest = JSON.parse(readFileSync(join(fixture.capture, 'manifest.json'), 'utf8'));
+    assert.deepEqual(manifest.imageRoles, { manager: MANAGER, dockerProxy: MANAGER, networkIsolation: MANAGER, initData: INIT, nodeRed: [`${NODE_REPO}:${TAGS}`] });
+    assert.equal(manifest.images.length, 3);
+    assert.equal(new Set(manifest.images.map(item => item.image)).size, 3);
+  } finally { fixture.cleanup(); }
+});
+
+test('an explicit same-image proxy override exports only one tag for the two roles', () => {
+  const fixture = bed({ proxy: MANAGER });
+  try {
+    const result = fixture.run();
+    assert.equal(result.status, 0, result.stderr);
+    const manifest = JSON.parse(readFileSync(join(fixture.capture, 'manifest.json'), 'utf8'));
+    assert.equal(manifest.images.filter(item => item.image === MANAGER).length, 1);
+  } finally { fixture.cleanup(); }
 });

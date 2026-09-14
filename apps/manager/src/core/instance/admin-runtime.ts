@@ -9,7 +9,7 @@ export interface InstanceAdminRuntime {
   target(instanceId: string): AdminTarget;
   waitReady(
     instanceId: string,
-    options: { timeoutMs: number; intervalMs: number },
+    options: { timeoutMs: number; intervalMs: number; username?: string },
   ): Promise<void>;
 }
 
@@ -60,7 +60,7 @@ export class RepositoryInstanceAdminRuntime implements InstanceAdminRuntime {
 
   async waitReady(
     instanceId: string,
-    options: { timeoutMs: number; intervalMs: number },
+    options: { timeoutMs: number; intervalMs: number; username?: string },
   ): Promise<void> {
     if (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) {
       throw new TypeError('timeoutMs 必须是正数');
@@ -69,6 +69,12 @@ export class RepositoryInstanceAdminRuntime implements InstanceAdminRuntime {
       throw new TypeError('intervalMs 必须是正数');
     }
     const target = this.target(instanceId);
+    if (options.username !== undefined) {
+      const credential = this.options.repo.credentials(instanceId).find(entry => entry.username === options.username);
+      if (!credential) throw new InstanceAdminRuntimeError('credential-not-found', `实例 ${instanceId} 的指定账号不可用`);
+      target.username = credential.username;
+      target.password = credential.password;
+    }
     const deadline = Date.now() + options.timeoutMs;
     while (true) {
       const remaining = deadline - Date.now();

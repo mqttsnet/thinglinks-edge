@@ -1,5 +1,5 @@
 /**
- * 端到端验证：Manager 反代 + 免密跳转 + WebSocket，对接真实 Node-RED 容器。
+ * 端到端验证：Manager 反代 + 独立编辑器口令/Origin + WebSocket，对接真实 Node-RED 容器。
  *
  * 实例容器保持生产配置原样（1880 不映射宿主），
  * 由一个显式的 socat 边车容器为宿主测试搭桥 —— 这是测试脚手架，不改变生产拓扑。
@@ -43,6 +43,7 @@ import {
   assemblePlatformOperationBarrier,
 } from '../dist/index.js';
 import { buildServer } from '../dist/http/app.js';
+import { startEditorOriginServers } from '../dist/http/editor-origin-server.js';
 
 const BASE_PATH = process.argv[2] ?? '';
 const RUN_LABEL = 'com.mqttsnet.thinglinks-edge.verifier-run';
@@ -60,6 +61,7 @@ let RUN_DATA_ROOT;
 let DATA_OWNER;
 let BRIDGE_PORT;
 let MGR_PORT;
+let EDITOR_PORT;
 const ADMIN_PW = randomBytes(24).toString('base64url');
 const ADMIN_NEXT_PW = randomBytes(24).toString('base64url');
 const NR_PW = randomBytes(24).toString('base64url');
@@ -70,6 +72,7 @@ const raw = new Docker();
 const results = [];
 let protectedBefore;
 let managerApp;
+let editorListeners;
 let managerDb;
 const ownedContainerIds = new Map();
 const ownedNetworkIds = new Map();
@@ -369,6 +372,8 @@ async function cleanup() {
     try { await task(); } catch (error) { errors.push(`${label}: ${error.message}`); }
   };
   await attempt('Manager close', async () => {
+    if (editorListeners) await editorListeners.close();
+    editorListeners = undefined;
     if (managerApp) await managerApp.close();
     managerApp = undefined;
   });
@@ -410,6 +415,7 @@ async function main() {
   await reserveRunDataRoot();
   BRIDGE_PORT = await freePort();
   do { MGR_PORT = await freePort(); } while (MGR_PORT === BRIDGE_PORT);
+  do { EDITOR_PORT = await freePort(); } while (EDITOR_PORT === BRIDGE_PORT || EDITOR_PORT === MGR_PORT);
 
   const adminRoot = adminRootFor(BASE_PATH, ID);
   const instanceNetwork = await raw.createNetwork({
@@ -499,6 +505,7 @@ async function main() {
     listenAddr: '127.0.0.1', listenPort: MGR_PORT,
     dataDir: runtimeRoot, dataRoot: runtimeRoot, instanceDataRoot: RUN_DATA_ROOT,
     portRange: { min: 30000, max: 30999 },
+    editorPortRange: { min: EDITOR_PORT, max: EDITOR_PORT },
     timezone: 'Asia/Shanghai', updateCheckUrl: '',
   };
   const app = buildServer({
@@ -513,11 +520,12 @@ async function main() {
   });
   managerApp = app;
   await app.listen({ host: '127.0.0.1', port: MGR_PORT });
+  editorListeners = await startEditorOriginServers(app, { host: '127.0.0.1', portRange: config.editorPortRange });
 
   const B = `http://127.0.0.1:${MGR_PORT}${BASE_PATH}`;
 
   // 1. 未登录被拒
-  check('未登录访问实例被拒绝', (await fetch(`${B}/red/${ID}/`, { redirect: 'manual' })).status === 401);
+  check('未登录访问实例被拒绝', (await fetch(`${B}/api/instances/${ID}`, { redirect: 'manual' })).status === 401);
 
   // 2. 登录
   const login = await fetch(`${B}/api/login`, {
@@ -551,8 +559,44 @@ async function main() {
   requireCheck('首次强制改密后可正常使用', relogin.status === 200 && cookie.includes('tle_sid'),
     `HTTP ${relogin.status}`);
 
+  const currentCsrf = /tle_csrf=([^;]+)/.exec(cookie)?.[1] ?? '';
+  const unlockHeaders = { 'content-type': 'application/json', cookie, 'x-csrf-token': currentCsrf,
+    origin: `http://127.0.0.1:${MGR_PORT}` };
+  const wrongPassword = await fetch(`${B}/api/instances/${ID}/editor-access`, {
+    method: 'POST', headers: unlockHeaders, body: JSON.stringify({ password: 'incorrect-test-password' }),
+  });
+  check('错误的实例编辑器口令被拒绝', wrongPassword.status === 401, `HTTP ${wrongPassword.status}`);
+  const unlocked = await fetch(`${B}/api/instances/${ID}/editor-access`, {
+    method: 'POST', headers: unlockHeaders, body: JSON.stringify({ password: NR_PW }),
+  });
+  const handoff = await unlocked.json();
+  requireCheck('显式实例口令验证只返回独立入口、不返回 Node-RED token', unlocked.status === 200
+    && typeof handoff.editorUrl === 'string' && !('token' in handoff) && !JSON.stringify(handoff).includes('access_token'));
+  const entryUrl = new URL(handoff.editorUrl);
+  const ticket = entryUrl.hash.slice(1);
+  const editorOrigin = `http://127.0.0.1:${EDITOR_PORT}`;
+  const E = `${editorOrigin}${BASE_PATH}`;
+  requireCheck('编辑器与管理台使用不同 Origin，交接票据不进入查询字符串',
+    entryUrl.origin === editorOrigin && entryUrl.search === '' && ticket.length === 43);
+  entryUrl.hash = '';
+  const entry = await fetch(entryUrl, { headers: { cookie } });
+  const entryHtml = await entry.text();
+  check('独立入口页面不嵌入实例 token，片段在交接前清除', entry.status === 200
+    && entryHtml.includes('history.replaceState') && entry.headers.get('cache-control') === 'no-store');
+  const exchange = await fetch(`${E}/red/${ID}/editor-handoff`, {
+    method: 'POST', headers: { 'content-type': 'application/json', cookie, origin: editorOrigin }, body: JSON.stringify({ ticket }),
+  });
+  const exchanged = await exchange.json();
+  const token = exchanged.token?.access_token;
+  requireCheck('绑定当前会话的一次性交接取得真实 access_token', exchange.status === 200
+    && typeof token === 'string' && token.length > 0 && exchanged.token?.scope === '*', `HTTP ${exchange.status}`);
+  const replay = await fetch(`${E}/red/${ID}/editor-handoff`, {
+    method: 'POST', headers: { 'content-type': 'application/json', cookie, origin: editorOrigin }, body: JSON.stringify({ ticket }),
+  });
+  check('交接票据不能重放', replay.status === 401, `HTTP ${replay.status}`);
+
   // 3. 编辑器
-  const editor = await fetch(`${B}/red/${ID}/`, { headers: { cookie } });
+  const editor = await fetch(`${E}/red/${ID}/`, { headers: { cookie } });
   const html = await editor.text();
   requireCheck('真实编辑器 HTML 可加载', editor.status === 200 && html.includes('red/red.min.js'),
     `HTTP ${editor.status}`);
@@ -560,12 +604,12 @@ async function main() {
   // 4. 静态资源（真实 Node-RED 用相对路径，按文档 URL 解析）
   const refs = [...html.matchAll(/(?:src|href)="([^"]+)"/g)].map((m) => m[1])
     .filter((u) => !u.startsWith('http') && /\.(js|css)/.test(u)).slice(0, 6);
-  const refPaths = refs.map((ref) => new URL(ref, `${B}/red/${ID}/`).pathname);
+  const refPaths = refs.map((ref) => new URL(ref, `${E}/red/${ID}/`).pathname);
   const hasJs = refPaths.some((path) => path.endsWith('.js'));
   const hasCss = refPaths.some((path) => path.endsWith('.css'));
   const fails = [];
   for (const rel of refs) {
-    const abs = new URL(rel, `${B}/red/${ID}/`).toString();
+    const abs = new URL(rel, `${E}/red/${ID}/`).toString();
     const r = await fetch(abs, { headers: { cookie } });
     if (r.status !== 200) fails.push(`${rel}→${r.status}`);
   }
@@ -574,14 +618,14 @@ async function main() {
     fails.join(',') || `JS=${hasJs ? 'yes' : 'no'} CSS=${hasCss ? 'yes' : 'no'} · ${refPaths.join(', ')}`);
 
   // 5. 无尾斜杠 301
-  const noSlash = await fetch(`${B}/red/${ID}`, { headers: { cookie }, redirect: 'manual' });
+  const noSlash = await fetch(`${E}/red/${ID}`, { headers: { cookie }, redirect: 'manual' });
   check('无尾斜杠被 301 重定向', noSlash.status >= 300 && noSlash.status < 400,
         `HTTP ${noSlash.status} → ${noSlash.headers.get('location') ?? ''}`);
 
   // 6. WebSocket
-  const wsUrl = `ws://127.0.0.1:${MGR_PORT}${BASE_PATH}/red/${ID}/comms`;
+  const wsUrl = `ws://127.0.0.1:${EDITOR_PORT}${BASE_PATH}/red/${ID}/comms`;
   const wsOk = await websocketOutcome(wsUrl, {
-    headers: { cookie, origin: `http://127.0.0.1:${MGR_PORT}` },
+    headers: { cookie, origin: editorOrigin },
   });
   check('真实 /comms WebSocket 握手成功', wsOk.kind === 'open', describeWsOutcome(wsOk));
 
@@ -599,23 +643,21 @@ async function main() {
     wsBadOrigin.kind === 'http' && wsBadOrigin.status === 403,
     describeWsOutcome(wsBadOrigin));
 
-  // 9. 免密跳转
-  const sso = await fetch(`${B}/red/${ID}/sso`, { headers: { cookie } });
-  const ssoHtml = await sso.text();
-  const token = (ssoHtml.match(/\\?"access_token\\?":\\?"([^"\\]+)/) ?? [])[1];
-  requireCheck('免密跳转取得真实 access_token', sso.status === 200 && Boolean(token),
-    token ? 'token present' : `HTTP ${sso.status}`);
+  // 9. 旧入口只能回到实例页面，不能再用存储口令自动换 token。
+  const sso = await fetch(`${B}/red/${ID}/sso`, { headers: { cookie }, redirect: 'manual' });
+  check('旧免密入口仅引导显式口令验证', sso.status === 302
+    && sso.headers.get('location') === `${BASE_PATH}/instances?editor=${ID}`);
 
   // 10. 存储键必须按 httpAdminRoot 命名空间化
   const expectKey = authTokenKeyFor(adminRoot);
-  check('token 存储键按 httpAdminRoot 命名空间化', ssoHtml.includes(`"${expectKey}"`), expectKey);
+  check('token 存储键按 httpAdminRoot 命名空间化', exchanged.storageKey === expectKey, expectKey);
 
   // 11. token 可调真实 admin API
-  const api = await fetch(`${B}/red/${ID}/flows`, { headers: { cookie, authorization: `Bearer ${token}` } });
+  const api = await fetch(`${E}/red/${ID}/flows`, { headers: { cookie, authorization: `Bearer ${token}` } });
   check('用该 token 调真实 admin API /flows', api.status === 200, `HTTP ${api.status}`);
 
   // 12. 无 token 时实例自身拒绝（纵深防御）
-  const bare = await fetch(`${B}/red/${ID}/flows`, { headers: { cookie } });
+  const bare = await fetch(`${E}/red/${ID}/flows`, { headers: { cookie } });
   check('无 token 调 admin API 被实例自身拒绝', bare.status === 401, `HTTP ${bare.status}（实例侧 adminAuth 生效）`);
 
   // 13. 流程自己提供的路径必须带 CSP
@@ -637,9 +679,18 @@ async function main() {
   check('CSP 同时封掉表单提交（否则 form POST 绕过 connect-src）',
         /form-action\s+'none'/.test(csp), csp.includes('form-action') ? '有' : '没有');
   check('流程路径禁止内容嗅探', flowRes.headers.get('x-content-type-options') === 'nosniff');
+  check('流程页面不能获得管理台同源存储权限', /sandbox\s+allow-scripts/.test(csp) && !/allow-same-origin/.test(csp));
+
+  check('主端口拒绝直接访问编辑器代码', (await fetch(`${B}/red/${ID}/red/red.min.js`, { headers: { cookie } })).status === 403);
+  check('实例独立端口拒绝管理接口', (await fetch(`${E}/api/users`, { headers: { cookie } })).status === 404);
+  check('实例独立端口拒绝其他实例路径', (await fetch(`${E}/red/unrelated/flows`, { headers: { cookie } })).status === 404);
+  const crossOriginLogout = await fetch(`${B}/api/logout`, {
+    method: 'POST', headers: { cookie, origin: editorOrigin, 'x-csrf-token': currentCsrf },
+  });
+  check('实例浏览器不能用共享 Cookie/CSRF 修改管理会话', crossOriginLogout.status === 403);
 
   // 编辑器自身不加 CSP —— 那是平台自己的界面，加了会把它拆坏
-  const edRes = await fetch(`${B}/red/${ID}/`, { headers: { cookie } });
+  const edRes = await fetch(`${E}/red/${ID}/`, { headers: { cookie } });
   check('编辑器本身不受 CSP 影响',
         !edRes.headers.get('content-security-policy'),
         edRes.headers.get('content-security-policy') ?? '（无，符合预期）');

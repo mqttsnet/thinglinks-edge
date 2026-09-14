@@ -16,60 +16,86 @@ x-initial-password: &initial-password ""
 # EDGE_NAME_PREFIX 只为「同机并行跑两套」而存在（例如现场栈开着、同时跑验证）。
 # 默认值与固定命名完全一致，生产不需要设置它。
 services:
-  # 受限 docker 端点。Manager 不再接触宿主 socket —— 它只能通过这里，
-  # 而这里只放行下面白名单里的十几条 API。
-  #
-  # 为什么不是 tecnativa/docker-socket-proxy：那个按「分区」开关（POST=1 一把全开），
-  # 这个能按方法逐条正则白名单，和本项目 container-spec 的硬白名单是同一套思路。
-  #
-  # 正则用 YAML **单引号**标量：双引号标量会解释 \. \? 并报
-  # found unknown escape character。行尾的 $$ 是防御写法 —— compose 只在 $ 后面
-  # 跟标识符或 { 时才插值（实测 ^abc$FOO 到容器里会变成 ^abc），孤立的行尾 $ 本身安全。
+  # 可信网络保护组件：只给它 NET_ADMIN，业务 Node-RED 实例不获得该权限。
+  # 首次部署应确认宿主支持已验证的 iptables(nf_tables) 后端；不支持时不会放行新实例。
+  network-isolation:
+    image: ${NETWORK_IMAGE:-${MANAGER_IMAGE:-mqttsnet/thinglinks-edge:1.0.1}}
+    container_name: ${EDGE_NAME_PREFIX:-thinglinks-edge}-network-isolation
+    command: ["node", "dist/network-isolation-main.js"]
+    restart: unless-stopped
+    network_mode: host
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN]
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 192m
+    cpus: 0.5
+    pids_limit: 64
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    environment:
+      TLE_NET_CONTROL_SOCKET: /run/tle-network/control.sock
+      TLE_NET_STATE_DIR: /run/tle-network/state
+      TLE_NET_HEALTH_HOST: 0.0.0.0
+      TLE_NET_HEALTH_PORT: ${NETWORK_HEALTH_PORT:-31555}
+      TLE_NET_EXTRA_PROTECTED_HOSTS: ${PROTECTED_HOST_IPS:-}
+    volumes:
+      - edge-network-control:/run/tle-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:$${TLE_NET_HEALTH_PORT}/healthz"]
+      interval: 15s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+  # 独立 Docker 执行策略服务。只有它持有 socket；请求体、资源归属及镜像均需校验。
   docker-proxy:
-    # 参数化是为了两件事：离线包要把镜像改名后随包发（见 scripts/build-offline-bundle.sh），
-    # 以及现场把镜像同步到内网仓库时不必改这个文件
-    image: ${PROXY_IMAGE:-wollomatic/socket-proxy:1.13.1}
+    image: ${PROXY_IMAGE:-${MANAGER_IMAGE:-mqttsnet/thinglinks-edge:1.0.1}}
     container_name: ${EDGE_NAME_PREFIX:-thinglinks-edge}-docker-proxy
     restart: unless-stopped
-    command:
-      - -loglevel=info
-      - -listenip=0.0.0.0
-      - -allowfrom=${EDGE_NAME_PREFIX:-thinglinks-edge}-manager
-      - -allowhealthcheck
-      - -watchdoginterval=30
-      - -stoponwatchdog
-      # images/json 与 images/<name>/json 是**只读**的：只能看本机有哪些镜像，
-      # 不能拉取（images/create 仍未放行）也不能删除。放行它是为了让 Manager
-      # 能在建实例前判断镜像在不在 —— 否则只能等 containers/create 回 404
-      # 名字里允许 / 与 :（nodered/node-red:5.0.4-…），但必须以 /json 结尾，只能查不能改
-      #
-      # `info` 是安装自检要的：架构匹配与 cgroup 内存限额两项只能从它读。
-      # 它是纯只读的守护进程元信息（版本、架构、cgroup、存储驱动、容器计数），
-      # 敏感度低于已经放行的 containers/json —— 不放行的话那两项在装完之后
-      # 永远报「读不到 docker info」，而现场恰恰要靠它们发现「限额配了不生效」。
-      # 「No such image」，那句话对现场人员毫无指导意义。
-      - '-allowGET=^(/v1\.[0-9]+)?/(_ping|version|info|containers/json|containers/[a-zA-Z0-9][a-zA-Z0-9_.-]*/(json|logs|stats)|images/json|images/[a-zA-Z0-9][a-zA-Z0-9_.:@/-]*/json|volumes/[a-zA-Z0-9][a-zA-Z0-9_.-]*|networks|networks/[a-zA-Z0-9][a-zA-Z0-9_.-]*)(\?.*)?$$'
-      - '-allowPOST=^(/v1\.[0-9]+)?/(containers/create|containers/[a-zA-Z0-9][a-zA-Z0-9_.-]*/(start|stop|restart)|networks/create|networks/[a-zA-Z0-9][a-zA-Z0-9_.-]*/(connect|disconnect)|volumes/create)(\?.*)?$$'
-      - '-allowPUT=^(/v1\.[0-9]+)?/containers/[a-zA-Z0-9][a-zA-Z0-9_.-]*/archive(\?.*)?$$'
-      - '-allowDELETE=^(/v1\.[0-9]+)?/(containers/[a-zA-Z0-9][a-zA-Z0-9_.-]*|networks/[a-zA-Z0-9][a-zA-Z0-9_.-]*|volumes/[a-zA-Z0-9][a-zA-Z0-9_.-]*)(\?.*)?$$'
+    command: ["node", "dist/docker-policy-main.js"]
+    environment:
+      TLE_POLICY_DATA_ROOT: ${EDGE_DATA_ROOT:-/data01/mqttsnet/thinglinks-edge}/instances
+      TLE_POLICY_NETWORK_PREFIX: ${INSTANCE_NETWORK:-thinglinks-edge}
+      TLE_POLICY_MANAGER_CONTAINER: ${EDGE_NAME_PREFIX:-thinglinks-edge}-manager
+      TLE_POLICY_IMAGE_REPO: ${NODE_RED_IMAGE_REPO:-nodered/node-red}
+      TLE_POLICY_ALLOWED_TAGS: ${ALLOWED_IMAGE_TAGS:-5.0.7-24-minimal,5.0.4-24-minimal,4.1.13-22-minimal}
+      TLE_POLICY_PORT_MIN: ${INSTANCE_PORT_MIN:-30000}
+      TLE_POLICY_PORT_MAX: ${INSTANCE_PORT_MAX:-30999}
+      TLE_POLICY_NETWORK_SOCKET: /run/tle-network/control.sock
+      TLE_POLICY_NETWORK_HEALTH_PORT: ${NETWORK_HEALTH_PORT:-31555}
+      TLE_POLICY_STATE_ROOT: /var/lib/tle-policy
+      TLE_POLICY_PROTECTED_HOSTS: ${PROTECTED_HOST_IPS:-}
+      TLE_POLICY_ALLOWED_HOST_ENDPOINTS: '${ALLOWED_HOST_ENDPOINTS:-[]}'
+      TLE_POLICY_MANAGER_PORT: ${HOST_PORT:-19100}
+      TLE_POLICY_EDITOR_PORT_MIN: ${EDITOR_PORT_MIN:-19200}
+      TLE_POLICY_EDITOR_PORT_MAX: ${EDITOR_PORT_MAX:-19263}
     volumes:
-      # 只读挂载：代理自己也不需要写 socket 文件本身。
-      # 路径可配是为了 rootless Docker —— 它的 socket 在 $XDG_RUNTIME_DIR/docker.sock
-      # 而不是 /var/run。写死会让 rootless 环境挂上一个不存在的路径，
-      # 而 docker 会**自动建一个同名空目录**顶上去，于是代理启动后一直连不上，
-      # 报错却是「connection refused」，看不出根因是挂错了。
+      # socket 的 ro 挂载不是 Docker API 只读授权；授权由执行策略校验。
       - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock:ro
-    # 只有受限代理以 socket 所有者 root 运行，免去现场查找 Docker 组 ID。
-    # 无 Linux capabilities、无额外挂载、无宿主端口，API 白名单仍逐条生效。
-    # Manager 与 Node-RED 继续以 uid 1000 运行，均不接触宿主 socket。
+      - ${EDGE_DATA_ROOT:-/data01/mqttsnet/thinglinks-edge}/instances:${EDGE_DATA_ROOT:-/data01/mqttsnet/thinglinks-edge}/instances:ro
+      - edge-network-control:/run/tle-network
+      - edge-policy-state:/var/lib/tle-policy
     user: "0:0"
-    cap_drop:
-      - ALL
-    networks:
-      - edge-docker
+    cap_drop: [ALL]
+    networks: [edge-docker]
     read_only: true
-    security_opt:
-      - no-new-privileges:true
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 192m
+    cpus: 0.5
+    pids_limit: 64
+    depends_on:
+      network-isolation:
+        condition: service_healthy
+      init-data:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2375/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
 
   # 首次启动准备宿主数据根。Docker 自动创建缺失的 bind 源目录时属主是 root:root，
   # 而 Manager 与 Node-RED 都以 uid 1000 运行 —— 不先摆平属主，第一次启动就写不进去，
@@ -212,11 +238,15 @@ services:
       # 历史只存内存：重启即清零，换来的是不去磨盒子的 SD 卡
       EDGE_METRICS_INTERVAL_SEC: ${EDGE_METRICS_INTERVAL_SEC:-10}
       # 受限代理的地址。显式解析，配错了直接启动报错而不是悄悄回落到裸 socket
+      EDITOR_PORT_MIN: ${EDITOR_PORT_MIN:-19200}
+      EDITOR_PORT_MAX: ${EDITOR_PORT_MAX:-19263}
       DOCKER_HOST: tcp://${EDGE_NAME_PREFIX:-thinglinks-edge}-docker-proxy:2375
 
     ports:
       # 服务器可直接访问；放在宿主反代后时可用 BIND_ADDR=127.0.0.1。
       - "${BIND_ADDR:-0.0.0.0}:${HOST_PORT:-19100}:19100"
+      # 每个实例使用独立浏览器来源；端口一旦使用便保留，避免复用浏览器存储。
+      - "${BIND_ADDR:-0.0.0.0}:${EDITOR_PORT_MIN:-19200}-${EDITOR_PORT_MAX:-19263}:${EDITOR_PORT_MIN:-19200}-${EDITOR_PORT_MAX:-19263}"
 
     volumes:
       # 同名挂载：容器内路径 == 宿主路径。Manager 要 mkdir/删除实例数据目录（容器内视角），
@@ -242,6 +272,12 @@ services:
       - /tmp
     security_opt:
       - no-new-privileges:true
+
+volumes:
+  edge-network-control:
+    name: ${EDGE_NAME_PREFIX:-thinglinks-edge}-network-control
+  edge-policy-state:
+    name: ${EDGE_NAME_PREFIX:-thinglinks-edge}-policy-state
 
 networks:
   # 只有 Manager 与代理在这张网上；实例各有各的网络，够不到代理

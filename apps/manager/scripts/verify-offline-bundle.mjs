@@ -155,6 +155,53 @@ export function singleConfigId(archive, expectedArchitecture) {
   return `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
 }
 
+/** Role references stay explicit when Manager and Docker policy share a single archive image. */
+export function bundleImageRoles(manifest) {
+  assert.ok(Array.isArray(manifest.images) && manifest.images.length >= 3, 'bundle manifest images missing');
+  const refs = manifest.images.map(item => item.image);
+  assert.equal(new Set(refs).size, refs.length, 'bundle manifest images must be unique');
+  const roles = manifest.imageRoles;
+  assert.ok(roles && typeof roles.manager === 'string' && typeof roles.dockerProxy === 'string'
+    && typeof roles.networkIsolation === 'string'
+    && typeof roles.initData === 'string' && Array.isArray(roles.nodeRed) && roles.nodeRed.length > 0,
+  'bundle manifest imageRoles missing');
+  const referenced = [roles.manager, roles.dockerProxy, roles.networkIsolation, roles.initData, ...roles.nodeRed];
+  assert.deepEqual([...new Set(referenced)].sort(), [...refs].sort(), 'bundle image roles must reference exactly its exported images');
+  assert.equal(new Set(roles.nodeRed).size, roles.nodeRed.length, 'duplicate Node-RED role images');
+  const byRef = new Map(manifest.images.map(item => [item.image, item]));
+  assert.equal(byRef.get(roles.dockerProxy).id, byRef.get(roles.manager).id,
+    'Docker 执行策略服务必须与 Manager 使用同一发行构件');
+  assert.equal(byRef.get(roles.networkIsolation).id, byRef.get(roles.manager).id,
+    '网络隔离服务必须与 Manager 使用同一发行构件');
+  return roles;
+}
+
+export function assertNetworkIsolationDeployment(services) {
+  const controller = services['network-isolation'];
+  assert.ok(controller, 'network-isolation service missing');
+  assert.deepEqual(controller.command, ['node', 'dist/network-isolation-main.js'], 'network-isolation entrypoint must be explicit');
+  assert.equal(controller.network_mode, 'host', 'network-isolation must use the host network namespace');
+  assert.equal(controller.user, '0:0');
+  assert.equal(controller.read_only, true);
+  assert.notEqual(controller.privileged, true);
+  assert.deepEqual(controller.cap_drop, ['ALL']);
+  assert.deepEqual(controller.cap_add, ['NET_ADMIN'], 'network-isolation must add only NET_ADMIN');
+  assert.deepEqual(controller.security_opt, ['no-new-privileges:true']);
+  assert.equal(controller.volumes?.length, 1, 'network-isolation may mount only its private control volume');
+  const control = controller.volumes[0];
+  assert.equal(control.type, 'volume');
+  assert.equal(control.source, 'edge-network-control');
+  assert.equal(control.target, '/run/tle-network');
+  const policy = services['docker-proxy'];
+  assert.ok(policy?.volumes?.some(volume => volume.type === 'volume' && volume.source === control.source && volume.target === control.target));
+  assert.ok(policy.volumes.some(volume => volume.type === 'volume' && volume.source === 'edge-policy-state' && volume.target === '/var/lib/tle-policy'));
+  assert.ok(!(services.manager?.volumes ?? []).some(volume => ['edge-network-control', 'edge-policy-state'].includes(volume.source)),
+    'Manager must not mount private network control or policy state');
+  assert.equal(controller.environment?.TLE_NET_CONTROL_SOCKET, '/run/tle-network/control.sock');
+  assert.equal(policy.environment?.TLE_POLICY_NETWORK_SOCKET, '/run/tle-network/control.sock');
+  assert.equal(String(controller.environment?.TLE_NET_HEALTH_PORT), String(policy.environment?.TLE_POLICY_NETWORK_HEALTH_PORT));
+}
+
 function uniqueSuffix(entries, suffix) {
   const matches = entries.filter((entry) => entry.endsWith(`/${suffix}`));
   assert.equal(matches.length, 1, `bundle must contain exactly one ${suffix}`);
@@ -178,6 +225,7 @@ function cleanComposeEnvironment() {
   for (const key of [
     'MANAGER_IMAGE',
     'PROXY_IMAGE',
+    'NETWORK_IMAGE',
     'INIT_IMAGE',
     'NODE_RED_IMAGE_REPO',
     'NODE_RED_BOOTSTRAP_IMAGE',
@@ -316,9 +364,8 @@ export function verifyOfflineBundle(bundleArg, expectedManagerTag, expectedManag
     });
 
     const manifest = JSON.parse(readFileSync(join(packageRoot, 'manifest.json'), 'utf8'));
-    assert.ok(Array.isArray(manifest.images) && manifest.images.length >= 4,
-      'bundle manifest images missing');
-    const manager = manifest.images[0];
+    const roles = bundleImageRoles(manifest);
+    const manager = manifest.images.find(item => item.image === roles.manager);
     check('manifest Manager tag 与 descriptor 归档 Config ID 同源', () => {
       assert.deepEqual(manager, { image: expectedManagerTag, id: expectedManagerConfigId });
     });
@@ -346,11 +393,12 @@ export function verifyOfflineBundle(bundleArg, expectedManagerTag, expectedManag
       .map((tag) => tag.trim()).filter(Boolean);
     const nodeRepo = env.get('NODE_RED_IMAGE_REPO') ?? '';
     check('.env.example 与 manifest 镜像一致', () => {
-      assert.equal(env.get('MANAGER_IMAGE'), manifest.images[0].image);
-      assert.equal(env.get('PROXY_IMAGE'), manifest.images[1].image);
-      assert.equal(env.get('INIT_IMAGE'), manifest.images[2].image);
-      assert.equal(env.get('NODE_RED_BOOTSTRAP_IMAGE'), imageRefs[3]);
-      assert.deepEqual(allowedTags.map((tag) => `${nodeRepo}:${tag}`), imageRefs.slice(3));
+      assert.equal(env.get('MANAGER_IMAGE'), roles.manager);
+      assert.equal(env.get('PROXY_IMAGE'), roles.dockerProxy);
+      assert.equal(env.get('NETWORK_IMAGE'), roles.networkIsolation);
+      assert.equal(env.get('INIT_IMAGE'), roles.initData);
+      assert.equal(env.get('NODE_RED_BOOTSTRAP_IMAGE'), roles.nodeRed[0]);
+      assert.deepEqual(allowedTags.map((tag) => `${nodeRepo}:${tag}`), roles.nodeRed);
     });
 
     const composeText = command('docker', [
@@ -362,16 +410,19 @@ export function verifyOfflineBundle(bundleArg, expectedManagerTag, expectedManag
     const compose = JSON.parse(composeText);
     const services = compose.services ?? {};
     check('compose 解析引用 images.tar 同一组 tag', () => {
-      assert.equal(services.manager?.image, manifest.images[0].image);
-      assert.equal(services['docker-proxy']?.image, manifest.images[1].image);
-      assert.equal(services['init-data']?.image, manifest.images[2].image);
-      assert.equal(services['node-red-image']?.image, imageRefs[3]);
-      for (const service of ['manager', 'docker-proxy', 'init-data', 'node-red-image']) {
+      assert.equal(services.manager?.image, roles.manager);
+      assert.equal(services['docker-proxy']?.image, roles.dockerProxy);
+      assert.equal(services['network-isolation']?.image, roles.networkIsolation);
+      assert.equal(services['init-data']?.image, roles.initData);
+      assert.equal(services['node-red-image']?.image, roles.nodeRed[0]);
+      assert.deepEqual(services['docker-proxy']?.command, ['node', 'dist/docker-policy-main.js'], 'Docker 执行策略入口必须保留');
+      for (const service of ['manager', 'docker-proxy', 'network-isolation', 'init-data', 'node-red-image']) {
         assert.ok(repoTags.has(services[service]?.image), service);
         assert.equal(services[service]?.pull_policy, 'never', `${service} pull_policy`);
       }
       assert.equal(services.manager?.environment?.NODE_RED_IMAGE_REPO, nodeRepo);
       assert.equal(services.manager?.environment?.ALLOWED_IMAGE_TAGS, allowedTags.join(','));
+      assertNetworkIsolationDeployment(services);
     });
 
     console.log(`\n  ${checks.length}/${checks.length} 通过\n`);

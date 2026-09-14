@@ -37,6 +37,7 @@ export type Action =
   | 'instance:list'
   | 'instance:view'
   | 'instance:operate'
+  | 'instance:credentials'
   | 'instance:create'
   | 'instance:delete'
   | 'field:view'
@@ -87,7 +88,7 @@ export type GrantLevel = 'view' | 'operate';
 
 const ROLE_ACTIONS: Record<Role, ReadonlySet<Action>> = {
   admin: new Set<Action>([
-    'system:view', 'system:manage', 'instance:list', 'instance:view', 'instance:operate', 'instance:create', 'instance:delete',
+    'system:view', 'system:manage', 'instance:list', 'instance:view', 'instance:operate', 'instance:credentials', 'instance:create', 'instance:delete',
     'field:view', 'replay:run', 'backup:run', 'user:manage',
     'cloud:view', 'cloud:manage', 'diag:run', 'template:view', 'template:manage',
     'node:view', 'node:manage',
@@ -114,7 +115,7 @@ export function can(role: string, need: Action): boolean {
 
 /** 该动作是否需要落到某台具体实例上 */
 export function isInstanceScoped(need: Action): boolean {
-  return need === 'instance:view' || need === 'instance:operate' || need === 'instance:delete';
+  return need === 'instance:view' || need === 'instance:operate' || need === 'instance:credentials' || need === 'instance:delete';
 }
 
 /**

@@ -15,7 +15,7 @@ test('v12 database upgrades instance runtime and journal idempotently through cu
   ).run('line-a', 'Line A', '5.0.4-24-minimal', 512, 0.5,
     '/red/line-a/', 'secret', 'preserve me');
 
-  assert.equal(migrate(db), 17);
+  assert.equal(migrate(db), 18);
   const runtime = new InstanceRepo(db, Buffer.alloc(32, 1)).nodeRuntime('line-a');
   assert.deepEqual(runtime, {
     mode: 'legacy',
@@ -37,7 +37,7 @@ test('v12 database upgrades instance runtime and journal idempotently through cu
     { name: 'execution_lease_expires_at', dflt_value: '0', required: 1 },
     { name: 'execution_owner', dflt_value: "''", required: 1 },
   ]);
-  assert.equal(migrate(db), 17);
+  assert.equal(migrate(db), 18);
   const preserved = db.prepare(
     'SELECT name, notes FROM instance WHERE id = ?',
   ).get('line-a') as { name: string; notes: string };
@@ -48,12 +48,12 @@ test('migration target is validated and never downgrades a newer database', () =
   const db = new Database(':memory:');
   assert.throws(() => migrate(db, -1), /目标版本/);
   assert.throws(() => migrate(db, 13.5), /目标版本/);
-  assert.throws(() => migrate(db, 18), /目标版本/);
-  assert.equal(migrate(db), 17);
-  assert.equal(migrate(db, 12), 17);
+  assert.throws(() => migrate(db, 19), /目标版本/);
+  assert.equal(migrate(db), 18);
+  assert.equal(migrate(db, 12), 18);
   assert.equal(
     (db.prepare('SELECT version FROM schema_version').get() as { version: number }).version,
-    17,
+    18,
   );
 });
 

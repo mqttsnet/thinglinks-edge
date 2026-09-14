@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { networkBootstrapEntrypoint, INSTANCE_IPV6_SYSCTLS } from './network-bootstrap.ts';
 import {
   assertValidId, assertValidSpec, buildCreateOptions, assertSafeCreateOptions,
   buildMigrationProbeCreateOptions, assertSafeMigrationProbeOptions,
@@ -20,7 +21,9 @@ const build = (s: InstanceSpec) =>
     network: 'tle-net', imageRepo: 'nodered/node-red',
     instanceDataRoot: DATA_ROOT, timezone: 'Asia/Shanghai',
   });
-const guard = (o: Record<string, unknown>) => assertSafeCreateOptions(o, { instanceDataRoot: DATA_ROOT });
+const guard = (o: Record<string, unknown>) => assertSafeCreateOptions(o, {
+  instanceDataRoot: DATA_ROOT, expectedNetwork: 'tle-net',
+});
 
 test('实例 ID 严格字符集 —— 它会进容器名、卷名与访问路径', () => {
   assertValidId('line-a');
@@ -47,11 +50,18 @@ test('同一实例内宿主端口重复被拒', () => {
 test('生成的配置默认安全：非 root、只读根、能力全裁、配额生效', () => {
   const o = build(spec());
   const hc = o['HostConfig'] as Record<string, unknown>;
-  assert.equal(o['User'], 'node-red');
+  assert.equal(o['User'], '1000:1000');
+  assert.deepEqual(o['Entrypoint'], networkBootstrapEntrypoint());
+  assert.deepEqual(o['Cmd'], []);
   assert.equal(hc['ReadonlyRootfs'], true);
   assert.deepEqual(hc['CapDrop'], ['ALL']);
   assert.deepEqual(hc['SecurityOpt'], ['no-new-privileges:true']);
   assert.equal(hc['Memory'], 512 * 1024 * 1024);
+  assert.equal(hc['MemorySwap'], hc['Memory']);
+  assert.deepEqual(hc['Sysctls'], INSTANCE_IPV6_SYSCTLS);
+  assert.deepEqual(hc['LogConfig'], {
+    Type: 'json-file', Config: { 'max-size': '10m', 'max-file': '3' },
+  });
   assert.equal(hc['NanoCpus'], 5e8);
   assert.deepEqual(hc['Binds'], [`${DATA_ROOT}/line-a:/data`]);
   guard(o);
@@ -218,4 +228,112 @@ test('容器时区必须显式给定，缺失或非法一律拦下', () => {
 test('容器名与数据目录按实例 id 派生', () => {
   assert.equal(containerName('line-a'), 'tle-nr-line-a');
   assert.equal(instanceDataDir(DATA_ROOT, 'line-a'), `${DATA_ROOT}/line-a`);
+});
+
+test('未知 Docker 配置与旁路挂载无法突破固定创建模板', () => {
+  for (const [key, value] of [
+    ['Mounts', [{ Type: 'bind', Source: '/', Target: '/host' }]],
+    ['Volumes', { '/etc': {} }],
+    ['NetworkingConfig', { EndpointsConfig: { 'other-instance': {} } }],
+    ['Entrypoint', ['/bin/sh']],
+  ] as const) {
+    const options = build(spec());
+    options[key] = value;
+    assert.throws(() => guard(options), SpecError, key);
+  }
+  for (const [key, value] of [
+    ['Mounts', [{ Type: 'bind', Source: '/var/run/docker.sock', Target: '/socket' }]],
+    ['VolumesFrom', ['other-instance']],
+    ['PidMode', 'container:other-instance'],
+    ['IpcMode', 'container:other-instance'],
+    ['UTSMode', 'host'],
+    ['CgroupnsMode', 'host'],
+    ['UsernsMode', 'host'],
+    ['DeviceRequests', [{ Count: -1, Capabilities: [['gpu']] }]],
+    ['Links', ['other-instance']],
+    ['GroupAdd', ['0']],
+    ['ExtraHosts', ['host.docker.internal:host-gateway']],
+  ] as const) {
+    const options = build(spec());
+    (options['HostConfig'] as Record<string, unknown>)[key] = value;
+    assert.throws(() => guard(options), SpecError, key);
+  }
+});
+
+test('设备实例不得共享宿主、其他容器或其他实例网络', () => {
+  for (const network of ['host', 'bridge', 'default', 'none', 'container:tle-nr-line-b', 'tle-net-line-b']) {
+    const options = build(spec());
+    (options['HostConfig'] as Record<string, unknown>)['NetworkMode'] = network;
+    assert.throws(() => guard(options), SpecError, network);
+  }
+});
+
+test('权限与资源限制不能被移除、放大或用其他参数替代', () => {
+  for (const [key, value] of [
+    ['CapDrop', undefined], ['CapDrop', []],
+    ['SecurityOpt', []], ['SecurityOpt', ['no-new-privileges:true', 'seccomp=unconfined']],
+    ['Memory', 0], ['Memory', 128 * 1024 ** 3],
+    ['MemorySwap', -1], ['NanoCpus', 0], ['PidsLimit', -1],
+    ['LogConfig', { Type: 'json-file', Config: {} }],
+    ['LogConfig', { Type: 'syslog', Config: { 'syslog-address': 'tcp://other-instance:514' } }],
+    ['Tmpfs', { '/tmp': 'rw,exec,suid,size=64m' }],
+    ['Tmpfs', { '/tmp': 'rw,noexec,nosuid,size=64m', '/etc': 'rw' }],
+    ['Sysctls', { 'net.ipv6.conf.all.disable_ipv6': '0' }],
+    ['Binds', undefined], ['Binds', []], ['Binds', [`${DATA_ROOT}/line-a:/data`, `${DATA_ROOT}/line-a:/data`]],
+  ] as const) {
+    const options = build(spec());
+    const host = options['HostConfig'] as Record<string, unknown>;
+    if (value === undefined) delete host[key]; else host[key] = value;
+    assert.throws(() => guard(options), SpecError, key);
+  }
+  const options = build(spec());
+  options['User'] = 'node-red';
+  assert.throws(() => guard(options), SpecError, '用户名可能在镜像中映射为 root');
+});
+
+test('bootstrap cannot be replaced or injected through Node startup environment', () => {
+  for (const [key, value] of [['Entrypoint', ['/bin/sh']], ['Cmd', ['--eval', 'process.exit(0)']]] as const) {
+    const options = build(spec()); options[key] = value;
+    assert.throws(() => guard(options), SpecError);
+  }
+  for (const entry of ['NODE_OPTIONS=--require=/data/attack.js', 'LD_PRELOAD=/data/attack.so', 'BASH_ENV=/data/attack.sh']) {
+    const options = build(spec());
+    options['Env'] = [...options['Env'] as string[], entry];
+    assert.throws(() => guard(options), SpecError);
+  }
+});
+
+test('标签、容器名与受管数据路径必须属于同一实例', () => {
+  for (const mutate of [
+    (options: Record<string, unknown>) => { options['name'] = 'tle-nr-line-b'; },
+    (options: Record<string, unknown>) => {
+      (options['Labels'] as Record<string, unknown>)['com.mqttsnet.thinglinks-edge.managed'] = 'false';
+    },
+  ]) {
+    const options = build(spec()); mutate(options);
+    assert.throws(() => guard(options), SpecError);
+  }
+  for (const root of ['/', '/etc', '/etc/shadow', '/var/run', '/proc', '/sys', '/dev', './instances', '/tmp/a/../../etc']) {
+    const options = buildCreateOptions(spec(), {
+      network: 'tle-net', imageRepo: 'nodered/node-red', instanceDataRoot: root, timezone: 'UTC',
+    });
+    assert.throws(() => assertSafeCreateOptions(options, { instanceDataRoot: root }), SpecError, root);
+  }
+});
+
+test('迁移 probe 不能利用独立创建入口绕过能力、命名空间、资源限制', () => {
+  for (const [key, value] of [
+    ['NetworkMode', 'container:tle-nr-line-a'], ['PidMode', 'container:tle-nr-line-a'],
+    ['CapDrop', []], ['SecurityOpt', []], ['MemorySwap', -1], ['PidsLimit', 0],
+    ['LogConfig', { Type: 'json-file', Config: {} }],
+  ] as const) {
+    const options = buildMigrationProbeCreateOptions(spec(), {
+      instanceDataRoot: DATA_ROOT, imageRepo: 'nodered/node-red', timezone: 'UTC',
+      txId: 'migration-tx-01', imageId: `sha256:${'e'.repeat(64)}`, networkId: 'probe-network-id',
+    });
+    (options['HostConfig'] as Record<string, unknown>)[key] = value;
+    assert.throws(() => assertSafeMigrationProbeOptions(options, {
+      instanceDataRoot: DATA_ROOT, instanceId: 'line-a', txId: 'migration-tx-01', expectedNetwork: 'probe-network-id',
+    }), SpecError, key);
+  }
 });

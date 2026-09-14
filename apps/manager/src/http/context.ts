@@ -5,8 +5,11 @@
  * 这三件事必须全站一致，散在各处迟早会出现某条路由漏掉 CSRF 的情况。
  */
 import type { FastifyInstance } from 'fastify';
+import { createHash } from 'node:crypto';
 import type { EdgeConfig } from '../core/config.ts';
 import { AuthService } from '../core/auth/service.ts';
+import { EditorAccessStore } from '../core/auth/editor-access.ts';
+import { EditorOrigins } from '../core/instance/editor-origins.ts';
 import { InstanceRepo } from '../core/instance/repo.ts';
 import type { InstanceService } from '../core/instance/service.ts';
 import { containerName } from '../core/instance/container-spec.ts';
@@ -113,6 +116,9 @@ export interface ServerDeps {
 const defaultUpstream = (id: string) => `http://${containerName(id)}:1880`;
 
 export interface HttpContext {
+  editorAccess: EditorAccessStore;
+  editorOrigins: EditorOrigins;
+  disposeEditorSessions: () => void;
   config: EdgeConfig;
   cloudSink: ((payload: unknown) => Promise<void>) | undefined;
   cloud: CloudRuntime | undefined;
@@ -179,8 +185,31 @@ export function createContext(deps: ServerDeps): HttpContext {
   const settings = new SettingsRepo(deps.db);
   const currentUser = (req: { cookies: Record<string, string | undefined> }) =>
     auth.resolve(req.cookies[SID]);
+  const editorAccess = new EditorAccessStore({ credentialFor: id => {
+    const credential = deps.repo.credentials(id)[0];
+    const instance = deps.repo.get(id);
+    return credential && instance ? { ...credential, revision: instance.credSecret } : undefined;
+  } });
+  const editorOrigins = new EditorOrigins(deps.db, {
+    externalUrl: config.externalUrl, basePath: config.basePath,
+    portRange: config.editorPortRange, allowedMainOrigins: config.allowedOrigins,
+    generationFor: id => {
+      const instance = deps.repo.get(id);
+      return instance ? createHash('sha256').update(instance.credSecret).digest('hex') : undefined;
+    },
+  });
+  const disposeEditorSessions = deps.proxySessions.onRevoked(event => {
+    if ('username' in event) {
+      editorAccess.revokeUser(event.username, event.instanceId);
+      editorOrigins.revokeUser(event.username, event.instanceId);
+    } else {
+      editorAccess.revokeSession(event.sessionId, event.instanceId);
+      editorOrigins.revokeSession(event.sessionId, event.instanceId);
+    }
+  });
 
   return {
+    editorAccess, editorOrigins, disposeEditorSessions,
     config,
     users,
     settings,

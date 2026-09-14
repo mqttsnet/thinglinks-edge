@@ -8,6 +8,7 @@
  * 所有创建请求都必须经 assertSafeCreateOptions 二次校验后才下发。
  */
 import { createHash } from 'node:crypto';
+import { constants } from 'node:fs';
 import { mkdir, rm, cp, lstat, open, readFile, rename, chmod } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import Docker from 'dockerode';
@@ -22,6 +23,11 @@ import {
 import { tarFile } from '../archive/tar.ts';
 import { dockerLogToText } from './log-stream.ts';
 import type { NodeRuntimeMode } from './repo.ts';
+import { assertContainerRuntimeIsolation } from './container-isolation.ts';
+import { assertOwnedDirectory } from '../docker-policy/ownership.ts';
+import { deploymentRealm } from '../docker-policy/config.ts';
+import { NETWORK_POLICY_REALM_LABEL } from '../docker-policy/network-intents.ts';
+import { isIP } from 'node:net';
 
 /** 平台管理的容器统一打这个标签，列举与操作一律按标签过滤 */
 export const MANAGED_LABEL = 'com.mqttsnet.thinglinks-edge.managed';
@@ -192,6 +198,17 @@ export class DockerClient {
     this.docker = new Docker(opts.connection ?? {});
   }
 
+  /** docker-modem otherwise duplicates every option (including Env secrets) into the URL. */
+  private createContainer(options: Record<string, unknown>): Promise<Docker.Container> {
+    return this.docker.createContainer({
+      _query: { name: options['name'] }, _body: options,
+    } as unknown as Docker.ContainerCreateOptions);
+  }
+
+  private createNetwork(options: Docker.NetworkCreateOptions): Promise<Docker.Network> {
+    return this.docker.createNetwork({ _query: {}, _body: options } as unknown as Docker.NetworkCreateOptions);
+  }
+
   /** Non-secret deployment identity expected in every migratable instance container. */
   expectedMigrationEnvironment(): { managerUrl: string; npmRegistry: string } {
     return {
@@ -251,9 +268,10 @@ export class DockerClient {
     if (found.some((n) => n.Name === name)) {
       return (await this.assertOwnedNetwork(instanceId)).Id;
     }
-    const created = await this.docker.createNetwork({
+    const created = await this.createNetwork({
       Name: name,
       Driver: 'bridge',
+      EnableIPv6: false,
       Labels: { [MANAGED_LABEL]: 'true', [INSTANCE_LABEL]: instanceId },
     });
     return created.id;
@@ -695,9 +713,10 @@ export class DockerClient {
   }
 
   private async createBootstrapNetwork(instanceId: string, txId: string): Promise<string> {
-    const created = await this.docker.createNetwork({
+    const created = await this.createNetwork({
       Name: this.instanceNetwork(instanceId),
       Driver: 'bridge',
+      EnableIPv6: false,
       Labels: {
         [MANAGED_LABEL]: 'true',
         [INSTANCE_LABEL]: instanceId,
@@ -742,12 +761,12 @@ export class DockerClient {
         proxyEnv: this.opts.proxyEnv ?? [],
         bootstrapTxId: txId,
       });
-      assertSafeCreateOptions(value, { instanceDataRoot: this.opts.instanceDataRoot });
+      assertSafeCreateOptions(value, { instanceDataRoot: this.opts.instanceDataRoot, expectedNetwork: networkId, portRange: this.opts.portRange });
       return value;
     });
     const container = await bootstrapContainerStep(
       'container-create',
-      () => this.docker.createContainer(options as Docker.ContainerCreateOptions),
+      () => this.createContainer(options),
     );
     await bootstrapContainerStep(
       'manager-attach',
@@ -781,10 +800,10 @@ export class DockerClient {
       timezone: this.opts.timezone,
       proxyEnv: this.opts.proxyEnv ?? [],
     });
-    assertSafeCreateOptions(options, { instanceDataRoot: this.opts.instanceDataRoot });
+    assertSafeCreateOptions(options, { instanceDataRoot: this.opts.instanceDataRoot, expectedNetwork: networkId, portRange: this.opts.portRange });
     await this.ensureDataDir(spec.id, runtimeMode);
 
-    const container = await this.docker.createContainer(options as Docker.ContainerCreateOptions);
+    const container = await this.createContainer(options);
     await this.attachManager(spec.id);
     await container.putArchive(
       tarFile('settings.js', settingsJs, { uid: NODE_RED_UID, gid: NODE_RED_UID, mode: 0o644 }),
@@ -816,9 +835,9 @@ export class DockerClient {
       proxyEnv: this.opts.proxyEnv ?? [],
       imageIdOverride: input.imageId,
     });
-    assertSafeCreateOptions(options, { instanceDataRoot: this.opts.instanceDataRoot });
+    assertSafeCreateOptions(options, { instanceDataRoot: this.opts.instanceDataRoot, expectedNetwork: networkId, portRange: this.opts.portRange });
     await this.ensureDataDir(spec.id, input.runtimeMode);
-    const container = await this.docker.createContainer(options as Docker.ContainerCreateOptions);
+    const container = await this.createContainer(options);
     await this.attachManager(spec.id);
     await container.putArchive(
       tarFile('settings.js', input.settingsJs, {
@@ -967,9 +986,10 @@ export class DockerClient {
     const dataRoot = await this.restoreProbeWorkRoot(input);
     const networkName = migrationProbeNetworkName(spec.id, input.txId);
     const labels = this.probeLabels(spec.id, input.txId);
-    const createdNetwork = await this.docker.createNetwork({
+    const createdNetwork = await this.createNetwork({
       Name: networkName,
       Driver: 'bridge',
+      EnableIPv6: false,
       Internal: true,
       Labels: labels,
     });
@@ -987,8 +1007,9 @@ export class DockerClient {
       instanceDataRoot: this.opts.instanceDataRoot,
       instanceId: spec.id,
       txId: input.txId,
+      expectedNetwork: networkId,
     });
-    const container = await this.docker.createContainer(options as Docker.ContainerCreateOptions);
+    const container = await this.createContainer(options);
     if (this.opts.managerContainer) {
       const network = await this.docker.getNetwork(networkId).inspect();
       this.assertProbeLabels(network.Labels, spec.id, input.txId);
@@ -1198,6 +1219,58 @@ export class DockerClient {
       tarFile('settings.js', settingsJs, { uid: NODE_RED_UID, gid: NODE_RED_UID, mode: 0o644 }),
       { path: '/data' },
     );
+  }
+
+  /** Read-only credential-change preflight; it must run before any repository or settings mutation. */
+  async assertRestartable(instanceId: string): Promise<{ settingsJs: string; running: boolean }> {
+    assertValidId(instanceId);
+    const info = await this.docker.getContainer(containerName(instanceId)).inspect();
+    if (info.Config.Labels?.[MANAGED_LABEL] !== 'true' || info.Config.Labels[INSTANCE_LABEL] !== instanceId) {
+      throw new Error('实例运行归属不匹配，不能更新运行配置');
+    }
+    const network = await this.assertOwnedNetwork(instanceId);
+    const dataDirectory = instanceDataDir(this.opts.instanceDataRoot, instanceId);
+    const realm = deploymentRealm({ dataRoot: this.opts.instanceDataRoot, networkPrefix: this.opts.network });
+    const gateway = network.IPAM?.Config?.[0]?.Gateway;
+    if (network.Labels?.[NETWORK_POLICY_REALM_LABEL] !== realm || network.EnableIPv6 !== false
+      || network.IPAM?.Config?.length !== 1 || typeof gateway !== 'string' || isIP(gateway) !== 4) {
+      throw new Error('实例网络尚未通过本部署网络保护配置，不能修改运行凭据');
+    }
+    const environment = info.Config.Env ?? [];
+    for (const expected of [`TLE_NETWORK_GUARD_ID=${network.Id}`, `TLE_NETWORK_GUARD_GATEWAY=${gateway}`]) {
+      const prefix = expected.slice(0, expected.indexOf('=') + 1);
+      const values = environment.filter(value => value.startsWith(prefix));
+      if (values.length !== 1 || values[0] !== expected) throw new Error('实例启动门禁与实际网络不一致');
+    }
+    const ports = environment.filter(value => value.startsWith('TLE_NETWORK_GUARD_PORT='));
+    const port = Number(ports[0]?.split('=')[1]);
+    if (ports.length !== 1 || !Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('实例网络门禁端口不可用');
+    assertContainerRuntimeIsolation(info as unknown as Record<string, unknown>, {
+      containerName: containerName(instanceId), dataDirectory, network: network.Id,
+      networkName: this.instanceNetwork(instanceId), restartPolicy: 'unless-stopped', portRange: this.opts.portRange,
+    });
+    // With the independent execution proxy, this inspect also proves the immutable image is approved.
+    await this.assertImagePresent(info.Image);
+    await assertOwnedDirectory(this.opts.instanceDataRoot, dataDirectory);
+    const handle = await open(join(dataDirectory, 'settings.js'), constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const stat = await handle.stat();
+      const maxBytes = 4 * 1024 ** 2;
+      if (!stat.isFile() || stat.nlink !== 1 || stat.size > maxBytes) throw new Error('实例配置文件不符合安全读取要求');
+      // Bound the read itself; checking readFile().length afterwards would allow a
+      // concurrent writer to grow the file and allocate unbounded Manager memory.
+      const contents = Buffer.alloc(maxBytes + 1);
+      let size = 0;
+      while (size < contents.length) {
+        const { bytesRead } = await handle.read(contents, size, contents.length - size, size);
+        if (bytesRead === 0) break;
+        size += bytesRead;
+      }
+      if (size > maxBytes) throw new Error('实例配置文件过大');
+      const settingsJs = contents.toString('utf8', 0, size);
+      if (!Buffer.from(settingsJs).equals(contents.subarray(0, size))) throw new Error('实例配置文件必须是有效 UTF-8');
+      return { settingsJs, running: info.State.Running === true };
+    } finally { await handle.close(); }
   }
 
   async stop(instanceId: string): Promise<void> {

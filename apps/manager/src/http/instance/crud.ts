@@ -60,6 +60,7 @@ export function registerInstances(api: FastifyInstance, ctx: HttpContext): void 
         imageTag: String(b['imageTag'] ?? ''),
         memoryMb: Number(b['memoryMb'] ?? 512),
         cpus: Number(b['cpus'] ?? 0.5),
+        ...(b['editorPassword'] === undefined ? {} : { editorPassword: b['editorPassword'] as string }),
         // 端口映射逐条显式传入。这里只做形状归一，取值合法性交给
         // validatePortMappings —— 校验集中一处，HTTP 层不重复判断
         ports: Array.isArray(b['ports'])
@@ -103,13 +104,14 @@ export function registerInstances(api: FastifyInstance, ctx: HttpContext): void 
   });
 
   api.post(`${config.basePath}/api/instances/:id/credentials/:username/reset`, async (req, reply) => {
-    const user = guard(req, reply, { csrf: true, need: 'instance:operate', instance: (req.params as { id: string }).id });
+    const user = guard(req, reply, { csrf: true, need: 'instance:credentials', instance: (req.params as { id: string }).id });
     if (!user) return;
     const { id, username } = req.params as { id: string; username: string };
     try {
       const password = await service.resetCredential(id, username, user.username);
+      ctx.proxySessions.revalidate();
       // 新口令只在此处返回一次，之后仅以密文留存
-      return reply.send({ password });
+      return reply.header('cache-control', 'no-store').send({ password });
     } catch (e) { return fail(reply, e); }
   });
 
@@ -117,7 +119,7 @@ export function registerInstances(api: FastifyInstance, ctx: HttpContext): void 
    * 换镜像版本（01 号文 5.2）。
    *
    * 用 `instance:operate` 而不是 `instance:create`：这是对**已存在实例**的运行管理，
-   * 与启停、重置口令同一类，而且第一个到现场打补丁的通常就是运维。
+   * 与启停同属运行维护；重置编辑器口令则有独立的管理员权限。
    * 要求管理员才能升级，等于让安全补丁等一通电话。
    *
    * 破坏性由实例授权矩阵兜住 —— 只能升级自己有 operate 权限的那几台。

@@ -24,6 +24,8 @@ import Docker from 'dockerode';
 import { reconcileAbsentResources } from './_resource-ledger.mjs';
 import { probeFreshHttpStatus, transportDiagnostics } from './_transport-diagnostics.mjs';
 import { chooseVerifierSubnet } from './_verifier-subnet.mjs';
+import { assertNetworkIsolationDeployment } from './verify-offline-bundle.mjs';
+import { captureDockerResource, cleanupTrackedDockerResources, requireDockerNameAbsent } from './verify-offline.mjs';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const RUN_ID = randomUUID().replaceAll('-', '').slice(0, 12);
@@ -34,7 +36,8 @@ const INSTANCE_LABEL = 'com.mqttsnet.thinglinks-edge.instance';
 const COMPOSE_PROJECT_LABEL = 'com.docker.compose.project';
 const COMPOSE_SERVICE_LABEL = 'com.docker.compose.service';
 const REVIEWED_MANAGER_IMAGE = process.env.MANAGER_IMAGE?.trim() ?? '';
-const PROXY_IMAGE = process.env.PROXY_IMAGE?.trim() || 'wollomatic/socket-proxy:1.13.1';
+const PROXY_IMAGE = process.env.PROXY_IMAGE?.trim() || REVIEWED_MANAGER_IMAGE;
+const NETWORK_IMAGE = process.env.NETWORK_IMAGE?.trim() || REVIEWED_MANAGER_IMAGE;
 const NODE_IMAGE = 'nodered/node-red:5.0.7-24-minimal';
 const PROJECT = `tle-compose-${RUN_ID}`;
 /*
@@ -45,11 +48,13 @@ const PROJECT = `tle-compose-${RUN_ID}`;
 const PREFIX = `tle-cv-${RUN_ID}`;
 const MGR = `${PREFIX}-manager`;
 const PROXY = `${PREFIX}-docker-proxy`;
+const NET_CONTROLLER = `${PREFIX}-network-isolation`;
 const INIT = `${PREFIX}-init-data`;
 const NODE_PREPARE = `${PREFIX}-node-red-image`;
 const NET = `tle-cv-net-${RUN_ID}`;
 /** 首次设置时现场指定的口令。这一串**不该出现在任何日志里** */
 const SETUP_PW = `Aa1!}-$HOME-#-:"-${randomBytes(20).toString('base64url')}`;
+const EDITOR_PW = randomBytes(24).toString('base64url');
 const ID = `cva${RUN_ID}`;
 const BROKEN_ID = `cvb${RUN_ID}`;
 const TAG = '5.0.7-24-minimal';
@@ -58,6 +63,8 @@ assert.ok(CANONICAL_TMP_PARENT === '/private/tmp' || CANONICAL_TMP_PARENT === '/
 
 let PORT;
 let B;
+let EDITOR_PORT;
+let NETWORK_HEALTH_PORT;
 let RUN_ROOT;
 let OWNER_FILE;
 let TEST_EDGE_ROOT;
@@ -67,6 +74,7 @@ let overrideFile;
 let composeFile;
 let managerImageId;
 let proxyImageId;
+let networkImageId;
 let initImageId;
 let nodeImageId;
 let protectedBefore;
@@ -75,6 +83,11 @@ const raw = new Docker();
 const results = [];
 const immutableContainerIds = new Map();
 const immutableNetworkIds = new Map();
+const privateVolumeLedger = new Map();
+const privateVolumes = [['network-control', 'edge-network-control'], ['policy-state', 'edge-policy-state']].map(([suffix, volume]) => ({
+  kind: 'volume', name: `${PREFIX}-${suffix}`, cleanupOrder: 50,
+  labels: { [COMPOSE_PROJECT_LABEL]: PROJECT, 'com.docker.compose.volume': volume },
+}));
 const check = (name, ok, detail = '') => {
   results.push({ name, ok });
   console.log(`  ${ok ? '✓' : '✗'} ${name}${detail ? '  — ' + detail : ''}`);
@@ -117,12 +130,14 @@ const composeEnvironment = () => {
     'EXTERNAL_URL', 'MASTER_KEY', 'MASTER_KEY_FILE', 'DOCKER_GID', 'BIND_ADDR', 'HOST_PORT',
     'INITIAL_PASSWORD', 'COMPOSE_INITIAL_PASSWORD', 'ADMIN_SETUP_MODE', 'SETUP_WINDOW_MIN', 'NODE_RED_BOOTSTRAP_IMAGE',
     'INSTANCE_NETWORK', 'ALLOWED_IMAGE_TAGS', 'EDGE_DATA_ROOT', 'EDGE_NAME_PREFIX',
-    'INSTANCE_PORT_MIN', 'INSTANCE_PORT_MAX', 'EDGE_NODE_INSTALL_POLICY',
+    'INSTANCE_PORT_MIN', 'INSTANCE_PORT_MAX', 'EDITOR_PORT_MIN', 'EDITOR_PORT_MAX', 'EDGE_NODE_INSTALL_POLICY',
     'EDGE_NPM_UPSTREAM', 'NODE_RED_IMAGE_REPO',
-    'MANAGER_IMAGE', 'PROXY_IMAGE', 'INIT_IMAGE',
+    'MANAGER_IMAGE', 'PROXY_IMAGE', 'NETWORK_IMAGE', 'INIT_IMAGE',
+    'PROTECTED_HOST_IPS', 'ALLOWED_HOST_ENDPOINTS', 'NETWORK_HEALTH_PORT',
   ]) delete env[key];
   if (managerImageId) env.MANAGER_IMAGE = managerImageId;
   if (proxyImageId) env.PROXY_IMAGE = proxyImageId;
+  if (networkImageId) env.NETWORK_IMAGE = networkImageId;
   if (initImageId) env.INIT_IMAGE = initImageId;
   if (nodeImageId) env.NODE_RED_BOOTSTRAP_IMAGE = nodeImageId;
   return env;
@@ -384,7 +399,7 @@ async function cleanupItems(items, kind, verifyOwnership) {
 }
 
 async function captureComposeResources() {
-  const expected = new Map([[MGR, 'manager'], [PROXY, 'docker-proxy'], [INIT, 'init-data'], [NODE_PREPARE, 'node-red-image']]);
+  const expected = new Map([[MGR, 'manager'], [PROXY, 'docker-proxy'], [NET_CONTROLLER, 'network-isolation'], [INIT, 'init-data'], [NODE_PREPARE, 'node-red-image']]);
   for (const [name, service] of expected) {
     await captureContainer(name, {
       [COMPOSE_PROJECT_LABEL]: PROJECT, [COMPOSE_SERVICE_LABEL]: service,
@@ -395,10 +410,11 @@ async function captureComposeResources() {
     assert.ok(info && info.Labels?.[COMPOSE_PROJECT_LABEL] === PROJECT);
     immutableNetworkIds.set(info.Name, info.Id);
   }
+  for (const expectedVolume of privateVolumes) await captureDockerResource(raw, privateVolumeLedger, expectedVolume);
 }
 
 async function assertComposeOwnership() {
-  const services = new Map([[MGR, 'manager'], [PROXY, 'docker-proxy'], [INIT, 'init-data'], [NODE_PREPARE, 'node-red-image']]);
+  const services = new Map([[MGR, 'manager'], [PROXY, 'docker-proxy'], [NET_CONTROLLER, 'network-isolation'], [INIT, 'init-data'], [NODE_PREPARE, 'node-red-image']]);
   for (const [name, service] of services) {
     const id = immutableContainerIds.get(name);
     const info = id ? await inspectOrAbsent(raw.getContainer(id)) : undefined;
@@ -421,13 +437,13 @@ async function cleanup() {
   };
 
   await attempt('compose containers', async () => {
-    await cleanupItems(await composeContainers(), 'container', (info) => {
+    await cleanupItems((await composeContainers()).filter(info => info.Labels?.[COMPOSE_SERVICE_LABEL] !== 'network-isolation'), 'container', (info) => {
       const service = info.Config?.Labels?.[COMPOSE_SERVICE_LABEL];
       assert.equal(info.Config?.Labels?.[COMPOSE_PROJECT_LABEL], PROJECT);
       assert.ok(['manager', 'docker-proxy', 'init-data', 'node-red-image'].includes(service));
       assert.equal(info.Name, `/${PREFIX}-${service}`);
     });
-    assert.deepEqual(await composeContainers(), []);
+    assert.ok((await composeContainers()).every(info => info.Labels?.[COMPOSE_SERVICE_LABEL] === 'network-isolation'));
   });
   await attempt('managed containers', async () => {
     await cleanupItems(await managedContainers(), 'container', (info) => {
@@ -445,6 +461,14 @@ async function cleanup() {
       assert.ok(['socket-gid', 'foreign-container'].includes(info.Config?.Labels?.[ROLE_LABEL]));
     });
     assert.deepEqual(await verifyContainers(), []);
+  });
+  await attempt('network isolation container', async () => {
+    await cleanupItems((await composeContainers()).filter(info => info.Labels?.[COMPOSE_SERVICE_LABEL] === 'network-isolation'), 'container', info => {
+      assert.equal(info.Name, `/${NET_CONTROLLER}`);
+      assert.equal(info.Config?.Labels?.[COMPOSE_PROJECT_LABEL], PROJECT);
+      assert.equal(info.Config?.Labels?.[COMPOSE_SERVICE_LABEL], 'network-isolation');
+    });
+    assert.deepEqual(await composeContainers(), []);
   });
 
   await attempt('compose networks', async () => {
@@ -484,6 +508,14 @@ async function cleanup() {
     assert.equal(immutableContainerIds.size, 0);
     assert.equal(immutableNetworkIds.size, 0);
   });
+  await attempt('private control and policy volumes', async () => {
+    if (errors.length) throw new Error('retain private recovery volumes after earlier cleanup failures');
+    for (const expectedVolume of privateVolumes) {
+      if (!privateVolumeLedger.has(expectedVolume.name)) await captureDockerResource(raw, privateVolumeLedger, expectedVolume, { optional: true });
+    }
+    await cleanupTrackedDockerResources(raw, privateVolumeLedger);
+    assert.equal(privateVolumeLedger.size, 0);
+  });
   await attempt('run root', removeRunRoot);
   await attempt('protected baseline', async () => {
     if (protectedBefore) assert.deepEqual(await protectedSnapshot(), protectedBefore);
@@ -494,19 +526,26 @@ async function cleanup() {
 async function main() {
   console.log('\n──── docker-compose 部署 · 真实验证 ────\n');
   protectedBefore = await protectedSnapshot();
-  [managerImageId, proxyImageId, nodeImageId] = await Promise.all([
+  [managerImageId, proxyImageId, networkImageId, nodeImageId] = await Promise.all([
     resolveImage(REVIEWED_MANAGER_IMAGE, 'MANAGER_IMAGE'),
     resolveImage(PROXY_IMAGE, 'PROXY_IMAGE'),
+    resolveImage(NETWORK_IMAGE, 'NETWORK_IMAGE'),
     resolveImage(NODE_IMAGE, 'NODE_IMAGE'),
   ]);
+  assert.equal(proxyImageId, managerImageId, 'Docker policy service must use the same reviewed release artifact as Manager');
+  assert.equal(networkImageId, managerImageId, 'Network isolation must use the same reviewed release artifact as Manager');
   const [apiMajor, apiMinor] = (await raw.version()).ApiVersion.split('.').map(Number);
   const gatewayPrioritySupported = apiMajor > 1 || (apiMajor === 1 && apiMinor >= 48);
   // The reviewed Manager image is Alpine-based, has no ENTRYPOINT override,
   // and is already pinned. Reuse it for the one-shot init service without pulling another tag.
   initImageId = managerImageId;
   PORT = await allocatePort();
+  do { EDITOR_PORT = await allocatePort(); } while (EDITOR_PORT === PORT);
+  do { NETWORK_HEALTH_PORT = await allocatePort(); } while ([PORT, EDITOR_PORT].includes(NETWORK_HEALTH_PORT));
   B = `http://127.0.0.1:${PORT}`;
   await createRunRoot();
+  await requireDockerNameAbsent(raw, { kind: 'container', name: NET_CONTROLLER });
+  for (const expectedVolume of privateVolumes) await requireDockerNameAbsent(raw, expectedVolume);
   assert.deepEqual(await composeContainers(), []);
   assert.deepEqual(await composeNetworks(), []);
   assert.deepEqual(await verifyContainers(), []);
@@ -517,6 +556,7 @@ async function main() {
   // Fresh deployment requires neither a hand-written key nor Docker group lookup.
   writeFileSync(envFile, '', { mode: 0o600 });
   const defaults = JSON.parse(compose('config', '--format', 'json')).services;
+  assertNetworkIsolationDeployment(defaults);
   check('没有 .env 配置也能解析，密钥采用持久化文件模式',
     defaults.manager.environment.MASTER_KEY === ''
       && defaults.manager.environment.MASTER_KEY_FILE.endsWith('/.master.key')
@@ -529,9 +569,15 @@ async function main() {
     `EXTERNAL_URL=${B}`,
     `MANAGER_IMAGE=${managerImageId}`,
     `PROXY_IMAGE=${proxyImageId}`,
+    `NETWORK_IMAGE=${networkImageId}`,
     `INIT_IMAGE=${initImageId}`,
     'BIND_ADDR=127.0.0.1',
     `HOST_PORT=${PORT}`,
+    `EDITOR_PORT_MIN=${EDITOR_PORT}`,
+    `EDITOR_PORT_MAX=${EDITOR_PORT}`,
+    `NETWORK_HEALTH_PORT=${NETWORK_HEALTH_PORT}`,
+    'PROTECTED_HOST_IPS=',
+    'ALLOWED_HOST_ENDPOINTS=[]',
     `INSTANCE_NETWORK=${NET}`,
     `NODE_RED_IMAGE_REPO=nodered/node-red`,
     `ALLOWED_IMAGE_TAGS=${TAG}`,
@@ -673,6 +719,7 @@ async function main() {
   const created = await fetch(`${B}/api/instances`, {
     method: 'POST', headers: H,
     body: JSON.stringify({ id: ID, name: 'compose 验证', imageTag: TAG,
+                           editorPassword: EDITOR_PW,
                            ports: [] }),
   });
   // 失败时把正文带出来 —— 光一个「HTTP 400」在这一步是排不动的
@@ -784,6 +831,17 @@ async function main() {
   });
   check('特权集中在代理上：只有它挂 socket，且是只读',
         (proxyInfo.Mounts ?? []).some((m) => String(m.Source).includes('docker.sock') && m.RW === false));
+  check('代理运行同一发行构件的参数与资源归属策略入口', proxyInfo.Image === managerImageId
+    && JSON.stringify(proxyInfo.Config.Cmd) === JSON.stringify(['node', 'dist/docker-policy-main.js']));
+  const controllerInfo = await captureContainer(NET_CONTROLLER, {
+    [COMPOSE_PROJECT_LABEL]: PROJECT, [COMPOSE_SERVICE_LABEL]: 'network-isolation',
+  });
+  check('网络保护组件仅获 NET_ADMIN 与私有控制卷，不挂载 socket 或实例数据', controllerInfo.Image === managerImageId
+    && controllerInfo.HostConfig.NetworkMode === 'host' && !controllerInfo.HostConfig.Privileged
+    && JSON.stringify(controllerInfo.HostConfig.CapDrop) === JSON.stringify(['ALL'])
+    && JSON.stringify((controllerInfo.HostConfig.CapAdd ?? []).map(cap => cap.replace(/^CAP_/, ''))) === JSON.stringify(['NET_ADMIN'])
+    && controllerInfo.Mounts?.length === 1 && controllerInfo.Mounts[0].Type === 'volume'
+    && controllerInfo.Mounts[0].Name === `${PREFIX}-network-control`);
 
   const startupLog = compose('logs', 'manager');
   check('Manager 启动日志确认端点是代理而非裸 socket',
@@ -827,18 +885,48 @@ async function main() {
   const fromInstance = probeFrom(`tle-nr-${ID}`, '/version');
   check('实例容器够不到代理（网络上就不通）', fromInstance === 'X', fromInstance);
 
+  const unlocked = await fetch(`${B}/api/instances/${ID}/editor-access`, {
+    method: 'POST', headers: { 'content-type': 'application/json', cookie, 'x-csrf-token': csrf, origin: B },
+    body: JSON.stringify({ password: EDITOR_PW }),
+  });
+  const handoff = await unlocked.json();
+  check('编辑器要求实例密码并只返回独立入口', unlocked.status === 200 && typeof handoff.editorUrl === 'string' && !handoff.token);
+  const entry = new URL(handoff.editorUrl);
+  check('编辑器入口使用预留的独立端口', entry.port === String(EDITOR_PORT));
+  const exchanged = await fetch(`${entry.origin}/red/${ID}/editor-handoff`, {
+    method: 'POST', headers: { 'content-type': 'application/json', cookie, origin: entry.origin },
+    body: JSON.stringify({ ticket: entry.hash.slice(1) }),
+  });
+  check('一次性交接在独立 Origin 完成', exchanged.status === 200);
   let editor = 0;
   for (let i = 0; i < 40 && editor !== 200; i++) {
     await sleep(1000);
-    editor = await fetch(`${B}/red/${ID}/`, { headers: { cookie }, redirect: 'manual' })
+    editor = await fetch(`${entry.origin}/red/${ID}/`, { headers: { cookie }, redirect: 'manual' })
       .then((r) => r.status).catch(() => 0);
   }
   check('打开编辑器可用（反代按容器名解析到实例）', editor === 200, `HTTP ${editor}`);
+  const reopenEditor = async (sessionCookie) => {
+    const sessionCsrf = /tle_csrf=([^;]+)/.exec(sessionCookie)?.[1] ?? '';
+    const unlock = await fetch(`${B}/api/instances/${ID}/editor-access`, {
+      method: 'POST', headers: { 'content-type': 'application/json', cookie: sessionCookie, 'x-csrf-token': sessionCsrf, origin: B },
+      body: JSON.stringify({ password: EDITOR_PW }),
+    });
+    if (!unlock.ok) return unlock.status;
+    const next = await unlock.json();
+    const target = new URL(next.editorUrl);
+    assert.equal(target.origin, entry.origin, 'Manager restart must preserve the instance browser origin');
+    const exchange = await fetch(`${target.origin}/red/${ID}/editor-handoff`, {
+      method: 'POST', headers: { 'content-type': 'application/json', cookie: sessionCookie, origin: target.origin },
+      body: JSON.stringify({ ticket: target.hash.slice(1) }),
+    });
+    if (!exchange.ok) return exchange.status;
+    return fetch(`${target.origin}/red/${ID}/`, { headers: { cookie: sessionCookie }, redirect: 'manual' }).then(r => r.status);
+  };
 
   /*
    * 复现已运行实例的关键场景：部署升级或运维修复可能只 force-recreate
    * Manager，实例容器和数据根则必须原样保留。若新 Manager 没有重新加入
-   * 实例专属网络，/red/:id/sso 会因反代无法解析实例而变成 502。
+   * 实例专属网络，显式编辑器认证会因反代无法解析实例而变成 502。
   */
   const managerBeforeRecreate = (await raw.getContainer(MGR).inspect()).Id;
   compose('up', '-d', '--no-build', '--force-recreate', '--no-deps', 'manager');
@@ -884,7 +972,7 @@ async function main() {
   const impostorMembers = Object.values(impostor.Containers ?? {}).map((c) => c.Name);
   check('重建 Manager 不接入同名错误归属网络', !impostorMembers.includes(MGR), impostorMembers.join(' + ') || '无成员');
 
-  // Manager 重建会令旧会话失效；重新登录后再测 SSO，避免把会话语义误判成网络回归。
+  // Manager 重建会令旧会话失效；重新登录后再次验证编辑器密码。
   const reloginRes = await fetch(`${B}/api/login`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ username: 'admin', password: SETUP_PW }),
@@ -895,11 +983,9 @@ async function main() {
   check('重建 Manager 后重新登录成功并取得新会话',
         reloginRes.status === 200 && recreatedCookie.includes('tle_sid') && Boolean(recreatedCsrf),
         `HTTP ${reloginRes.status}`);
-  const ssoAfterRecreate = await fetch(`${B}/red/${ID}/sso`, {
-    headers: { cookie: recreatedCookie }, redirect: 'manual',
-  }).then((r) => r.status).catch(() => 0);
-  check('重建 Manager 后重新登录访问实例 SSO 仍成功', ssoAfterRecreate === 200,
-        `HTTP ${ssoAfterRecreate}`);
+  const editorAfterRecreate = await reopenEditor(recreatedCookie);
+  check('重建 Manager 后重新验证实例密码与独立入口仍成功', editorAfterRecreate === 200,
+        `HTTP ${editorAfterRecreate}`);
 
   // 同一容器仍在网络中时重启，覆盖 connect 的幂等路径而不重建 Manager 容器。
   compose('restart', 'manager');
@@ -922,11 +1008,9 @@ async function main() {
   check('Manager 重启后重新登录成功',
     restartedLogin.status === 200 && restartedCookie.includes('tle_sid') && Boolean(restartedCsrf),
     `HTTP ${restartedLogin.status}`);
-  const ssoAfterRestart = await fetch(`${B}/red/${ID}/sso`, {
-    headers: { cookie: restartedCookie }, redirect: 'manual',
-  }).then((r) => r.status).catch(() => 0);
-  check('已接入网络的 Manager 重启后实例 SSO 仍成功', ssoAfterRestart === 200,
-        `HTTP ${ssoAfterRestart}`);
+  const editorAfterRestart = await reopenEditor(restartedCookie);
+  check('已接入网络的 Manager 重启后实例独立入口仍成功', editorAfterRestart === 200,
+        `HTTP ${editorAfterRestart}`);
 
   const restartedH = {
     cookie: restartedCookie, 'x-csrf-token': restartedCsrf, 'content-type': 'application/json',

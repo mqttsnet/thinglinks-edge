@@ -11,7 +11,7 @@ cd thinglinks-edge-offline-<版本>-linux-<架构>
 ```
 
 脚本会依次做四件事：校验包完整性与架构 → `docker load` 导入镜像 →
-准备访问地址与初始管理员密码 → 起服务并等健康检查通过。加密主密钥由 Manager 首次自动生成并保存到 `<EDGE_DATA_ROOT>/.master.key`，安装器不会覆盖旧密钥。
+准备访问地址与初始管理员密码 → 起服务并等待 Manager、Docker 执行策略、网络隔离三个服务都通过健康检查。加密主密钥由 Manager 首次自动生成并保存到 `<EDGE_DATA_ROOT>/.master.key`，安装器不会覆盖旧密钥。
 
 装完打开脚本最后打印的地址，使用 **admin** 和刚才设置的密码登录。升级已有部署时账号与密码保持不变。非交互安装可预先在 `.env` 中设置 `EXTERNAL_URL` 和 `INITIAL_PASSWORD`。
 
@@ -33,12 +33,13 @@ cd thinglinks-edge-offline-<版本>-linux-<架构>
 ## 包里有什么
 
 ```
-images.tar                  Manager、受限 docker 代理、init 容器、Node-RED 实例镜像
+images.tar                  Manager/Docker策略/网络隔离同一镜像、init 容器、Node-RED 实例镜像
 docker-compose.yml          主部署文件（与在线安装完全一致）
 docker-compose.offline.yml  离线覆盖层：pull_policy: never
 .env.example                配置模板
 install.sh                  安装脚本
 manifest.json               版本、架构、各镜像 ID —— 现场核对与售后追溯用
+INSTANCE-ISOLATION.md        实例隔离、独立编辑器入口与升级维护说明
 SHA256SUMS                  镜像、部署文件以及每个 node-seed/*.tgz 的校验和
 changelogs/                 变更说明
 ```
@@ -47,6 +48,19 @@ changelogs/                 变更说明
 白名单之外的版本在离线现场没有镜像，创建会被当场拒绝并说明原因。
 `nodeSeed` 与 `nodeSeedIntegrity` 还会列出随包节点的文件名和原始 SHA-512 SRI；
 平台 Edge/common 两个固定包可以据此与发布合同逐字核对。
+`imageRoles` 指明 Manager、Docker 执行策略、网络隔离、初始化和 Node-RED 的角色引用；`images` 是去重后的镜像清单。前三个角色必须使用相同镜像 ID，不能把旧 socket-proxy 或其他网络工具镜像替换进来。
+
+网络隔离组件使用 Docker 宿主网络与 `NET_ADMIN`，只挂载私有控制卷；Docker 策略另有私有状态卷，Manager/Node-RED 不挂载这些卷。包校验会明确核对该权限边界；安装完成和健康检查不等于已完成现场防火墙验收。
+
+当前网络策略按 IPv4 设计，新实例网络固定禁用 IPv6。`PROTECTED_HOST_IPS` 填写逗号分隔的明确 IPv4；Mac 原生宿主地址需只读核对后配置，不能仅依赖 Docker 虚拟机内的网卡。宿主服务例外由 `ALLOWED_HOST_ENDPOINTS` 精确 JSON 配置，例如 `[{"address":"192.0.2.10","port":4840,"protocol":"tcp"}]`（示例地址必须替换），默认空数组。`NETWORK_HEALTH_PORT` 默认 `31555`；网络、VPN 或宿主 IP 变化后需重新验证。
+
+## 编辑器访问
+
+控制台创建实例时，需要填写并确认独立编辑器口令（至少 12 位，UTF-8 不超过 72 字节）。实例就绪后，从列表进入编辑器还需输入该口令；管理台登录不能代替实例验证，也不会自动启动停止的实例。当前解锁有效期为 30 分钟，超时重新验证；未知的旧实例口令由管理员在维护窗口重置。
+
+编辑器默认使用独立端口 `19200–19263`；修改 `EDITOR_PORT_MIN/MAX` 时同时调整端口发布和防火墙。HTTPS 部署需要为每个实际使用的编辑器端口提供 TLS，并转发到相同的后端端口，不能全部转到 `19100`。
+
+请始终使用 `EXTERNAL_URL` 的主机名访问，避免在 `localhost`、`127.0.0.1` 和局域网 IP 之间切换登录 Cookie。编辑器端口曾分配后不会自动复用；用完需要扩大范围。详细约束和当前未覆盖的磁盘、出站访问及 Cookie 边界见包内 `INSTANCE-ISOLATION.md`。
 
 ## 第三方 Node-RED 节点
 
@@ -83,15 +97,17 @@ npm 会去公网找它的依赖 —— 表现是「包明明在源里，还是�
 
 ## 升级
 
-拿到新版本的离线包，在同一目录下重跑 `install.sh` 即可：
-镜像换新、`.env` 与数据目录原样保留。升级前建议先做一次备份
-（控制台 → 备份），异机恢复演练过的那条路径。
+拿到新版本离线包后，保留原 `.env`、主密钥与数据目录，并按新包 `.env.example` 更新镜像和端口配置，再运行 `install.sh`。尤其要移除旧的 `PROXY_IMAGE=wollomatic/socket-proxy:...`，`PROXY_IMAGE` 和 `NETWORK_IMAGE` 必须与 Manager 来自同一构件；安装器拒绝包外镜像，避免旧配置悄悄运行旧组件。
+
+升级前先做备份。更新 Manager 不会主动停止现有实例；旧实例下一次启动或重启若不符合新隔离约束，应安排维护窗口重建，并重新验证采集和控制，不要放松隔离参数绕过检查。
+
+普通升级不要执行 `docker compose down -v`：它会删除两个私有网络控制/策略状态卷，而这些卷不包含在 Manager 业务备份中。保留 bind 数据目录并不等于保留了网络保护的恢复状态；需另行备份和核对私有卷与实际 Docker 网络的对应关系。
 
 ## 出问题时
 
 ```bash
 docker compose ps                 # 谁没起来
-docker compose logs manager       # Manager 的日志
+docker compose logs manager docker-proxy network-isolation    # 三个管理组件的日志
 docker compose exec manager node dist/index.js preflight    # 环境自检九项
 ```
 

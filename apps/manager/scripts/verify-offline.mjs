@@ -9,11 +9,13 @@
  * 建本次调用独享的假仓库 tag，再生成一个最小种子包，证明安装没有回源。
  *
  * Docker Desktop 往往由多个项目共享。这里所有容器、网络、镜像别名和数据目录都
- * 使用不可预测的调用级名称；启动前只读拒绝同名，清理前复核 name + immutable ID
- * + ownership labels，最后固定到 ID 删除。绝不清共享 TLE_VERIFY_EDGE_ROOT，也绝不
+ * 使用不可预测的调用级名称；容器和网络清理固定 immutable ID 与归属标签。
+ * Docker 卷无 immutable ID，私有卷另核对部署标签和创建指纹且绝不强制删除。
+ * 绝不清共享 TLE_VERIFY_EDGE_ROOT，也绝不
  * 以固定 tle-off* 名称扫删宿主资源。
  */
 import { createHash, randomBytes } from 'node:crypto';
+import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import {
   existsSync,
@@ -32,6 +34,7 @@ import { fileURLToPath } from 'node:url';
 import { gzipSync } from 'node:zlib';
 
 import Docker from 'dockerode';
+import { bundleImageRoles } from './verify-offline-bundle.mjs';
 
 import { tarArchive } from '../dist/core/archive/tar.js';
 import {
@@ -44,6 +47,18 @@ const VERIFY_BUNDLE = join(REPO, 'apps/manager/scripts/verify-offline-bundle.mjs
 const SETUP_PW = 'offline-verify-pass-01';
 const STANDALONE_TAG = '5.0.4-24-minimal';
 const SEED_BASE = 'node-red-contrib-tle-offline-seed';
+
+export function offlineInstallEnvironment(parent, project) {
+  const env = { ...parent, COMPOSE_PROJECT_NAME: project };
+  for (const key of [
+    'MANAGER_IMAGE', 'PROXY_IMAGE', 'NETWORK_IMAGE', 'INIT_IMAGE', 'NODE_RED_IMAGE_REPO', 'NODE_RED_BOOTSTRAP_IMAGE', 'ALLOWED_IMAGE_TAGS',
+    'EXTERNAL_URL', 'BIND_ADDR', 'HOST_PORT', 'EDITOR_PORT_MIN', 'EDITOR_PORT_MAX', 'INSTANCE_PORT_MIN', 'INSTANCE_PORT_MAX',
+    'INSTANCE_NETWORK', 'EDGE_NAME_PREFIX', 'EDGE_DATA_ROOT', 'MASTER_KEY', 'MASTER_KEY_FILE', 'INITIAL_PASSWORD',
+    'COMPOSE_INITIAL_PASSWORD', 'ADMIN_SETUP_MODE', 'SETUP_WINDOW_MIN', 'COMPOSE_FILE', 'COMPOSE_PROFILES',
+    'PROTECTED_HOST_IPS', 'ALLOWED_HOST_ENDPOINTS', 'NETWORK_HEALTH_PORT',
+  ]) delete env[key];
+  return env;
+}
 
 const COMPOSE_PROJECT_LABEL = 'com.docker.compose.project';
 const COMPOSE_SERVICE_LABEL = 'com.docker.compose.service';
@@ -101,13 +116,17 @@ export function createInvocationIdentity({
     defaultComposeNetwork: `tle-offline-${scope}_default`,
     managerName: `${prefix}-manager`,
     proxyName: `${prefix}-docker-proxy`,
+    networkName: `${prefix}-network-isolation`,
+    controlVolume: `${prefix}-network-control`,
+    policyVolume: `${prefix}-policy-state`,
     initName: `${prefix}-init-data`,
     nodeRedImageName: `${prefix}-node-red-image`,
     instanceName: `tle-nr-${instanceId}`,
     seedPackage: `${SEED_BASE}-${scope}`,
     fakeImages: Object.freeze({
       manager: `tle-offline-verify.invalid/${scope}/manager:probe`,
-      proxy: `tle-offline-verify.invalid/${scope}/socket-proxy:probe`,
+      proxy: `tle-offline-verify.invalid/${scope}/docker-policy:probe`,
+      network: `tle-offline-verify.invalid/${scope}/network-isolation:probe`,
       init: `tle-offline-verify.invalid/${scope}/init:probe`,
     }),
     ownerText: `${runId}\n${randomToken}\n`,
@@ -176,7 +195,7 @@ export function removeOwnedTempArea(area, adapters = {}) {
 }
 
 function dockerHandle(raw, kind, ref) {
-  return kind === 'container' ? raw.getContainer(ref) : raw.getNetwork(ref);
+  return kind === 'container' ? raw.getContainer(ref) : kind === 'volume' ? raw.getVolume(ref) : raw.getNetwork(ref);
 }
 
 async function inspectOrAbsent(handle) {
@@ -203,7 +222,7 @@ function hasLabels(actual, expected) {
 export function assertExactDockerResource(info, expected) {
   if (
     !info
-    || !IMMUTABLE_ID.test(String(info.Id ?? ''))
+    || (expected.kind !== 'volume' && !IMMUTABLE_ID.test(String(info.Id ?? '')))
     || resourceName(info, expected.kind) !== expected.name
     || !hasLabels(resourceLabels(info, expected.kind), expected.labels)
   ) {
@@ -212,7 +231,23 @@ export function assertExactDockerResource(info, expected) {
   if (expected.id && info.Id !== expected.id) {
     throw new Error(`refusing immutable ID mismatch for ${expected.kind} ${expected.name}`);
   }
+  if (expected.kind === 'volume') {
+    assert.equal(info.Driver, 'local', 'private verifier volumes must use the local driver');
+    assert.ok(typeof info.Mountpoint === 'string' && info.Mountpoint.startsWith('/'));
+    assert.ok(Number.isFinite(Date.parse(info.CreatedAt)), 'private volume creation time missing');
+    if (expected.volumeFingerprint && volumeFingerprint(info) !== expected.volumeFingerprint) {
+      throw new Error(`refusing volume creation identity mismatch: ${expected.name}`);
+    }
+  }
   return info;
+}
+
+function volumeFingerprint(info) {
+  // Docker volumes expose no immutable ID. Capture creation metadata plus labels,
+  // recheck before removal and never force deletion of an in-use volume.
+  const stable = object => Object.entries(object ?? {}).sort(([a], [b]) => a.localeCompare(b));
+  return createHash('sha256').update(JSON.stringify([info.Name, info.Driver, info.Mountpoint,
+    info.CreatedAt, info.Scope, stable(info.Options), stable(info.Labels)])).digest('hex');
 }
 
 export async function requireDockerNameAbsent(raw, expected) {
@@ -227,17 +262,19 @@ export async function captureDockerResource(raw, ledger, expected, { optional = 
     throw new Error(`expected ${expected.kind} was not created: ${expected.name}`);
   }
   assertExactDockerResource(info, expected);
-  const captured = Object.freeze({ ...expected, id: info.Id });
+  const captured = Object.freeze({ ...expected, ...(expected.kind === 'volume'
+    ? { volumeFingerprint: volumeFingerprint(info) } : { id: info.Id }) });
   const previous = ledger.get(expected.name);
-  if (previous && previous.id !== captured.id) {
-    throw new Error(`captured ${expected.kind} changed ID: ${expected.name}`);
+  if (previous && (previous.id !== captured.id || previous.volumeFingerprint !== captured.volumeFingerprint)) {
+    throw new Error(`captured ${expected.kind} changed identity: ${expected.name}`);
   }
   ledger.set(expected.name, captured);
   return captured;
 }
 
 async function removeCapturedDockerResource(raw, captured) {
-  const byId = await inspectOrAbsent(dockerHandle(raw, captured.kind, captured.id));
+  const reference = captured.kind === 'volume' ? captured.name : captured.id;
+  const byId = await inspectOrAbsent(dockerHandle(raw, captured.kind, reference));
   if (!byId) {
     const replacement = await inspectOrAbsent(dockerHandle(raw, captured.kind, captured.name));
     if (replacement) {
@@ -246,14 +283,14 @@ async function removeCapturedDockerResource(raw, captured) {
     return;
   }
   assertExactDockerResource(byId, captured);
-  const handle = dockerHandle(raw, captured.kind, captured.id);
+  const handle = dockerHandle(raw, captured.kind, reference);
   if (captured.kind === 'container') {
     await handle.remove({ force: true, v: true });
   } else {
     await handle.remove();
   }
-  const remainsById = await inspectOrAbsent(dockerHandle(raw, captured.kind, captured.id));
-  if (remainsById) throw new Error(`owned ${captured.kind} still exists: ${captured.id}`);
+  const remainsById = await inspectOrAbsent(dockerHandle(raw, captured.kind, reference));
+  if (remainsById) throw new Error(`owned ${captured.kind} still exists: ${reference}`);
   const remainsByName = await inspectOrAbsent(dockerHandle(raw, captured.kind, captured.name));
   if (remainsByName) {
     throw new Error(`same-name replacement appeared for ${captured.kind} ${captured.name}`);
@@ -265,6 +302,7 @@ export async function cleanupTrackedDockerResources(raw, ledger) {
   const captured = [...ledger.values()].sort((a, b) => a.cleanupOrder - b.cleanupOrder);
   for (const item of captured) {
     try {
+      if (item.kind === 'volume' && failures.length) throw new Error('retain private recovery volumes after an earlier cleanup failure');
       await removeCapturedDockerResource(raw, item);
       ledger.delete(item.name);
     } catch (error) {
@@ -338,10 +376,8 @@ function readBundleManifest(bundle) {
   if (manifests.length !== 1) throw new Error('bundle must contain exactly one manifest.json');
   const manifestText = command('tar', ['-xOf', bundle, '--', manifests[0]], { maxBuffer: 4 * 1024 * 1024 });
   const manifest = JSON.parse(manifestText);
-  if (!Array.isArray(manifest.images) || manifest.images.length < 4) {
-    throw new Error('bundle manifest images missing');
-  }
-  const manager = manifest.images[0];
+  const roles = bundleImageRoles(manifest);
+  const manager = manifest.images.find(item => item.image === roles.manager);
   command(process.execPath, [VERIFY_BUNDLE, bundle, manager.image, manager.id], {
     stdio: 'pipe',
     env: { ...process.env },
@@ -388,6 +424,7 @@ export function expectedDockerResources(identity) {
   return [
     composeContainer(identity.managerName, 'manager', 20),
     composeContainer(identity.proxyName, 'docker-proxy', 21),
+    composeContainer(identity.networkName, 'network-isolation', 24),
     composeContainer(identity.initName, 'init-data', 22),
     composeContainer(identity.nodeRedImageName, 'node-red-image', 23),
     {
@@ -405,6 +442,11 @@ export function expectedDockerResources(identity) {
         [COMPOSE_NETWORK_LABEL]: 'edge-docker',
       },
     },
+    ...[[identity.controlVolume, 'edge-network-control'], [identity.policyVolume, 'edge-policy-state']].map(([name, volume]) => ({
+      kind: 'volume', name, cleanupOrder: 50, labels: {
+        [COMPOSE_PROJECT_LABEL]: identity.project, 'com.docker.compose.volume': volume,
+      },
+    })),
   ];
 }
 
@@ -577,7 +619,8 @@ export async function runVerification() {
         const realManager = process.env.MANAGER_IMAGE ?? `mqttsnet/thinglinks-edge:${version}`;
         for (const [src, dst] of [
           [realManager, imageAliases.manager],
-          ['wollomatic/socket-proxy:1.13.1', imageAliases.proxy],
+          [realManager, imageAliases.proxy],
+          [realManager, imageAliases.network],
           ['alpine:3.22', imageAliases.init],
         ]) {
           const sourceId = await createTrackedImageAlias(imageAdapters, aliasLedger, src, dst);
@@ -601,6 +644,7 @@ export async function runVerification() {
             ...process.env,
             MANAGER_IMAGE: imageAliases.manager,
             PROXY_IMAGE: imageAliases.proxy,
+            NETWORK_IMAGE: imageAliases.network,
             INIT_IMAGE: imageAliases.init,
             ALLOWED_IMAGE_TAGS: STANDALONE_TAG,
             NODE_SEED_DIR: seedArea.path,
@@ -642,6 +686,7 @@ export async function runVerification() {
       [
         envTemplate.get('MANAGER_IMAGE'),
         envTemplate.get('PROXY_IMAGE'),
+        envTemplate.get('NETWORK_IMAGE'),
         envTemplate.get('INIT_IMAGE'),
         `${nodeRepo}:${tag}`,
       ].every((image) => listed.includes(image)), listed.join(' '));
@@ -671,6 +716,10 @@ export async function runVerification() {
       fallbackDescriptorIds,
     );
     const port = await allocatePort();
+    let editorPort;
+    do { editorPort = await allocatePort(); } while (editorPort === port);
+    let networkHealthPort;
+    do { networkHealthPort = await allocatePort(); } while ([port, editorPort].includes(networkHealthPort));
     const baseUrl = `http://127.0.0.1:${port}`;
     writeFileSync(join(installArea.path, '.env'), [
       `EXTERNAL_URL=${baseUrl}`,
@@ -678,11 +727,17 @@ export async function runVerification() {
       `INITIAL_PASSWORD=${SETUP_PW}`,
       `MANAGER_IMAGE=${envTemplate.get('MANAGER_IMAGE')}`,
       `PROXY_IMAGE=${envTemplate.get('PROXY_IMAGE')}`,
+      `NETWORK_IMAGE=${envTemplate.get('NETWORK_IMAGE')}`,
       `INIT_IMAGE=${envTemplate.get('INIT_IMAGE')}`,
       `NODE_RED_IMAGE_REPO=${nodeRepo}`,
       `NODE_RED_BOOTSTRAP_IMAGE=${envTemplate.get('NODE_RED_BOOTSTRAP_IMAGE')}`,
       'BIND_ADDR=127.0.0.1',
       `HOST_PORT=${port}`,
+      `EDITOR_PORT_MIN=${editorPort}`,
+      `EDITOR_PORT_MAX=${editorPort}`,
+      `NETWORK_HEALTH_PORT=${networkHealthPort}`,
+      'PROTECTED_HOST_IPS=',
+      'ALLOWED_HOST_ENDPOINTS=[]',
       `INSTANCE_NETWORK=${identity.instanceNetworkBase}`,
       `ALLOWED_IMAGE_TAGS=${allowedTags.join(',')}`,
       `EDGE_DATA_ROOT=${edgeRoot}`,
@@ -696,15 +751,18 @@ export async function runVerification() {
     installMayHaveLoadedImages = true;
     const installLog = command('./install.sh', ['--yes'], {
       cwd: installArea.path,
-      env: { ...process.env, COMPOSE_PROJECT_NAME: identity.project },
+      env: offlineInstallEnvironment(process.env, identity.project),
       stdio: 'pipe',
     });
     for (const name of [
       identity.managerName,
       identity.proxyName,
+      identity.networkName,
       identity.initName,
       identity.nodeRedImageName,
       identity.composeNetwork,
+      identity.controlVolume,
+      identity.policyVolume,
     ]) {
       await captureDockerResource(raw, dockerLedger,
         expectedResources.find((item) => item.name === name));

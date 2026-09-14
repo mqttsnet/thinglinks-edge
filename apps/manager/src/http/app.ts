@@ -33,6 +33,9 @@ import { registerConsole } from './console.ts';
 import { registerNpmRegistry } from './nodes/registry.ts';
 import { registerNodeCatalog } from './nodes/catalog.ts';
 import { registerProtocols } from './protocols/catalog.ts';
+import { registerEditorOriginGate } from './editor-origin-server.ts';
+import { registerEditorOriginEntry } from './instance/editor-origin-entry.ts';
+import { registerEditorAccess } from './instance/editor-access.ts';
 
 export type { ServerDeps } from './context.ts';
 
@@ -41,6 +44,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   const app = Fastify({ logger: false, trustProxy: true });
 
   app.register(cookie);
+  registerEditorOriginGate(app, ctx);
+  registerEditorOriginEntry(app, ctx);
 
   /*
    * API 与免密跳转放在独立插件作用域内。
@@ -69,6 +74,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     registerInstances(api, ctx);
     registerMetrics(api, ctx);
     registerSso(api, ctx);
+    registerEditorAccess(api, ctx);
     registerIngest(api, ctx);
     registerField(api, ctx);
     registerBackup(api, ctx);
@@ -105,6 +111,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   });
 
   registerProxy(app, ctx);
+  app.addHook('onClose', async () => { ctx.disposeEditorSessions(); });
   if (deps.commandBridge) app.addHook('onClose', async () => { await deps.commandBridge!.close(); });
   if (deps.presence) app.addHook('onClose', async () => { await deps.presence!.close(); });
 

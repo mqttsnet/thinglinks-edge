@@ -44,7 +44,7 @@ jobs:
 
       - name: 全量回归入口自测
         # fake Docker/pnpm/node，只验证入口编排；不会启动或修改任何真实容器。
-        run: node --test apps/manager/scripts/verify-all.test.mjs apps/manager/scripts/build-offline-bundle.test.mjs apps/manager/scripts/verify-offline-bundle.test.mjs
+        run: node --test apps/manager/scripts/verify-all.test.mjs apps/manager/scripts/build-offline-bundle.test.mjs apps/manager/scripts/verify-offline-bundle.test.mjs apps/manager/scripts/offline-install.test.mjs apps/manager/scripts/verify-instance-isolation.test.mjs
 
       - name: lint
         run: pnpm lint

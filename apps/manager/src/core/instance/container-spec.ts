@@ -12,13 +12,12 @@
 import { createHash } from 'node:crypto';
 import { isAbsolute, relative, resolve } from 'node:path';
 import { registryEnv } from '../nodes/policy.ts';
-
-export class SpecError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'SpecError';
-  }
-}
+import {
+  SpecError, INSTANCE_USER, INSTANCE_TMPFS, INSTANCE_LOG_CONFIG,
+  assertContainerIsolation, assertManagedDataDirectory, assertDedicatedNetwork,
+} from './container-isolation.ts';
+export { SpecError } from './container-isolation.ts';
+import { networkBootstrapEntrypoint, INSTANCE_STARTUP_ENV, INSTANCE_IPV6_SYSCTLS } from './network-bootstrap.ts';
 
 export interface PortBinding {
   /** 宿主端口 */
@@ -184,8 +183,10 @@ export function buildCreateOptions(
   return {
     name: containerName(spec.id),
     Image: opts.imageIdOverride ?? `${opts.imageRepo}:${spec.imageTag}`,
-    // 非 root 运行
-    User: 'node-red',
+    // 固定 uid/gid；镜像中的用户名即使意外映射为 0 也不能改变运行权限。
+    User: INSTANCE_USER,
+    Entrypoint: networkBootstrapEntrypoint(),
+    Cmd: [],
     Env: [
       // 官方镜像默认 UTC，不给 TZ 的话定时流程与时间戳会整体偏移，且不报错
       `TZ=${opts.timezone}`,
@@ -210,6 +211,7 @@ export function buildCreateOptions(
       ...(opts.proxyEnv ?? []),
       // OPC UA 等协议库遵循 XDG；默认 HOME 位于只读镜像，配置必须写入受管数据目录。
       'XDG_CONFIG_HOME=/data/.config',
+      ...INSTANCE_STARTUP_ENV,
     ],
     Labels: {
       'com.mqttsnet.thinglinks-edge.managed': 'true',
@@ -220,6 +222,8 @@ export function buildCreateOptions(
     HostConfig: {
       // 资源配额
       Memory: spec.memoryMb * 1024 * 1024,
+      // Docker 的 MemorySwap 是内存加 swap 总额，设为 Memory 即不额外占用宿主 swap。
+      MemorySwap: spec.memoryMb * 1024 * 1024,
       NanoCpus: Math.round(spec.cpus * 1e9),
       PidsLimit: 512,
       // 只允许平台计算出的本实例数据目录；1880 不在 PortBindings 内，唯一入口是 Manager 反代
@@ -229,10 +233,12 @@ export function buildCreateOptions(
       ReadonlyRootfs: true,
       CapDrop: ['ALL'],
       SecurityOpt: ['no-new-privileges:true'],
+      Sysctls: structuredClone(INSTANCE_IPV6_SYSCTLS),
       RestartPolicy: { Name: 'unless-stopped' },
+      LogConfig: structuredClone(INSTANCE_LOG_CONFIG),
       NetworkMode: opts.network,
       // 只读根文件系统下这些目录仍需可写
-      Tmpfs: { '/tmp': 'rw,noexec,nosuid,size=64m' },
+      Tmpfs: { '/tmp': INSTANCE_TMPFS },
     },
   };
 }
@@ -278,20 +284,9 @@ export function buildMigrationProbeCreateOptions(
 }
 
 /** 下发前的二次校验：确保模板没有被意外改出提权配置 */
-const FORBIDDEN_HOST_CONFIG = [
-  'Privileged',
-  'CapAdd',
-  'Devices',
-  'DeviceCgroupRules',
-  'IpcMode',
-  'UsernsMode',
-  'CgroupParent',
-  'Sysctls',
-] as const;
-
 export function assertSafeCreateOptions(
   options: Record<string, unknown>,
-  opts: { instanceDataRoot: string },
+  opts: { instanceDataRoot: string; expectedNetwork?: string; portRange?: { min: number; max: number } },
 ): void {
   const hc = (options['HostConfig'] ?? {}) as Record<string, unknown>;
   const labels = (options['Labels'] ?? {}) as Record<string, unknown>;
@@ -302,39 +297,19 @@ export function assertSafeCreateOptions(
     throw new SpecError('bootstrap tx label 非法');
   }
 
-  for (const key of FORBIDDEN_HOST_CONFIG) {
-    if (hc[key] !== undefined) {
-      throw new SpecError(`容器配置命中禁用项 HostConfig.${key}`);
-    }
+  const instanceId = labels['com.mqttsnet.thinglinks-edge.instance'];
+  if (labels['com.mqttsnet.thinglinks-edge.managed'] !== 'true' || typeof instanceId !== 'string') {
+    throw new SpecError('缺少受管实例归属标签');
   }
-  if (hc['Privileged'] === true) throw new SpecError('禁止特权容器');
-  if (hc['ReadonlyRootfs'] !== true) throw new SpecError('必须启用只读根文件系统');
-  if (options['User'] !== 'node-red') throw new SpecError('必须以非 root 身份运行');
-
-  for (const mode of ['NetworkMode', 'PidMode'] as const) {
-    const v = hc[mode];
-    if (typeof v === 'string' && (v === 'host' || v.startsWith('host'))) {
-      throw new SpecError(`禁止使用宿主 ${mode}`);
-    }
-  }
-
-  const binds = hc['Binds'];
-  if (binds !== undefined) {
-    if (!Array.isArray(binds)) throw new SpecError('Binds 必须是数组');
-    // 合法挂载只有一个，且完全由平台算出：数据根来自配置，实例 id 取自标签并过 ID_RE。
-    // 用「精确等于」而不是模式匹配 —— 模式匹配留给 ../ 之类构造的余地，等号不留。
-    const instanceId = labels['com.mqttsnet.thinglinks-edge.instance'];
-    if (typeof instanceId !== 'string') {
-      throw new SpecError('缺少实例标签，无法校验数据目录挂载');
-    }
-    assertValidId(instanceId);
-    const allowed = `${instanceDataDir(opts.instanceDataRoot, instanceId)}:/data`;
-    for (const b of binds as unknown[]) {
-      if (b !== allowed) {
-        throw new SpecError(`禁止的挂载：${String(b)}。只允许 ${allowed}`);
-      }
-    }
-  }
+  assertValidId(instanceId);
+  assertManagedDataDirectory(opts.instanceDataRoot);
+  const network = opts.expectedNetwork ?? hc['NetworkMode'];
+  assertDedicatedNetwork(network);
+  assertContainerIsolation(options, {
+    dataDirectory: instanceDataDir(opts.instanceDataRoot, instanceId),
+    network, containerName: containerName(instanceId), restartPolicy: 'unless-stopped',
+    ...(opts.portRange ? { portRange: opts.portRange } : {}),
+  });
 
   // TZ 必须是像样的时区名。少传 timezone 时模板会生成 `TZ=undefined`，
   // 容器不会报错、只是退回 UTC —— 定时流程和时间戳整体偏移且毫无症状。
@@ -368,7 +343,7 @@ function assertConfigDirectory(env: unknown[]): void {
 /** Probe-specific secondary guard for its independent sibling data root. */
 export function assertSafeMigrationProbeOptions(
   options: Record<string, unknown>,
-  opts: { instanceDataRoot: string; instanceId: string; txId: string },
+  opts: { instanceDataRoot: string; instanceId: string; txId: string; expectedNetwork?: string },
 ): void {
   assertValidId(opts.instanceId);
   assertTxId(opts.txId);
@@ -384,13 +359,14 @@ export function assertSafeMigrationProbeOptions(
     throw new SpecError('probe 容器名不匹配');
   }
   assertImmutableImageId(String(options['Image'] ?? ''));
-  if (options['User'] !== 'node-red' || host['ReadonlyRootfs'] !== true) {
-    throw new SpecError('probe 必须以只读根非 root 运行');
-  }
+  assertManagedDataDirectory(opts.instanceDataRoot);
+  const network = opts.expectedNetwork ?? host['NetworkMode'];
+  assertDedicatedNetwork(network);
+  assertContainerIsolation(options, {
+    dataDirectory: migrationProbeDataDir(opts.instanceDataRoot, opts.instanceId, opts.txId),
+    network, containerName: migrationProbeName(opts.instanceId, opts.txId), restartPolicy: 'no',
+  });
   assertConfigDirectory((options['Env'] ?? []) as unknown[]);
-  for (const key of FORBIDDEN_HOST_CONFIG) {
-    if (host[key] !== undefined) throw new SpecError(`probe 命中禁用项 HostConfig.${key}`);
-  }
   const expectedBind = `${migrationProbeDataDir(
     opts.instanceDataRoot, opts.instanceId, opts.txId,
   )}:/data`;

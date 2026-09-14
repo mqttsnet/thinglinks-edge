@@ -1,4 +1,6 @@
 import { test } from 'node:test';
+import { loadConfig } from '../../core/config.ts';
+import { ProxySessionRegistry } from '../../core/instance/proxy-session-registry.ts';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -332,11 +334,11 @@ test('migration routes enforce real session grants and CSRF without route-side o
   const app = Fastify({ logger: false });
   await app.register(cookie);
   const context = createContext({
-    config: { basePath: '', cookieSecure: false },
+    config: loadConfig({ EXTERNAL_URL: 'http://127.0.0.1:19100' }),
     db, auth, repo,
     service: {}, adminRuntime: {},
     operationGate: new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repo)),
-    migrationService, proxySessions: {}, platformPackages: {},
+    migrationService, proxySessions: new ProxySessionRegistry(), platformPackages: {},
   } as unknown as ServerDeps);
   registerNodeCatalog(app, context, {
     store: new NodeStore(root), catalog: new NodeCatalog(db), migrationService,

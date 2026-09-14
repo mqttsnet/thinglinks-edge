@@ -5,6 +5,7 @@
  * 其余能力（南向接入、云边协同、告警）按实施计划后置。
  */
 import { loadConfig } from './core/config.ts';
+import { startEditorOriginServers } from './http/editor-origin-server.ts';
 import { openDb } from './core/db.ts';
 import { deriveKey } from './core/auth/crypto.ts';
 import { loadMasterKey } from './core/auth/master-key.ts';
@@ -833,10 +834,18 @@ export async function main(overrides: InternalManagerOverrides = {}): Promise<vo
          */
         npmRegistryUrl,
       });
+      let editorServers: { close(): Promise<void> } | undefined;
+      app.addHook('preClose', async () => { await editorServers?.close(); });
       return {
         server: app,
         listen: async () => {
-          await app.listen({ host: config.listenAddr, port: config.listenPort });
+          try {
+            editorServers = await startEditorOriginServers(app, { host: config.listenAddr, portRange: config.editorPortRange });
+            await app.listen({ host: config.listenAddr, port: config.listenPort });
+          } catch (error) {
+            await app.close();
+            throw error;
+          }
           console.log(
             `[ready] ${describe()} 监听 ${config.listenAddr}:${config.listenPort}` +
               ` · 外部地址 ${config.externalUrl}` +

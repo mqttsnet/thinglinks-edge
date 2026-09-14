@@ -6,7 +6,7 @@ import { recordAudit } from '../../core/db.ts';
 import { SID, CSRF, type HttpContext } from '../context.ts';
 
 export function registerSession(api: FastifyInstance, ctx: HttpContext): void {
-  const { config, db, auth, currentUser } = ctx;
+  const { config, db, auth, currentUser, proxySessions } = ctx;
 
   /** 发会话 Cookie。登录与第二因子两条路都走这里，Cookie 属性只写一遍 */
   const sendSession = (reply: any, sid: string, user: unknown) => {
@@ -66,6 +66,7 @@ export function registerSession(api: FastifyInstance, ctx: HttpContext): void {
 
   api.post(`${config.basePath}/api/logout`, async (req, reply) => {
     auth.logout(req.cookies[SID]);
+    proxySessions.closeSession(req.cookies[SID]);
     return reply.clearCookie(SID, { path: '/' }).code(204).send();
   });
 
@@ -83,6 +84,7 @@ export function registerSession(api: FastifyInstance, ctx: HttpContext): void {
     const { oldPassword, newPassword } = (req.body ?? {}) as Record<string, string>;
     try {
       auth.changePassword(user.username, oldPassword ?? '', newPassword ?? '');
+      proxySessions.closeUser(user.username);
       recordAudit(db, { actor: user.username, action: 'change-password', result: 'ok' });
       return reply.clearCookie(SID, { path: '/' }).code(204).send();
     } catch (e) {

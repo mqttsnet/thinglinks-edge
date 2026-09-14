@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { openDb } from '../db.ts';
 import { AuthService, AuthError, type LoginResult } from './service.ts';
 import { UserRepo } from './user-repo.ts';
+import { SettingsRepo } from './settings.ts';
 
 const fresh = () => {
   const svc = new AuthService(openDb(':memory:'));
@@ -55,6 +56,42 @@ test('未知或空会话不通过', () => {
   const svc = fresh();
   assert.equal(svc.resolve(undefined), undefined);
   assert.equal(svc.resolve('deadbeef'), undefined);
+});
+
+test('peek checks current credentials and idle expiry without renewing the login session', (t) => {
+  const db = openDb(':memory:');
+  t.after(() => db.close());
+  const svc = new AuthService(db);
+  svc.createFirstAdmin('admin', 'a-long-test-password');
+  new SettingsRepo(db).save({ sessionIdleMin: 5 }, 'admin');
+  t.mock.timers.enable({ apis: ['Date'], now: 1_000_000 });
+  const { sid } = expectSessionLogin(svc.login('admin', 'a-long-test-password'));
+  t.mock.timers.tick(4 * 60_000);
+  assert.equal(svc.peek(sid)?.username, 'admin');
+  t.mock.timers.tick(60_001);
+  assert.equal(svc.peek(sid), undefined);
+  assert.equal(svc.resolve(sid), undefined);
+});
+
+test('peek reflects account role, disabled status, password changes and logout', (t) => {
+  const db = openDb(':memory:');
+  t.after(() => db.close());
+  const svc = new AuthService(db);
+  svc.createFirstAdmin('admin', 'a-long-test-password');
+  const users = new UserRepo(db);
+  const pw = users.create('lineop', 'operator', 'admin');
+  const { sid } = expectSessionLogin(svc.login('lineop', pw));
+  users.setRole('lineop', 'viewer');
+  assert.equal(svc.peek(sid)?.role, 'viewer');
+  users.setDisabled('lineop', true);
+  assert.equal(svc.peek(sid), undefined);
+  users.setDisabled('lineop', false);
+  const next = expectSessionLogin(svc.login('lineop', pw));
+  users.resetPassword('lineop');
+  assert.equal(svc.peek(next.sid), undefined);
+  const admin = expectSessionLogin(svc.login('admin', 'a-long-test-password'));
+  svc.logout(admin.sid);
+  assert.equal(svc.peek(admin.sid), undefined);
 });
 
 test('改密后清除必须改密标记，且旧会话被踢下线', () => {

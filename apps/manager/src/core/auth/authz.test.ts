@@ -2,6 +2,14 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { can, canInstance, actionsOf, isInstanceScoped, describeRole, ROLES, type Action } from './authz.ts';
 
+test('editor password administration is separate from operating an instance', () => {
+  const action = 'instance:credentials' as Action;
+  assert.equal(canInstance('admin', action, undefined), true);
+  assert.equal(canInstance('operator', action, 'operate'), false);
+  assert.equal(canInstance('viewer', action, 'view'), false);
+  assert.equal(isInstanceScoped(action), true);
+});
+
 test('三个角色的能力边界', () => {
   assert.ok(can('admin', 'user:manage'));
   assert.ok(can('admin', 'instance:delete'));
@@ -64,7 +72,7 @@ test('每个动作至少归属一个角色 —— 否则谁都做不了', () => 
    */
   const ALL: Record<Action, true> = {
     'system:view': true, 'system:manage': true, 'instance:list': true, 'instance:view': true, 'instance:operate': true,
-    'instance:create': true, 'instance:delete': true, 'field:view': true, 'replay:run': true,
+    'instance:create': true, 'instance:delete': true, 'instance:credentials': true, 'field:view': true, 'replay:run': true,
     'backup:run': true, 'cloud:view': true, 'cloud:manage': true, 'diag:run': true,
     'template:view': true, 'template:manage': true, 'node:view': true, 'node:manage': true,
     'user:manage': true,

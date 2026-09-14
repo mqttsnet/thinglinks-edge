@@ -110,6 +110,17 @@ fi
 # ── 5. 起服务 ────────────────────────────────────────────
 say ""
 say "── 启动 ──"
+# Existing .env files can still point to an older Manager or socket-proxy image.
+# Never let an installed host tag silently replace an image from this delivery.
+PACKAGE_IMAGES="$(sed -n 's/^[[:space:]]*"image": "\([^"]*\)".*/\1/p' manifest.json)"
+[ -n "$PACKAGE_IMAGES" ] || die "安装包未声明镜像清单，请重新生成离线包"
+COMPOSE_IMAGES="$(docker compose -f docker-compose.yml -f docker-compose.offline.yml config --images)" \
+  || die "Compose 镜像配置无法解析，请检查 .env"
+while IFS= read -r IMAGE_REF; do
+  [ -n "$IMAGE_REF" ] || continue
+  printf '%s\n' "$PACKAGE_IMAGES" | grep -Fqx "$IMAGE_REF" \
+    || die "Compose 引用了包外镜像 ${IMAGE_REF}。请按本包 .env.example 更新 MANAGER_IMAGE、PROXY_IMAGE、NETWORK_IMAGE 等镜像配置；三个服务必须使用同一发行构件"
+done <<< "$COMPOSE_IMAGES"
 # offline 覆盖层让「镜像没 load 进去」当场失败，而不是去连网拉
 docker compose -f docker-compose.yml -f docker-compose.offline.yml up -d
 
@@ -117,19 +128,25 @@ say ""
 printf '  等待健康检查'
 HEALTHY=0
 for _ in $(seq 1 60); do
-  state="$(docker compose ps --format '{{.Name}} {{.Status}}' 2>/dev/null | grep manager || true)"
-  case "$state" in
-    *"(healthy)"*) HEALTHY=1; say ""; say "  ✓ ${state}"; break ;;
+  state="$(docker compose ps --format '{{.Name}} {{.Status}}' manager 2>/dev/null || true)"
+  policy_state="$(docker compose ps --format '{{.Name}} {{.Status}}' docker-proxy 2>/dev/null || true)"
+  network_state="$(docker compose ps --format '{{.Name}} {{.Status}}' network-isolation 2>/dev/null || true)"
+  case "$state|$policy_state|$network_state" in
+    *"(healthy)"*"|"*"(healthy)"*"|"*"(healthy)"*) HEALTHY=1; say ""; say "  ✓ Manager、Docker 执行策略与网络隔离服务均已就绪"; break ;;
   esac
   printf '.'
   sleep 2
 done
-[ "$HEALTHY" = "1" ] || die "Manager 未就绪，请检查访问地址、初始密码和 docker compose logs manager"
+[ "$HEALTHY" = "1" ] || die "Manager、docker-proxy 或 network-isolation 未就绪。请检查同版本镜像、网络后端、端口配置，并查看 docker compose logs manager docker-proxy network-isolation"
 
 say ""
 say "── 完成 ──"
 say "  控制台： $(grep '^EXTERNAL_URL=' .env | cut -d= -f2-)"
 say "  首次部署请使用 admin 和刚才配置的密码登录；已有账号保持不变。"
+say "  编辑器使用独立端口（默认 19200–19263）；请放通配置范围，HTTPS 反代需逐端口转发到相同后端端口。"
+say "  请始终使用 EXTERNAL_URL 的主机名访问；localhost 与 127.0.0.1 的登录 Cookie 不通用。"
+say "  网络保护组件在 Docker 宿主网络中运行，仅它获得 NET_ADMIN；Mac 原生宿主 IP 需明确配置为 PROTECTED_HOST_IPS。"
+say "  宿主服务例外通过 ALLOWED_HOST_ENDPOINTS 的精确 IPv4/端口/协议 JSON 配置，网络变化后需重新验证。"
 say ""
 if [ -d node-seed ]; then
   # 不在这里逐个列名字：一个节点包连着十几个依赖包，列出来是几十行噪音。
@@ -138,6 +155,10 @@ if [ -d node-seed ]; then
   say ""
 fi
 say "  实例镜像已随包装好，创建实例时可直接选："
-grep -o '"nodered/node-red:[^"]*"' manifest.json | tr -d '"' | sed 's/^/    /'
+awk '
+  /"nodeRed"[[:space:]]*:[[:space:]]*\[/ { in_nodes = 1; next }
+  in_nodes && /\]/ { in_nodes = 0; next }
+  in_nodes { sub(/^[[:space:]]*"/, ""); sub(/"[,]?[[:space:]]*$/, ""); print "    " $0 }
+' manifest.json
 say ""
 say "  自检（建议装完跑一次）： docker compose exec manager node dist/index.js preflight"

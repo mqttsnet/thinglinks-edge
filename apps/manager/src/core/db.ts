@@ -418,6 +418,14 @@ const MIGRATIONS: string[] = [
   COMMAND_SCHEMA,
   // v17 — confirmed child presence sources, isolated by gateway.
   PRESENCE_SCHEMA,
+  // v18 — never recycle a browser origin across instance generations: storage and
+  // service workers can survive an instance deletion in users' browsers.
+  `CREATE TABLE editor_origin (
+    instance_id TEXT NOT NULL,
+    generation TEXT NOT NULL,
+    port INTEGER NOT NULL UNIQUE CHECK (port BETWEEN 1 AND 65535),
+    PRIMARY KEY (instance_id, generation)
+  );`,
 ];
 export function openDb(file: string): Db {
   if (file !== ':memory:') mkdirSync(dirname(file), { recursive: true });

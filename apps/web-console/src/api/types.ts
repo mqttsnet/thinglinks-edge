@@ -163,6 +163,7 @@ export interface CreateInstanceBody {
   imageTag: string;
   memoryMb: number;
   cpus: number;
+  editorPassword?: string;
   /**
    * 端口映射表，一行一条；不需要设备直连时传空数组。
    *

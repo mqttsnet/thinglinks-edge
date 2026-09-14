@@ -150,6 +150,12 @@ export const api = {
       method: 'POST', body: JSON.stringify(body),
     }),
 
+  unlockEditor: (id: string, password: string) =>
+    request<{ editorUrl: string; expiresAt: number }>(
+      `/api/instances/${encodeURIComponent(id)}/editor-access`, {
+        method: 'POST', body: JSON.stringify({ password }),
+      }),
+
   startInstance: (id: string) => request<void>(`/api/instances/${id}/start`, { method: 'POST' }),
   stopInstance: (id: string) => request<void>(`/api/instances/${id}/stop`, { method: 'POST' }),
 

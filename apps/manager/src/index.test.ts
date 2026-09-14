@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { openDb } from './core/db.ts';
+import { loadConfig } from './core/config.ts';
+import { ProxySessionRegistry } from './core/instance/proxy-session-registry.ts';
 import { NodeCatalog } from './core/nodes/catalog.ts';
 import { PlatformPackageService } from './core/nodes/platform-package.ts';
 import { NodeStore } from './core/nodes/store.ts';
@@ -77,7 +79,7 @@ test('migration HTTP composition preserves the one service and operation-gate id
   const migrationService = {} as PlatformMigrationService;
   const operationGate = {} as InstanceOperationGate;
   const serverDeps = {
-    config: { basePath: '' },
+    config: loadConfig({ EXTERNAL_URL: 'http://127.0.0.1:19100' }),
     db,
     auth: new AuthService(db, deriveKey('index-migration-http', 'auth')),
     repo,
@@ -85,7 +87,7 @@ test('migration HTTP composition preserves the one service and operation-gate id
     adminRuntime: {},
     operationGate,
     migrationService,
-    proxySessions: {},
+    proxySessions: new ProxySessionRegistry(),
     platformPackages: {},
   } as ServerDeps;
   const context = createContext(serverDeps);

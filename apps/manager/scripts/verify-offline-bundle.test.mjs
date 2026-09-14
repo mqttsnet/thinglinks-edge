@@ -20,7 +20,7 @@ import { test } from 'node:test';
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const VERIFY = join(SCRIPT_DIR, 'verify-offline-bundle.mjs');
 const MANAGER = 'thinglinks-edge-manager-verify:artifact-test';
-const PROXY = 'fixture/proxy:1';
+const PROXY = MANAGER;
 const INIT = 'fixture/init:1';
 const NODE_REPO = 'fixture/node-red';
 const NODE_TAG = '5.0.4-test';
@@ -57,6 +57,10 @@ function fixture({
   extraType = 'regular',
   duplicateExtra = false,
   corruptExtra = false,
+  proxyImage = PROXY,
+  proxyCommand = ['node', 'dist/docker-policy-main.js'],
+  networkImage = MANAGER,
+  networkCapabilities = ['NET_ADMIN'],
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'tle-offline-contract-test-'));
   const bin = join(root, 'bin');
@@ -64,7 +68,7 @@ function fixture({
   mkdirSync(bin);
   mkdirSync(stage);
 
-  const images = [MANAGER, PROXY, INIT, NODE_IMAGE];
+  const images = [...new Set([MANAGER, proxyImage, networkImage, INIT, NODE_IMAGE])];
   const inner = join(root, 'inner');
   mkdirSync(inner);
   const innerManifest = [];
@@ -104,10 +108,12 @@ function fixture({
   writeFileSync(join(stage, 'manifest.json'), JSON.stringify({
     platform: 'linux/amd64',
     images: outerImages,
+    imageRoles: { manager: MANAGER, dockerProxy: proxyImage, networkIsolation: networkImage, initData: INIT, nodeRed: [NODE_IMAGE] },
   }));
   const envText = [
     `MANAGER_IMAGE=${MANAGER}`,
-    `PROXY_IMAGE=${PROXY}`,
+    `PROXY_IMAGE=${proxyImage}`,
+    `NETWORK_IMAGE=${networkImage}`,
     `INIT_IMAGE=${INIT}`,
     `NODE_RED_IMAGE_REPO=${NODE_REPO}`,
     `NODE_RED_BOOTSTRAP_IMAGE=${NODE_IMAGE}`,
@@ -189,7 +195,17 @@ process.exit(result.status ?? 1);
   writeFileSync(docker, `#!/bin/sh
 set -e
 [ "$1" = compose ] || exit 91
-printf '%s\\n' '{"services":{"manager":{"image":"${composeManager}","pull_policy":"never","environment":{"NODE_RED_IMAGE_REPO":"${NODE_REPO}","ALLOWED_IMAGE_TAGS":"${NODE_TAG}"}},"docker-proxy":{"image":"${PROXY}","pull_policy":"never"},"init-data":{"image":"${INIT}","pull_policy":"never"},"node-red-image":{"image":"${NODE_IMAGE}","pull_policy":"never"}}}'
+printf '%s\\n' '${JSON.stringify({ services: {
+  manager: { image: composeManager, pull_policy: 'never', environment: { NODE_RED_IMAGE_REPO: NODE_REPO, ALLOWED_IMAGE_TAGS: NODE_TAG } },
+  'docker-proxy': { image: proxyImage, pull_policy: 'never', command: proxyCommand,
+    environment: { TLE_POLICY_NETWORK_SOCKET: '/run/tle-network/control.sock', TLE_POLICY_NETWORK_HEALTH_PORT: '31555' },
+    volumes: [{ type: 'volume', source: 'edge-network-control', target: '/run/tle-network' }, { type: 'volume', source: 'edge-policy-state', target: '/var/lib/tle-policy' }] },
+  'network-isolation': { image: networkImage, pull_policy: 'never', command: ['node', 'dist/network-isolation-main.js'],
+    network_mode: 'host', user: '0:0', read_only: true, cap_drop: ['ALL'], cap_add: networkCapabilities, security_opt: ['no-new-privileges:true'],
+    environment: { TLE_NET_CONTROL_SOCKET: '/run/tle-network/control.sock', TLE_NET_HEALTH_PORT: '31555' },
+    volumes: [{ type: 'volume', source: 'edge-network-control', target: '/run/tle-network' }] },
+  'init-data': { image: INIT, pull_policy: 'never' }, 'node-red-image': { image: NODE_IMAGE, pull_policy: 'never' },
+} })}'
 `);
   chmodSync(docker, 0o755);
 
@@ -222,6 +238,35 @@ test('exact bundle 的 RepoTags、manifest、env 与 compose config 构成同一
     assert.doesNotMatch(result.stdout, /0\/0 通过/);
   } finally {
     bed.cleanup();
+  }
+});
+
+test('old socket-proxy image cannot replace the Docker parameter policy service', () => {
+  const bed = fixture({ proxyImage: 'wollomatic/socket-proxy:1.13.1' });
+  try {
+    const result = bed.run();
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /同一发行构件/);
+  } finally { bed.cleanup(); }
+});
+
+test('proxy role must launch the reviewed Docker policy entrypoint', () => {
+  const bed = fixture({ proxyCommand: ['node', 'dist/index.js'] });
+  try {
+    const result = bed.run();
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /策略入口/);
+  } finally { bed.cleanup(); }
+});
+
+test('network isolation must share the exact Manager release and cannot add broader host capabilities', () => {
+  for (const options of [{ networkCapabilities: ['NET_ADMIN', 'SYS_ADMIN'] }, { networkImage: 'foreign/network:old' }]) {
+    const bed = fixture(options);
+    try {
+      const result = bed.run();
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /同一发行构件|NET_ADMIN/);
+    } finally { bed.cleanup(); }
   }
 });
 

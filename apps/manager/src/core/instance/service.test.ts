@@ -117,6 +117,10 @@ function fixture(
     raw: {},
     imageRepo: 'nodered/node-red',
     assertManaged: async (id: string) => { calls.push(`assertManaged:${id}`); },
+    assertRestartable: async (id: string) => {
+      calls.push(`assertRestartable:${id}`);
+      return { settingsJs: 'original-settings-bytes', running: true };
+    },
     start: async (id: string) => { calls.push(`start:${id}`); },
     stop: async (id: string) => { calls.push(`stop:${id}`); },
     remove: async (id: string) => { calls.push(`remove:${id}`); },
@@ -140,18 +144,19 @@ function fixture(
   const gate = new InstanceOperationGate(
     policySetup?.(repo, db) ?? new InstanceRepositoryOperationPolicy(repo),
   );
+  const adminRuntime: InstanceAdminRuntime = {
+    target: () => ({
+      upstream: 'http://127.0.0.1:1880', adminRoot: '/red/line-a/',
+      username: 'admin', password: 'old-password',
+    }),
+    waitReady: async (id) => { calls.push(`ready:${id}`); },
+  };
   const service = new InstanceService({
     db,
     repo,
     docker,
     gate,
-    adminRuntime: {
-      target: () => ({
-        upstream: 'http://127.0.0.1:1880', adminRoot: '/red/line-a/',
-        username: 'admin', password: 'old-password',
-      }),
-      waitReady: async (id) => { calls.push(`ready:${id}`); },
-    },
+    adminRuntime,
     instanceDataRoot: '/tmp/thinglinks-service-test-instances',
     platformPackages: { verifyForInstall: () => ({}) } as never,
     barrier: { reach: async () => undefined },
@@ -178,7 +183,7 @@ function fixture(
       catalogues: [],
     }),
   });
-  return { db, repo, calls, gate, service, docker };
+  return { db, repo, calls, gate, service, docker, adminRuntime };
 }
 
 const newInstance: CreateInstanceInput = {
@@ -241,6 +246,103 @@ test('public start acquires one start lease and its under-lease primitive reuses
   await f.service.start('line-a', 'admin');
   assert.deepEqual(f.calls, ['assertManaged:line-a', 'start:line-a']);
   assert.equal(f.gate.current('line-a'), undefined);
+});
+
+test('credential reset refuses an incompatible instance before any repository or configuration write', async () => {
+  const f = fixture();
+  const original = f.repo.credentials('line-a')[0]!.password;
+  f.docker.assertRestartable = async () => { throw new Error('legacy runtime incompatible'); };
+  await assert.rejects(f.service.resetCredential('line-a', 'admin', 'admin'), /隔离|重建/);
+  assert.equal(f.repo.credentials('line-a')[0]!.password === original, true);
+  assert.deepEqual(f.calls, []);
+});
+
+test('credential reset restores exact original settings and repository password after write or restart failure', async () => {
+  for (const failAt of ['write', 'restart']) {
+    const f = fixture();
+    const original = f.repo.credentials('line-a')[0]!.password;
+    const settings: string[] = [];
+    let writes = 0, restarts = 0;
+    f.docker.writeSettings = async (_id, value) => {
+      settings.push(value); writes++;
+      if (failAt === 'write' && writes === 1) throw new Error('fake write failure');
+    };
+    f.docker.restart = async () => {
+      restarts++;
+      if (failAt === 'restart' && restarts === 1) throw new Error('fake restart failure');
+    };
+    await assert.rejects(f.service.resetCredential('line-a', 'admin', 'admin'), /已恢复/);
+    assert.equal(f.repo.credentials('line-a')[0]!.password === original, true);
+    assert.equal(settings.at(-1) === 'original-settings-bytes', true);
+    assert.equal(restarts, failAt === 'write' ? 1 : 2);
+    const audit = f.db.prepare("SELECT result FROM audit WHERE action = 'reset-instance-credential'").all() as { result: string }[];
+    assert.equal(audit.length, 1); assert.equal(audit[0]!.result, 'fail');
+  }
+});
+
+test('failed credential compensation is explicit and never leaves the new repository password reported as success', async () => {
+  const f = fixture();
+  const original = f.repo.credentials('line-a')[0]!.password;
+  f.docker.writeSettings = async () => { throw new Error('fake write unavailable'); };
+  await assert.rejects(f.service.resetCredential('line-a', 'admin', 'admin'), /人工恢复/);
+  assert.equal(f.repo.credentials('line-a')[0]!.password === original, true);
+  const audit = f.db.prepare("SELECT result, detail FROM audit WHERE action = 'reset-instance-credential'").all() as { result: string; detail: string }[];
+  assert.equal(audit.length, 1); assert.equal(audit[0]!.result, 'fail');
+  assert.equal(audit[0]!.detail.includes(original), false);
+});
+
+test('credential reset returns its new password only after restart and authenticated readiness', async () => {
+  const f = fixture();
+  const result = await f.service.resetCredential('line-a', 'admin', 'admin');
+  assert.equal(f.repo.credentials('line-a')[0]!.password === result, true);
+  assert.deepEqual(f.calls, ['assertRestartable:line-a', 'writeSettings:line-a', 'restart:line-a', 'ready:line-a']);
+});
+
+test('credential reset of a stopped instance stays stopped and takes effect at next start', async () => {
+  const f = fixture();
+  f.docker.assertRestartable = async () => ({ settingsJs: 'original-settings-bytes', running: false });
+  const result = await f.service.resetCredential('line-a', 'admin', 'admin');
+  assert.equal(f.repo.credentials('line-a')[0]!.password === result, true);
+  assert.deepEqual(f.calls, ['writeSettings:line-a']);
+  const audit = f.db.prepare("SELECT detail FROM audit WHERE action = 'reset-instance-credential'").get() as { detail: string };
+  assert.equal(audit.detail.includes('next-start'), true);
+});
+
+test('a running instance whose new credential is rejected restores the old account and rechecks it', async () => {
+  const f = fixture();
+  const original = f.repo.credentials('line-a')[0]!.password;
+  let attempts = 0;
+  f.adminRuntime.waitReady = async (_id, options) => {
+    assert.equal(options.username === 'admin', true);
+    attempts++;
+    if (attempts === 1) throw new Error('fake authentication refused');
+    assert.equal(f.repo.credentials('line-a')[0]!.password === original, true);
+  };
+  await assert.rejects(f.service.resetCredential('line-a', 'admin', 'admin'), /已恢复/);
+  assert.equal(attempts, 2);
+  assert.equal(f.repo.credentials('line-a')[0]!.password === original, true);
+});
+
+test('stopped credential compensation does not accidentally start the instance', async () => {
+  const f = fixture();
+  const original = f.repo.credentials('line-a')[0]!.password;
+  f.docker.assertRestartable = async () => ({ settingsJs: 'original-settings-bytes', running: false });
+  let attempts = 0;
+  f.docker.writeSettings = async () => { if (++attempts === 1) throw new Error('fake write refused'); };
+  await assert.rejects(f.service.resetCredential('line-a', 'admin', 'admin'), /已恢复/);
+  assert.equal(attempts, 2);
+  assert.equal(f.repo.credentials('line-a')[0]!.password === original, true);
+  assert.deepEqual(f.calls, []);
+});
+
+test('credential reset compensates if recording its successful completion fails', async () => {
+  const f = fixture();
+  const original = f.repo.credentials('line-a')[0]!.password;
+  f.db.exec(`CREATE TRIGGER fail_reset_success_audit BEFORE INSERT ON audit
+    WHEN NEW.action = 'reset-instance-credential' AND NEW.result = 'ok'
+    BEGIN SELECT RAISE(FAIL, 'test audit failure'); END;`);
+  await assert.rejects(f.service.resetCredential('line-a', 'admin', 'admin'), /已恢复/);
+  assert.equal(f.repo.credentials('line-a')[0]!.password === original, true);
 });
 
 test('under-lease primitives reject fabricated and wrong-instance leases before Docker', async () => {
@@ -861,6 +963,42 @@ test('unexpected image preflight errors never expose raw external details', asyn
   } finally {
     await f.close();
   }
+});
+
+test('new instance accepts an explicit editor password without returning or auditing it', async () => {
+  const f = await bootstrapFixture();
+  const password = 'Fixture-editor-pass-2026';
+  try {
+    const created = await f.service.create({ ...newInstance, editorPassword: password } as CreateInstanceInput);
+    assert.equal(f.repo.credentials('line-new')[0]?.password === password, true);
+    assert.equal(JSON.stringify(created).includes(password), false);
+    assert.equal(JSON.stringify(f.db.prepare('SELECT * FROM audit').all()).includes(password), false);
+  } finally { await f.close(); }
+});
+
+test('invalid explicit editor passwords fail before instance or Docker side effects', async () => {
+  for (const editorPassword of ['', 'short', 'a'.repeat(73), '密'.repeat(25), 123, null]) {
+    const f = await bootstrapFixture();
+    try {
+      await assert.rejects(() => f.service.create({ ...newInstance, editorPassword } as unknown as CreateInstanceInput), /编辑器口令/);
+      assert.equal(f.repo.get('line-new'), undefined);
+      assert.equal(f.events.length, 0);
+    } finally { await f.close(); }
+  }
+});
+
+test('concurrent instance creation cannot double reserve remaining host capacity', async () => {
+  const f = await bootstrapFixture();
+  try {
+    const results = await Promise.allSettled([
+      f.service.create({ ...newInstance, cpus: 2.5 }),
+      f.service.create({ ...newInstance, id: 'line-other', cpus: 2.5 }),
+    ]);
+    assert.equal(results.filter(result => result.status === 'fulfilled').length, 1);
+    const rejected = results.find(result => result.status === 'rejected');
+    assert.ok(rejected?.status === 'rejected' && /CPU 预算/.test(String(rejected.reason)));
+    assert.equal(f.repo.list().length, 1);
+  } finally { await f.close(); }
 });
 
 test('new instance returns only after npm install Admin health and host files are committed', async () => {

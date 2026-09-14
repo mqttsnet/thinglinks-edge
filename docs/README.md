@@ -10,6 +10,7 @@
 | [部署说明](architecture/deployment.md) | 在线启动、不同现场的部署方式、数据与交付边界 |
 | [协议组件与采集控制](guides/protocol-components.md) | 组件准备、设备点位配置、物模型映射与控制限制 |
 | [备份与恢复](guides/backup-restore.md) | 密钥保管、恢复范围、停机前提与中断恢复 |
+| [实例隔离与编辑器访问](guides/instance-isolation.md) | 宿主隔离、独立编辑器口令与端口、升级维护和当前边界 |
 | [品牌与关于页配置](guides/product-branding.md) | 产品名称、Logo、版权、社区与更新记录配置 |
 | [离线安装](../scripts/offline/README.md) | 离线交付包安装与运行要求 |
 

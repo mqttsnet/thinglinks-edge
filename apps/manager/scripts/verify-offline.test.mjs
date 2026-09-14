@@ -27,6 +27,7 @@ import {
   restoreBundleImageState,
   seededApprovalContract,
   selectBundleSource,
+  offlineInstallEnvironment,
 } from './verify-offline.mjs';
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
@@ -61,6 +62,13 @@ test('offline verifier owns and verifies every recursive temporary-directory cle
   assert.doesNotMatch(VERIFY_SOURCE, /rmSync\(seedDir/);
 });
 
+test('offline install uses its fixture environment instead of parent image, port and credential overrides', () => {
+  const env = offlineInstallEnvironment({ PATH: '/fixture/bin', DOCKER_HOST: 'unix:///fixture/docker.sock',
+    MANAGER_IMAGE: 'foreign/manager:old', PROXY_IMAGE: 'foreign/proxy:old', HOST_PORT: '19100',
+    EDITOR_PORT_MIN: '19200', EDITOR_PORT_MAX: '19263', MASTER_KEY: 'fake-parent-key', INITIAL_PASSWORD: 'fake-parent-password' }, 'owned-project');
+  assert.deepEqual(env, { PATH: '/fixture/bin', DOCKER_HOST: 'unix:///fixture/docker.sock', COMPOSE_PROJECT_NAME: 'owned-project' });
+});
+
 test('provided exact artifact auto-approves only the pinned Edge package while fallback seeds stay unapproved', () => {
   const exact = [
     { module: '@mqttsnet/thinglinks-edge-nodes', approved: true },
@@ -77,8 +85,8 @@ const immutableId = (digit) => `sha256:${digit.repeat(64)}`;
 
 class FakeDocker {
   constructor() {
-    this.byName = { container: new Map(), network: new Map() };
-    this.byId = { container: new Map(), network: new Map() };
+    this.byName = { container: new Map(), network: new Map(), volume: new Map() };
+    this.byId = { container: new Map(), network: new Map(), volume: new Map() };
     this.removals = [];
   }
 
@@ -86,7 +94,7 @@ class FakeDocker {
     const name = kind === 'container' ? info.Name.replace(/^\//, '') : info.Name;
     const record = { info, removed: false };
     this.byName[kind].set(name, record);
-    this.byId[kind].set(info.Id, record);
+    this.byId[kind].set(info.Id ?? info.Name, record);
     return record;
   }
 
@@ -113,11 +121,28 @@ class FakeDocker {
 
   getContainer(ref) { return this.handle('container', ref); }
   getNetwork(ref) { return this.handle('network', ref); }
+  getVolume(ref) { return this.handle('volume', ref); }
 }
 
 function containerInfo(id, name, labels) {
   return { Id: id, Name: `/${name}`, Config: { Labels: labels }, State: { Running: true } };
 }
+
+test('private volume cleanup checks deployment labels and creation identity without inventing a Docker volume ID', async () => {
+  const raw = new FakeDocker(); const ledger = new Map();
+  const expected = { kind: 'volume', name: 'owned-policy-state', cleanupOrder: 50,
+    labels: { 'com.docker.compose.project': 'owned-project', 'com.docker.compose.volume': 'edge-policy-state' } };
+  const volume = { Name: expected.name, Driver: 'local', CreatedAt: '2026-01-01T00:00:00Z',
+    Mountpoint: '/var/lib/docker/volumes/owned-policy-state/_data', Scope: 'local', Options: null, Labels: expected.labels };
+  raw.put('volume', volume);
+  await captureDockerResource(raw, ledger, expected);
+  raw.put('volume', { ...volume, CreatedAt: '2026-01-02T00:00:00Z' });
+  await assert.rejects(cleanupTrackedDockerResources(raw, ledger), /cleanup failed/);
+  assert.deepEqual(raw.removals, []);
+  raw.put('volume', volume);
+  await cleanupTrackedDockerResources(raw, ledger);
+  assert.deepEqual(raw.removals, [{ kind: 'volume', ref: expected.name }]);
+});
 
 test('provided exact artifact wins and standalone fallback is not called', async () => {
   let fallbackCalls = 0;

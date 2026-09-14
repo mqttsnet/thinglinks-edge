@@ -16,13 +16,15 @@ afterEach(async () => {
   })));
 });
 
-function repoWithInstance() {
+function repoWithInstance(credentials: Parameters<InstanceRepo['create']>[2] = [
+  { username: 'admin', password: 'decrypted-password', permissions: '*' },
+]) {
   const repo = new InstanceRepo(openDb(':memory:'), deriveKey('admin-runtime-test', 'instance'));
   repo.create({
     id: 'line-a', name: 'Line A', imageTag: '5.0.4-24-minimal',
     memLimit: 512, cpuLimit: 0.5, adminRoot: '/red/line-a/',
     credSecret: 'credential-secret', notes: '', nodeRuntimeMode: 'npm',
-  }, [], [{ username: 'admin', password: 'decrypted-password', permissions: '*' }]);
+  }, [], credentials);
   return repo;
 }
 
@@ -102,4 +104,36 @@ test('waitReady aborts hanging Admin attempts at the caller deadline', async () 
     },
   );
   assert.ok(Date.now() - started < 300);
+});
+
+test('explicit readiness checks the reset account through the actual authentication endpoint', async () => {
+  let requestedAccountMatched = false;
+  const server = createServer((req, res) => {
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      const value = JSON.parse(body) as { username?: string; password?: string };
+      requestedAccountMatched = value.username === 'reader' && value.password === 'reader-test-password';
+      res.writeHead(requestedAccountMatched ? 200 : 403, { 'content-type': 'application/json' });
+      res.end(requestedAccountMatched ? '{"access_token":"test-readiness-token"}' : '{"message":"test-secret-response"}');
+    });
+  });
+  servers.push(server);
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address(); assert.ok(address && typeof address === 'object');
+  const runtime = new RepositoryInstanceAdminRuntime({ repo: repoWithInstance([
+    { username: 'admin', password: 'admin-test-password', permissions: '*' },
+    { username: 'reader', password: 'reader-test-password', permissions: 'read' },
+  ]), upstreamFor: () => `http://127.0.0.1:${address.port}` });
+  await runtime.waitReady('line-a', { timeoutMs: 300, intervalMs: 5, username: 'reader' });
+  assert.equal(requestedAccountMatched, true);
+  await assert.rejects(runtime.waitReady('line-a', { timeoutMs: 100, intervalMs: 5, username: 'absent' }), error => {
+    assert.equal(error instanceof InstanceAdminRuntimeError && error.reason === 'credential-not-found', true);
+    return true;
+  });
+  await assert.rejects(runtime.waitReady('line-a', { timeoutMs: 40, intervalMs: 5, username: 'admin' }), error => {
+    assert.equal(error instanceof InstanceAdminRuntimeError && error.reason === 'readiness-timeout', true);
+    assert.equal(String(error).includes('admin-test-password') || String(error).includes('test-secret-response'), false);
+    return true;
+  });
 });

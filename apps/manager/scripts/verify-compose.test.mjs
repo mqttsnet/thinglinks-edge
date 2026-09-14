@@ -8,14 +8,16 @@ import test from 'node:test';
 
 const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'verify-compose.mjs');
 
-test('Compose verifier reserves a host port only for Manager and keeps instance fixtures internal', () => {
+test('Compose verifier reserves Manager, editor and network health ports while instance protocol fixtures stay internal', () => {
   const source = readFileSync(SCRIPT, 'utf8');
   const allocationCalls = (source.match(/\ballocatePort\(\)/g) ?? []).length - 1;
   const instanceRequests = [...source.matchAll(
     /body: JSON\.stringify\(\{ id: (?:BROKEN_)?ID,[\s\S]*?ports: (\[[^\n]*\])/g,
   )];
 
-  assert.equal(allocationCalls, 1, 'only the Manager listener may reserve a host port');
+  assert.equal(allocationCalls, 3, 'only Manager, independent editor and network health reserve host ports');
+  assert.match(source, /EDITOR_PORT_MIN=\$\{EDITOR_PORT\}/);
+  assert.match(source, /EDITOR_PORT_MAX=\$\{EDITOR_PORT\}/);
   assert.equal(instanceRequests.length, 2, 'both historical and healthy instance fixtures are covered');
   assert.deepEqual(
     instanceRequests.map((match) => match[1]),
@@ -23,6 +25,32 @@ test('Compose verifier reserves a host port only for Manager and keeps instance 
     'Compose-only checks must not race on unrelated instance host-port bindings',
   );
   assert.doesNotMatch(source, /\b(?:HEALTHY|BROKEN)_PORT\b/);
+});
+
+test('default Compose uses the Manager release for the Docker policy service and publishes isolated editor origins', () => {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'tle-compose-policy-'));
+  try {
+    const envFile = join(root, 'empty.env'); writeFileSync(envFile, '', { mode: 0o600 });
+    const parsed = JSON.parse(execFileSync('docker', ['compose', '-f', join(dirname(SCRIPT), '../../../docker-compose.yml'),
+      '--env-file', envFile, 'config', '--format', 'json'], { encoding: 'utf8', env: { PATH: process.env.PATH } }));
+    const proxy = parsed.services['docker-proxy'];
+    assert.equal(proxy.image, parsed.services.manager.image);
+    const controller = parsed.services['network-isolation'];
+    assert.equal(controller.image, parsed.services.manager.image);
+    assert.deepEqual(controller.command, ['node', 'dist/network-isolation-main.js']);
+    assert.equal(controller.network_mode, 'host');
+    assert.deepEqual(controller.cap_add, ['NET_ADMIN']);
+    assert.deepEqual(controller.cap_drop, ['ALL']);
+    assert.equal(controller.volumes.length, 1);
+    assert.equal(controller.volumes[0].source, 'edge-network-control');
+    assert.ok(!(parsed.services.manager.volumes ?? []).some(volume => ['edge-network-control', 'edge-policy-state'].includes(volume.source)));
+    assert.deepEqual(proxy.command, ['node', 'dist/docker-policy-main.js']);
+    assert.equal(proxy.environment.TLE_POLICY_MANAGER_CONTAINER, parsed.services.manager.container_name);
+    assert.ok(proxy.volumes.some(v => v.read_only === true && v.target.endsWith('/instances')));
+    assert.equal(parsed.services.manager.environment.EDITOR_PORT_MIN, '19200');
+    assert.equal(parsed.services.manager.environment.EDITOR_PORT_MAX, '19263');
+    assert.equal(parsed.services.manager.ports.filter(p => p.target >= 19200 && p.target <= 19263).length, 64);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test('healthy bootstrap completes before the historical instance network is corrupted', () => {

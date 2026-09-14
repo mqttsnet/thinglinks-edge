@@ -8,6 +8,7 @@ import {
   readdirSync,
   renameSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -19,7 +20,7 @@ import {
   MANAGED_LABEL,
   type DockerClientOptions,
 } from './docker-client.ts';
-import { BOOTSTRAP_TX_LABEL } from './container-spec.ts';
+import { BOOTSTRAP_TX_LABEL, buildCreateOptions } from './container-spec.ts';
 import {
   MIGRATION_PROBE_LABEL,
   MIGRATION_TX_LABEL,
@@ -28,6 +29,8 @@ import {
   migrationProbeNetworkName,
 } from './container-spec.ts';
 import { MigrationCheckpointStore } from '../nodes/migration-checkpoint.ts';
+import { deploymentRealm } from '../docker-policy/config.ts';
+import { NETWORK_POLICY_REALM_LABEL } from '../docker-policy/network-intents.ts';
 
 const roots: string[] = [];
 after(() => {
@@ -78,6 +81,40 @@ function ownedLabels(instanceId: string, txId: string): Record<string, string> {
     [BOOTSTRAP_TX_LABEL]: txId,
   };
 }
+
+test('restart preflight reads exact settings only after proving runtime isolation without mutation', async () => {
+  const f = fixture();
+  const root = dirname(dirname(f.instanceNodesDir)), dataDir = join(root, 'line-a');
+  const networkId = 'c'.repeat(64);
+  mkdirSync(dataDir, { recursive: true });
+  writeFileSync(join(dataDir, 'settings.js'), 'original-settings-bytes');
+  const options = buildCreateOptions({ id: 'line-a', imageTag: '5.0.4-24-minimal', memoryMb: 512, cpus: .5, ports: [], adminRoot: '/red/line-a/' },
+    { network: networkId, imageRepo: 'nodered/node-red', instanceDataRoot: root, timezone: 'UTC' });
+  options['Env'] = [...options['Env'] as string[], `TLE_NETWORK_GUARD_ID=${networkId}`, 'TLE_NETWORK_GUARD_GATEWAY=172.30.0.1', 'TLE_NETWORK_GUARD_PORT=31555'];
+  const info = { Id: 'a'.repeat(64), Name: '/tle-nr-line-a', Image: `sha256:${'b'.repeat(64)}`, Config: options,
+    HostConfig: options['HostConfig'], State: { Running: false }, Mounts: [{ Type: 'bind', Source: dataDir, Destination: '/data', RW: true }] };
+  const raw = rawOf(f.docker), mutations: string[] = [];
+  raw.getContainer = () => ({ inspect: async () => info, restart: async () => { mutations.push('restart'); }, putArchive: async () => { mutations.push('write'); } });
+  raw.getNetwork = () => ({ inspect: async () => ({ Id: networkId, Name: 'test-edge-line-a', EnableIPv6: false,
+    IPAM: { Config: [{ Subnet: '172.30.0.0/24', Gateway: '172.30.0.1' }] },
+    Labels: { ...options['Labels'] as Record<string, string>, [NETWORK_POLICY_REALM_LABEL]: deploymentRealm({ dataRoot: root, networkPrefix: 'test-edge' }) } }) });
+  raw.getImage = () => ({ inspect: async () => ({ Id: info.Image }) });
+  const snapshot = await f.docker.assertRestartable('line-a');
+  assert.equal(snapshot.settingsJs === 'original-settings-bytes', true);
+  assert.equal(snapshot.running, false);
+  assert.deepEqual(mutations, []);
+  options['User'] = 'node-red';
+  await assert.rejects(f.docker.assertRestartable('line-a'));
+  options['User'] = '1000:1000';
+  const host = options['HostConfig'] as Record<string, unknown>;
+  host['NetworkMode'] = 'host';
+  await assert.rejects(f.docker.assertRestartable('line-a'));
+  host['NetworkMode'] = networkId;
+  rmSync(join(dataDir, 'settings.js'));
+  symlinkSync('/etc/passwd', join(dataDir, 'settings.js'));
+  await assert.rejects(f.docker.assertRestartable('line-a'));
+  assert.deepEqual(mutations, []);
+});
 
 test('migration inspection returns immutable running and environment evidence only for exact managed owner', async () => {
   const f = fixture({
@@ -150,7 +187,9 @@ test('same-image recreate uses the immutable image id and preserves stopped stat
     }),
   });
   raw.createContainer = async (options: Record<string, unknown>) => {
-    created = options;
+    assert.deepEqual(options['_query'], { name: 'tle-nr-line-a' });
+    assert.deepEqual(Object.keys(options).sort(), ['_body', '_query']);
+    created = options['_body'] as Record<string, unknown>;
     return { putArchive: async () => { calls.push('settings'); } };
   };
   f.docker.remove = async (id) => { calls.push(`remove:${id}`); };
@@ -221,11 +260,12 @@ test('stopped probe restores only immutable checkpoint files and owns exact cont
   let networkExists = true;
   raw.getImage = () => ({ inspect: async () => ({}) });
   raw.createNetwork = async (options: Record<string, unknown>) => {
-    networkOptions = options;
+    assert.deepEqual(options['_query'], {});
+    networkOptions = options['_body'] as Record<string, unknown>;
     return { id: 'probe-network-id' };
   };
   raw.createContainer = async (options: Record<string, unknown>) => {
-    containerOptions = options;
+    containerOptions = options['_body'] as Record<string, unknown>;
     return { id: 'probe-container-id', start: async () => { started += 1; } };
   };
   raw.getContainer = (ref: string) => ({
@@ -334,11 +374,12 @@ test('bootstrap create writes the exact tx owner label to network and container 
   let containerOptions: Record<string, unknown> | undefined;
   raw.getImage = () => ({ inspect: async () => ({}) });
   raw.createNetwork = async (options: Record<string, unknown>) => {
-    networkOptions = options;
+    assert.deepEqual(options['_query'], {});
+    networkOptions = options['_body'] as Record<string, unknown>;
     return { id: 'network-id' };
   };
   raw.createContainer = async (options: Record<string, unknown>) => {
-    containerOptions = options;
+    containerOptions = options['_body'] as Record<string, unknown>;
     return { putArchive: async () => undefined };
   };
   await f.docker.prepareBootstrapDataDir('line-a', 'bootstrap-tx-a');
