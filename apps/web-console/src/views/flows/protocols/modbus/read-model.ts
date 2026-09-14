@@ -1,4 +1,6 @@
+import { MODBUS_MAX_REGISTER_RANGE } from './read-limits.ts';
 import type { ModbusReadConnection } from '../../../../api/types.ts';
+import { effectiveService } from '../../service-identity.ts';
 
 export function modbusReadConnection(values: Record<string, unknown>): { connection?: ModbusReadConnection; issues: string[] } {
   const issues: string[] = [];
@@ -16,7 +18,7 @@ export function modbusReadConnection(values: Record<string, unknown>): { connect
   const connection: ModbusReadConnection = {
     host, port: integer('port', '端口', 502, 1, 65535), unitId: integer('unitId', '站号', 1, 0, 255),
     registerType: registerType as ModbusReadConnection['registerType'],
-    address: integer('address', '起始地址', 0, 0, 65535), quantity: integer('quantity', '读取数量', 2, 1, 125),
+    address: integer('address', '起始地址', 0, 0, 65535), quantity: integer('quantity', '读取数量', 2, 1, MODBUS_MAX_REGISTER_RANGE),
     clientTimeout: integer('clientTimeout', '读取超时', 2000, 100, 60000),
     reconnectTimeout: integer('reconnectTimeout', '重连间隔', 5000, 100, 60000),
   };
@@ -29,7 +31,7 @@ export function sameReadConnection(first: Record<string, unknown>, second: Recor
   return Boolean(a && b && JSON.stringify(a) === JSON.stringify(b));
 }
 
-export interface RegisterPointPreview { property: string; raw?: number; value?: number; error?: string }
+export interface RegisterPointPreview { property: string; serviceCode?: string; raw?: number; value?: number; error?: string }
 const readers: Record<string, (view: DataView, offset: number) => number> = {
   uint16be: (view, offset) => view.getUint16(offset), uint16le: (view, offset) => view.getUint16(offset, true),
   int16be: (view, offset) => view.getInt16(offset), int16le: (view, offset) => view.getInt16(offset, true),
@@ -39,14 +41,16 @@ const readers: Record<string, (view: DataView, offset: number) => number> = {
 };
 
 /** Local sample calculation, using the same 16-bit word layout as the generated flow. */
-export function previewRegisterPoints(registers: number[], points: unknown): RegisterPointPreview[] {
+export function previewRegisterPoints(registers: number[], points: unknown, defaultService?: string): RegisterPointPreview[] {
   if (!Array.isArray(points)) return [];
-  const valid = registers.length <= 125 && registers.every(word => Number.isInteger(word) && word >= 0 && word <= 65535);
+  const valid = registers.length <= MODBUS_MAX_REGISTER_RANGE && registers.every(word => Number.isInteger(word) && word >= 0 && word <= 65535);
   const bytes = new Uint8Array((valid ? registers.length : 0) * 2), view = new DataView(bytes.buffer);
   if (valid) registers.forEach((word, i) => view.setUint16(i * 2, word));
-  return points.slice(0, 64).map((candidate: unknown, index: number) => {
+  return points.map((candidate: unknown, index: number) => {
     const point = candidate && typeof candidate === 'object' ? candidate as Record<string, unknown> : {};
     const property = typeof point.property === 'string' && point.property ? point.property : `点位 ${index + 1}`;
+    const serviceCode = effectiveService(point.serviceCode, defaultService);
+    const identity = { property, ...(serviceCode ? { serviceCode } : {}) };
     try {
       if (!valid) throw new Error('试读返回的寄存器无效');
       const kind = String(point.dataType), source = String(point.source), offset = Number(source) * 2;
@@ -62,7 +66,7 @@ export function previewRegisterPoints(registers: number[], points: unknown): Reg
         || typeof shift !== 'number' || !Number.isFinite(shift) || Math.abs(shift) > 1e12) throw new Error('请填写有效的倍率和偏移');
       const value = raw * scale + shift;
       if (![raw, value].every(number => Number.isFinite(number) && (!Number.isInteger(number) || Number.isSafeInteger(number)))) throw new Error('换算值无法安全表示');
-      return { property, raw, value };
-    } catch (error) { return { property, error: error instanceof Error ? error.message : '点位换算失败' }; }
+      return { ...identity, raw, value };
+    } catch (error) { return { ...identity, error: error instanceof Error ? error.message : '点位换算失败' }; }
   });
 }

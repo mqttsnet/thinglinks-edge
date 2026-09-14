@@ -21,6 +21,7 @@ import type {
   PlatformNodeMigration, ProtocolComponentStatus, InstanceProtocolStatus, CloudModelQuery, CloudModelQueryResult, EdgeCommandRecord,
 } from './types';
 import { filenameFrom } from './filename';
+import { fieldQuery } from './field-query';
 import type { ProductMetadata, ProductReleaseResult } from '../product/types';
 
 /**
@@ -187,10 +188,9 @@ export const api = {
    * 刻意做成**按需单点位查**而不是展开设备就把所有点位的历史都拉下来：
    * 一台设备可能有几十个点位，那样一次就是几十个查询打在跑着采集的边缘盒子上。
    */
-  tagHistory: (instanceId: string, nodeId: string, tagId: string, limit = 300) =>
+  tagHistory: (instanceId: string, nodeId: string, tagId: string, limit = 300, serviceCode?: string) =>
     request<TagHistory>(
-      `/api/field/history?instanceId=${encodeURIComponent(instanceId)}`
-      + `&nodeId=${encodeURIComponent(nodeId)}&tagId=${encodeURIComponent(tagId)}&limit=${limit}`),
+      `/api/field/history${fieldQuery({ instanceId, nodeId, tagId, limit: String(limit), serviceCode })}`),
 
   images: () => request<{ images: ImageOption[] }>('/api/images'),
 
@@ -254,8 +254,8 @@ export const api = {
     request<{ devices: FieldDeviceRecord[] }>(`/api/field/devices${qs({ instanceId })}`),
 
   /** 点位按设备懒加载：现场一台实例几千个点，全量拉会把首屏拖垮 */
-  fieldTags: (instanceId?: string, nodeId?: string) =>
-    request<{ tags: FieldTagRecord[] }>(`/api/field/tags${qs({ instanceId, nodeId })}`),
+  fieldTags: (instanceId?: string, nodeId?: string, serviceCode?: string) =>
+    request<{ tags: FieldTagRecord[] }>(`/api/field/tags${fieldQuery({ instanceId, nodeId, serviceCode })}`),
 
   /** 南向探测**必须**指名实例：读的是那台的 flows.json，比台账更敏感 */
   southbound: (instanceId: string) =>

@@ -14,13 +14,14 @@
  * 他会据此判断现场是不是都正常。
  */
 import { ref, computed, onMounted, onBeforeUnmount } from 'vue';
-import { NSelect, NSpin, NEmpty, NTag, NButton, NAlert, useMessage } from 'naive-ui';
+import { NSelect, NSpin, NEmpty, NTag, NButton, NAlert, NPagination, useMessage } from 'naive-ui';
 import { useRouter } from 'vue-router';
 import { api, ApiError } from '../../api/client';
 import TrendChart from '../../components/TrendChart.vue';
 import FieldValue from './components/FieldValue.vue';
 import { fieldDeviceStatus } from './field-status';
 import { createFieldRefreshTask } from './field-refresh';
+import { fieldTagKey, fieldServiceLabel, fieldTagPage, fieldServiceOptions } from './field-tags';
 import type { TagHistory } from '../../api/types';
 import type {
   Instance, FieldDeviceRecord, FieldTagRecord, FieldSummary, ProbeResult,
@@ -58,8 +59,20 @@ const expanded = ref<Set<string>>(new Set());
 const tagsOf = ref<Map<string, FieldTagRecord[]>>(new Map());
 const tagsBusy = ref<Set<string>>(new Set());
 
-/** 单台设备的点位展示上限。超了截断并说明 —— 不假装那就是全部 */
-const TAG_LIMIT = 200;
+const serviceScopes = ref<Map<string, string>>(new Map());
+const tagPages = ref<Map<string, number>>(new Map());
+const visibleTags = computed(() => new Map([...tagsOf.value].map(([key, tags]) =>
+  [key, fieldTagPage(tags, serviceScopes.value.get(key) ?? '*', tagPages.value.get(key) ?? 1)])));
+const tagPage = (device: FieldDeviceRecord) => visibleTags.value.get(keyOf(device)) ?? fieldTagPage([], '*', 1);
+function selectService(device: FieldDeviceRecord, serviceCode: string) {
+  serviceScopes.value = new Map(serviceScopes.value).set(keyOf(device), serviceCode);
+  tagPages.value = new Map(tagPages.value).set(keyOf(device), 1);
+  closeTrend();
+}
+function selectTagPage(device: FieldDeviceRecord, page: number) {
+  tagPages.value = new Map(tagPages.value).set(keyOf(device), page);
+  closeTrend();
+}
 
 async function loadTags(d: FieldDeviceRecord, quiet = false) {
   const k = keyOf(d);
@@ -131,6 +144,7 @@ async function onScopeChange(v: string) {
   probeNote.value = '';
   expanded.value = new Set();
   tagsOf.value = new Map();
+  serviceScopes.value = new Map(); tagPages.value = new Map(); closeTrend();
   loading.value = true;
   await load();
 }
@@ -190,22 +204,24 @@ const orphanTags = computed(() => (probe.value?.tags ?? []).filter((t) => t.node
 const openTag = ref('');
 const hist = ref<TagHistory | null>(null);
 const histBusy = ref(false);
-const tagKey = (instanceId: string, nodeId: string, tagId: string) =>
-  `${instanceId}\u0000${nodeId}\u0000${tagId}`;
+let historyGeneration = 0;
+function closeTrend() { historyGeneration++; openTag.value = ''; hist.value = null; histBusy.value = false; }
 
-async function toggleTrend(instanceId: string, nodeId: string, tagId: string): Promise<void> {
-  const k = tagKey(instanceId, nodeId, tagId);
-  if (openTag.value === k) { openTag.value = ''; hist.value = null; return; }
+async function toggleTrend(tag: FieldTagRecord): Promise<void> {
+  const k = fieldTagKey(tag);
+  if (openTag.value === k) { closeTrend(); return; }
+  const generation = ++historyGeneration;
   openTag.value = k;
   hist.value = null;
   histBusy.value = true;
   try {
-    hist.value = await api.tagHistory(instanceId, nodeId, tagId);
+    const response = await api.tagHistory(tag.instanceId, tag.nodeId, tag.tagId, 300, tag.serviceCode || '');
+    if ((response.serviceCode ?? '') !== (tag.serviceCode || '')) throw new ApiError(409, '历史记录的服务与当前点位不一致，请刷新后重试');
+    if (generation === historyGeneration) hist.value = response;
   } catch (e) {
-    message.error(e instanceof ApiError ? e.message : '读取趋势失败');
-    openTag.value = '';
+    if (generation === historyGeneration) { message.error(e instanceof ApiError ? e.message : '读取趋势失败'); openTag.value = ''; }
   } finally {
-    histBusy.value = false;
+    if (generation === historyGeneration) histBusy.value = false;
   }
 }
 
@@ -319,13 +335,19 @@ function qualityBad(q: string): boolean {
               <NSpin :show="tagsBusy.has(keyOf(d)) && !tagsOf.has(keyOf(d))" size="small">
                 <NEmpty v-if="(tagsOf.get(keyOf(d)) ?? []).length === 0 && !tagsBusy.has(keyOf(d))"
                         description="这台设备还没有点位" size="small" style="padding: 16px 0" />
-                <table v-else>
+                <div v-else class="service-selector">
+                  <NSelect :value="serviceScopes.get(keyOf(d)) ?? '*'" :options="fieldServiceOptions(tagsOf.get(keyOf(d)) ?? [])"
+                    size="small" :aria-label="`${d.name}的点位服务`" @update:value="selectService(d, $event)" />
+                </div>
+                <table v-if="tagPage(d).total">
                   <thead>
                     <tr><th>点位</th><th>标识</th><th class="r">{{ deviceStatus(d).instanceUnavailable ? '最后采集值' : '当前值' }}</th><th>质量</th><th>更新</th><th></th></tr>
                   </thead>
                   <tbody>
-                    <template v-for="t in (tagsOf.get(keyOf(d)) ?? []).slice(0, TAG_LIMIT)"
-                              :key="t.tagId">
+                    <template v-for="({ value: t }, position) in tagPage(d).items" :key="fieldTagKey(t)">
+                    <tr v-if="position === 0 || tagPage(d).items[position - 1]?.value.serviceCode !== t.serviceCode" class="service-group">
+                      <td colspan="6">{{ fieldServiceLabel(t.serviceCode || '') }}</td>
+                    </tr>
                     <tr>
                       <td>{{ t.name || t.tagId }}</td>
                       <td class="mono muted">{{ t.tagId }}</td>
@@ -342,12 +364,12 @@ function qualityBad(q: string): boolean {
                       <td class="muted" :title="fmtAbs(t.lastAt)">{{ fmtAgo(t.lastAt) }}</td>
                       <td class="r">
                         <NButton size="tiny" quaternary
-                                 @click="toggleTrend(t.instanceId, t.nodeId, t.tagId)">
-                          {{ openTag === tagKey(t.instanceId, t.nodeId, t.tagId) ? '收起' : '趋势' }}
+                                 :aria-label="`${fieldServiceLabel(t.serviceCode || '')} ${t.tagId} 趋势`" @click="toggleTrend(t)">
+                          {{ openTag === fieldTagKey(t) ? '收起' : '趋势' }}
                         </NButton>
                       </td>
                     </tr>
-                    <tr v-if="openTag === tagKey(t.instanceId, t.nodeId, t.tagId)" class="trend">
+                    <tr v-if="openTag === fieldTagKey(t)" class="trend">
                       <td colspan="6">
                         <NSpin :show="histBusy" size="small">
                           <!-- 未启用要说清是配置关掉的，不是采集坏了 -->
@@ -374,10 +396,11 @@ function qualityBad(q: string): boolean {
                     </template>
                   </tbody>
                 </table>
-                <p v-if="(tagsOf.get(keyOf(d)) ?? []).length > TAG_LIMIT" class="more">
-                  这台设备共 {{ (tagsOf.get(keyOf(d)) ?? []).length }} 个点位，
-                  上面只列了前 {{ TAG_LIMIT }} 个。
-                </p>
+                <div v-if="tagPage(d).total" class="tag-pagination">
+                  <span class="hint">第 {{ tagPage(d).start + 1 }}–{{ tagPage(d).end }} 个，共 {{ tagPage(d).total }} 个点位</span>
+                  <NPagination v-if="tagPage(d).pageCount > 1" :page="tagPage(d).page" :page-count="tagPage(d).pageCount" :page-slot="5"
+                    size="small" :aria-label="`${d.name}点位分页`" @update:page="selectTagPage(d, $event)" />
+                </div>
               </NSpin>
             </div>
           </div>
@@ -509,6 +532,9 @@ function qualityBad(q: string): boolean {
 
 .tags { padding: 4px 0 14px 26px; }
 .last-values-note { margin-bottom: 10px; }
+.service-selector { max-width: 420px; margin: 8px 0 12px; }
+.service-group td { color: var(--primary); font-weight: 600; background: var(--sidebar); }
+.tag-pagination { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin: 12px 0; }
 .trend > td { padding: 10px 6px 14px; }
 .trend .hint { margin: 8px 0 0; font-size: 12px; color: var(--text-3); line-height: 1.7; }
 .more, .note, .idle { margin: 10px 0 0; font-size: 12px; color: var(--muted); }

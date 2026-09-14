@@ -9,6 +9,20 @@ const schema: TemplateParameter = { key: 'points', label: '点表', type: 'table
   {key:'scale',label:'倍率',type:'number',default:1,min:-1e12,max:1e12},
   {key:'offset',label:'偏移',type:'number',default:0,min:-1e12,max:1e12},
 ]};
+test('optional service headers may be reordered and same-named points in different services are preserved', () => {
+  const result = previewPointImport('服务编码,属性编码,source,offset,dataType,scale\na,temp,x,0,number,1\nb,temp,y,0,number,2', schema, {});
+  assert.deepEqual(result.issues, []); assert.equal(result.rows.length, 2);
+  assert.equal(result.rows[1]!.point.serviceCode, 'b'); assert.equal(result.rows[1]!.point.scale, 2);
+  const duplicate = previewPointImport('source,property,dataType,scale,offset,serviceCode\na,p,number,1,0,\nb,p,number,1,0,default', schema, { serviceCode: 'default' });
+  assert.match(duplicate.issues.join(), /重复/);
+  const overflow = previewPointImport('source,property,dataType,scale,offset,serviceCode\n' + Array.from({ length: 33 }, (_, i) => `a,p${i},number,1,0,s${i}`).join('\n'), schema, {});
+  assert.match(overflow.issues.join(), /32/);
+});
+test('reserved or malformed service identities cannot be imported', () => {
+  for (const service of ['__proto__', 'constructor', 'prototype', 'bad/service']) {
+    assert.match(previewPointImport(`source,property,dataType,scale,offset,serviceCode\na,p,number,1,0,${service}`, schema, {}).issues.join(), /服务编码/);
+  }
+});
 test('NodeId text identities preserve significant spaces when requested by the recipe', () => {
   const opcSchema={...schema,columns:schema.columns!.map(c=>c.key==='source'?{...c,preserveWhitespace:true}:c)};
   const result=previewPointImport('source,property,dataType,scale,offset\n"ns=2;s=Temperature ",p,number,1,0',opcSchema,{});
@@ -37,6 +51,34 @@ test('bad rows and wrong format cannot replace existing points', () => {
 test('limits and defaults keep import bounded and do not guess numeric values', () => {
   const p=previewPointImport('source,property,dataType,scale,offset\na,p,number,,',schema,{});
   assert.deepEqual(p.issues,[]);assert.equal(p.rows[0]!.point.scale,1);assert.equal(p.rows[0]!.point.offset,0);
-  assert.ok(previewPointImport('x'.repeat(65537),schema,{}).issues.length);
+  assert.ok(previewPointImport('x'.repeat(262145),schema,{}).issues.length);
   assert.ok(previewPointImport('source,property,dataType,scale,offset\n'+Array.from({length:65},(_,i)=>`a,p${i},number,1,0`).join('\n'),schema,{}).issues.length);
+});
+
+test('schema allows all 300 points and rejects 301 without truncating or replacing data', () => {
+  const largeSchema = { ...schema, max: 300 };
+  const text = 'source,property,dataType,scale,offset\n' + Array.from({ length: 300 }, (_, i) => `${'a'.repeat(250)}${i},p${i},number,1,0`).join('\n');
+  const preview = previewPointImport(text, largeSchema, {});
+  assert.deepEqual(preview.issues, []); assert.equal(preview.rows.length, 300);
+  assert.equal(preview.rows.at(-1)?.point.property, 'p299');
+  assert.equal((applyPointImport({ keep: true }, preview).points as unknown[]).length, 300);
+  const overflow = previewPointImport(text + '\na,p300,number,1,0', largeSchema, {});
+  assert.match(overflow.issues.join(), /300/); assert.throws(() => applyPointImport({}, overflow));
+  const narrow = previewPointImport('source,property,dataType,scale,offset\na,a,number,1,0\nb,b,number,1,0', { ...schema, max: 1 }, {});
+  assert.match(narrow.issues.join(), /1/);
+});
+
+test('large imports still reject an oversized source and report the actual last text line', () => {
+  const rows = Array.from({ length: 299 }, (_, i) => `a,p${i},number,1,0`);
+  const preview = previewPointImport('source,property,dataType,scale,offset\n' + [...rows, `${'x'.repeat(257)},last,number,1,0`].join('\n'), { ...schema, max: 300 }, {});
+  assert.match(preview.issues.join(), /第 301 行/);
+  assert.throws(() => applyPointImport({}, preview));
+});
+
+test('CSV quoting overhead fits 300 valid maximum-width sources while field width remains bounded', () => {
+  const source = 'a'.repeat(128) + '"'.repeat(128);
+  const rows = Array.from({ length: 300 }, (_, i) => `"${source.replaceAll('"', '""')}",p${i},number,1,0`);
+  const preview = previewPointImport('source,property,dataType,scale,offset\n' + rows.join('\n'), { ...schema, max: 300 }, {});
+  assert.deepEqual(preview.issues, []); assert.equal(preview.rows.length, 300);
+  assert.equal(preview.rows[299]?.point.source, source);
 });

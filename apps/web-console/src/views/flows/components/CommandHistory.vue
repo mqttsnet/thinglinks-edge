@@ -28,6 +28,7 @@ function nameOf(record: EdgeCommandRecord) {
       <article v-for="record in commands" :key="record.id" class="command-record">
         <div class="record-heading"><b>{{ nameOf(record) }}</b><time>{{ localTime(record.createdAt) }}</time></div>
         <div class="record-states">
+          <NTag size="small" :bordered="false">服务：{{ record.serviceCode }}</NTag>
           <NTag size="small" :type="commandStatus(record.status).type">{{ commandStatus(record.status).label }}</NTag>
           <NTag size="small" :type="record.modelChecked ? 'info' : 'default'">{{ record.modelChecked ? '已执行模型校验' : '未同步模型校验' }}</NTag>
           <NTag size="small" :type="commandReplyStatus(record).type">{{ commandReplyStatus(record).label }}</NTag>

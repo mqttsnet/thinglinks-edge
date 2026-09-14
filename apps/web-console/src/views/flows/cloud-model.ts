@@ -1,4 +1,5 @@
 import type { CloudProductModel, TemplateParameter } from '../../api/types.ts';
+import { effectiveService, servicePointKey, validServiceCode, MAX_TEMPLATE_SERVICES } from './service-identity.ts';
 export type ModelFieldOption = { label: string; value: string };
 export type ModelOptionResolver = (key: string, table?: string, row?: Record<string, unknown>) => ModelFieldOption[];
 const text = (value: unknown) => typeof value === 'string' ? value.trim() : '';
@@ -14,8 +15,9 @@ export function modelFieldOptions(
   table?: string, row: Record<string, unknown> = {},
 ): ModelFieldOption[] {
   const services = model?.services ?? [];
-  const service = services.find((item) => item.serviceCode === values.serviceCode);
-  if (!table && key === 'serviceCode') return services.map((item) => named(item.serviceCode, item.serviceName));
+  const code = effectiveService(row.serviceCode, values.serviceCode);
+  const service = services.find((item) => item.serviceCode === code);
+  if (key === 'serviceCode' || table === 'commands' && key === 'targetServiceCode') return services.map((item) => named(item.serviceCode, item.serviceName));
   if (table === 'points' && key === 'property') return (service?.properties ?? []).map((item) => named(item.propertyCode, item.propertyName, item.datatype));
   if (table !== 'commands') return [];
   if (key === 'cmd') return (service?.commands ?? []).map((item) => named(item.commandCode, item.commandName));
@@ -25,30 +27,47 @@ export function modelFieldOptions(
       item.min !== undefined && item.min !== '' ? `最小 ${item.min}` : '',
       item.max !== undefined && item.max !== '' ? `最大 ${item.max}` : '',
     ].filter(Boolean).join(' · ')));
-  if (key === 'property') return [...new Set(rows(values.points).map((point) => text(point.property)).filter(Boolean))]
-    .map((code) => named(code, service?.properties?.find((item) => item.propertyCode === code)?.propertyName));
+  if (key === 'property') {
+    const targetCode = effectiveService(row.targetServiceCode, code);
+    const target = services.find(item => item.serviceCode === targetCode);
+    return [...new Set(rows(values.points).filter(point => effectiveService(point.serviceCode, values.serviceCode) === targetCode)
+      .map((point) => text(point.property)).filter(Boolean))]
+      .map((property) => named(property, target?.properties?.find((item) => item.propertyCode === property)?.propertyName));
+  }
   return [];
 }
 
 /** Warnings describe only a comparison with the selected product model, never runtime verification. */
 export function mappingIssues(values: Record<string, unknown>, model: CloudProductModel | null): string[] {
-  if (!model) return [];
-  const code = text(values.serviceCode);
-  const service = model.services?.find((item) => item.serviceCode === code);
-  if (!service) return code ? [`服务 ${code} 未在本次读取的物模型中找到，请核对产品和版本。`] : [];
   const issues: string[] = [];
   const points = rows(values.points);
+  const groups = new Set<string>(), identities = new Set<string>();
   for (const [index, point] of points.entries()) {
-    const property = text(point.property);
-    if (property && !service.properties?.some((item) => item.propertyCode === property)) issues.push(`点位 ${index + 1} 的属性 ${property} 未在所选服务中找到。`);
+    const property = text(point.property), code = effectiveService(point.serviceCode, values.serviceCode);
+    if (!code) { issues.push(`点位 ${index + 1} 尚未选择服务，请填写行内服务或默认服务。`); continue; }
+    if (!validServiceCode(code)) { issues.push(`点位 ${index + 1} 的服务编码格式无效。`); continue; }
+    groups.add(code);
+    const identity = servicePointKey(code, property);
+    if (property && identities.has(identity)) issues.push(`点位 ${index + 1} 的 ${code} / ${property} 重复。`);
+    identities.add(identity);
+    const service = model?.services?.find(item => item.serviceCode === code);
+    if (model && !service) issues.push(`点位 ${index + 1} 的服务 ${code} 未在本次物模型中找到。`);
+    else if (model && property && !service?.properties?.some((item) => item.propertyCode === property)) issues.push(`点位 ${index + 1} 的属性 ${property} 未在服务 ${code} 中找到。`);
   }
   if (values.downlinkEnabled === true) for (const [index, row] of rows(values.commands).entries()) {
     const cmd = text(row.cmd), param = text(row.param), property = text(row.property);
-    const command = service.commands?.find((item) => item.commandCode === cmd);
-    if (cmd && !command) issues.push(`命令映射 ${index + 1} 的命令 ${cmd} 未在所选服务中找到。`);
-    else if (param && !command?.requests?.some((item) => item.parameterCode === param)) issues.push(`命令映射 ${index + 1} 的参数 ${param} 不属于命令 ${cmd}。`);
-    if (property && !points.some((point) => point.property === property)) issues.push(`命令映射 ${index + 1} 的目标属性 ${property} 没有对应采集点位。`);
+    const code = effectiveService(row.serviceCode, values.serviceCode), targetCode = effectiveService(row.targetServiceCode, code);
+    if (!code) { issues.push(`命令映射 ${index + 1} 尚未选择命令所属服务。`); continue; }
+    if (!validServiceCode(code) || !validServiceCode(targetCode)) { issues.push(`命令映射 ${index + 1} 的命令或目标服务编码格式无效。`); continue; }
+    groups.add(code);
+    const service = model?.services?.find(item => item.serviceCode === code);
+    const command = service?.commands?.find((item) => item.commandCode === cmd);
+    if (model && !service) issues.push(`命令映射 ${index + 1} 的服务 ${code} 未在本次物模型中找到。`);
+    else if (model && cmd && !command) issues.push(`命令映射 ${index + 1} 的命令 ${cmd} 未在服务 ${code} 中找到。`);
+    else if (model && param && !command?.requests?.some((item) => item.parameterCode === param)) issues.push(`命令映射 ${index + 1} 的参数 ${param} 不属于服务 ${code} 的命令 ${cmd}。`);
+    if (property && !identities.has(servicePointKey(targetCode, property))) issues.push(`命令映射 ${index + 1} 的目标 ${targetCode} / ${property} 没有对应采集点位。`);
   }
+  if (groups.size > MAX_TEMPLATE_SERVICES) issues.push(`当前配置涉及 ${groups.size} 个服务，最多 ${MAX_TEMPLATE_SERVICES} 个；请拆分为多个流程。`);
   return issues;
 }
 

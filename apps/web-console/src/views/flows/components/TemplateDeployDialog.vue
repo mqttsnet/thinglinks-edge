@@ -123,7 +123,7 @@ defineExpose({ open: (template: FlowTemplate) => open(template) });
           <ProtocolConnectionGuide v-else-if="otherProtocol" :source-id="otherProtocol" :values="parameters" :instance="selectedInstance" />
         </template>
         <template #point-assist>
-          <ModbusPointImport v-if="modbus" v-model:values="parameters" :disabled="formBusy" />
+          <ModbusPointImport v-if="modbus && pointSchema" :schema="pointSchema" v-model:values="parameters" :disabled="formBusy" />
           <ProtocolPointImport v-else-if="otherProtocol && pointSchema" :schema="pointSchema" v-model:values="parameters" :disabled="formBusy" />
         </template>
       </TemplateParameters>

@@ -7,7 +7,7 @@ test('read configuration is independent of Cloud identity and rejects invalid re
   assert.equal(valid.connection?.host, '192.0.2.10');
   assert.equal(valid.connection?.clientTimeout, 2000);
   assert.deepEqual(valid.issues, []);
-  for (const change of [{ host: '' }, { quantity: 126 }, { address: 65535, quantity: 2 }, { unitId: -1 }, { unitId: 256 }]) {
+  for (const change of [{ host: '' }, { quantity: 601 }, { address: 65535, quantity: 2 }, { unitId: -1 }, { unitId: 256 }]) {
     assert.equal(modbusReadConnection({ ...valid.connection, ...change }).connection, undefined);
   }
   for (const unitId of [0, 255]) assert.equal(modbusReadConnection({ ...valid.connection, unitId }).connection?.unitId, unitId);
@@ -29,6 +29,14 @@ test('previews signed values, floats and scaling from the actual register sample
   assert.deepEqual(result.map(row => row.raw), [250, -12, 3.5]);
 });
 
+test('read previews keep the effective service on same-named properties', () => {
+  const result = previewRegisterPoints([10, 20], [
+    { source: '0', property: 'temperature', dataType: 'uint16be' },
+    { source: '1', property: 'temperature', serviceCode: 'other', dataType: 'uint16be' },
+  ], 'default');
+  assert.deepEqual(result.map(row => [row.serviceCode, row.property, row.value]), [['default', 'temperature', 10], ['other', 'temperature', 20]]);
+});
+
 test('supports every existing Modbus endian type without silently replacing invalid values', () => {
   const cases: [string, number[], number][] = [
     ['uint16be', [0x1234], 0x1234], ['uint16le', [0x1234], 0x3412],
@@ -46,4 +54,17 @@ test('supports every existing Modbus endian type without silently replacing inva
     assert.ok(row.error); assert.equal(row.value, undefined);
   }
   assert.ok(previewRegisterPoints([NaN], [{ source: '0', dataType: 'uint16be' }])[0]?.error);
+});
+
+test('calculated preview retains all 300 point rows including values beyond the first 125 registers', () => {
+  const registers = Array.from({ length: 300 }, (_, i) => i + 100);
+  const points = registers.map((_, i) => ({ property: `p${i}`, source: String(i), dataType: 'uint16be' }));
+  const result = previewRegisterPoints(registers, points);
+  assert.equal(result.length, 300); assert.equal(result[299]?.value, 399);
+  assert.ok(result.every(row => !row.error));
+});
+
+test('one diagnostic configuration can read the full 600-register range', () => {
+  assert.equal(modbusReadConnection({ host: 'meter.local', quantity: 600 }).connection?.quantity, 600);
+  assert.equal(modbusReadConnection({ host: 'meter.local', quantity: 601 }).connection, undefined);
 });

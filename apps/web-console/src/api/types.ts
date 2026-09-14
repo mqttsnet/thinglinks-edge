@@ -220,6 +220,7 @@ export interface NodeSearchHit {
 
 /** 点位历史的一段 */
 export interface TagHistory {
+  serviceCode: string;
   /**
    * 本部署有没有开点位历史。false 时 points 必为空，界面要说明「未启用」
    * 而不是画一张空图 —— 空图会让人以为是采集坏了。
@@ -545,6 +546,8 @@ export interface FieldDeviceRecord {
 export interface FieldTagRecord {
   instanceId: string;
   nodeId: string;
+  /** Empty means a legacy record whose service was not recorded. */
+  serviceCode: string;
   tagId: string;
   name: string;
   unit: string;

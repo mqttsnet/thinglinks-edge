@@ -11,7 +11,7 @@ test('shows real protocol range and conventional manual references separately', 
 
 test('does not invent five-digit manual addresses or valid ranges for invalid inputs', () => {
   assert.equal(reviewModbusConnection({address:65535,quantity:1,registerType:'HoldingRegister'}).range?.reference,undefined);
-  for(const values of [{address:65535,quantity:2},{address:0.5,quantity:2},{address:0,quantity:126}]) {
+  for(const values of [{address:65535,quantity:2},{address:0.5,quantity:2},{address:0,quantity:601}]) {
     const result=reviewModbusConnection({...values,registerType:'HoldingRegister'});
     assert.equal(result.range,undefined);
     assert.ok(result.notices.some(n=>n.code==='invalid-range'));
@@ -26,4 +26,11 @@ test('loopback addresses describe the instance and timing warnings preserve lega
   assert.ok(reviewModbusConnection({interval:1}).notices.some(n=>n.code==='slow-polling'));
   assert.equal(reviewModbusConnection({interval:5,clientTimeout:2000}).notices.some(n=>n.code==='slow-polling'),false);
   assert.ok(reviewModbusConnection({interval:5,clientTimeout:5000}).notices.some(n=>n.code==='slow-polling'));
+});
+
+test('600-register range explains five sequential reads without changing the configured target', () => {
+  const result = reviewModbusConnection({ address: 100, quantity: 600, registerType: 'HoldingRegister', interval: 5, clientTimeout: 2000 });
+  assert.equal(result.range?.end, 699); assert.equal(result.batchCount, 5);
+  assert.ok(result.notices.some(notice => notice.code === 'slow-polling'));
+  assert.equal(reviewModbusConnection({ address: 0, quantity: 601, registerType: 'HoldingRegister' }).range, undefined);
 });

@@ -17,6 +17,7 @@ function update(key: string, value: unknown) { emit('update:values', { ...props.
         <p v-if="field.disabledReason" class="hint" role="note">{{ field.disabledReason }}<template v-if="field.type === 'boolean' && values[field.key] === true">。该副本仍保留开启值，可关闭后继续配置采集。</template></p>
         <p v-else-if="field.description" class="hint">{{ field.description }}</p>
         <ParameterTable v-if="field.type === 'table'" :field="field" :value="values[field.key]" :disabled="disabled || Boolean(field.disabledReason)"
+          :default-service="typeof values.serviceCode === 'string' ? values.serviceCode : ''"
           :options-for="optionsFor" @update:value="update(field.key, $event)" />
         <ParameterScalar v-else :field="field" :value="values[field.key]" :disabled="disabled"
           :suggestions="optionsFor?.(field.key) ?? []" @update:value="update(field.key, $event)" />

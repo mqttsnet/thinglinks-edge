@@ -1,8 +1,10 @@
+export const MAX_POINT_IMPORT_TEXT_LENGTH = 262_144;
+
 export interface TextRow { cells: string[]; line: number }
 
 /** A bounded RFC-style CSV/Excel TSV parser; quoted separators/newlines stay within a cell. */
 export function parseRows(text: string, trimCells = true): TextRow[] {
-  if (text.length > 65536) throw new Error('点表文本超过 64 Ki 字符，请拆分后导入。');
+  if (text.length > MAX_POINT_IMPORT_TEXT_LENGTH) throw new Error('点表文本超过 256 Ki 字符，请拆分后导入。');
   const delimiter = text.slice(0, text.indexOf('\n') < 0 ? undefined : text.indexOf('\n')).includes('\t') ? '\t' : ',';
   const rows: TextRow[] = [];
   let cells: string[] = [], cell = '', quoted = false, closedQuote = false;
