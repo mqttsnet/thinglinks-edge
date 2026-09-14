@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Script } from 'node:vm';
+import { Script, runInNewContext } from 'node:vm';
 import { getBuiltinTemplate, renderBuiltinTemplate } from './catalog.ts';
 import { parameterDefaults } from './parameters.ts';
 
@@ -66,6 +66,34 @@ test('control rejects undeclared properties, duplicate commands, zero scale and 
   );
 });
 
+test('multi-service S7 commands use one private controller and the same raw aliases as its one endpoint', () => {
+  const flow = renderBuiltinTemplate('builtin:s7', {
+    ...params('builtin:s7'), serviceCode: '',
+    points: [
+      { serviceCode: 'motor', property: 'speed', source: 'DB1,WORD0', dataType: 'number', scale: 1, offset: 0 },
+      { serviceCode: 'fan', property: 'speed', source: 'DB1,WORD2', dataType: 'number', scale: 2, offset: 0 },
+    ],
+    commands: [
+      { serviceCode: 'motor', cmd: 'set', param: 'value', property: 'speed' },
+      { serviceCode: 'fan', cmd: 'set', param: 'value', property: 'speed' },
+    ],
+  })!.flows;
+  assert.equal(flow.filter(node => node.id === 'control-controller').length, 1);
+  assert.equal(flow.filter(node => node.type === 's7 out').length, 1);
+  const controller = flow.find(node => node.id === 'control-controller')!;
+  assert.match(String(controller.initialize), /globalThis/);
+  assert.doesNotMatch(String(controller.func), /flow\.(get|set)/);
+  assert.deepEqual((controller.wires as string[][])[5], ['control-writer']);
+  const encoder = flow.find(node => node.id === 'control-encode')!;
+  assert.deepEqual(encoder.wires, [['control-controller']], 'encoded writes return to the lease/generation gate');
+  const msg = { payload: { command: { id: 'service-write', leaseToken: 'lease-fixture', leaseDeadline: Date.now() + 30000,
+    deviceIdentification: 'plc-1', serviceCode: 'fan', cmd: 'set', params: { value: 20 } } } };
+  const encoded = runInNewContext(`(function(msg){${String(encoder.func)}})(msg)`, { msg, Buffer, URL,
+    node: { error(message: string) { assert.fail(message); } } });
+  assert.equal(encoded.variable, 'raw_1'); assert.equal(encoded.payload, 10); assert.equal(encoded._tlePrepared, true);
+  assert.equal(encoded._tleWriteAttempted, false);
+});
+
 
 test('OPC UA remains acquisition-capable but declares unavailable control and refuses enabling it', () => {
   const template = getBuiltinTemplate('builtin:opcua')!;
@@ -89,7 +117,7 @@ test('Modbus acquisition stays available but late-write risk disables and reject
   assert.equal(commands.disabledReason, toggle.disabledReason);
   assert.throws(() => renderBuiltinTemplate(template.id, params(template.id)), /Modbus.*采集.*断网.*迟到/);
   const read = renderBuiltinTemplate(template.id, { ...params(template.id), downlinkEnabled: false })!;
-  assert.ok(read.flows.some(node => node.type === 'modbus-read'));
+  assert.ok(read.flows.some(node => node.type === 'modbus-flex-getter'));
   assert.ok(read.flows.some(node => node.type === 'tl-uplink'));
   assert.equal(read.flows.some(node => node.type === 'modbus-flex-write' || node.id === 'control-poll'), false);
   assert.ok(read.requirements!.some(requirement => requirement.module === 'node-red-contrib-modbus' && requirement.version === '5.60.2'));

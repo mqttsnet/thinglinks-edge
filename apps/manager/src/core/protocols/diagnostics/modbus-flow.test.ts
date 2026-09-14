@@ -4,34 +4,38 @@ import vm from 'node:vm';
 import { buildModbusDiagnosticFlow, modbusDiagnosticFingerprint } from './modbus-flow.ts';
 
 const config = () => ({ taskId: 'a7a4cb4f-f633-48d9-87ea-9b2681d6a642', readerId: 'a5902e04-040f-4145-98c9-a0e40d86c2a7',
-  host: '192.0.2.10', port: 502, unitId: 1, registerType: 'HoldingRegister' as const,
+  host: '192.0.2.10', port: 502, unitId: 1, registerType: 'HoldingRegister' as 'HoldingRegister' | 'InputRegister',
   address: 100, quantity: 2, clientTimeout: 1000, reconnectTimeout: 500, expiresAt: 30_000 });
-function harness() {
-  const built = buildModbusDiagnosticFlow(config());
+function harness(overrides: Partial<ReturnType<typeof config>> = {}) {
+  const settings = { ...config(), ...overrides };
+  const built = buildModbusDiagnosticFlow(settings);
   const fn = built.flow.nodes.find(node => node.type === 'function')!;
   const store = new Map<string, unknown>(); let now = 1000;
   const sandbox = vm.createContext({ flow: { get: (key: string) => store.get(key), set: (key: string, value: unknown) => store.set(key, value) },
     env: { get: (key: string) => key === 'TLE_MANAGER_URL' ? 'http://manager:9100' : 'fixture-ingest-token' },
     Date: { now: () => now }, node: { error: () => undefined }, msg: {} });
+  vm.runInContext(`(function(){${String(fn.initialize)}})()`, sandbox);
   return { built, now: (value: number) => { now = value; },
     run: (msg: Record<string, unknown>) => {
-      sandbox.msg = structuredClone(msg);
+      sandbox.msg = structuredClone({ ...msg, ...(Array.isArray(msg.payload) ? {
+        modbusRequest: { fc: settings.registerType === 'HoldingRegister' ? 3 : 4, unitid: settings.unitId, address: settings.address, quantity: settings.quantity },
+      } : {}) });
       return vm.runInContext(`(function(){${String(fn.func)}})()`, sandbox) as (Record<string, unknown> | null)[] | null;
     },
   };
 }
 function ready(h: ReturnType<typeof harness>) {
-  const getter = h.built.flow.nodes.find(node => node.type === 'modbus-getter')!;
+  const getter = h.built.flow.nodes.find(node => node.type === 'modbus-flex-getter')!;
   return h.run({ status: { source: { id: getter.id }, fill: 'green', shape: 'dot', text: 'active' } });
 }
 function claimed(h: ReturnType<typeof harness>, request: Record<string, unknown>, deadline = 10_000) {
   return h.run({ ...request, statusCode: 200, payload: { leaseToken: 'a'.repeat(43), deadline } });
 }
 
-test('diagnostic uses fixed official getter and tab-private client without cloud nodes or stored credentials', () => {
+test('diagnostic uses fixed official flex getter and tab-private client without cloud nodes or stored credentials', () => {
   const { flow, nodeIds, fingerprint } = buildModbusDiagnosticFlow(config());
-  const getter = flow.nodes.find(node => node.type === 'modbus-getter')!;
-  assert.equal(getter.dataType, 'HoldingRegister'); assert.equal(getter.adr, '100'); assert.equal(getter.quantity, '2');
+  const getter = flow.nodes.find(node => node.type === 'modbus-flex-getter')!;
+  assert.equal(getter.dataType, undefined); assert.equal(getter.adr, undefined); assert.equal(getter.quantity, undefined);
   assert.equal(getter.keepMsgProperties, true); assert.equal(getter.delayOnStart, false);
   assert.equal(flow.configs?.[0]?.bufferCommands, false);
   assert.equal(flow.configs?.[0]?.z, flow.id);
@@ -44,20 +48,22 @@ test('diagnostic uses fixed official getter and tab-private client without cloud
   assert.throws(() => buildModbusDiagnosticFlow({ ...config(), registerType: 'Coil' as 'HoldingRegister' }));
 });
 
-test('native TCP getter preserves Unit ID 0 and 255 in both its private client and fixed read configuration', () => {
+test('native TCP flex getter preserves Unit ID 0 and 255 in both its private client and dynamic request', () => {
   for (const unitId of [0, 248, 255]) {
     for (const registerType of ['HoldingRegister', 'InputRegister'] as const) {
       const { flow } = buildModbusDiagnosticFlow({ ...config(), unitId, registerType });
       assert.equal(flow.configs?.[0]?.unit_id, unitId);
-      const getter = flow.nodes.find(node => node.type === 'modbus-getter')!;
-      assert.equal(getter.unitid, String(unitId)); assert.equal(getter.dataType, registerType);
+      const h = harness({ unitId, registerType });
+      const read = claimed(h, ready(h)![0]!)![1]!;
+      assert.deepEqual(JSON.parse(JSON.stringify(read.payload)), { fc: registerType === 'HoldingRegister' ? 3 : 4,
+        unitid: unitId, address: 100, quantity: 2 });
     }
   }
   for (const unitId of [-1, 256, 0.5]) assert.throws(() => buildModbusDiagnosticFlow({ ...config(), unitId }));
 });
 
 test('getter must report active, not merely connected, before a bounded claim and one read', () => {
-  const h = harness(); const getter = h.built.flow.nodes.find(node => node.type === 'modbus-getter')!;
+  const h = harness(); const getter = h.built.flow.nodes.find(node => node.type === 'modbus-flex-getter')!;
   assert.equal(h.run({ _tleDiagnosticTick: true }), null);
   assert.equal(h.run({ status: { source: { id: getter.id }, fill: 'green', shape: 'ring', text: 'connected' } }), null);
   const request = ready(h)![0]!;
@@ -65,7 +71,7 @@ test('getter must report active, not merely connected, before a bounded claim an
   assert.deepEqual(JSON.parse(JSON.stringify(request.payload)), { readerId: config().readerId });
   assert.equal(ready(h), null);
   const read = claimed(h, request)![1]!;
-  assert.deepEqual(JSON.parse(JSON.stringify(read.payload)), {});
+  assert.deepEqual(JSON.parse(JSON.stringify(read.payload)), { fc: 3, unitid: 1, address: 100, quantity: 2 });
   assert.equal(claimed(h, request), null, 'duplicate HTTP replies must not read twice');
   assert.equal(ready(h), null);
   h.now(1500);
@@ -96,7 +102,7 @@ test('read failures and deadlines report bounded codes instead of raw device err
   for (const [error, code] of [['connect ECONNREFUSED user:secret', 'CONNECT_FAILED'], ['device timeout token=secret', 'READ_TIMEOUT'], ['exception function=99', 'READ_FAILED']]) {
     const h = harness(), request = ready(h)![0]!, read = claimed(h, request)![1]!;
     h.now(1500);
-    const report = h.run({ ...read, error: { message: error, source: { id: h.built.flow.nodes.find(node => node.type === 'modbus-getter')!.id } } })![2]!;
+    const report = h.run({ ...read, error: { message: error, source: { id: h.built.flow.nodes.find(node => node.type === 'modbus-flex-getter')!.id } } })![2]!;
     assert.equal((report.payload as Record<string, unknown>).errorCode, code);
     assert.doesNotMatch(JSON.stringify(report.payload), /secret|function=99/);
   }
@@ -166,7 +172,7 @@ test('fingerprint tolerates assigned tab id/order/runtime users but rejects chan
   const built = buildModbusDiagnosticFlow(config());
   const assigned = structuredClone(built.flow); assigned.id = 'assigned-by-node-red';
   for (const node of [...assigned.nodes, ...assigned.configs!]) node.z = assigned.id;
-  assigned.nodes.reverse(); assigned.configs![0]!._users = [assigned.nodes.find(node => node.type === 'modbus-getter')!.id];
+  assigned.nodes.reverse(); assigned.configs![0]!._users = [assigned.nodes.find(node => node.type === 'modbus-flex-getter')!.id];
   assert.equal(modbusDiagnosticFingerprint(assigned), built.fingerprint);
   assigned.nodes[0]!.name = 'user edited';
   assert.notEqual(modbusDiagnosticFingerprint(assigned), built.fingerprint);

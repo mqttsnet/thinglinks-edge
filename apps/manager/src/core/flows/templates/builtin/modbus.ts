@@ -1,5 +1,7 @@
 import { TemplateError } from '../../types.ts';
 import type { TemplateRecipe } from '../types.ts';
+import { MAX_MODBUS_REGISTERS, modbusReadDurationMs } from '../modbus-read-plan.ts';
+import { modbusAcquisitionScript, MODBUS_ACQUISITION_INITIALIZE, MODBUS_ACQUISITION_FINALIZE } from '../modbus-acquisition.ts';
 import {
   identityFields,
   hostField,
@@ -13,6 +15,8 @@ import {
   host,
   pipeline,
   pointsOf,
+  functionNode,
+  injectNode,
 } from './common.ts';
 
 export const modbusRecipe: TemplateRecipe = {
@@ -21,7 +25,7 @@ export const modbusRecipe: TemplateRecipe = {
   description: '读取保持/输入寄存器，支持多点位、有符号数、浮点数与常见字节序。',
   category: 'industrial',
   protocols: ['modbus-tcp'],
-  revision: '1.2.0',
+  revision: '1.3.0',
   previewParameters: { host: '192.0.2.1' },
   controlSupported: false,
   requirements: requirements('modbus-tcp'),
@@ -66,12 +70,12 @@ export const modbusRecipe: TemplateRecipe = {
       type: 'number',
       default: 2,
       min: 1,
-      max: 125,
-      description: '一次读取的连续 16 位寄存器数量，不是点位数量。16 位点位占 1 个寄存器，32 位点位占 2 个；读取范围必须覆盖所有点位。',
+      max: MAX_MODBUS_REGISTERS,
+      description: '一轮读取的连续 16 位寄存器总量，最多 600，不是点位数量。16 位点位占 1 个寄存器，32 位点位占 2 个；超过 125 时自动串行分批，整轮成功后统一上报。',
     },
     {
       ...intervalField,
-      description: '建议大于高级设置中的读取超时。周期短于超时时，慢响应可能造成请求积压；系统保留填写的周期，不会自动调整。',
+      description: '建议大于整轮分批读取的耗时。上一轮未结束时跳过本次触发，不积压请求；每批读取超时在高级设置调整。',
     },
     {
       key: 'clientTimeout',
@@ -100,6 +104,8 @@ export const modbusRecipe: TemplateRecipe = {
   ],
   notes: [
     ...notes,
+    '连续范围最多 600 个寄存器，每个原生请求最多 125 个，使用同一连接逐批读取。任一批失败或超时会丢弃整轮，后续周期重新读取；不会把不同轮次的数据拼在一起上报。',
+    '范围中的空隙也会被读取。分批不是 PLC 同一时刻的原子快照；变化快速、要求多寄存器一致性的设备需使用其锁存或快照机制。',
     '有效寄存器采样维持在线；明确连接失败或持续重连窗口后上报离线。寄存器异常、点位配置错误和数据质量错误不直接等同于设备断线。',
     '点位偏移相对于本次读取的起始地址；16 位占 1 个寄存器，32 位占 2 个。设备手册中的 40001 常对应地址 0，须按设备说明确认。',
   ],
@@ -144,7 +150,7 @@ export const modbusRecipe: TemplateRecipe = {
           type: 'modbus-client',
           name: 'Modbus 连接',
           clienttype: 'tcp',
-          bufferCommands: true,
+          bufferCommands: false,
           stateLogEnabled: false,
           queueLogEnabled: false,
           failureLogEnabled: true,
@@ -158,9 +164,14 @@ export const modbusRecipe: TemplateRecipe = {
           reconnectTimeout,
           parallelUnitIdsAllowed: false,
         },
+        { ...injectNode('modbus-poll', Number(p.interval), [['modbus-cycle']]),
+          props: [{ p: '_tleModbusPoll', v: 'true', vt: 'bool' }] },
+        { ...functionNode('modbus-cycle', '分批读取与整轮确认', modbusAcquisitionScript({
+          address, quantity, unitId: integer(p.unitId, '站号'), fc: p.registerType === 'InputRegister' ? 4 : 3, clientTimeout,
+        }), [['input'], ['decode']]), initialize: MODBUS_ACQUISITION_INITIALIZE, finalize: MODBUS_ACQUISITION_FINALIZE },
         {
           id: 'input',
-          type: 'modbus-read',
+          type: 'modbus-flex-getter',
           z: 'tab',
           name: '读取寄存器',
           topic: '',
@@ -168,28 +179,25 @@ export const modbusRecipe: TemplateRecipe = {
           logIOActivities: false,
           showErrors: true,
           showWarnings: true,
-          unitid: String(p.unitId),
-          dataType: p.registerType,
-          adr: String(address),
-          quantity: String(quantity),
-          rate: String(p.interval),
-          rateUnit: 's',
-          delayOnStart: true,
+          delayOnStart: false,
           startDelayTime: 1,
           server: 'connection',
           useIOFile: false,
           ioFile: '',
           useIOForPayload: false,
-          emptyMsgOnFail: false,
+          emptyMsgOnFail: true,
+          keepMsgProperties: true,
           enableDeformedMessages: false,
           x: 160,
           y: 160,
-          wires: [['decode'], []],
+          wires: [['modbus-cycle'], []],
         },
+        { id: 'modbus-read-errors', type: 'catch', z: 'tab', name: '终止失败的采集轮次', scope: ['input'], uncaught: false,
+          x: 160, y: 410, wires: [['modbus-cycle']] },
       ],
       'registers',
       pointsOf(p),
-      { protocol: 'modbus', sourceIds: ['input', 'connection'], failureWindowMs: Math.ceil(Math.max(10000, Number(p.interval) * 3000 + clientTimeout)) },
+      { protocol: 'modbus', sourceIds: ['input', 'connection'], failureWindowMs: Math.ceil(Math.max(10000, Number(p.interval) * 3000 + modbusReadDurationMs(quantity, clientTimeout))) },
     );
   },
 };

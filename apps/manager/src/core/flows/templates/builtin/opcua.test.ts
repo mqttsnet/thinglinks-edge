@@ -22,7 +22,7 @@ test('compatibility NodeId errors identify the affected row and reject nonstanda
   for (const source of ['ns=65536;i=1', 'ns=1;i=1oops', 'ns=1;i=4294967296', 'ns=1;g=not-a-guid', 'ns=1;b=%%%=', 'ns=1;s=Temp;datatype=Float', 'ns=1;s=Temp\u0000']) {
     assert.throws(() => renderBuiltinTemplate(opcuaRecipe.id, configuration({ points: [point(source)] })), /第 1 行.*temperature.*NodeId/);
   }
-  assert.throws(() => renderBuiltinTemplate(opcuaRecipe.id, configuration({ points: [point('i=42'), point('ns=0;i=42', 'Double', { property: 'copy' })] })), /第 2 行.*copy.*重复/);
+  assert.throws(() => renderBuiltinTemplate(opcuaRecipe.id, configuration({ points: [point('i=42'), point('ns=0;i=42', 'Float', { property: 'copy' })] })), /第 2 行.*copy.*原始数据类型/);
 });
 
 test('compatibility preserves anonymous read/subscription and rejects ignored scalar conversion settings', () => {

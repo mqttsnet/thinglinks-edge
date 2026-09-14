@@ -49,12 +49,12 @@ function scalarConversion(point: Record<string, unknown>): void {
 
 /** Normalize the actual targets once, so read, control and returned parameterValues use one identity. */
 export function normalizeOpcuaPoints(points: Record<string, unknown>[]): Record<string, unknown>[] {
-  const seen = new Set<string>();
+  const types = new Map<string, unknown>();
   return points.map((point, index) => {
     try {
       const source = normalizeOpcuaNodeId(point.source);
-      if (seen.has(source)) throw new TemplateError('OPC UA NodeId 重复，同一变量请只配置一次');
-      scalarConversion(point); seen.add(source);
+      if (types.has(source) && types.get(source) !== point.dataType) throw new TemplateError('同一 OPC UA NodeId 的原始数据类型必须一致；可分别配置服务、属性和倍率');
+      scalarConversion(point); types.set(source, point.dataType);
       return { ...point, source };
     } catch (error) { throw new TemplateError(`${rowLabel(point, index)}：${(error as Error).message}`); }
   });

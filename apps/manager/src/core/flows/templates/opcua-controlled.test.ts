@@ -17,7 +17,7 @@ function vm(script: unknown, msg: Record<string, unknown>) {
   const result = runInNewContext(`(function(msg){${String(script)}})(msg)`, { msg, Buffer, Date, node: { error: (message: string) => errors.push(message) } });
   return { result, errors };
 }
-const readResult = (value: unknown = 25) => ({ payload: [{ nodeId: 'ns=1;s=Temperature', alias: 'temperature', value, statusCode: 'Good', sourceTimestamp: '2026-09-10T00:00:00Z' }], opcua: { operation: 'read', total: 1, good: 1, resultDetail: 'compact' } });
+const readResult = (value: unknown = 25) => ({ payload: [{ nodeId: 'ns=1;s=Temperature', alias: 'raw_0', value, statusCode: 'Good', sourceTimestamp: '2026-09-10T00:00:00Z' }], opcua: { operation: 'read', total: 1, good: 1, resultDetail: 'compact' } });
 function writable() { return configured({ downlinkEnabled: true, commands: [{ cmd: 'set_temperature', param: 'value', property: 'temperature' }] }); }
 function writeInput(deadline = Date.now() + 30000, value: unknown = 31) {
   return { payload: { command: { id: 'c-1', leaseToken: 'l-1', deviceIdentification: 'opcua-device', serviceCode: 'telemetry', cmd: 'set_temperature', params: { value }, leaseDeadline: deadline } } };
@@ -35,7 +35,7 @@ test('template uses only existing tier0 0.6.0 nodes and retains the legacy OPC a
   const read = template.flows.find(n => n.type === 'tier0-opcua-read')!;
   assert.equal(read.connection, 'connection');
   assert.equal(read.resultDetail, 'compact'); assert.equal(read.outputMode, 'batch');
-  assert.deepEqual(JSON.parse(String(read.pointList)), [{ nodeId: 'ns=1;s=Temperature', alias: 'temperature' }]);
+  assert.deepEqual(JSON.parse(String(read.pointList)), [{ nodeId: 'ns=1;s=Temperature', alias: 'raw_0' }]);
 });
 
 test('certificate and key paths map to actual tier0 fields, while passwords stay out of templates', () => {

@@ -24,7 +24,7 @@ export const tcpRecipe: TemplateRecipe = {
   description: '接收设备推送或连接设备，按换行/固定长度分帧，解析点位后上报。',
   category: 'network',
   protocols: ['tcp'],
-  revision: '1.2.0',
+  revision: '1.3.0',
   requirements: requirements('tcp'),
   parameters: [
     ...identityFields,

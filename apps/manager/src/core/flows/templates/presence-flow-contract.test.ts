@@ -33,7 +33,7 @@ test('generated S7 observer bootstrap, decoded sample/report:false and renew mat
     const started = execute(observer.func, { _msgid: 'unique-runtime', _tlePresenceTick: true });
     const challenge = await request(started[1]); await request(challenge[1]);
     const sendSample = async () => {
-      const decoded = execute(nodes.find(n => n.id === 'decode')!.func, { payload: { temperature: 503 } });
+      const decoded = execute(nodes.find(n => n.id === 'decode')!.func, { payload: { raw_0: 503 } });
       const [sample] = execute(observer.func, decoded);
       assert.equal(sample.payload.values.temperature, 51.300000000000004);
       const response = await app.inject({ method: 'POST', url: '/api/edge/uplink', headers: { authorization: 'Bearer fixture-token' }, payload: { nodeId: sample.nodeId, serviceId: sample.serviceId, data: sample.payload } });

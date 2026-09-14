@@ -4,6 +4,8 @@ import { getProtocol } from '../../../protocols/catalog.ts';
 import { presenceFlow, type PresenceFlowConfig } from '../presence-flow.ts';
 import { transformScript } from '../transform.ts';
 import type { TemplateParameter, NodeRequirement } from '../types.ts';
+import { MAX_TEMPLATE_POINTS } from '../limits.ts';
+import { resolvePoints, MAX_TEMPLATE_SERVICES } from '../service-mapping.ts';
 
 export const identityFields: TemplateParameter[] = [
   {
@@ -18,12 +20,13 @@ export const identityFields: TemplateParameter[] = [
   },
   {
     key: 'serviceCode',
-    label: '物模型服务编码',
+    label: '默认物模型服务编码',
     type: 'text',
-    required: true,
+    required: false,
     default: '',
     max: 128,
     group: 'cloud',
+    description: `点位可分别选择服务；留空时每个点位须填写自己的服务编码。同次采集最多映射 ${MAX_TEMPLATE_SERVICES} 个服务。`,
   },
   {
     key: 'productIdentification',
@@ -105,7 +108,7 @@ export function pointTable(
     type: 'table',
     required: true,
     min: 1,
-    max: 64,
+    max: MAX_TEMPLATE_POINTS,
     default: [
       {
         source: options.sourceDefault ?? 'temperature',
@@ -124,6 +127,7 @@ export function pointTable(
         max: 256,
       },
       { key: 'property', label: '物模型属性编码', type: 'text', required: true, max: 64 },
+      { key: 'serviceCode', label: '所属服务编码（留空继承默认）', type: 'text', default: '', max: 128 },
       {
         key: 'dataType',
         label: '数据类型',
@@ -239,16 +243,19 @@ export function pipeline(
   points = pointsOf(p),
   presence?: Omit<PresenceFlowConfig, 'nodeId' | 'serviceCode'>,
 ): FlowNode[] {
+  const resolved = resolvePoints(points, p.serviceCode);
+  const serviceCodes = [...new Set(resolved.map(point => point.serviceCode))];
+  const serviceCode = serviceCodes[0]!;
   return [
     { id: 'tab', type: 'tab', label: title, disabled: false, info: notes.join('\n'), env: [] },
     ...inputs,
     functionNode(
       'decode',
       '解析与物模型映射',
-      transformScript({ format, points, nodeId: String(p.nodeId), serviceCode: String(p.serviceCode) }),
+      transformScript({ format, points: resolved, nodeId: String(p.nodeId), serviceCode }),
       [[presence ? 'presence' : 'device']],
     ),
-    ...(presence ? presenceFlow({ ...presence, nodeId: String(p.nodeId), serviceCode: String(p.serviceCode) }) : []),
+    ...(presence ? presenceFlow({ ...presence, nodeId: String(p.nodeId), serviceCode, serviceCodes }) : []),
     {
       id: 'device',
       type: 'tl-device',
@@ -269,7 +276,9 @@ export function pipeline(
       z: 'tab',
       name: '上报 ThingLinks',
       deviceId: String(p.nodeId),
-      serviceId: String(p.serviceCode),
+      // The published node prefers its configured service over msg.serviceId.
+      // Multi-service subscriptions must retain the service selected by each real sample.
+      serviceId: serviceCodes.length === 1 ? serviceCode : '',
       x: 990,
       y: 160,
       wires: [[]],

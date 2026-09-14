@@ -17,11 +17,11 @@ test('secure OPC UA recipe has no executable loopback default and keeps explicit
   assert.match(String(getBuiltinTemplate(controlledOpcuaRecipe.id)!.flows.find(node => node.type === 'tier0-opcua-connection')?.endpoint), /192\.0\.2\./);
 });
 
-test('secure OPC UA shares strict row-aware NodeId and duplicate validation', () => {
+test('secure OPC UA shares strict row-aware NodeId and native-type validation', () => {
   for (const source of ['ns=70000;i=1', 'ns=1;i=-1', 'ns=1;i=4294967296', 'ns=1;g=123', 'ns=1;b=AQ=', 'ns=1;s=Temp;datatype=Double']) {
     assert.throws(() => renderBuiltinTemplate(controlledOpcuaRecipe.id, configuration({ points: [point(source)] })), /第 1 行.*temperature.*NodeId/);
   }
-  assert.throws(() => renderBuiltinTemplate(controlledOpcuaRecipe.id, configuration({ points: [point('ns=01;i=1'), point('ns=1;i=01', { property: 'copy' })] })), /第 2 行.*copy.*重复/);
+  assert.throws(() => renderBuiltinTemplate(controlledOpcuaRecipe.id, configuration({ points: [point('ns=01;i=1'), point('ns=1;i=01', { property: 'copy', dataType: 'Float' })] })), /第 2 行.*copy.*原始数据类型/);
   assert.throws(() => renderBuiltinTemplate(controlledOpcuaRecipe.id, configuration({ points: [point('ns=1;s=Label', { dataType: 'String', offset: 2 })] })), /第 1 行.*temperature.*倍率|第 1 行.*temperature.*偏移/);
 });
 
@@ -43,9 +43,9 @@ test('canonical NodeId is identical in returned parameters, native reads, read m
   const canonical = 'ns=1;i=42';
   assert.equal((result.parameterValues!.points as Record<string, unknown>[])[0]!.source, canonical);
   assert.equal((input.points as Record<string, unknown>[])[0]!.source, 'ns=0001;i=00042', 'caller input must remain unchanged');
-  assert.deepEqual(JSON.parse(String(result.flows.find(node => node.type === 'tier0-opcua-read')?.pointList)), [{ nodeId: canonical, alias: 'temperature' }]);
+  assert.deepEqual(JSON.parse(String(result.flows.find(node => node.type === 'tier0-opcua-read')?.pointList)), [{ nodeId: canonical, alias: 'raw_0' }]);
   const decode = String(result.flows.find(node => node.id === 'decode')?.func), errors: string[] = [];
-  const message = { payload: [{ nodeId: canonical, alias: 'temperature', statusCode: 'Good', value: 5 }], opcua: { operation: 'read', total: 1, good: 1, resultDetail: 'compact' } };
+  const message = { payload: [{ nodeId: canonical, alias: 'raw_0', statusCode: 'Good', value: 5 }], opcua: { operation: 'read', total: 1, good: 1, resultDetail: 'compact' } };
   const mapped = vm.runInNewContext(`(function(){${decode}})()`, { msg: message, Buffer, node: { error: (error: string) => errors.push(error) } }) as { payload: Record<string, unknown> };
   assert.equal(errors.length, 0); assert.equal(mapped.payload.temperature, 11);
   const prepare = String(result.flows.find(node => node.id === 'control-opcua-prepare')?.func);

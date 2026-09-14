@@ -33,7 +33,7 @@ test('Modbus guidance distinguishes the remote port, zero-based range and regist
   assert.match(field('quantity').description!, /16.*1.*32.*2/);
   assert.match(field('points').description!, /相对.*0/);
   assert.match(field('interval').description!, /超时/);
-  assert.equal(modbusRecipe.revision, '1.2.0');
+  assert.equal(modbusRecipe.revision, '1.3.0');
 });
 
 test('old Modbus parameter archives retain the previous timeout and reconnect defaults', () => {
@@ -41,7 +41,7 @@ test('old Modbus parameter archives retain the previous timeout and reconnect de
   const client = rendered.flows.find(node => node.type === 'modbus-client')!;
   assert.equal(client.clientTimeout, 2000);
   assert.equal(client.reconnectTimeout, 5000);
-  assert.equal(rendered.flows.find(node => node.type === 'modbus-read')?.rate, '1');
+  assert.equal(rendered.flows.find(node => node.id === 'modbus-poll')?.repeat, '1');
   assert.equal(rendered.parameterValues?.clientTimeout, 2000);
   assert.equal(rendered.parameterValues?.reconnectTimeout, 5000);
 });
@@ -74,11 +74,12 @@ test('Modbus keeps FC3 and FC4, zero-based read addresses and mapped pipeline un
   for (const registerType of ['HoldingRegister', 'InputRegister']) {
     const flows = build({ registerType, address: 100, quantity: 3,
       points: [point('0'), point('1', 'float32swap', 'pressure')] });
-    const read = flows.find(node => node.type === 'modbus-read')!;
-    assert.equal(read.dataType, registerType);
-    assert.equal(read.adr, '100');
-    assert.equal(read.quantity, '3');
-    assert.deepEqual(read.wires, [['decode'], []]);
+    const read = flows.find(node => node.type === 'modbus-flex-getter')!;
+    assert.equal(read.server, 'connection');
+    assert.deepEqual(read.wires, [['modbus-cycle'], []]);
+    const cycle = String(flows.find(node => node.id === 'modbus-cycle')?.func);
+    assert.match(cycle, /"address":100,"quantity":3/);
+    assert.match(cycle, new RegExp(`"fc":${registerType === 'InputRegister' ? 4 : 3}`));
     assert.equal(flows.find(node => node.type === 'tl-uplink')?.serviceId, 'telemetry');
     assert.match(String(flows.find(node => node.id === 'decode')?.func), /"source":"1"/);
     assert.match(String(flows.find(node => node.id === 'decode')?.func), /"scale":0\.1,"offset":1/);
@@ -91,7 +92,7 @@ test('Modbus keeps FC3 and FC4, zero-based read addresses and mapped pipeline un
 test('Modbus register address and quantity reject fractional, negative and unsafe integers', () => {
   for (const [key, values] of Object.entries({
     address: [-1, 1.5, 65536, Number.MAX_SAFE_INTEGER + 1],
-    quantity: [-1, 0, 1.5, 126, Number.MAX_SAFE_INTEGER + 1],
+    quantity: [-1, 0, 1.5, 601, Number.MAX_SAFE_INTEGER + 1],
     unitId: [-1, 1.5, 256, Number.MAX_SAFE_INTEGER + 1],
     port: [0, 502.5, 65536, Number.MAX_SAFE_INTEGER + 1],
   })) {
@@ -109,8 +110,8 @@ test('TCP Unit ID supports native 0 and 255 without changing the default or read
     for (const registerType of ['HoldingRegister', 'InputRegister']) {
       const nodes = build({ unitId, registerType });
       assert.equal(nodes.find(node => node.type === 'modbus-client')?.unit_id, unitId);
-      assert.equal(nodes.find(node => node.type === 'modbus-read')?.unitid, String(unitId));
-      assert.equal(nodes.find(node => node.type === 'modbus-read')?.dataType, registerType);
+      const cycle = String(nodes.find(node => node.id === 'modbus-cycle')?.func);
+      assert.match(cycle, new RegExp(`"unitId":${unitId},"fc":${registerType === 'InputRegister' ? 4 : 3}`));
     }
   }
 });
@@ -130,4 +131,17 @@ test('Modbus offsets reject fractional, negative and unsafe numbers with an acti
     assert.throws(() => build({ points: [point(source)] }),
       /第 1 行（temperature）.*非负安全整数.*0–1/, source);
   }
+});
+
+test('large Modbus read ranges use a serial native reader and publish only a complete collection round', () => {
+  const flows = build({ address: 100, quantity: 300, points: [point('299')] });
+  const reader = flows.find(node => node.type === 'modbus-flex-getter');
+  assert.ok(reader, 'large ranges require the native flexible reader');
+  assert.equal(reader.keepMsgProperties, true);
+  assert.deepEqual(reader.wires, [['modbus-cycle'], []]);
+  assert.equal(flows.find(node => node.id === 'connection')?.bufferCommands, false);
+  const cycle = flows.find(node => node.id === 'modbus-cycle');
+  assert.deepEqual(cycle?.wires, [['input'], ['decode']]);
+  assert.equal(flows.some(node => node.type === 'modbus-read'), false);
+  assert.equal(flows.some(node => node.type === 'exec'), false);
 });

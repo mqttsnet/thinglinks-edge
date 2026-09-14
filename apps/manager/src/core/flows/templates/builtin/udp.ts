@@ -20,7 +20,7 @@ export const udpRecipe: TemplateRecipe = {
   description: '每个 UDP 数据报独立解析，支持 JSON 字段与二进制点位。',
   category: 'network',
   protocols: ['udp'],
-  revision: '1.2.0',
+  revision: '1.3.0',
   requirements: requirements('udp'),
   parameters: [
     ...identityFields,

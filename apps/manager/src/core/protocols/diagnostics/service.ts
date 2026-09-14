@@ -7,6 +7,7 @@ import { buildModbusDiagnosticFlow, modbusDiagnosticFingerprint } from './modbus
 import { ProtocolDiagnosticStore, type DiagnosticRecord } from './store.ts';
 import { DiagnosticError, DIAGNOSTIC_FAILURES, diagnosticFailure, type DiagnosticFailureCode, type ProtocolDiagnosticTask } from './types.ts';
 import { validateConnection } from './validation.ts';
+import { modbusReadDurationMs } from '../../flows/templates/modbus-read-plan.ts';
 export interface DiagnosticAdminPort {
   readModules(instanceId: string): Promise<InstalledModule[]>;
   listFlows(instanceId: string, reservedBytes?: number): Promise<FlowNode[]>;
@@ -64,7 +65,7 @@ function assertModules(modules: InstalledModule[]): void {
   const module = modules.find(m => m.module === 'node-red-contrib-modbus');
   if (!module || module.version !== '5.60.2' || module.health !== 'healthy' || module.enabled === false || module.errors.length || module.observedVersions.length !== 1 || module.observedVersions[0] !== '5.60.2')
     throw failure('COMPONENT_UNAVAILABLE');
-  for (const type of ['modbus-client', 'modbus-getter']) {
+  for (const type of ['modbus-client', 'modbus-flex-getter']) {
     const sets = modules.flatMap(m => m.nodeSets).filter(set => set.types.includes(type));
     if (sets.length !== 1 || sets[0]!.module !== module.module || sets[0]!.version !== '5.60.2' || !sets[0]!.enabled || sets[0]!.enabledKnown === false || sets[0]!.err)
       throw failure('COMPONENT_UNAVAILABLE');
@@ -96,7 +97,10 @@ export class ProtocolDiagnosticService {
       throw failure('INSTANCE_UNAVAILABLE');
     const id = this.options.taskId?.() ?? randomUUID();
     const readerId = this.options.readerId?.() ?? `tld-reader-${randomUUID()}`;
-    const deadline = this.now() + Math.min(125000, Math.max(10000, connection.reconnectTimeout + 2000) + connection.clientTimeout + 3000);
+    // At most five serial FC3/FC4 requests. Reserve the whole round, not just its first block.
+    // Validated limits (600 registers, 60s read/reconnect timeout) keep the task below 370s.
+    const deadline = this.now() + Math.min(370000, Math.max(10000, connection.reconnectTimeout + 2000)
+      + modbusReadDurationMs(connection.quantity, connection.clientTimeout) + 3000);
     const built = buildModbusDiagnosticFlow({ taskId: id, readerId, ...connection, expiresAt: deadline });
     let resolveAdmission!: (task: ProtocolDiagnosticTask) => void;
     let rejectAdmission!: (error: unknown) => void;
@@ -177,8 +181,9 @@ export class ProtocolDiagnosticService {
       throw new DiagnosticError('CLAIM_CLOSED', '本次试读已领取或已结束。', 409);
     if (!row.deployVerified)
       throw new DiagnosticError('NOT_READY', '临时试读流程尚未就绪。', 503);
-    const deadline = Math.min(row.deadline, this.now() + row.connection.clientTimeout + 2500);
-    if (deadline - this.now() < row.connection.clientTimeout + 2000)
+    const readDurationMs = modbusReadDurationMs(row.connection.quantity, row.connection.clientTimeout);
+    const deadline = Math.min(row.deadline, this.now() + readDurationMs + 2500);
+    if (deadline - this.now() < readDurationMs + 2000)
       throw new DiagnosticError('CLAIM_EXPIRED', '剩余时间不足，不能开始新的读取。', 409);
     const leaseToken = randomBytes(32).toString('base64url');
     this.store.update(id, { state: 'reading', leaseHash: hash(leaseToken), leaseDeadline: deadline, claimAt: this.now() });

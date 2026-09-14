@@ -5,6 +5,7 @@ import { OPCUA_CONTROL_UNAVAILABLE_REASON } from '../control-flow.ts';
 import type { TemplateRecipe } from '../types.ts';
 import { opcuaTransformScript } from '../transform.ts';
 import { normalizeOpcuaPoints, opcuaEndpoint, opcuaPointTable } from '../industrial-address.ts';
+import { rawPointMappings, resolvePoints } from '../service-mapping.ts';
 import {
   identityFields,
   intervalField,
@@ -23,7 +24,7 @@ export const opcuaRecipe: TemplateRecipe = {
   description: '适合匿名、无加密的兼容采集，支持定时读取或订阅变化；需要证书、账号或控制时请选择安全采集与控制模板。',
   category: 'industrial',
   protocols: ['opcua'],
-  revision: '1.2.0',
+  revision: '1.3.0',
   previewParameters: { endpoint: 'opc.tcp://192.0.2.10:4840/UA/Server' },
   requirements: requirements('opcua'),
   parameters: [
@@ -68,6 +69,8 @@ export const opcuaRecipe: TemplateRecipe = {
     const url = opcuaEndpoint(p.endpoint);
     const points = normalizeOpcuaPoints(pointsOf(p));
     p.points = points;
+    const resolved = resolvePoints(points, p.serviceCode);
+    const raw = rawPointMappings(resolved);
     const inputs: FlowNode[] = [
       {
         id: 'connection', z: 'tab',
@@ -81,13 +84,13 @@ export const opcuaRecipe: TemplateRecipe = {
         usercert: false,
       },
       injectNode('poll', p.action === 'subscribe' ? 0 : Number(p.interval), [
-        points.map((_, i) => `item-${i}`),
+        raw.reads.map((_, i) => `item-${i}`),
       ]),
-      ...points.map((point, i) => ({
+      ...raw.reads.map((point, i) => ({
         id: `item-${i}`,
         type: 'OpcUa-Item',
         z: 'tab',
-        name: String(point.property),
+        name: point.source,
         item: String(point.source),
         datatype: String(point.dataType),
         value: '',
@@ -143,8 +146,8 @@ export const opcuaRecipe: TemplateRecipe = {
     const withHealth = p.action === 'subscribe' && healthInterval > 0;
     if (withHealth) {
       inputs.push(
-        { ...injectNode('health-poll', healthInterval, [points.map((_, i) => `health-item-${i}`)]), name: '定期验证订阅设备通信', y: 720 },
-        ...points.map((_, i) => ({ ...structuredClone(inputs.find(node => node.id === `item-${i}`)!), id: `health-item-${i}`, y: 720 + i * 55, wires: [['health-input']] })),
+        { ...injectNode('health-poll', healthInterval, [raw.reads.map((_, i) => `health-item-${i}`)]), name: '定期验证订阅设备通信', y: 720 },
+        ...raw.reads.map((_, i) => ({ ...structuredClone(inputs.find(node => node.id === `item-${i}`)!), id: `health-item-${i}`, y: 720 + i * 55, wires: [['health-input']] })),
         { ...structuredClone(inputs.find(node => node.id === 'input')!), id: 'health-input', name: '订阅健康读取', action: 'read', y: 720, wires: [['health-decode'], ['opc-status', 'health-presence-source'], []] },
       );
     }
@@ -153,13 +156,13 @@ export const opcuaRecipe: TemplateRecipe = {
     result.find((n) => n.id === 'decode')!.func = opcuaTransformScript(
       String(p.nodeId),
       String(p.serviceCode),
-      points,
+      resolved,
     );
     if (withHealth) {
       const decode = structuredClone(result.find(node => node.id === 'decode')!);
       result.push({ ...decode, id: 'health-decode', name: '健康读取与物模型映射', y: 800, wires: [['health-presence']] });
       (result.find(node => node.id === 'errors')!.scope as string[]).push('health-decode');
-      const observer = presenceFlow({ nodeId: String(p.nodeId), serviceCode: String(p.serviceCode), protocol: 'opcua', sourceIds: ['health-input'], failureWindowMs: 10000 });
+      const observer = presenceFlow({ nodeId: String(p.nodeId), serviceCode: String(p.serviceCode), serviceCodes: [...new Set(resolved.map(point => point.serviceCode))], protocol: 'opcua', sourceIds: ['health-input'], failureWindowMs: 10000 });
       for (const node of observer) { node.y = Number(node.y ?? 0) + 600; if (node.id === 'presence') node.name = '健康读取状态观察'; }
       result = appendFlows(result, observer, id => `health-${id}`);
     }

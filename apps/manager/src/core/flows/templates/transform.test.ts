@@ -100,3 +100,38 @@ test('unsafe integers never silently round during JSON parsing, conversion or sc
     '9007199254740993',
   );
 });
+
+test('one sample maps repeated raw fields into independent services without splitting its Node-RED message', () => {
+  const r = run('json', { temperature: 25, current: 8 }, [
+    point({ property: 'value', serviceCode: 'environment' }),
+    point({ property: 'value', serviceCode: 'power', source: 'current' }),
+    point({ property: 'temperatureCopy', serviceCode: 'power', scale: 10 }),
+  ]);
+  assert.equal(r.errors.length, 0);
+  assert.deepEqual(JSON.parse(JSON.stringify(r.result._tleServices)), [
+    { serviceCode: 'environment', values: { value: 25 } },
+    { serviceCode: 'power', values: { value: 8, temperatureCopy: 250 } },
+  ]);
+  assert.equal(Array.isArray(r.result), false);
+  assert.equal(r.result.payload.__tlePresence, undefined);
+});
+
+test('single explicit service replaces the default while reserved incoming routing metadata is cleared', () => {
+  const script = transformScript({ format: 'json', points: [point({ serviceCode: 'power' })], nodeId: 'plc-1', serviceCode: 'env' });
+  const msg = { payload: { temperature: 9 }, _tleServices: [{ serviceCode: 'forged', values: { changed: 1 } }] };
+  const r = runInNewContext(`(function(msg,node){${script}})(msg,node)`, { msg, Buffer, node: { error() {} } });
+  assert.equal(r.serviceId, 'power');
+  assert.equal(r.payload.temp, 9);
+  assert.equal(r._tleServices, undefined);
+});
+
+test('one OPC UA variable notification may feed mappings in several services', () => {
+  const script = opcuaTransformScript('plc-1', '', [
+    point({ source: 'ns=2;s=Temperature', property: 'value', serviceCode: 'environment', dataType: 'Double' }),
+    point({ source: 'ns=2;s=Temperature', property: 'value', serviceCode: 'alarm', dataType: 'Double', scale: 10 }),
+  ]);
+  const r = runInNewContext(`(function(msg,node){${script}})(msg,node)`, { msg: { payload: 25, topic: 'ns=2;s=Temperature', statusCode: { value: 0 } }, Buffer, node: { error() {} } });
+  assert.deepEqual(JSON.parse(JSON.stringify(r._tleServices)), [
+    { serviceCode: 'environment', values: { value: 25 } }, { serviceCode: 'alarm', values: { value: 250 } },
+  ]);
+});

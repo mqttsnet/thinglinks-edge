@@ -17,9 +17,11 @@ try {
       input.writeUInt16BE(word, i * 2);
     });
   }
-  const output = {};
+  const services = new Map();
   for (const point of config.points) {
     if (!point.property || blocked.has(point.property)) throw new Error('属性编码不合法');
+    const serviceCode=String(point.serviceCode||config.serviceCode);
+    if(!serviceCode||blocked.has(serviceCode))throw new Error('服务编码不合法');
     let value;
     const numeric = { uint16be:['readUInt16BE',2], uint16le:['readUInt16LE',2],
       int16be:['readInt16BE',2], int16le:['readInt16LE',2],
@@ -68,11 +70,18 @@ try {
       if (!Number.isFinite(value)) throw new Error('点位不是有限数值');
       if(Number.isInteger(value)&&!Number.isSafeInteger(value)) throw new Error('换算后的整数超出安全精度范围');
     }
+    if(!services.has(serviceCode))services.set(serviceCode,{});
+    const output=services.get(serviceCode);
+    if(Object.prototype.hasOwnProperty.call(output,point.property))throw new Error('服务内的属性编码重复');
     output[point.property] = value;
   }
-  msg.payload = output;
+  const groups=Array.from(services,([serviceCode,values])=>({serviceCode,values}));
+  if(!groups.length)throw new Error('未配置有效点位');
+  delete msg._tleServices;
+  if(groups.length>1)msg._tleServices=groups;
+  msg.payload = groups[0].values;
   msg.nodeId = config.nodeId;
-  msg.serviceId = config.serviceCode;
+  msg.serviceId = groups[0].serviceCode;
   return msg;
 } catch (error) {
   node.error('采集数据解析失败：' + error.message, msg);
@@ -97,12 +106,12 @@ export function opcuaTransformScript(
   points: Record<string, unknown>[],
 ): string {
   return `const mappings=${JSON.stringify(points)};
-const mapping=mappings.find((point)=>String(msg.topic).split(';datatype=')[0]===point.source);
-if(!mapping){node.error('OPC UA 返回了未配置的变量',msg);return null;}
+const selected=mappings.filter((point)=>String(msg.topic).split(';datatype=')[0]===point.source);
+if(!selected.length){node.error('OPC UA 返回了未配置的变量',msg);return null;}
 const status=msg.statusCode;
 const quality=typeof status==='number'?status:status && status.value;
 if(!Number.isInteger(quality)||quality<0||quality>0xffffffff||(quality>>>30)!==0){node.error('OPC UA 数据质量未确认或非 Good',msg);return null;}
 const config={format:'json',nodeId:${JSON.stringify(nodeId)},serviceCode:${JSON.stringify(serviceCode)},
-  points:[{...mapping,source:'value',dataType:mapping.dataType==='Boolean'?'boolean':mapping.dataType==='String'?'string':'number'}]};
+  points:selected.map(mapping=>({...mapping,source:'value',dataType:mapping.dataType==='Boolean'?'boolean':mapping.dataType==='String'?'string':'number'}))};
 msg.payload={value:msg.payload};\n${BODY}`;
 }

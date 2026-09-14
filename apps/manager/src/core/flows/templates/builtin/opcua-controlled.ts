@@ -3,6 +3,7 @@ import { TemplateError } from '../../types.ts';
 import type { TemplateRecipe } from '../types.ts';
 import { identityFields, intervalField, notes, pipeline, pointTable, pointsOf, requirements, integer, injectNode } from './common.ts';
 import { normalizeOpcuaPoints, opcuaEndpoint, opcuaPointTable } from '../industrial-address.ts';
+import { rawPointMappings, resolvePoints, type RawPointRead } from '../service-mapping.ts';
 
 function fileReference(value: unknown, label: string, required = false): string {
   const text = String(value ?? '');
@@ -17,15 +18,15 @@ function fileList(value: unknown, label: string): string[] {
 }
 
 /** Checks the existing component's compact result contract; it performs no OPC UA I/O. */
-function readMapping(points: Record<string, unknown>[]): string {
+function readMapping(points: RawPointRead[]): string {
   return `try {
-const expected=${JSON.stringify(points.map(point => ({nodeId:point.source,alias:point.property,type:point.dataType})))};
+const expected=${JSON.stringify(points.map(point => ({nodeId:point.source,alias:point.alias,type:point.dataType})))};
 if(!Array.isArray(msg.payload)||msg.payload.length!==expected.length||!msg.opcua||msg.opcua.operation!=='read'||msg.opcua.total!==expected.length||msg.opcua.good!==expected.length||msg.opcua.resultDetail!=='compact')throw new Error('OPC UA 读取结果不完整');
 const data={},seen=new Set();
 const ranges={Int16:[-32768,32767],UInt16:[0,65535],Int32:[-2147483648,2147483647],UInt32:[0,4294967295]};
 for(const row of msg.payload){
  const point=expected.find(point=>point.nodeId===row?.nodeId&&point.alias===row?.alias);
- if(!point||seen.has(point.nodeId)||row.statusCode!=='Good')throw new Error('OPC UA 点位或数据质量未确认');
+ if(!point||seen.has(point.alias)||row.statusCode!=='Good')throw new Error('OPC UA 点位或数据质量未确认');
  const value=row.value;
  if(point.type==='Boolean'){if(typeof value!=='boolean')throw new Error('OPC UA 布尔值类型不匹配');}
  else if(point.type==='String'){if(typeof value!=='string'||value.length>4096)throw new Error('OPC UA 文本值类型不匹配');}
@@ -34,7 +35,7 @@ for(const row of msg.payload){
   const range=ranges[point.type];if(range&&(!Number.isInteger(value)||value<range[0]||value>range[1]))throw new Error('OPC UA 整数超出范围');
   if(point.type==='Float'&&(!Number.isFinite(Math.fround(value))||(value!==0&&Math.fround(value)===0)))throw new Error('OPC UA 浮点数超出范围');
  }
- seen.add(point.nodeId);data[point.alias]=value;
+ seen.add(point.alias);data[point.alias]=value;
 }
 msg.payload=data;msg.quality='good';
 }catch(error){node.error(error.message,msg);return null;}
@@ -44,7 +45,7 @@ msg.payload=data;msg.quality='good';
 export const controlledOpcuaRecipe: TemplateRecipe = {
   id: 'builtin:opcua-controlled', name: 'OPC-UA 安全采集与控制',
   description: '配置现成 OPC UA 节点读取变量、验证证书及写入点位，按服务和属性编码换算上云。',
-  category: 'industrial', protocols: ['opcua'], revision: '1.2.0', controlSupported: true,
+  category: 'industrial', protocols: ['opcua'], revision: '1.3.0', controlSupported: true,
   previewParameters: { endpoint: 'opc.tcp://192.0.2.10:4840/UA/Server' },
   requirements: requirements('opcua-controlled'),
   parameters: [
@@ -89,7 +90,8 @@ export const controlledOpcuaRecipe: TemplateRecipe = {
     const timeout = integer(p.timeoutMs, '请求超时');
     const points = normalizeOpcuaPoints(pointsOf(p));
     p.points = points;
-    const scalarPoints = points.map(point => ({ ...point, source: point.property, dataType: point.dataType === 'Boolean' ? 'boolean' : point.dataType === 'String' ? 'string' : 'number' }));
+    const raw = rawPointMappings(resolvePoints(points, p.serviceCode));
+    const scalarPoints = raw.points.map(point => ({ ...point, source: point.rawAlias, dataType: point.dataType === 'Boolean' ? 'boolean' : point.dataType === 'String' ? 'string' : 'number' }));
     const flows = pipeline(p, 'OPC UA 安全采集与控制', 'opcua', url, [
       { id: 'connection', z: 'tab', type: 'tier0-opcua-connection', name: 'OPC UA 连接', endpoint: url,
         securityPolicy: p.securityPolicy, securityMode: p.securityMode, applicationUri: p.applicationUri,
@@ -97,11 +99,11 @@ export const controlledOpcuaRecipe: TemplateRecipe = {
         commandQueueSize: 1, reconnectInterval: 1000, maxReconnectInterval: 5000, connectivityCheckInterval: 1000 },
       injectNode('read-trigger', Number(p.interval), [['input']]),
       { id: 'input', type: 'tier0-opcua-read', z: 'tab', name: '读取 OPC UA 点位', connection: 'connection', nodeId: '',
-        pointList: JSON.stringify(points.map(point => ({ nodeId: String(point.source), alias: String(point.property) }))),
+        pointList: JSON.stringify(raw.reads.map(point => ({ nodeId: point.source, alias: point.alias }))),
         batchSize: 1, resultDetail: 'compact', outputMode: 'batch', x: 280, y: 160, wires: [['decode']] },
     ], 'json', scalarPoints, { protocol: 'opcua-secure', sourceIds: ['input'], failureWindowMs: Math.ceil(Math.max(10000, Number(p.interval) * 3000 + timeout)) });
     const decode = flows.find(node => node.id === 'decode')!;
-    decode.func = readMapping(points) + String(decode.func);
+    decode.func = readMapping(raw.reads) + String(decode.func);
     return flows;
   },
 };

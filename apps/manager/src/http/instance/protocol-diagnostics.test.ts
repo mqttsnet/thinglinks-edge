@@ -71,3 +71,17 @@ test('callbacks require the current instance ingest token and never accept reque
     await f.close();
   }
 });
+
+test('the bounded result route admits all 600 uint16 registers and still rejects oversized callbacks', async () => {
+  const f = await fixture();
+  try {
+    const request = { method: 'POST' as const, url: '/api/edge/protocol-diagnostics/task/result',
+      headers: { authorization: 'Bearer fake-ingest-a' } };
+    const payload = { readerId: 'reader', leaseToken: 'r'.repeat(43), registers: Array(600).fill(65535), durationMs: 3500 };
+    assert.ok(Buffer.byteLength(JSON.stringify(payload), 'utf8') < 8192);
+    assert.equal((await f.app.inject({ ...request, payload })).statusCode, 200);
+    assert.equal(f.calls, 1);
+    assert.equal((await f.app.inject({ ...request, payload: { ...payload, padding: 'x'.repeat(8192) } })).statusCode, 413);
+    assert.equal(f.calls, 1);
+  } finally { await f.close(); }
+});

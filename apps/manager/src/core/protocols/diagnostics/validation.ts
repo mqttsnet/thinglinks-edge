@@ -1,6 +1,7 @@
 import { modbusRecipe } from '../../flows/templates/builtin/modbus.ts';
 import { validateParameters } from '../../flows/templates/parameters.ts';
 import { host } from '../../flows/templates/builtin/common.ts';
+import { modbusReadPlan } from '../../flows/templates/modbus-read-plan.ts';
 import { DiagnosticError, type ModbusDiagnosticConnection } from './types.ts';
 const keys = ['host', 'port', 'unitId', 'registerType', 'address', 'quantity', 'clientTimeout', 'reconnectTimeout'];
 const fields = modbusRecipe.parameters.filter(field => keys.includes(field.key));
@@ -13,8 +14,7 @@ export function validateConnection(input: unknown): ModbusDiagnosticConnection {
       if (!Number.isSafeInteger(values[key]))
         throw new Error();
     values.host = host(values.host);
-    if ((values.address as number) + (values.quantity as number) > 65536)
-      throw new Error();
+    modbusReadPlan(values.address as number, values.quantity as number);
     return values as unknown as ModbusDiagnosticConnection;
   }
   catch {

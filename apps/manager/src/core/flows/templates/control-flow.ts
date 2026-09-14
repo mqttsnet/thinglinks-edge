@@ -4,14 +4,14 @@ import { controlWriteScript } from './control-codec.ts';
 import { framingScript } from './framing.ts';
 import { managedOpcuaControlNodes } from './control-opcua-managed.ts';
 import {
-  bindingPollScript,
-  nextCommandScript,
-  claimCommandScript,
+  controlControllerScript,
+  CONTROL_INITIALIZE,
+  CONTROL_FINALIZE,
   commandResultScript,
   networkAckScript,
-  resultDeliveredScript,
-  type ControlBindingConfig,
 } from './control-runtime.ts';
+import { resolveControlMappings } from './control-mapping.ts';
+import { rawPointMappings, resolvePoints } from './service-mapping.ts';
 import { functionNode, injectNode, endpoint, host, integer } from './builtin/common.ts';
 
 export const OPCUA_CONTROL_UNAVAILABLE_REASON = '当前受管实例支持采集；控制待独立受控执行节点交付';
@@ -42,8 +42,10 @@ export function controlParameters(protocol: string, supported = !['opcua', 'modb
       group: 'commands',
       visibleWhen,
       columns: [
+        { key: 'serviceCode', label: '命令服务编码（空时用默认）', type: 'text', default: '', max: 128 },
         { key: 'cmd', label: '云端命令编码', type: 'text', required: true, max: 128 },
         { key: 'param', label: '命令参数编码', type: 'text', required: true, max: 128 },
+        { key: 'targetServiceCode', label: '目标服务编码（空时用命令服务）', type: 'text', default: '', max: 128 },
         { key: 'property', label: '目标点位属性编码', type: 'text', required: true, max: 64 },
       ],
     },
@@ -152,30 +154,15 @@ export function attachControlFlow(
   if (protocol === 'modbus-tcp') throw new TemplateError(MODBUS_CONTROL_UNAVAILABLE_REASON);
   if (protocol === 'opcua' && !base.some(node => node.id === 'connection' && node.type === 'tier0-opcua-connection'))
     throw new TemplateError(OPCUA_CONTROL_UNAVAILABLE_REASON);
-  const mappings = p.commands as ControlBindingConfig['commands'];
-  if (!mappings.length) throw new TemplateError('启用设备控制时至少配置一个命令映射');
-  const points = p.points as Record<string, unknown>[];
-  const seen = new Set<string>();
-  for (const mapping of mappings) {
-    if (
-      !/^[A-Za-z_][A-Za-z0-9_.-]{0,127}$/.test(mapping.cmd) ||
-      !/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(mapping.param) ||
-      ['__proto__', 'constructor', 'prototype'].includes(mapping.param)
-    )
-      throw new TemplateError('命令或参数编码格式无效');
-    if (seen.has(mapping.cmd)) throw new TemplateError('同一命令只能配置一个单参数映射');
-    seen.add(mapping.cmd);
-    const point = points.find((row) => row.property === mapping.property);
-    if (!point) throw new TemplateError('控制映射必须选择已配置的点位属性');
-    if (point.scale === 0) throw new TemplateError('控制点位倍率不能为 0');
-  }
+  const points = rawPointMappings(resolvePoints(p.points as Record<string, unknown>[], p.serviceCode)).points;
+  const mappings = resolveControlMappings(p.commands, points, p.serviceCode);
   if ((protocol === 'tcp' || protocol === 'udp') && p.format !== 'json')
     throw new TemplateError('网络通用控制模板只支持 JSON 请求/应答；私有二进制控制需要专门适配');
   if (protocol === 'udp' && p.commandReplyPort === p.port)
     throw new TemplateError('命令应答端口不能与采集端口相同');
   const ack = String(p.commandAckField ?? 'ok');
   if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(ack)) throw new TemplateError('命令确认字段格式无效');
-  const binding = { nodeId: String(p.nodeId), serviceCode: String(p.serviceCode), commands: mappings };
+  const binding = { nodeId: String(p.nodeId), serviceCode: String(p.serviceCode ?? ''), commands: mappings };
   const options = {
     nodeId: binding.nodeId,
     serviceCode: binding.serviceCode,
@@ -185,48 +172,47 @@ export function attachControlFlow(
     ...(protocol === 'http' ? { commandUrl: endpoint(p.commandUrl, ['http:', 'https:']) } : {}),
   };
   const nodes: FlowNode[] = [
-    injectNode('control-poll', 1, [['control-bind']]),
-    functionNode('control-bind', '登记命令映射与轮询', bindingPollScript(binding), [
+    { ...injectNode('control-poll', 1, [['control-controller']]), props: [{ p: '_tleControlTick', v: 'true', vt: 'bool' }] },
+    { ...functionNode('control-controller', '多服务登记与串行命令控制', controlControllerScript(binding, protocol), [
       ['control-bind-http'],
+      ['control-next-http'],
+      ['control-encode'],
       ['control-result-http'],
       protocol === 'tcp' ? ['control-writer'] : [],
-    ]),
-    requestNode('control-bind-http', '登记控制映射', [['control-next']]),
-    functionNode('control-next', '获取当前设备命令', nextCommandScript(binding), [['control-next-http']]),
-    requestNode('control-next-http', '领取一个命令', [['control-claim']]),
-    functionNode('control-claim', '保存命令租约', claimCommandScript(), [['control-encode']]),
+      ['control-writer'],
+    ]), initialize: CONTROL_INITIALIZE, finalize: CONTROL_FINALIZE },
+    requestNode('control-bind-http', '续约全部服务的命令映射', [['control-controller']]),
+    requestNode('control-next-http', '领取一个服务命令', [['control-controller']]),
     functionNode(
       'control-encode',
       '命令参数转换',
-      `${protocol === 'opcua' ? 'const leaseDeadline=msg.payload&&msg.payload.command&&msg.payload.command.leaseDeadline;' : ''}
+      `const leaseDeadline=msg.payload&&msg.payload.command&&msg.payload.command.leaseDeadline;
+msg._tleWriteAttempted=false;
 const output=(function(msg){${controlWriteScript(protocol, options)}})(msg);
 if(!output)return null;
-${protocol === 'opcua' ? "if(!Number.isSafeInteger(leaseDeadline)||leaseDeadline<=Date.now()){output._tleWriteAttempted=false;node.error('OPC UA 命令租约无效或已过期',output);return null;}output._tleCommand.leaseDeadline=leaseDeadline;" : ''}
-output._tleWriteAttempted=${protocol === 'opcua' ? 'false' : 'true'};
+if(!Number.isSafeInteger(leaseDeadline)||leaseDeadline<=Date.now()){node.error('命令租约无效或已过期，尚未提交设备',output);return null;}
+output._tleCommand.leaseDeadline=leaseDeadline;output._tlePrepared=true;
 ${protocol === 'http' ? 'output.requestTimeout=10000;' : ''}
 ${protocol === 'tcp' ? 'output.reset=true;output.payload += "\\n";' : ''}
 return output;`,
-      [['control-writer']],
+      [['control-controller']],
     ),
     functionNode('control-result', '确认设备执行结果', commandResultScript(protocol, true, ack), [
-      ['control-result-http'],
+      ['control-controller'],
     ]),
     functionNode('control-failed', '记录设备执行失败', commandResultScript(protocol, false), [
-      ['control-result-http'],
+      ['control-controller'],
     ]),
-    requestNode('control-result-http', '提交执行回执', [['control-delivered']]),
-    functionNode('control-delivered', '检查回执提交', resultDeliveredScript(), []),
+    requestNode('control-result-http', '提交执行回执', [['control-controller']]),
     {
       id: 'control-errors',
       type: 'catch',
       z: 'tab',
       name: '控制链路异常',
       scope: [
-        'control-bind',
+        'control-controller',
         'control-bind-http',
-        'control-next',
         'control-next-http',
-        'control-claim',
         'control-encode',
         'control-writer',
         'control-result',
@@ -266,7 +252,7 @@ return output;`,
       },
     );
   else if (protocol === 'opcua') {
-    nodes.find(node => node.id === 'control-encode')!.wires = [['control-opcua-prepare']];
+    (nodes.find(node => node.id === 'control-controller')!.wires as string[][])[5] = ['control-opcua-prepare'];
     nodes.find(node => node.id === 'control-errors')!.wires = [['control-opcua-error', 'error-log']];
     (nodes.find(node => node.id === 'control-errors')!.scope as string[]).push('control-opcua-prepare', 'control-opcua-result');
     nodes.push(...managedOpcuaControlNodes(connection!.id, points, Number(p.timeoutMs)));

@@ -35,6 +35,32 @@ test('presence uses runtime identity, orders decoded samples and suppresses only
   assert.equal(first.headers, undefined); assert.equal(JSON.stringify(first).includes('fixture-token'), false);
 });
 
+test('multi-service samples use one observer sequence and one all-service change decision', () => {
+  const f = fixture(true, { serviceCodes: ['environment', 'power'] }); f.activate();
+  const incoming = { nodeId: 'plc', serviceId: 'environment', payload: { value: 25 }, _tleServices: [
+    { serviceCode: 'environment', values: { value: 25 } }, { serviceCode: 'power', values: { value: 8 } },
+  ] };
+  const first = f.run(incoming)![0]!;
+  assert.deepEqual(first.payload.services, incoming._tleServices);
+  assert.equal(first.payload.values, undefined);
+  assert.equal(first._tleServices, undefined);
+  assert.equal(first.payload.__tlePresence.sequence, 1);
+  assert.equal(first.payload.__tlePresence.report, true);
+  assert.equal(f.run(incoming)![0]!.payload.__tlePresence.report, false);
+  incoming._tleServices[1]!.values.value = 9;
+  const changed = f.run(incoming)![0]!;
+  assert.equal(changed.payload.__tlePresence.sequence, 3);
+  assert.equal(changed.payload.__tlePresence.report, true);
+});
+
+test('a configured service may submit a scalar subscription sample without opening arbitrary service routing', () => {
+  const f = fixture(false, { serviceCodes: ['environment', 'power'] }); f.activate();
+  assert.equal(f.run({ nodeId: 'plc', serviceId: 'forged', payload: { value: 1 } }), null);
+  const sample = f.run({ nodeId: 'plc', serviceId: 'power', payload: { value: 8 } })![0]!;
+  assert.equal(sample.serviceId, 'power');
+  assert.deepEqual(sample.payload.values, { value: 8 });
+});
+
 test('S7 green does not synthesize online; sustained native unavailability does and recovery requires new data', () => {
   const f = fixture(true); f.activate(); f.sample();
   assert.equal(f.status('online'), null); assert.equal(f.status('offline'), null);

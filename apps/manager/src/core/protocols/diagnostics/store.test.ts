@@ -20,7 +20,7 @@ test('admission is persistent, bounded and excludes cleanup failures from reuse'
 });
 test('connection validation uses recipe defaults and refuses writes, fractional addresses and overflow', () => {
   assert.deepEqual(validateConnection({ host: '192.0.2.1' }), connection);
-  for (const value of [{ host: 'x', registerType: 'Coil' }, { host: 'x', address: 0.5 }, { host: 'x', address: 65535, quantity: 2 }, { host: 'x', quantity: 126 }, { host: 'x', secret: 'never echo' }])
+  for (const value of [{ host: 'x', registerType: 'Coil' }, { host: 'x', address: 0.5 }, { host: 'x', address: 65535, quantity: 2 }, { host: 'x', quantity: 601 }, { host: 'x', secret: 'never echo' }])
     assert.throws(() => validateConnection(value));
 });
 

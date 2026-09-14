@@ -123,7 +123,7 @@ test('every builtin can append with confirmed dependencies and config links rema
     assert.equal(prepared.resultNodeCount, rendered.nodeCount + 1);
     const copiedIds = new Set(prepared.flowsToDeploy.slice(1).map((node) => node.id));
     for (const node of prepared.flowsToDeploy.slice(1)) {
-      if (node.type === 'modbus-read') assert.ok(copiedIds.has(String(node['server'])));
+      if (node.type === 'modbus-read' || node.type === 'modbus-flex-getter') assert.ok(copiedIds.has(String(node['server'])));
       if (node.type === 'tier0-opcua-read') assert.ok(copiedIds.has(String(node['connection'])));
       if (node.type === 'OpcUa-Client' || node.type === 's7 in') assert.ok(copiedIds.has(String(node['endpoint'])));
       if (node.type === 'status' || node.type === 'catch') {

@@ -8,14 +8,24 @@ test('HTTP push posts the versioned envelope to the Manager and preserves only i
  const res={marker:1};const output=run('presence-uplink-request',{req:{headers:{authorization:'device-secret'}},res,nodeId:'device',serviceId:'telemetry',payload:{__tlePresence:{kind:'sample'},values:{t:1}},headers:{cookie:'device-cookie'}})[0];
  assert.equal(output.url,'http://manager:9100/api/edge/uplink');assert.equal(output.res,res);
  assert.equal(output.headers.authorization,'Bearer manager-secret');assert.equal(JSON.stringify(output.payload).includes('secret'),false);
+ assert.equal(output._tleExpectedAccepted,1);
  assert.deepEqual(JSON.parse(JSON.stringify(output.payload)),{nodeId:'device',serviceId:'telemetry',data:{__tlePresence:{kind:'sample'},values:{t:1}}});
 });
 test('HTTP push only acknowledges an actual 202 with positive acceptance and never exposes backend headers or errors',()=>{
  for(const [statusCode,body,expected] of [[202,{accepted:1},202],[202,{accepted:0},503],[200,{accepted:1},503],[503,{error:'sensitive backend text'},503],[409,{accepted:1},503]]){
-  const output=run('presence-uplink-result',{res:{},req:{},statusCode,payload:body,headers:{authorization:'manager-secret','set-cookie':'backend-cookie'}});
+  const output=run('presence-uplink-result',{res:{},req:{},statusCode,payload:body,_tleExpectedAccepted:1,headers:{authorization:'manager-secret','set-cookie':'backend-cookie'}});
   assert.equal(output.statusCode,expected);assert.equal(JSON.stringify(output).includes('manager-secret'),false);assert.equal(JSON.stringify(output).includes('backend-cookie'),false);assert.equal(JSON.stringify(output).includes('sensitive'),false);
  }
  assert.equal(run('presence-uplink-result',{res:{headersSent:true},statusCode:202,payload:{accepted:1}}),null);
  assert.equal(run('presence-uplink-result',{res:{_res:{headersSent:true}},statusCode:202,payload:{accepted:1}}),null);
  assert.equal(run('presence-uplink-result',{statusCode:202,payload:{accepted:1}}),null,'status envelopes have no HTTP peer');
+});
+
+test('HTTP push acknowledges all mapped services together and rejects a partial acceptance receipt',()=>{
+ const request=run('presence-uplink-request',{res:{},req:{},nodeId:'device',serviceId:'a',payload:{__tlePresence:{kind:'sample'},services:[{serviceCode:'a',values:{t:1,h:2}},{serviceCode:'b',values:{t:3}}]}})[0];
+ assert.equal(request._tleExpectedAccepted,3);
+ for(const accepted of [1,2,4])assert.equal(run('presence-uplink-result',{...request,statusCode:202,payload:{accepted}}).statusCode,503);
+ const response=run('presence-uplink-result',{...request,statusCode:202,payload:{accepted:3}});
+ assert.equal(response.statusCode,202);assert.equal(response._tleExpectedAccepted,undefined);
+ assert.equal(run('presence-uplink-result',{res:{},statusCode:202,payload:{accepted:3}}).statusCode,503);
 });

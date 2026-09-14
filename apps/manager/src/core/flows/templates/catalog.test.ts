@@ -76,7 +76,7 @@ test('configured renders expose an isolated normalized parameter archive includi
   assert.equal(rendered.parameterValues?.nodeId, 'saved-device');
   assert.equal(rendered.parameterValues?.port, 15001);
   assert.equal(rendered.parameterValues?.downlinkEnabled, true);
-  assert.deepEqual(rendered.parameterValues?.commands, input.commands);
+  assert.deepEqual(rendered.parameterValues?.commands, input.commands.map(command => ({ ...command, serviceCode: '', targetServiceCode: '' })));
   input.commands[0]!.cmd = 'changed-outside';
   assert.equal((rendered.parameterValues?.commands as { cmd: string }[])[0]?.cmd, 'setTemperature');
 });

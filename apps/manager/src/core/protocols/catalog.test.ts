@@ -14,6 +14,14 @@ const installed = (overrides: Partial<InstalledNodeSet> = {}) => {
     version: r.version, types: r.nodeTypes, enabled: true, err: '', ...overrides }]);
 };
 
+test('Modbus readiness requires the native request node used by automatic read batches', () => {
+  assert.deepEqual(req().nodeTypes, ['modbus-client', 'modbus-flex-getter']);
+  const oldReadOnly = protocolStatuses(facts, [installed({ types: ['modbus-client', 'modbus-read'] })])
+    .find(p => p.id === 'modbus-tcp')!;
+  assert.equal(oldReadOnly.ready, false);
+  assert.deepEqual(oldReadOnly.packages[0]!.missingNodeTypes, ['modbus-flex-getter']);
+});
+
 test('catalogue distinguishes available protocol adapters from serial and extension candidates', () => {
   assert.equal(PROTOCOL_COMPONENTS.filter((p) => p.status === 'available').length, 7);
   assert.equal(PROTOCOL_COMPONENTS.find((p) => p.id === 'modbus-rtu')!.status, 'blocked');

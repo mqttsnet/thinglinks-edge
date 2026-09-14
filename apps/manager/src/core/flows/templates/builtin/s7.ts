@@ -1,5 +1,6 @@
 import type { TemplateRecipe } from '../types.ts';
 import { validateS7Points } from '../industrial-address.ts';
+import { rawPointMappings, resolvePoints } from '../service-mapping.ts';
 import {
   identityFields,
   hostField,
@@ -20,7 +21,7 @@ export const s7Recipe: TemplateRecipe = {
   description: '通过 S7 连接读取变量表，支持定时上报与变化上报。',
   category: 'industrial',
   protocols: ['s7'],
-  revision: '1.2.0',
+  revision: '1.3.0',
   previewParameters: { host: '192.0.2.20', nodeId: 'example-s7', serviceCode: 'telemetry' },
   requirements: requirements('s7'),
   parameters: [
@@ -47,6 +48,7 @@ export const s7Recipe: TemplateRecipe = {
       port = integer(p.port, '端口');
     const points = pointsOf(p);
     validateS7Points(points);
+    const raw = rawPointMappings(resolvePoints(points, p.serviceCode));
     return pipeline(
       p,
       'S7 PLC 采集',
@@ -71,7 +73,7 @@ export const s7Recipe: TemplateRecipe = {
           cycletime: Number(p.interval) * 1000,
           timeout: integer(p.timeoutMs, 'S7 请求超时'),
           name: 'S7 连接',
-          vartable: points.map((point) => ({ name: String(point.property), addr: String(point.source) })),
+          vartable: raw.reads.map((point) => ({ name: point.alias, addr: point.source })),
         },
         {
           id: 'input',
@@ -88,7 +90,7 @@ export const s7Recipe: TemplateRecipe = {
         },
       ],
       'json',
-      points.map((point) => ({ ...point, source: point.property })),
+      raw.points.map((point) => ({ ...point, source: point.rawAlias })),
       { protocol: 's7', sourceIds: ['input', 'connection'], changesOnly: p.changesOnly === true, failureWindowMs: Math.ceil(Math.max(10000, Number(p.interval) * 3000 + Number(p.timeoutMs))) },
     );
   },

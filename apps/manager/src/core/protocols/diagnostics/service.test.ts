@@ -29,7 +29,7 @@ function fixture() {
   let verifyBarrier: Promise<void> | undefined;
   const store = new ProtocolDiagnosticStore(db, { now: () => now });
   const gate = new InstanceOperationGate({ assertAllowed() { } });
-  const mod = { module: 'node-red-contrib-modbus', version: '5.60.2', observedVersions: ['5.60.2'], enabled: true, local: false, observedFiles: [], source: 'unknown', health: 'healthy', errors: [], types: ['modbus-client', 'modbus-getter'], nodeSets: [{ id: 'modbus', name: 'modbus', module: 'node-red-contrib-modbus', version: '5.60.2', enabled: true, types: ['modbus-client', 'modbus-getter'], err: '' }] } as InstalledModule;
+  const mod = { module: 'node-red-contrib-modbus', version: '5.60.2', observedVersions: ['5.60.2'], enabled: true, local: false, observedFiles: [], source: 'unknown', health: 'healthy', errors: [], types: ['modbus-client', 'modbus-flex-getter'], nodeSets: [{ id: 'modbus', name: 'modbus', module: 'node-red-contrib-modbus', version: '5.60.2', enabled: true, types: ['modbus-client', 'modbus-flex-getter'], err: '' }] } as InstalledModule;
   const service = new ProtocolDiagnosticService({ store, gate, now: () => now, taskId: () => `task-${++sequence}`, readerId: () => `reader-${sequence}`, generationFor: () => generation, runtime: { async inspect() { return { runtimeId, generation: 'generation', running, callbackReady: true }; }, async exists() { return runtimeExists; } }, admin: { async readModules() { return modules ? [mod] : []; }, async listFlows(_id, reservedBytes) { listReservations.push(reservedBytes ?? 0); if (failList) throw new Error('private upstream diagnostic'); if (rawGraphOversized) throw new ManagedFlowResponseTooLargeError(); return [...flows.values()].flatMap(f => [{ id: f.id!, type: 'tab' }, ...f.nodes, ...(f.configs ?? [])]) as FlowNode[]; }, async addFlow(_id, f) { assert.equal(store.unfinished().length, 1); added++; if (ambiguousNoFlow) throw new Error('unknown deployment response'); const id = `generated-${added}`; flows.set(id, { ...structuredClone(f), id, nodes: f.nodes.map(n => ({ ...n, z: id })), configs: (f.configs ?? []).map(n => ({ ...n, z: id })) }); if (lostResponse)
         throw new Error('response lost'); return { id }; }, async getFlow(_id, id) { await verifyBarrier; const f = flows.get(id); if (!f)
         throw Object.assign(new Error('missing'), { status: 404 }); return structuredClone(f); }, async deleteFlow(_id, id) { if (failDelete)
@@ -41,6 +41,75 @@ async function until(check: () => boolean) { for (let i = 0; i < 300; i++) {
     return;
   await delay(5);
 } assert.fail('condition not reached'); }
+test('600-register task grants one whole-round lease and publishes the unchanged result after cleanup', async () => {
+  const f = fixture();
+  try {
+    const before = Date.now();
+    const task = await f.service.start('a', { ...connection, quantity: 600, clientTimeout: 1000 }, 'actor');
+    await until(() => f.service.get('a', task.id).state === 'connecting');
+    const readerId = f.store.get(task.id)!.readerId;
+    const lease = f.service.claim('a', task.id, { readerId });
+    assert.ok(lease.deadline - before >= 7500, 'lease covers five request deadlines and result reporting');
+    assert.ok(task.deadline - before <= 370000, 'overall diagnostic budget stays bounded');
+    assert.throws(() => f.service.claim('a', task.id, { readerId }));
+    assert.throws(() => f.service.complete('a', task.id, { readerId, leaseToken: lease.leaseToken, registers: Array(125).fill(1), durationMs: 100 }));
+    const registers = Array.from({ length: 600 }, (_, index) => index);
+    f.service.complete('a', task.id, { readerId, leaseToken: lease.leaseToken, registers, durationMs: 5500 });
+    await until(() => f.service.get('a', task.id).cleanup === 'done');
+    const complete = f.service.get('a', task.id);
+    assert.equal(complete.state, 'succeeded');
+    assert.deepEqual(complete.result, { registers, hex: registers.map(value => value.toString(16).padStart(4, '0').toUpperCase()).join(' '), durationMs: 5500 });
+    assert.equal(f.added, 1); assert.equal(f.deleted, 1);
+    assert.equal(f.store.unfinished().length, 0);
+  } finally { await f.service.close(); f.db.close(); }
+});
+
+test('oversize register span is rejected before creating a diagnostic task or client', async () => {
+  const f = fixture();
+  try {
+    await assert.rejects(f.service.start('a', { ...connection, quantity: 601 }, 'actor'));
+    assert.equal(f.added, 0); assert.equal(f.store.list('a').length, 0);
+  } finally { await f.service.close(); f.db.close(); }
+});
+
+test('the largest valid timeout budget covers all five blocks and remains below 370 seconds', async () => {
+  const f = fixture();
+  try {
+    const task = await f.service.start('a', { ...connection, quantity: 600, clientTimeout: 60000, reconnectTimeout: 60000 }, 'actor');
+    await until(() => f.service.get('a', task.id).state === 'connecting');
+    const readerId = f.store.get(task.id)!.readerId;
+    const lease = f.service.claim('a', task.id, { readerId });
+    assert.equal(lease.deadline - task.createdAt, 303750);
+    assert.equal(task.deadline - task.createdAt, 366250);
+    assert.equal((await f.service.cancel('a', task.id)).cleanup, 'done');
+    assert.equal(f.deleted, 1);
+  } finally { await f.service.close(); f.db.close(); }
+});
+
+test('a failed multi-block task keeps cleanup responsibility through interruption and cleanup retry', async () => {
+  const f = fixture();
+  try {
+    const task = await f.service.start('a', { ...connection, quantity: 600 }, 'actor');
+    await until(() => f.service.get('a', task.id).state === 'connecting');
+    const readerId = f.store.get(task.id)!.readerId;
+    const lease = f.service.claim('a', task.id, { readerId });
+    f.setFailDelete(true);
+    f.service.complete('a', task.id, { readerId, leaseToken: lease.leaseToken, errorCode: 'READ_FAILED', durationMs: 1 });
+    await until(() => f.service.get('a', task.id).cleanup === 'failed');
+    assert.equal(f.service.get('a', task.id).result, undefined);
+    assert.equal(new ProtocolDiagnosticStore(f.db).unfinished()[0]!.connection.quantity, 600);
+    const restarted = new ProtocolDiagnosticService({ store: f.store, gate: f.gate, generationFor: () => 'generation',
+      admin: {} as import('./service.ts').DiagnosticAdminPort, runtime: {} as import('./service.ts').DiagnosticRuntimePort });
+    assert.throws(() => restarted.claim('a', task.id, { readerId }));
+    assert.throws(() => restarted.complete('a', task.id, { readerId, leaseToken: lease.leaseToken, registers: Array(600).fill(2), durationMs: 1 }));
+    await restarted.close();
+    f.setFailDelete(false);
+    await f.service.recover();
+    assert.equal(f.service.get('a', task.id).cleanup, 'done');
+    assert.equal(f.service.get('a', task.id).state, 'failed');
+    assert.equal(f.added, 1); assert.equal(f.deleted, 1);
+  } finally { await f.service.close(); f.db.close(); }
+});
 test('read is claimed once, scoped, validated, and success follows confirmed single-tab cleanup', async () => {
   const f = fixture();
   try {

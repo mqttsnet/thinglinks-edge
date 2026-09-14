@@ -32,7 +32,7 @@ test('S7 diagnoses wrong PLC address and unsupported arrays/date values before d
 test('S7 preserves actual scalar aliases, text arrays, and existing useful scalar conversions', () => {
   for (const [source, dataType] of [['DB1,R0', 'number'], ['DB1,RWORD4', 'number'], ['EW0', 'number'], ['AD0', 'number'], ['MRW4', 'number'], ['PIW0', 'number'], ['DB1,C0.10', 'string'], ['DB1,S0.10', 'string'], ['DB1,REAL0.1', 'number'], ['T0', 'number'], ['C0', 'number'], ['DB1,X0.1', 'boolean'], ['DB1,INT0', 'string'], ['DB1,BYTE0', 'boolean']]) {
     const flows = renderBuiltinTemplate(s7Recipe.id, configuration({ points: [point(source!, dataType)] }))!.flows;
-    assert.deepEqual(flows.find(node => node.type === 's7 endpoint')?.vartable, [{ name: 'temperature', addr: source }]);
+    assert.deepEqual(flows.find(node => node.type === 's7 endpoint')?.vartable, [{ name: 'raw_0', addr: source }]);
   }
   assert.throws(() => renderBuiltinTemplate(s7Recipe.id, configuration({ points: [point('DB1,X0.1', 'number')] })), /第 1 行.*temperature.*布尔/);
   assert.throws(() => renderBuiltinTemplate(s7Recipe.id, configuration({ points: [point('DB1,C0.10', 'boolean')] })), /第 1 行.*temperature.*文本/);

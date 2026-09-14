@@ -199,7 +199,7 @@ test('new configured copies expose their archived form and control identity thro
     for (const template of [listed, detail.json().template]) {
       assert.equal(template.parameterValues.nodeId, 'saved-device');
       assert.equal(template.parameterValues.downlinkEnabled, true);
-      assert.deepEqual(template.parameterValues.commands, [{ cmd: 'setTemperature', param: 'value', property: 'temperature' }]);
+      assert.deepEqual(template.parameterValues.commands, [{ serviceCode: '', cmd: 'setTemperature', param: 'value', targetServiceCode: '', property: 'temperature' }]);
       assert.ok(template.parameters.some((field: { key: string }) => field.key === 'commands'));
       assert.ok(template.notes.length > 0);
       assert.equal(template.derivedFrom.templateId, 'builtin:tcp');
@@ -245,6 +245,6 @@ test('Modbus control render and configured-copy APIs reject it while preserving 
     assert.deepEqual(new TemplateRepo(db).getWithContent(existing.id)!.flows, oldFlows, 'old snapshots must not be silently rewritten');
     const acquisition = await app.inject({ method: 'POST', url: '/api/templates/builtin%3Amodbus-tcp/render', payload: { parameters: { ...parameters, downlinkEnabled: false } } });
     assert.equal(acquisition.statusCode, 200);
-    assert.ok(acquisition.json().template.flows.some((node: { type: string }) => node.type === 'modbus-read'));
+    assert.ok(acquisition.json().template.flows.some((node: { type: string }) => node.type === 'modbus-flex-getter'));
   } finally { await app.close(); db.close(); }
 });

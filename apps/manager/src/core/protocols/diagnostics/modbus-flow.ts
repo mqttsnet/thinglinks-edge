@@ -2,6 +2,8 @@ import { createHash } from 'node:crypto';
 import type { SingleFlowConfig } from '../../flows/admin-client.ts';
 import type { FlowNode } from '../../flows/types.ts';
 import { host as validateHost } from '../../flows/templates/builtin/common.ts';
+import { modbusRoundProgram } from '../../flows/templates/modbus-acquisition.ts';
+import { MAX_MODBUS_REGISTERS, modbusReadDurationMs } from '../../flows/templates/modbus-read-plan.ts';
 
 export interface ModbusDiagnosticFlowInput {
   taskId: string;
@@ -19,10 +21,14 @@ export interface ModbusDiagnosticFlowInput {
 
 /** Fixed controller program. Only serialized configuration enters it; no credentials live in the flow JSON. */
 function controllerScript(config: ModbusDiagnosticFlowInput): string {
-  return `const config=${JSON.stringify(config)};
-const now=Date.now(),key='__tle_diagnostic_'+config.taskId;
-let state=flow.get(key)||{phase:'waiting',ready:false,claimAttempts:0,claimFailures:0,resultAttempts:0};
-const save=()=>flow.set(key,state);
+  return `${modbusRoundProgram({ address: config.address, quantity: config.quantity, unitId: config.unitId,
+    fc: config.registerType === 'HoldingRegister' ? 3 : 4, clientTimeout: config.clientTimeout })}
+const config=${JSON.stringify(config)},readDurationMs=${modbusReadDurationMs(config.quantity, config.clientTimeout)};
+const now=Date.now();
+// VM-local only: configured file-backed flow context must never persist leases or partial rounds.
+let state=globalThis.__tleDiagnosticState;
+if(!state)return null;
+const save=()=>{globalThis.__tleDiagnosticState=state;};
 if(now>=config.expiresAt){state.phase='expired';save();return null;}
 if(state.phase==='done'||state.phase==='expired')return null;
 const marker=msg._tleDiagnostic;
@@ -35,10 +41,21 @@ const request=(kind,payload,attempt)=>{
   _tleDiagnostic:{taskId:config.taskId,readerId:config.readerId,kind,attempt}};
 };
 const report=(body)=>{
- state.phase='reporting';
+ state.phase='reporting';state.round=null;
  state.result={readerId:config.readerId,leaseToken:state.leaseToken,durationMs:Math.max(1,now-(state.startedAt||now)),...body};
  state.resultAttempts=1;state.resultAt=now;save();
  return [null,null,request('result',state.result,state.resultAttempts)];
+};
+const advance=(event)=>{
+ const result=advanceModbusRound(state.round,event,now);state.round=result.state;save();
+ if(result.failure){
+  const error=event.kind==='reply'&&event.message.error&&event.message.error.message;
+  const code=result.failure==='READ_FAILED'&&typeof error==='string'&&/ECONN|EHOST|not ready|inactive client|connection.*(?:closed|refused|failed)/i.test(error.slice(0,1024))?'CONNECT_FAILED':result.failure;
+  return report({errorCode:code});
+ }
+ if(result.complete)return report({registers:result.complete});
+ if(result.request)return [null,{...result.request,_tleDiagnostic:{taskId:config.taskId,readerId:config.readerId,kind:'read',leaseToken:state.leaseToken}},null];
+ return null;
 };
 if(msg.status&&msg.status.source&&msg.status.source.id===config.readerId){
  state.ready=msg.status.text==='active'&&msg.status.fill==='green'&&msg.status.shape==='dot';
@@ -69,26 +86,18 @@ if(matched&&marker.kind==='claim'){
   !Number.isSafeInteger(lease.deadline)||lease.deadline>config.expiresAt||lease.deadline<=now){state.phase='done';save();return null;}
  state.leaseToken=lease.leaseToken;state.leaseDeadline=lease.deadline;state.startedAt=now;
  if(!state.ready)return report({errorCode:'CONNECT_FAILED'});
- if(now+config.clientTimeout+50>lease.deadline)return report({errorCode:'READ_TIMEOUT'});
- state.phase='reading';state.readDeadline=now+config.clientTimeout+50;save();
- return [null,{payload:{},_tleDiagnostic:{taskId:config.taskId,readerId:config.readerId,kind:'read',leaseToken:state.leaseToken}},null];
+ if(now+readDurationMs>lease.deadline)return report({errorCode:'READ_TIMEOUT'});
+ state.phase='reading';save();
+ return advance({kind:'start',nonce:state.leaseToken,deadline:lease.deadline});
 }
 if(matched&&marker.kind==='read'){
  if(state.phase!=='reading'||marker.leaseToken!==state.leaseToken)return null;
- if(now>=state.readDeadline||now>=state.leaseDeadline)return report({errorCode:'READ_TIMEOUT'});
- if(msg.error){
-  if(!msg.error.source||msg.error.source.id!==config.readerId)return null;
-  const error=typeof msg.error.message==='string'?msg.error.message.slice(0,1024):'';
-  const code=/timeout|timed out/i.test(error)?'READ_TIMEOUT':/ECONN|EHOST|connection.*(?:closed|refused|failed)/i.test(error)?'CONNECT_FAILED':'READ_FAILED';
-  return report({errorCode:code});
- }
- if(!Array.isArray(msg.payload)||msg.payload.length!==config.quantity||msg.payload.some(v=>!Number.isInteger(v)||v<0||v>65535)){
-  return report({errorCode:'INVALID_RESPONSE'});
- }
- return report({registers:msg.payload.slice()});
+ // Native failure outputs preserve the request markers but do not add Catch's source field.
+ if(msg.error&&msg.error.source&&msg.error.source.id!==config.readerId)return null;
+ return advance({kind:'reply',message:msg});
 }
 if(msg._tleDiagnosticTick!==true&&!msg.status)return null;
-if(state.phase==='reading'&&now>=state.readDeadline)return report({errorCode:'READ_TIMEOUT'});
+if(state.phase==='reading')return advance({kind:'tick'});
 if(state.phase==='reporting'){
  if(state.resultAttempts>=5||now>=state.leaseDeadline){state.phase='done';save();return null;}
  if(now-state.resultAt<2500)return null;
@@ -100,7 +109,7 @@ if(state.phase==='claiming'){
  state.phase='waiting';state.claimFailures++;
 }
 if(state.phase!=='waiting'||!state.ready||now<(state.nextClaimAt||0))return null;
-if(state.claimFailures>=5||now+config.clientTimeout+50>=config.expiresAt){state.phase='done';save();return null;}
+if(state.claimFailures>=5||now+readDurationMs>=config.expiresAt){state.phase='done';save();return null;}
 state.phase='claiming';state.claimAt=now;state.claimAttempts++;save();
 return [request('claim',{readerId:config.readerId},state.claimAttempts),null,null];`;
 }
@@ -119,7 +128,7 @@ export function buildModbusDiagnosticFlow(input: ModbusDiagnosticFlowInput): {
     if (!/^[a-zA-Z0-9_-]{1,64}$/.test(id)) throw new Error('试读任务或读取节点标识无效');
   }
   integer(config.port, 1, 65535, '设备端口'); integer(config.unitId, 0, 255, '单元标识 Unit ID');
-  integer(config.address, 0, 65535, '起始地址'); integer(config.quantity, 1, 125, '读取数量');
+  integer(config.address, 0, 65535, '起始地址'); integer(config.quantity, 1, MAX_MODBUS_REGISTERS, '读取总量');
   integer(config.clientTimeout, 100, 60000, '读取超时'); integer(config.reconnectTimeout, 100, 60000, '重连间隔');
   integer(config.expiresAt, 1, 8_640_000_000_000_000, '截止时间');
   if (config.address + config.quantity > 65536 || !['HoldingRegister', 'InputRegister'].includes(config.registerType)) {
@@ -140,13 +149,13 @@ export function buildModbusDiagnosticFlow(input: ModbusDiagnosticFlowInput): {
         repeat: '0.25', crontab: '', once: true, onceDelay: 0.1, x: 160, y: 100, wires: [[controller]] },
       { id: nodeId('status'), z: id, type: 'status', name: '等待读取节点 active', scope: [config.readerId], x: 160, y: 160, wires: [[controller]] },
       { id: controller, z: id, type: 'function', name: '一次租约与受限试读', func: controllerScript(config), outputs: 3, timeout: 1,
-        noerr: 0, initialize: '', finalize: '', libs: [], x: 450, y: 150, wires: [[claim], [config.readerId], [result]] },
+        noerr: 0, initialize: "globalThis.__tleDiagnosticState={phase:'waiting',ready:false,claimAttempts:0,claimFailures:0,resultAttempts:0,round:null};",
+        finalize: 'delete globalThis.__tleDiagnosticState;', libs: [], x: 450, y: 150, wires: [[claim], [config.readerId], [result]] },
       httpNode(claim, '申请单次试读租约', 180),
-      { id: config.readerId, z: id, type: 'modbus-getter', name: '只读一次寄存器', unitid: String(config.unitId),
-        dataType: config.registerType, adr: String(config.address), quantity: String(config.quantity), server: client,
+      { id: config.readerId, z: id, type: 'modbus-flex-getter', name: '依次读取寄存器分块', server: client,
         showStatusActivities: true, showErrors: true, showWarnings: true, logIOActivities: false,
-        useIOFile: false, ioFile: '', useIOForPayload: false, emptyMsgOnFail: false,
-        keepMsgProperties: true, msgThruput: false, delayOnStart: false, enableDeformedMessages: false,
+        useIOFile: false, ioFile: '', useIOForPayload: false, emptyMsgOnFail: true,
+        keepMsgProperties: true, delayOnStart: false, startDelayTime: '', enableDeformedMessages: false,
         x: 740, y: 140, wires: [[controller], []] },
       httpNode(result, '回报单次试读结果', 740),
       { id: nodeId('errors'), z: id, type: 'catch', name: '试读失败与回报失败', scope: [claim, result, config.readerId],

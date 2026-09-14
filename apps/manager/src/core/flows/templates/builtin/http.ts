@@ -22,7 +22,7 @@ export const httpPollRecipe: TemplateRecipe = {
   description: '定时读取设备 JSON 接口，映射点位后上报。HTTPS 使用系统证书校验。',
   category: 'network',
   protocols: ['http'],
-  revision: '1.2.0',
+  revision: '1.3.0',
   previewParameters: { url: 'http://192.0.2.10:8080/data' },
   requirements: requirements('http'),
   parameters: [
@@ -104,7 +104,7 @@ export const httpReceiveRecipe: TemplateRecipe = {
   description: '接收设备 POST JSON 数据，解析点位并异步上报 ThingLinks。',
   category: 'network',
   protocols: ['http'],
-  revision: '1.2.0',
+  revision: '1.3.0',
   requirements: requirements('http'),
   parameters: [
     ...identityFields,

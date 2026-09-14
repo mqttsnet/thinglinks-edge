@@ -1,65 +1,141 @@
-/** Fixed HTTP bridge scripts; credentials are resolved inside the instance and never saved in recipes. */
+import { TemplateError } from '../types.ts';
+import type { ControlMapping } from './control-mapping.ts';
+import { MAX_TEMPLATE_SERVICES, resolveServiceCode } from './service-mapping.ts';
+
 export interface ControlBindingConfig {
   nodeId: string;
   serviceCode: string;
-  commands: { cmd: string; param: string; property: string }[];
-}
-const REQUEST = `
-const base=env.get('TLE_MANAGER_URL'),token=env.get('TLE_INGEST_TOKEN');
-if(!base||!token){node.error('实例未配置 ThingLinks 命令桥接入信息',msg);return null;}
-msg.method='POST';msg.headers={'content-type':'application/json',authorization:'Bearer '+token};msg.requestTimeout=5000;
-`;
-const pendingKey = '__tle_control_pending';
-const resultKey = '__tle_control_result';
-const pollKey = '__tle_control_poll_until';
-
-export function bindingPollScript(config: ControlBindingConfig): string {
-  const binding = {
-    nodeId: config.nodeId,
-    serviceCode: config.serviceCode,
-    commands: config.commands.map(({ cmd, param }) => ({ cmd, param })),
-  };
-  return `${REQUEST}
-const now=Date.now();
-if((flow.get('${pollKey}')||0)>now)return null;
-flow.set('${pollKey}',now+12000);
-const result=flow.get('${resultKey}');
-if(result){
- if(now-result.time>60000){flow.set('${resultKey}',undefined);flow.set('${pendingKey}',undefined);node.error('执行结果未能及时提交，请查看 Edge 命令记录',msg);}
- else {msg.url=base+'/api/edge/commands/'+encodeURIComponent(result.id)+'/result';msg.payload=result.body;msg._tleResultId=result.id;return [null,msg,null];}
-}
-const pending=flow.get('${pendingKey}');
-if(pending&&now-pending.time<32000){flow.set('${pollKey}',0);return null;}
-if(pending){flow.set('${pendingKey}',undefined);node.send([null,null,{reset:true}]);}
-msg._tleConsumer=node.id;msg.url=base+'/api/edge/command-bindings';msg.payload={...${JSON.stringify(binding)},consumerId:node.id};
-return [msg,null,null];`;
+  commands: ControlMapping[];
 }
 
-export function nextCommandScript(config: ControlBindingConfig): string {
-  return `if(msg.statusCode<200||msg.statusCode>=300){flow.set('${pollKey}',0);node.error('命令绑定未成功，请检查重复设备映射或实例权限',msg);return null;}
-${REQUEST}
-msg.url=base+'/api/edge/commands/next';msg.payload={consumerId:msg._tleConsumer,nodeId:${JSON.stringify(config.nodeId)},serviceCode:${JSON.stringify(config.serviceCode)}};return msg;`;
+/** Each generated controller owns one VM; leases never enter configured persistent context stores. */
+export const CONTROL_INITIALIZE = "globalThis.__tleControl={run:String(Date.now())+':'+Math.random().toString(16).slice(2),sequence:0,cursor:0,registered:false,nextHeartbeat:0,nextPoll:0,binding:null,poll:null,pending:null,result:null};";
+export const CONTROL_FINALIZE = 'delete globalThis.__tleControl;';
+
+/** Outputs: binding heartbeat, next command, encoding, receipt, TCP reset, guarded physical execution. */
+export function controlControllerScript(config: ControlBindingConfig, protocol = ''): string {
+  const services: { serviceCode: string; commands: { cmd: string; param: string }[] }[] = [];
+  if (!config.commands.length || config.commands.length > 64) throw new TemplateError('命令映射需要 1–64 项');
+  for (const mapping of config.commands) {
+    const serviceCode = resolveServiceCode(mapping.serviceCode, config.serviceCode);
+    let service = services.find(item => item.serviceCode === serviceCode);
+    if (!service) { service = { serviceCode, commands: [] }; services.push(service); }
+    service.commands.push({ cmd: mapping.cmd, param: mapping.param });
+  }
+  if (services.length > MAX_TEMPLATE_SERVICES) throw new TemplateError(`控制映射最多包含 ${MAX_TEMPLATE_SERVICES} 个服务`);
+  return `const config=${JSON.stringify({ nodeId: config.nodeId, services })};
+const state=globalThis.__tleControl;if(!state)return null;
+const now=Date.now(),out=[null,null,null,null,null,null];
+const finish=()=>out.some(Boolean)?out:null;
+const request=(kind,path,payload)=>{
+ const base=env.get('TLE_MANAGER_URL'),token=env.get('TLE_INGEST_TOKEN');
+ if(typeof base!=='string'||!base||typeof token!=='string'||!token){node.error('实例未配置 ThingLinks 命令桥接入信息');return null;}
+ return {method:'POST',url:base.replace(/\\/$/,'')+path,headers:{'content-type':'application/json',authorization:'Bearer '+token},
+  requestTimeout:5000,payload,_tleControl:{run:state.run,kind,sequence:++state.sequence}};
+};
+const sendReceipt=()=>{
+ const result=state.result;
+ const message=request('receipt','/api/edge/commands/'+encodeURIComponent(result.id)+'/result',result.body);
+ if(message){result.transport={sequence:message._tleControl.sequence,deadline:now+5500};result.retryAt=now+2500;out[3]=message;}
+};
+const recordResult=(value)=>{
+ const pending=state.pending;if(!pending)return;
+ const command=pending.command;
+ state.pending=null;
+ state.result={id:command.id,body:{leaseToken:command.leaseToken,ok:value.ok,result:value.ok?{...command.params}:{},
+  ...(value.unknown?{unknown:true}:{}),...(!value.ok?{error:value.error||'设备未明确确认执行成功'}:{})},until:now+60000,retryAt:now,transport:null};
+ sendReceipt();
+};
+if(state.pending&&now>=state.pending.command.leaseDeadline){
+ const attempted=state.pending.phase==='executing';
+ recordResult({ok:false,unknown:attempted,error:attempted?'执行租约超时，设备执行结果未知，禁止自动重试':'命令租约过期，尚未提交设备写入'});out[4]={reset:true};
+}
+const marker=msg._tleControl;
+if(marker&&(marker.run!==state.run||!Number.isSafeInteger(marker.sequence)))return finish();
+if(marker&&marker.kind==='binding'){
+ if(!state.binding||marker.sequence!==state.binding.sequence)return finish();
+ state.binding=null;
+ state.registered=!msg.error&&msg.statusCode>=200&&msg.statusCode<300&&msg.payload&&msg.payload.accepted===${config.commands.length};
+ if(!state.registered){state.nextHeartbeat=now+2000;node.error('命令绑定未完整登记，请检查映射与实例权限');}
+ return finish();
+}
+if(marker&&marker.kind==='poll'){
+ const poll=state.poll;
+ if(!poll||marker.sequence!==poll.sequence||now>=poll.deadline)return finish();
+ state.poll=null;
+ if(msg.error||!Number.isInteger(msg.statusCode)||msg.statusCode<200||msg.statusCode>=300){node.error('命令获取失败');return finish();}
+ const command=msg.payload&&msg.payload.command;
+ if(!command)return finish();
+ const service=config.services.find(item=>item.serviceCode===poll.serviceCode);
+ const keys=command.params&&typeof command.params==='object'&&!Array.isArray(command.params)?Object.keys(command.params):[];
+ const identifier=value=>typeof value==='string'&&/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/.test(value);
+ if(!identifier(command.id)||!identifier(command.leaseToken)||
+  command.deviceIdentification!==config.nodeId||command.serviceCode!==poll.serviceCode||keys.length!==1||
+  !service.commands.some(item=>item.cmd===command.cmd&&item.param===keys[0])||
+  !Number.isSafeInteger(command.leaseDeadline)||command.leaseDeadline<=now){node.error('命令身份、映射或绝对租约无效，本条不执行');return finish();}
+ if(state.pending||state.result){node.error('设备已有执行或待提交结果，本条不重复执行');return finish();}
+ state.pending={command,sequence:marker.sequence,phase:'encoding'};
+ out[2]={payload:{command},_tleCommand:command,_tleControl:{run:state.run,sequence:marker.sequence,kind:'execution'}};
+ return finish();
+}
+if(marker&&marker.kind==='receipt'){
+ const result=state.result;
+ if(!result||!result.transport||marker.sequence!==result.transport.sequence)return finish();
+ result.transport=null;
+ if(!msg.error&&msg.statusCode>=200&&msg.statusCode<300){state.result=null;}
+ else if(msg.statusCode===404||msg.statusCode===409){state.result=null;node.error('命令租约已失效，执行结果请在 Edge 记录中核对');}
+ else {result.retryAt=now+2500;node.error('执行结果提交失败，将重试回执且不重新写设备');}
+ return finish();
+}
+if(msg._tlePrepared===true){
+ const pending=state.pending;
+ if(!pending||pending.phase!=='encoding'||!marker||marker.kind!=='execution'||marker.sequence!==pending.sequence||
+  msg._tleCommand?.id!==pending.command.id||msg._tleCommand?.leaseToken!==pending.command.leaseToken)return finish();
+ pending.phase='executing';delete msg._tlePrepared;msg._tleWriteAttempted=${protocol !== 'opcua'};out[5]=msg;return finish();
+}
+if(msg._tleExecutionResult){
+ const value=msg._tleExecutionResult,pending=state.pending;
+ if(!pending||!marker||marker.kind!=='execution'||marker.sequence!==pending.sequence||
+  value.id!==pending.command.id||value.leaseToken!==pending.command.leaseToken||typeof value.ok!=='boolean'||
+  (value.unknown!==undefined&&typeof value.unknown!=='boolean')||(value.ok&&value.unknown)||(value.ok&&pending.phase!=='executing'))return finish();
+ recordResult(value);return finish();
+}
+if(msg._tleNetworkAck){
+ const ack=msg._tleNetworkAck,pending=state.pending;
+ if(!pending||pending.phase!=='executing'||ack.id!==pending.command.id||(marker&&(marker.kind!=='execution'||marker.sequence!==pending.sequence)))return finish();
+ recordResult({ok:ack.ok===true,unknown:ack.ok!==true&&ack.ok!==false,error:'设备未明确确认执行成功'});return finish();
+}
+if(msg._tleControlTick!==true)return finish();
+if(state.binding&&now>=state.binding.deadline){state.binding=null;state.registered=false;state.nextHeartbeat=now;}
+if(!state.binding&&now>=state.nextHeartbeat){
+ const message=request('binding','/api/edge/command-bindings',{consumerId:node.id,...config});
+ if(message){state.binding={sequence:message._tleControl.sequence,deadline:now+5500};state.nextHeartbeat=now+10000;out[0]=message;}
+}
+if(state.result){
+ const result=state.result;
+ if(now>=result.until){state.result=null;node.error('执行结果未能及时提交，请查看 Edge 命令记录');}
+ else {
+  if(result.transport&&now>=result.transport.deadline)result.transport=null;
+  if(!result.transport&&now>=result.retryAt)sendReceipt();
+  return finish();
+ }
+}
+if(state.pending)return finish();
+if(state.poll){if(now<state.poll.deadline)return finish();state.poll=null;state.nextPoll=now+1000;}
+if(state.registered&&now>=state.nextPoll){
+ const service=config.services[state.cursor];state.cursor=(state.cursor+1)%config.services.length;
+ const message=request('poll','/api/edge/commands/next',{consumerId:node.id,nodeId:config.nodeId,serviceCode:service.serviceCode});
+ if(message){state.poll={sequence:message._tleControl.sequence,serviceCode:service.serviceCode,deadline:now+5500};state.nextPoll=now+1000;out[1]=message;}
+}
+return finish();`;
 }
 
-export function claimCommandScript(): string {
-  return `flow.set('${pollKey}',0);
-if(msg.statusCode<200||msg.statusCode>=300){node.error('命令获取失败',msg);return null;}
-const command=msg.payload&&msg.payload.command;
-if(!command)return null;
-if(typeof command.id!=='string'||typeof command.leaseToken!=='string'){node.error('命令租约无效',msg);return null;}
-if(!Number.isSafeInteger(command.leaseDeadline)||command.leaseDeadline<=Date.now()){node.error('命令租约截止时间无效或已过期，本条不执行',msg);return null;}
-const pending=flow.get('${pendingKey}');
-if(pending){node.error('设备已有执行中的命令，本条不重复执行',msg);return null;}
-flow.set('${pendingKey}',{command,time:Date.now()});msg._tleCommand=command;return msg;`;
-}
-
+/** Pure protocol result classification. The controller alone owns pending state and receipt retries. */
 export function commandResultScript(protocol: string, success: boolean, ackField = 'ok'): string {
   return `const command=msg._tleCommand||(msg.input&&msg.input._tleCommand);
 if(!command||typeof command.id!=='string'||typeof command.leaseToken!=='string')return null;
-const pending=flow.get('${pendingKey}');
-if(!pending||pending.command.id!==command.id||pending.command.leaseToken!==command.leaseToken)return null;
+if(!msg._tleControl&&msg.input)msg._tleControl=msg.input._tleControl;
 let ok=${success},reason='',unknown=false;
-// Driver errors can be structured objects containing request/credential material. Never copy them into Cloud receipts.
 const rawDetail=msg.error&&msg.error.message;
 let detail='协议节点报告错误，详情请在实例日志中核对';
 if(typeof rawDetail==='string'){
@@ -69,7 +145,7 @@ if(typeof rawDetail==='string'){
  else if(msg._tleExplicitRejection===true)detail='协议节点明确拒绝本次请求';
 }
 if(!ok)reason='设备执行失败：'+detail;
-if(!ok && msg._tleWriteAttempted===true && msg._tleExplicitRejection!==true){unknown=true;reason='设备执行结果未知：'+detail;}
+if(!ok&&msg._tleWriteAttempted===true&&msg._tleExplicitRejection!==true){unknown=true;reason='设备执行结果未知：'+detail;}
 if(ok&&${JSON.stringify(protocol)}==='opcua'){
  const status=msg.payload,code=typeof status==='number'?status:status&&status.value;
  if(!Number.isInteger(code)||code<0||code>0xffffffff||(code>>>30)!==0){ok=false;reason='OPC UA 写入未返回 Good 状态';}
@@ -77,32 +153,15 @@ if(ok&&${JSON.stringify(protocol)}==='opcua'){
 if(ok&&${JSON.stringify(protocol)}==='http'){
  if(msg.statusCode!==200||!msg.payload||msg.payload[${JSON.stringify(ackField)}]!==true){ok=false;unknown=msg.statusCode===202||!msg.payload||msg.payload[${JSON.stringify(ackField)}]!==false;reason='HTTP 控制接口未明确确认执行成功';}
 }
-${REQUEST}
-const body={leaseToken:command.leaseToken,ok,result:ok?{...pending.command.params}:{},...(!ok?{error:reason}:{}),...(unknown?{unknown:true}:{})};
-flow.set('${resultKey}',{id:command.id,body,time:Date.now()});flow.set('${pendingKey}',undefined);flow.set('${pollKey}',Date.now()+6000);
-msg.url=base+'/api/edge/commands/'+encodeURIComponent(command.id)+'/result';msg.payload=body;msg._tleResultId=command.id;return msg;`;
+msg._tleExecutionResult={id:command.id,leaseToken:command.leaseToken,ok,...(!ok?{error:reason}:{}),...(unknown?{unknown:true}:{})};
+return msg;`;
 }
 
-/** Network devices explicitly acknowledge a unique requestId; delivery alone is never success. */
-export function networkAckScript(protocol: 'tcp' | 'udp', ackField = 'ok'): string {
-  return `const succeed=function(msg){${commandResultScript(protocol, true)}};
-const fail=function(msg){${commandResultScript(protocol, false)}};
-const pending=flow.get('${pendingKey}');if(!pending)return null;
-try{
+/** An unsolicited UDP packet only supplies an id/ack; the VM controller supplies its current lease. */
+export function networkAckScript(_protocol: 'tcp' | 'udp', ackField = 'ok'): string {
+  return `try{
  const body=Buffer.isBuffer(msg.payload)?JSON.parse(msg.payload.toString('utf8')):typeof msg.payload==='string'?JSON.parse(msg.payload):msg.payload;
- if(!body||body.requestId!==pending.command.id)return null;
- msg._tleCommand=pending.command;
- if(body[${JSON.stringify(ackField)}]!==true){msg._tleExplicitRejection=body[${JSON.stringify(ackField)}]===false;msg._tleWriteAttempted=true;msg.error={message:'设备未确认执行成功'};return fail(msg);}
- return succeed(msg);
-}catch(error){node.error('设备命令应答格式无效',msg);return null;}`;
-}
-
-export function resultDeliveredScript(): string {
-  return `flow.set('${pollKey}',0);
-const saved=flow.get('${resultKey}');
-if(!saved||saved.id!==msg._tleResultId)return null;
-if(msg.statusCode>=200&&msg.statusCode<300){flow.set('${resultKey}',undefined);}
-else if(msg.statusCode===409||msg.statusCode===404){flow.set('${resultKey}',undefined);node.error('命令租约已失效，执行结果请在 Edge 记录中核对',msg);}
-else node.error('执行结果提交失败，将重试回执且不重新执行设备命令',msg);
-return null;`;
+ if(!body||typeof body.requestId!=='string')return null;
+ msg._tleNetworkAck={id:body.requestId,ok:body[${JSON.stringify(ackField)}]};return msg;
+}catch(error){node.error('设备命令应答格式无效');return null;}`;
 }

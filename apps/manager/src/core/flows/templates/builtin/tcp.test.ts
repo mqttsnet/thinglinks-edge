@@ -44,5 +44,5 @@ test('TCP instructions distinguish listener mapping, remote port, framing and on
   assert.match(String(tcpRecipe.parameters.find(field => field.key === 'host')?.description), /127\.0\.0\.1.*实例/);
   assert.match(String(tcpRecipe.parameters.find(field => field.key === 'framing')?.description), /二进制.*换行/);
   assert.match(tcpRecipe.notes.join(' '), /一台逻辑设备.*身份/);
-  assert.equal(tcpRecipe.revision, '1.2.0');
+  assert.equal(tcpRecipe.revision, '1.3.0');
 });

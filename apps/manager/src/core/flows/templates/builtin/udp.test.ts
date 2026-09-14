@@ -22,7 +22,7 @@ test('UDP onboarding explains receiving port, complete datagrams and source iden
   assert.match(notes, /一台逻辑设备/);
   assert.match(notes, /来源 IP.*端口.*身份/);
   assert.match(notes, /送达.*顺序/);
-  assert.equal(udpRecipe.revision, '1.2.0');
+  assert.equal(udpRecipe.revision, '1.3.0');
 });
 
 test('UDP optional command contract still requires a separate reply port', () => {

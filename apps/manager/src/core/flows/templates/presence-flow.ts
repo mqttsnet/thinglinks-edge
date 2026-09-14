@@ -1,9 +1,13 @@
 import { TemplateError, type FlowNode } from '../types.ts';
 import { observationScript, type ObservedProtocol } from './presence-observation.ts';
+import { resolveServiceCode, MAX_TEMPLATE_SERVICES } from './service-mapping.ts';
+import { MAX_TEMPLATE_POINTS } from './limits.ts';
 
 export interface PresenceFlowConfig {
   nodeId: string;
   serviceCode: string;
+  /** Every service in this physical acquisition is permitted on the same observer sequence. */
+  serviceCodes?: string[];
   protocol: ObservedProtocol;
   silenceTimeoutMs?: number;
   /** HTTP push keeps req/res only on in-flight messages and returns 503 until an active lease exists. */
@@ -27,16 +31,16 @@ const now=Date.now();
 const save=()=>globalThis.__tlePresenceRuntime=s;
 const stop=()=>{s.closed=true;s.pending=null;save();node.status({fill:'red',shape:'ring',text:'采集状态代次已失效，请重新部署'});return null;};
 const validCounter=n=>Number.isSafeInteger(n)&&n>=1;
-const envelope=(kind,values)=>{
+const envelope=(kind,values,services,serviceCode=config.serviceCode)=>{
  if(!s.generation||s.phase!=='active'||s.pending||now>=s.leaseExpiresAt)return null;
  if(!validCounter(s.sequence))return stop();
  const meta={version:1,observerId:node.id,runNonce:s.runNonce,generation:s.generation,sequence:s.sequence++,kind};
  if(kind==='sample'){
-  const serialized=JSON.stringify(values);
+  const serialized=JSON.stringify(services||[{serviceCode,values}]);
   meta.report=!config.changesOnly||serialized!==s.previousValues||now-s.lastFullReport>=60000;
   if(meta.report)s.lastFullReport=now;
   s.previousValues=serialized;s.unavailableSince=null;s.consecutiveFailures=0;s.offlineSent=false;s.lastSample=now;
-  save();return {nodeId:config.nodeId,serviceId:config.serviceCode,payload:{__tlePresence:meta,values}};
+  save();return {nodeId:config.nodeId,serviceId:serviceCode,payload:services?{__tlePresence:meta,services}:{__tlePresence:meta,values}};
  }
  meta.online=false;s.offlineSent=true;s.lastOffline=now;s.previousValues=undefined;
  save();return {nodeId:config.nodeId,serviceId:config.serviceCode,payload:{__tlePresence:meta}};
@@ -106,10 +110,20 @@ if(msg._tlePresenceSource===true){
  }
  return null;
 }
-if(msg.nodeId===config.nodeId&&msg.serviceId===config.serviceCode&&s.acceptSample){
+if(msg.nodeId===config.nodeId&&config.serviceCodes.includes(msg.serviceId)&&s.acceptSample){
  const values=msg.payload;
  if(!values||typeof values!=='object'||Array.isArray(values)||!Object.keys(values).length)return null;
- const output=envelope('sample',values);
+ const services=msg._tleServices;
+ if(services!==undefined){
+  if(!Array.isArray(services)||!services.length||services.length>config.serviceCodes.length)return null;
+  const seen=new Set();let count=0;
+  for(const group of services){
+   if(!group||!config.serviceCodes.includes(group.serviceCode)||seen.has(group.serviceCode)||!group.values||typeof group.values!=='object'||Array.isArray(group.values))return null;
+   const size=Object.keys(group.values).length;if(!size)return null;count+=size;seen.add(group.serviceCode);
+  }
+  if(count>config.maxPoints)return null;
+ }
+ const output=envelope('sample',values,services,msg.serviceId);
  if(output&&config.httpResponse&&msg.res){output.req=msg.req;output.res=msg.res;}
  return output?[output,null]:unavailable();
 }
@@ -124,7 +138,9 @@ export function presenceFlow(config: PresenceFlowConfig): FlowNode[] {
     throw new TemplateError('采集状态不可用判断窗口无效');
   }
   if (!Number.isSafeInteger(config.silenceTimeoutMs ?? 0) || (config.silenceTimeoutMs ?? 0) < 0) throw new TemplateError('静默超时无效');
-  const runtimeConfig = { nodeId: config.nodeId, serviceCode: config.serviceCode, protocol: config.protocol, changesOnly: config.changesOnly === true, failureWindowMs: config.failureWindowMs, silenceTimeoutMs: config.silenceTimeoutMs ?? 0, httpResponse: config.httpResponse === true };
+  const serviceCodes = [...new Set((config.serviceCodes?.length ? config.serviceCodes : [config.serviceCode]).map(code => resolveServiceCode(code)))];
+  if (serviceCodes.length > MAX_TEMPLATE_SERVICES) throw new TemplateError(`单个采集模板最多映射 ${MAX_TEMPLATE_SERVICES} 个服务`);
+  const runtimeConfig = { nodeId: config.nodeId, serviceCode: serviceCodes[0]!, serviceCodes, maxPoints: MAX_TEMPLATE_POINTS, protocol: config.protocol, changesOnly: config.changesOnly === true, failureWindowMs: config.failureWindowMs, silenceTimeoutMs: config.silenceTimeoutMs ?? 0, httpResponse: config.httpResponse === true };
   const nodes: FlowNode[] = [
     { id: 'presence', type: 'function', z: 'tab', name: '采集状态与变化上报', func: `const config=${JSON.stringify(runtimeConfig)};\nconst observe=msg=>{${observationScript(config.protocol)}};\n${BODY}`, initialize: INITIALIZE, finalize: FINALIZE, outputs: config.httpResponse ? 3 : 2, timeout: 1, noerr: 0, libs: [], x: 650, y: 240, wires: config.httpResponse ? [['device'], ['presence-http'], ['response']] : [['device'], ['presence-http']] },
     { id: 'presence-tick', type: 'inject', z: 'tab', name: '维护采集状态观察', props: [{ p: '_tlePresenceTick', v: 'true', vt: 'bool' }], repeat: '1', crontab: '', once: true, onceDelay: 0.1, x: 160, y: 460, wires: [['presence']] },
