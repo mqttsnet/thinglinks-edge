@@ -9,6 +9,7 @@ Recipes are pure flow builders. They do not install packages, contact devices, w
 | `../../protocols/catalog.ts` | Protocol identity, fixed driver version/integrity, required runtime node types |
 | `types.ts` | Declarative recipe and parameter contracts |
 | `parameters.ts` | Bounded, typed input validation; no coercion of empty numeric values |
+| `service-mapping.ts` | Default/per-point service resolution, composite property identities and private native read aliases |
 | `builtin/common.ts` | Shared point schemas, device registration and ThingLinks uplink wiring |
 | `transform.ts` | Tested data conversion; parameters are serialized as data, never interpolated as code |
 | `presence-flow.ts` / `presence-observation.ts` | Shared ordered observation transport and version-specific native connection classification; no protocol driver |
@@ -38,7 +39,7 @@ Diagnostic intent and cleanup state are persisted before adding a single Node-RE
 ## Adding a protocol
 
 1. Select a published driver and inspect its integrity-matched node configuration schema. Register exact requirements in the protocol catalogue. Update the dedicated protocol dependency lock and regenerate its complete offline seed; do not add a runtime dependency to Manager just to advertise the driver.
-2. Add a recipe under `builtin/`. Declare labels, defaults, bounds, a point table, prerequisites and a revision. Require the actual ThingLinks device identification and service code. Keep credentials out of shared parameters; configure them within the target instance.
+2. Add a recipe under `builtin/`. Declare labels, defaults, bounds, a point table, prerequisites and a revision. Require the actual ThingLinks device identification and resolve each point's service. Keep credentials out of shared parameters; configure them within the target instance.
 3. Build standard Node-RED nodes with explicit references. Route only successful values through device registration and the Manager uplink ingress. Most templates use `tl-uplink`; HTTP push uses standard HTTP Request to the same ingress so it can check the actual acceptance response before acknowledging the device. Add any new config-node reference fields to `../merge.ts`, so append can copy them without editing string literals or executable source.
 4. Register the recipe in `catalog.ts`. Cover valid configuration, invalid/empty parameters, multi-point decoding and flow references with focused tests. Execute generated Function code in tests using representative raw data, including error and precision boundaries.
 5. Run isolated installation and recipe verification on each supported target architecture. Record node loading, simulator acquisition, actual hardware and deployed ThingLinks acceptance separately. Only validated recipes become executable entries; extension candidates remain explicitly unavailable.
@@ -49,10 +50,18 @@ Diagnostic intent and cleanup state are persisted before adding a single Node-RE
 - The console defaults to adding a flow. Legacy direct/custom API calls without `mode` keep their historical replacement semantics. Explicit replacements remain visible actions.
 - Append uses Node-RED API v2 revisions to reject concurrent editor changes. It retains existing flows and remaps known references; unknown config-reference schemas produce an actionable error.
 - TCP/UDP listener templates require configured instance port mappings. HTTP receive paths are beneath the instance HTTP-node root and require a reachable, appropriately protected device ingress. Templates do not change network or authentication policy.
-- HTTP push returns 202 only after Manager has accepted at least one point; not-ready or rejected submissions return 503. This is local acceptance, not Cloud delivery. MQTT publication likewise does not prove ThingLinks model matching or persistence.
+- HTTP push returns 202 only after Manager has accepted every point in that sample across all mapped services; missing or partial acceptance returns 503. This is local acceptance, not Cloud delivery. MQTT publication likewise does not prove ThingLinks model matching or persistence.
 - Numbers outside JavaScript's safe integer range are rejected. For large counters/identifiers, devices must emit strings and the mapping must preserve text. Invalid values are never replaced with zero.
 - Polling, timestamp semantics, scaling and byte order must match the device contract. The existing Manager assigns event time on ingest; it does not reconstruct original device sampling timestamps.
 - Local device declarations do not automatically register cloud subdevices. Product version, service and property mappings must already exist in ThingLinks.
+
+## Multiple Cloud services from one acquisition
+
+A template contains up to 300 mapped points in total and up to 32 services. Each point's optional `serviceCode` overrides the template default; a blank default is valid only when every point resolves to a service. Targets are identified by `[serviceCode, property]`: the same property name in two services is valid, while duplicate targets in one service are rejected. Saved point addresses and Cloud codes remain human-readable.
+
+S7 and OPC UA compile private `raw_0`, `raw_1`, ... aliases. A repeated physical source with the same declared native type is read once and may feed several service/property conversions. An OPC UA NodeId must keep one native data type across its mappings. Do not use a Cloud property as the native alias: two services may both contain `temperature`.
+
+The decoder emits one message per real input sample. Single-service samples retain the original scalar property object; multi-service samples carry `msg._tleServices` until the shared presence Function places `services: [{ serviceCode, values }]` in its version-1 internal envelope instead of `values`. All groups use one observer generation/sequence and one Manager request. This envelope is removed at Manager ingress; routing metadata never becomes Cloud properties. Do not split groups into separate uplink calls with the same sequence, or later groups would be treated as stale. Multi-service `tl-uplink` configuration leaves its fixed `serviceId` blank so the published node respects each message's selected service, including scalar OPC UA notifications.
 
 ## Presence lifecycle
 
