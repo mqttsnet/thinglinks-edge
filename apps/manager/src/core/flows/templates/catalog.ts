@@ -72,7 +72,10 @@ function materialize(
 
 export function getBuiltinTemplate(id: string): FlowTemplateWithContent | undefined {
   const recipe = byId.get(id);
-  return recipe ? materialize(recipe, parameterDefaults(recipe.parameters), true) : undefined;
+  return recipe ? materialize(recipe, {
+    ...parameterDefaults(recipe.parameters), nodeId: 'example-device', serviceCode: 'telemetry',
+    ...structuredClone(recipe.previewParameters ?? {}),
+  }, true) : undefined;
 }
 
 export function listBuiltinTemplates(): FlowTemplate[] {

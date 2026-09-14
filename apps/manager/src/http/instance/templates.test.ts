@@ -5,6 +5,24 @@ import { openDb } from '../../core/db.ts';
 import { TemplateRepo } from '../../core/flows/repo.ts';
 import type { HttpContext } from '../context.ts';
 import { registerTemplates } from './templates.ts';
+import { InstanceOperationGate } from '../../core/instance/operation-gate.ts';
+
+test('instance snapshots do not capture active or unclean protocol diagnostic flows', async () => {
+  const { db, ctx } = context();
+  const gate = new InstanceOperationGate({ assertAllowed() {} });
+  ctx.operationGate = gate;
+  let unclean = true;
+  ctx.protocolDiagnostics = { list: () => unclean ? [{ cleanup: 'failed' }] : [] } as unknown as HttpContext['protocolDiagnostics'];
+  ctx.adminRuntime = { target: () => ({ upstream: 'http://127.0.0.1:1', adminRoot: '/', username: 'fixture', password: 'fixture-password' }), waitReady: async () => {} };
+  const app = Fastify(); registerTemplates(app, ctx);
+  const saveSnapshot = () => app.inject({ method: 'POST', url: '/api/templates', payload: { name: 'snapshot', instanceId: 'meter' } });
+  try {
+    const pending = await saveSnapshot(); assert.equal(pending.statusCode, 409); assert.match(pending.json().error, /试读|清理/);
+    unclean = false;
+    await gate.run('meter', 'protocol-read', async () => { assert.equal((await saveSnapshot()).statusCode, 409); });
+    assert.equal(new TemplateRepo(db).list().length, 0);
+  } finally { await app.close(); db.close(); }
+});
 
 const context = () => {
   const db = openDb(':memory:');
@@ -201,7 +219,7 @@ test('new configured copies expose their archived form and control identity thro
 test('HTTP rendering and configured-copy creation reject unavailable OPC UA control explicitly', async () => {
   const {db,ctx} = context();const app=Fastify();registerTemplates(app,ctx);
   try {
-    const parameters={nodeId:'device',serviceCode:'telemetry',downlinkEnabled:true,commands:[{cmd:'set',param:'value',property:'temperature'}]};
+    const parameters={nodeId:'device',serviceCode:'telemetry',endpoint:'opc.tcp://192.0.2.10:4840',downlinkEnabled:true,commands:[{cmd:'set',param:'value',property:'temperature'}]};
     const rendered=await app.inject({method:'POST',url:'/api/templates/builtin%3Aopcua/render',payload:{parameters}});
     const copied=await app.inject({method:'POST',url:'/api/templates',payload:{name:'Unavailable OPC control',builtinTemplateId:'builtin:opcua',parameters}});
     for(const response of [rendered,copied]){assert.equal(response.statusCode,400);assert.match(response.json().error,/当前受管实例支持采集.*独立受控执行节点/);}
@@ -216,7 +234,7 @@ test('Modbus control render and configured-copy APIs reject it while preserving 
     { id: 'old-write', type: 'modbus-flex-write', z: 'old-tab', server: 'old-connection', wires: [[]] }];
   const existing = new TemplateRepo(db).save({ name: 'Existing Modbus snapshot', content: oldFlows }, 'admin');
   try {
-    const parameters = { nodeId: 'device', serviceCode: 'telemetry', downlinkEnabled: true, commands: [{ cmd: 'set', param: 'value', property: 'temperature' }] };
+    const parameters = { nodeId: 'device', serviceCode: 'telemetry', host: '192.0.2.10', downlinkEnabled: true, commands: [{ cmd: 'set', param: 'value', property: 'temperature' }] };
     const rendered = await app.inject({ method: 'POST', url: '/api/templates/builtin%3Amodbus-tcp/render', payload: { parameters } });
     const copied = await app.inject({ method: 'POST', url: '/api/templates', payload: { name: 'Unsafe new control', builtinTemplateId: 'builtin:modbus-tcp', parameters } });
     for (const response of [rendered, copied]) {

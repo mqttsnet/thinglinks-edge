@@ -27,6 +27,10 @@ test('only authenticated and recorded real uplink triggers presence, never value
     await send('uplink', { nodeId: 'd', data: {} }); assert.equal(observed.length, 0);
     assert.equal((await send('uplink', { nodeId: 'd', data: { t: 2 } })).statusCode, 202);
     assert.deepEqual(observed, [['live', 'i', 'd']]);
+    for (const online of ['false', 0, null, undefined]) {
+      assert.equal((await send('devices/d/status', { online })).statusCode, 400);
+      assert.equal((db.prepare('SELECT online FROM field_device WHERE node_id = ?').get('d') as { online: number }).online, 1);
+    }
     await send('replay', {}); assert.equal(observed.length, 1);
     await send('devices/d/status', { online: false }); assert.deepEqual(observed.at(-1), ['offline', 'i', 'd']);
     tokens.clear();

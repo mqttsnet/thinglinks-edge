@@ -528,6 +528,8 @@ export interface BackupInspect {
 //     没有运行时数据。界面必须标「未纳管」，两边的数字也不许相加。
 
 export interface FieldDeviceRecord {
+  /** Present for templates with ordered per-collector observations. */
+  presenceState?: 'online' | 'offline' | 'unknown';
   instanceId: string;
   nodeId: string;
   name: string;
@@ -641,8 +643,32 @@ export interface DiagProbeResponse {
 
 export type TemplateCategory = 'industrial' | 'network' | 'building' | 'power' | 'custom';
 export type TemplateDeployMode = 'append' | 'replace';
+export interface ModbusReadConnection {
+  host: string;
+  port: number;
+  unitId: number;
+  registerType: 'HoldingRegister' | 'InputRegister';
+  address: number;
+  quantity: number;
+  clientTimeout: number;
+  reconnectTimeout: number;
+}
+export interface ProtocolDiagnosticTask {
+  id: string;
+  instanceId: string;
+  protocol: 'modbus-tcp';
+  state: 'preparing' | 'connecting' | 'reading' | 'succeeded' | 'failed' | 'cancelled' | 'cleanup-required';
+  deadline: number;
+  cleanup: 'pending' | 'done' | 'failed';
+  connection: ModbusReadConnection;
+  createdAt?: number;
+  finishedAt?: number;
+  result?: { registers: number[]; hex: string; durationMs: number };
+  error?: { code: string; message: string };
+}
 export interface TemplateRequirement { module: string; version: string; nodeTypes: string[] }
 export interface TemplateParameter {
+  preserveWhitespace?: boolean;
   /** Current capability restriction; an enabled legacy boolean may only be turned off. */
   disabledReason?: string;
   group?: 'device' | 'cloud' | 'points' | 'commands' | 'advanced';

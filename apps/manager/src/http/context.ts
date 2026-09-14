@@ -1,3 +1,4 @@
+import type { ProtocolDiagnosticService } from '../core/protocols/diagnostics/service.ts';
 /**
  * HTTP 层共享上下文。
  *
@@ -20,6 +21,7 @@ import type { OutageLog } from '../core/cloud/outage.ts';
 import type { CloudRuntime } from '../core/cloud/runtime.ts';
 import type { CommandBridge } from '../core/cloud/commands/bridge.ts';
 import type { PresenceSynchronizer } from '../core/cloud/presence/synchronizer.ts';
+import { PresenceObservers } from '../core/edge/presence-observers/index.ts';
 import type { CloudConfigRepo } from '../core/cloud/config-repo.ts';
 import { UserRepo } from '../core/auth/user-repo.ts';
 import { can, canInstance, isInstanceScoped, type Action } from '../core/auth/authz.ts';
@@ -69,7 +71,9 @@ export interface ServerDeps {
    */
   cloud?: CloudRuntime | undefined;
   commandBridge?: CommandBridge | undefined;
+  protocolDiagnostics?: ProtocolDiagnosticService | undefined;
   presence?: PresenceSynchronizer | undefined;
+  presenceObservers?: PresenceObservers | undefined;
   /** 云对接参数仓储。留空表示这个部署不提供云配置界面（如单测装配） */
   cloudConfig?: CloudConfigRepo | undefined;
   /**
@@ -123,6 +127,8 @@ export interface HttpContext {
   cloudSink: ((payload: unknown) => Promise<void>) | undefined;
   cloud: CloudRuntime | undefined;
   presence: PresenceSynchronizer | undefined;
+  presenceObservers: PresenceObservers;
+  protocolDiagnostics: ProtocolDiagnosticService | undefined;
   cloudConfig: CloudConfigRepo | undefined;
   spool: Spool | undefined;
   drainer: SpoolDrainer | undefined;
@@ -217,6 +223,8 @@ export function createContext(deps: ServerDeps): HttpContext {
     cloudSink: deps.cloudSink,
     cloud: deps.cloud,
     presence: deps.presence,
+    presenceObservers: deps.presenceObservers ?? new PresenceObservers(deps.db),
+    protocolDiagnostics: deps.protocolDiagnostics,
     cloudConfig: deps.cloudConfig,
     spool: deps.spool,
     drainer: deps.drainer,

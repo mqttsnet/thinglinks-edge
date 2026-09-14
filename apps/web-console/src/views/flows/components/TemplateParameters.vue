@@ -21,8 +21,10 @@ const groups = computed(() => parameterGroups(props.fields, props.values));
     <section v-else class="parameter-section">
       <h3>{{ group.label }}</h3>
       <p v-if="group.id === 'commands' && !group.fields.some(field => field.key === 'downlinkEnabled' && field.disabledReason)" class="hint">控制默认关闭。启用后仅按明确配置的命令映射向设备写入，参数与目标点位需现场核对。</p>
+      <slot v-if="group.id === 'points'" name="point-assist" />
       <ParameterFields :fields="group.fields" :values="values" :disabled="disabled" :options-for="optionsFor"
         @update:values="emit('update:values', $event)" />
+      <slot v-if="group.id === 'device'" name="connection-assist" />
       <slot v-if="group.id === 'cloud'" name="cloud-assist" />
     </section>
   </template>

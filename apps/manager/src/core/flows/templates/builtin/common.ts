@@ -1,6 +1,7 @@
 import { TemplateError, type FlowNode } from '../../types.ts';
 import { PLATFORM_NODE_PACKAGE } from '../../../nodes/platform-contract.ts';
 import { getProtocol } from '../../../protocols/catalog.ts';
+import { presenceFlow, type PresenceFlowConfig } from '../presence-flow.ts';
 import { transformScript } from '../transform.ts';
 import type { TemplateParameter, NodeRequirement } from '../types.ts';
 
@@ -57,6 +58,10 @@ export const intervalField: TemplateParameter = {
   default: 5,
   min: 0.1,
   max: 86400,
+};
+export const silenceTimeoutField: TemplateParameter = {
+  key: 'silenceTimeout', label: '无有效数据多久判离线（秒）', type: 'number', default: 0, min: 0, max: 86400, group: 'advanced',
+  description: '0 表示不按静默判离线。只有确定设备固定周期发送时才设置，并预留网络抖动时间；从首条有效数据开始计时，后续有效数据恢复在线。',
 };
 export const scalarTypes = ['number', 'boolean', 'string'];
 export const binaryTypes = [
@@ -232,6 +237,7 @@ export function pipeline(
   inputs: FlowNode[],
   format: string,
   points = pointsOf(p),
+  presence?: Omit<PresenceFlowConfig, 'nodeId' | 'serviceCode'>,
 ): FlowNode[] {
   return [
     { id: 'tab', type: 'tab', label: title, disabled: false, info: notes.join('\n'), env: [] },
@@ -240,8 +246,9 @@ export function pipeline(
       'decode',
       '解析与物模型映射',
       transformScript({ format, points, nodeId: String(p.nodeId), serviceCode: String(p.serviceCode) }),
-      [['device']],
+      [[presence ? 'presence' : 'device']],
     ),
+    ...(presence ? presenceFlow({ ...presence, nodeId: String(p.nodeId), serviceCode: String(p.serviceCode) }) : []),
     {
       id: 'device',
       type: 'tl-device',

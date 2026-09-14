@@ -5,8 +5,11 @@ import { getBuiltinTemplate, renderBuiltinTemplate } from './catalog.ts';
 import { parameterDefaults } from './parameters.ts';
 
 function params(id: string): Record<string, unknown> {
+  const fields = getBuiltinTemplate(id)!.parameters!;
   return {
-    ...parameterDefaults(getBuiltinTemplate(id)!.parameters!),
+    ...parameterDefaults(fields),
+    ...(fields.some(field => field.key === 'url') ? { url: 'http://192.0.2.10/data' } : {}),
+    ...(fields.some(field => field.key === 'endpoint') ? { endpoint: 'opc.tcp://192.0.2.10:4840' } : {}),
     nodeId: 'plc-1',
     serviceCode: 'env',
     host: '127.0.0.1',

@@ -1,3 +1,5 @@
+import { registerProtocolDiagnostics } from './instance/protocol-diagnostics.ts';
+import { registerEdgeProtocolDiagnostics } from './edge/protocol-diagnostics.ts';
 /**
  * Manager HTTP 服务装配。
  *
@@ -81,6 +83,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     registerCloud(api, ctx);
     registerCloudModel(api, ctx);
     if (deps.commandBridge) registerEdgeCommands(api, ctx, deps.commandBridge);
+    if (deps.protocolDiagnostics) { registerProtocolDiagnostics(api, ctx); registerEdgeProtocolDiagnostics(api, ctx); }
     registerDiag(api, ctx);
     registerTemplates(api, ctx);
     registerFlows(api, ctx);
@@ -113,6 +116,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   registerProxy(app, ctx);
   app.addHook('onClose', async () => { ctx.disposeEditorSessions(); });
   if (deps.commandBridge) app.addHook('onClose', async () => { await deps.commandBridge!.close(); });
+  if (deps.protocolDiagnostics) app.addHook('onClose', async () => { await deps.protocolDiagnostics!.close(); });
   if (deps.presence) app.addHook('onClose', async () => { await deps.presence!.close(); });
 
   /*

@@ -9,6 +9,7 @@ const id = 'builtin:opcua-controlled';
 function configured(extra: Record<string, unknown> = {}) {
   const recipe = getBuiltinTemplate(id)!;
   return renderBuiltinTemplate(id, { ...parameterDefaults(recipe.parameters!), nodeId: 'opcua-device', serviceCode: 'telemetry',
+    endpoint: 'opc.tcp://192.0.2.10:4840',
     points: [{ source: 'ns=1;s=Temperature', property: 'temperature', dataType: 'Double', scale: 2, offset: 1 }], ...extra })!;
 }
 function vm(script: unknown, msg: Record<string, unknown>) {
@@ -119,4 +120,22 @@ test('only confirmed queue rejection is classified unattempted; active timeout r
   }
   const result = vm(error.func, { _tleWriteAttempted: true, error: { message: 'Error: Batch write failed: BadTimeout' } }).result;
   assert.equal(result._tleWriteAttempted, true); assert.equal(result._tleExplicitRejection, false);
+});
+
+test('BadWriteNotSupported is an explicit rejection only for the single matching write result', () => {
+  const template = writable();
+  const prepared = vm(template.flows.find(n => n.id === 'control-opcua-prepare')!.func,
+    vm(template.flows.find(n => n.id === 'control-encode')!.func, writeInput()).result).result;
+  const result = template.flows.find(n => n.id === 'control-opcua-result')!;
+  const response = { ...prepared, payload: [{ nodeId: 'ns=1;s=Temperature', statusCode: 'BadWriteNotSupported' }], opcua: { operation: 'write', total: 1, good: 0 } };
+  const rejected = vm(result.func, response).result;
+  assert.equal(rejected[0], null);
+  assert.equal(rejected[1]._tleExplicitRejection, true);
+  for (const uncertain of [
+    { ...response, payload: [{ nodeId: 'ns=1;s=Other', statusCode: 'BadWriteNotSupported' }] },
+    { ...response, opcua: { operation: 'write', total: 2, good: 0 } },
+    { ...response, opcua: { operation: 'write', total: 1, good: 1 } },
+    { ...response, opcua: { operation: 'read', total: 1, good: 0 } },
+    { ...response, payload: [{ nodeId: 'ns=1;s=Temperature', statusCode: 'BadUnknownImplementationStatus' }] },
+  ]) assert.equal(vm(result.func, uncertain).result[1]._tleExplicitRejection, false);
 });

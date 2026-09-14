@@ -47,3 +47,10 @@ test('the visible online total excludes stopped instances and recovers from fres
   assert.equal(count(stopped), 1);
   assert.equal(count(running), 2);
 });
+test('unknown observation is displayed as awaiting confirmation instead of a stale online flag', () => {
+  assert.deepEqual(fieldDeviceStatus({ online: true, presenceState: 'unknown' }, { state: 'running', running: true }), {
+    online: false, label: '等待采集确认', instanceUnavailable: false,
+  });
+  assert.equal(fieldDeviceStatus({ online: false, presenceState: 'online' }).online, true);
+  assert.equal(fieldDeviceStatus({ online: true, presenceState: 'offline' }).online, false);
+});

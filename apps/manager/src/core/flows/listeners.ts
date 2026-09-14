@@ -11,7 +11,9 @@ function listeners(flows: FlowNode[]): Listener[] {
     }
     if (node.type === 'udp in' && node['port']) return [{ kind: 'udp', address: String(node['port']), name }];
     if (node.type === 'http in' && typeof node['url'] === 'string') {
-      return [{ kind: 'http', address: node['url'].replace(/\/+$/, '') || '/', method: String(node['method'] ?? 'get').toLowerCase(), name }];
+      // Native Node-RED/Express default routes match case-insensitively; compare
+      // that identity without rewriting the original configured URL.
+      return [{ kind: 'http', address: node['url'].replace(/\/+$/, '').toLowerCase() || '/', method: String(node['method'] ?? 'get').toLowerCase(), name }];
     }
     return [];
   });

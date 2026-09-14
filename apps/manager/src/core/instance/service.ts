@@ -141,7 +141,15 @@ export interface InstanceView {
   running: boolean;
 }
 
+export interface InstanceRemovalLifecycle {
+  /** True requires verified data purge and completion before removing the repository record. */
+  beforeRemove(instanceId: string, options: { removeData: boolean }): boolean | Promise<boolean>;
+  /** Runs under remove-instance only after deletion; must independently verify resource absence. */
+  afterDataRemoved(instanceId: string): void | Promise<void>;
+}
+
 export interface InstanceServiceOptions {
+  removalLifecycle?: InstanceRemovalLifecycle | undefined;
   db: Db;
   repo: InstanceRepo;
   docker: DockerClient;
@@ -614,8 +622,23 @@ export class InstanceService {
   ): Promise<void> {
     this.o.gate.assertLease(lease, id, ['remove-instance']);
     this.assertExists(id);
-    await this.o.docker.assertManaged(id).catch(() => undefined);
-    await this.o.docker.remove(id, { removeData: opts.removeData }).catch(() => undefined);
+    const needsSettlement = await this.o.removalLifecycle?.beforeRemove(id, { removeData: opts.removeData });
+    if (needsSettlement) {
+      if (!opts.removeData) throw new ServiceError('请先清理诊断任务，或选择同时删除实例数据。');
+      try {
+        await this.o.docker.assertManaged(id).catch(error => {
+          if ((error as { statusCode?: number }).statusCode !== 404) throw error;
+        });
+        await this.o.docker.remove(id, { removeData: opts.removeData });
+        if (opts.removeData) await this.o.removalLifecycle!.afterDataRemoved(id);
+      } catch {
+        throw new ServiceError('实例资源或诊断记录尚未确认全部清理，已保留实例记录，请修复后重试删除。');
+      }
+    } else {
+      // Preserve existing integrations without the optional domain lifecycle.
+      await this.o.docker.assertManaged(id).catch(() => undefined);
+      await this.o.docker.remove(id, { removeData: opts.removeData }).catch(() => undefined);
+    }
     this.o.repo.remove(id);
     recordAudit(this.o.db, {
       actor: opts.actor, action: 'remove-instance', target: id,

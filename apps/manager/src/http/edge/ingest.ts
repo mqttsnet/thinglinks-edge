@@ -11,6 +11,7 @@
  */
 import type { FastifyInstance } from 'fastify';
 import { FieldRegistry } from '../../core/edge/registry.ts';
+import { PresenceObservers, PresenceObserverError, parsePresenceEnvelope } from '../../core/edge/presence-observers/index.ts';
 import { BatchOverflowError, MicroBatcher, type UplinkPoint } from '../../core/cloud/batch.ts';
 import { SpoolDrainer } from '../../core/spool/drainer.ts';
 import type { HttpContext } from '../context.ts';
@@ -41,6 +42,13 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
   // 历史由这里的写入顺手落盘 —— 忘了传就是「趋势永远是空的」，
   // 而采集与当前值一切正常，从现象上完全看不出少了什么
   const registry = new FieldRegistry(db, ctx.valueHistory);
+  const observers = ctx.presenceObservers ?? new PresenceObservers(db);
+  const aggregate = (instanceId: string, nodeId: string, freshData = false) => {
+    const state = observers.aggregate(instanceId, nodeId);
+    if (state !== undefined) registry.setObservedOnline(instanceId, nodeId, state);
+    ctx.presence?.observeAggregate(instanceId, nodeId, state, freshData);
+    return state;
+  };
 
   /*
    * 微批。1.4k 点/秒的现场负载聚合后约 5 条消息/秒（08 号文第 2 节）。
@@ -143,7 +151,30 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
   };
 
   const fail = (reply: any, e: unknown) =>
-    reply.code(400).send({ error: (e as Error).message });
+    reply.code(e instanceof PresenceObserverError ? e.status : 400).send({
+      error: (e as Error).message, ...(e instanceof PresenceObserverError ? { code: e.code } : {}),
+    });
+
+  for (const operation of ['challenge', 'activate', 'renew'] as const) {
+    api.post(`${config.basePath}/api/edge/observers/${operation}`, async (req, reply) => {
+      const instanceId = authed(req, reply);
+      if (!instanceId) return;
+      const b = (req.body ?? {}) as { nodeId: string; observerId: string; runNonce: string; ticket: string; generation: number };
+      const scope = { instanceId, nodeId: b.nodeId, observerId: b.observerId };
+      try {
+        const result = operation === 'challenge'
+          ? observers.challenge(scope, b.runNonce)
+          : operation === 'activate'
+            ? observers.activate(scope, { runNonce: b.runNonce, ticket: b.ticket })
+            : observers.renew(scope, { runNonce: b.runNonce, generation: b.generation });
+        aggregate(instanceId, b.nodeId);
+        return reply.send(result);
+      } catch (e) {
+        if (typeof b.nodeId === 'string' && observers.hasObservers(instanceId, b.nodeId)) aggregate(instanceId, b.nodeId);
+        return fail(reply, e);
+      }
+    });
+  }
 
   // ── 上报：设备 ────────────────────────────────────────────
   api.post(`${config.basePath}/api/edge/devices`, async (req, reply) => {
@@ -164,7 +195,9 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
     if (!instanceId) return;
     const { nodeId } = req.params as { nodeId: string };
     const { online } = (req.body ?? {}) as { online?: boolean };
+    if (typeof online !== 'boolean') return reply.code(400).send({ error: 'online 必须是布尔值' });
     try {
+      if (observers.hasObservers(instanceId, nodeId)) return reply.code(204).send();
       registry.setDeviceOnline(instanceId, nodeId, online === true);
       if (online === false && registry.devices(instanceId).some(device => device.nodeId === nodeId)) {
         ctx.presence?.observeOffline(instanceId, nodeId);
@@ -194,7 +227,11 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
     if (items.length === 0) return reply.code(400).send({ error: '没有可记录的值' });
     if (items.length > MAX_BATCH) return reply.code(413).send({ error: `单次上限 ${MAX_BATCH} 条` });
     try {
-      return reply.send({ accepted: registry.recordValues(instanceId, items) });
+      const accepted = registry.recordValues(instanceId, items, { updateOnline: false });
+      for (const nodeId of new Set(items.map(item => item.nodeId))) {
+        if (!observers.hasObservers(instanceId, nodeId)) registry.setObservedOnline(instanceId, nodeId, true);
+      }
+      return reply.send({ accepted });
     } catch (e) { return fail(reply, e); }
   });
 
@@ -211,20 +248,46 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
     const instanceId = authed(req, reply);
     if (!instanceId) return;
     const b = (req.body ?? {}) as { serviceId?: string; nodeId?: string; data?: unknown };
+    if ((b.nodeId !== undefined && typeof b.nodeId !== 'string') || (b.serviceId !== undefined && typeof b.serviceId !== 'string')) {
+      return reply.code(400).send({ error: 'nodeId 和 serviceId 必须是文本' });
+    }
     if (b.data === undefined || b.data === null) {
       return reply.code(400).send({ error: '缺少 data' });
     }
 
-    // data 是对象时，其每个键当作一个点位；否则整体作为单点
     const nodeId = (b.nodeId ?? '').trim() || '_gateway';
-    const values = (typeof b.data === 'object' && !Array.isArray(b.data))
-      ? Object.entries(b.data as Record<string, unknown>)
-          .map(([tagId, value]) => ({ nodeId, tagId, value }))
-      : [{ nodeId, tagId: b.serviceId || 'value', value: b.data }];
-
+    let pointCount = 0;
     try {
-      const accepted = registry.recordValues(instanceId, values);
-      if (accepted > 0) ctx.presence?.observeUplink(instanceId, nodeId);
+      const envelope = parsePresenceEnvelope(b.data);
+      if (envelope?.__tlePresence.kind === 'status') {
+        const observation = envelope.__tlePresence;
+        const result = observers.accept({ instanceId, nodeId, observerId: observation.observerId }, observation);
+        if (!result.accepted) return reply.code(409).send({ error: '采集观察已过期，请检查当前流程运行代次' });
+        const state = aggregate(instanceId, nodeId);
+        return reply.code(202).send({ accepted: 0, presence: state === undefined ? 'unknown' : state ? 'online' : 'offline' });
+      }
+      const data = envelope && 'values' in envelope ? envelope.values : b.data;
+      // Only unwrapped point values enter the telemetry batch/spool, never observation metadata.
+      const values = (typeof data === 'object' && !Array.isArray(data))
+        ? Object.entries(data as Record<string, unknown>).map(([tagId, value]) => ({ nodeId, tagId, value }))
+        : [{ nodeId, tagId: b.serviceId || 'value', value: data }];
+      pointCount = values.length;
+      const managed = observers.hasObservers(instanceId, nodeId);
+      let accepted = 0;
+      if (envelope) {
+        const observation = envelope.__tlePresence;
+        const result = observers.accept({ instanceId, nodeId, observerId: observation.observerId }, observation, () => {
+          accepted = registry.recordValues(instanceId, values, { updateOnline: false });
+        });
+        if (!result.accepted) return reply.code(409).send({ error: '采集数据已过期，请检查当前流程运行代次' });
+        aggregate(instanceId, nodeId, accepted > 0);
+      } else {
+        accepted = registry.recordValues(instanceId, values, { updateOnline: !managed });
+        if (accepted > 0 && !managed) ctx.presence?.observeUplink(instanceId, nodeId);
+      }
+      if (envelope?.__tlePresence.kind === 'sample' && envelope.__tlePresence.report === false) {
+        return reply.code(202).send({ accepted, batched: batcher.pending, cloud: 'unchanged' });
+      }
 
       /*
        * 上行队列满了就当场回 503，**不收下再说**。
@@ -267,7 +330,7 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
     } catch (e) {
       // 队列在收点的中途满了：同样是「稍后再来」，不是「这条数据有问题」
       if (e instanceof BatchOverflowError) {
-        metrics.rejected += values.length;
+        metrics.rejected += pointCount;
         metrics.lastError = e.message;
         return reply.code(503).header('retry-after', '5')
           .send({ error: e.message, accepted: 0, cloud: 'saturated' });

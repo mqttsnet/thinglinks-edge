@@ -19,6 +19,11 @@ function sourceLabel(template: FlowTemplate) {
   if (template.derivedFrom) return `内置模板副本 · ${template.derivedFrom.revision}`;
   return template.source === 'upload' ? '文件导入' : instances.value.find((item) => item.id === template.source)?.name ?? template.source;
 }
+function controlLabel(template: FlowTemplate): string {
+  if (!isBuiltin(template)) return '';
+  const field = template.parameters?.find(item => item.key === 'downlinkEnabled');
+  return field ? (field.disabledReason ? '仅采集' : '可选控制') : '';
+}
 async function downloadTemplate(template: FlowTemplate) {
   try { await download(template); }
   catch (e) { message.error(e instanceof ApiError ? e.message : '下载失败'); }
@@ -52,6 +57,7 @@ onMounted(refresh);
               <NTag size="small" :type="isBuiltin(template) ? 'info' : 'default'" :bordered="false">{{ isBuiltin(template) ? '内置' : '我的模板' }}</NTag>
               <NTag size="small" :bordered="false">{{ categoryLabel(template.category) }}</NTag>
               <NTag v-for="protocol in template.protocols" :key="protocol" size="small" :bordered="false">{{ protocol }}</NTag>
+              <NTag v-if="controlLabel(template)" size="small" :bordered="false">{{ controlLabel(template) }}</NTag>
             </div>
             <NSpace :size="8" class="actions">
               <NButton v-if="!isBuiltin(template)" size="tiny" secondary @click="downloadTemplate(template)">下载</NButton>

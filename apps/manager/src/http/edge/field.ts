@@ -15,10 +15,17 @@ import { probeFlows } from '../../core/edge/southbound.ts';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { HttpContext } from '../context.ts';
+import { PresenceObservers } from '../../core/edge/presence-observers/index.ts';
 
 export function registerField(api: FastifyInstance, ctx: HttpContext): void {
   const { config, db, guard, visibleOnly } = ctx;
   const registry = new FieldRegistry(db);
+  const observers = ctx.presenceObservers ?? new PresenceObservers(db);
+  const devices = (instanceId?: string) => registry.devices(instanceId).map(device => {
+    if (!observers.hasObservers(device.instanceId, device.nodeId)) return device;
+    const state = observers.aggregate(device.instanceId, device.nodeId);
+    return { ...device, online: state === true, presenceState: state === undefined ? 'unknown' : state ? 'online' : 'offline' };
+  });
 
   /**
    * 读台账的鉴权。
@@ -36,7 +43,7 @@ export function registerField(api: FastifyInstance, ctx: HttpContext): void {
     const { instanceId } = req.query as { instanceId?: string };
     const user = fieldGuard(req, reply, instanceId);
     if (!user) return;
-    return reply.send({ devices: visibleOnly(user, registry.devices(instanceId)) });
+    return reply.send({ devices: visibleOnly(user, devices(instanceId)) });
   });
 
   api.get(`${config.basePath}/api/field/tags`, async (req, reply) => {
@@ -125,12 +132,12 @@ export function registerField(api: FastifyInstance, ctx: HttpContext): void {
      * 加在一起显示会让用户以为那是同一种东西。
      */
     // 汇总数字同样只能覆盖看得见的实例，否则「全厂多少台设备」会被越权读出来
-    const devices = visibleOnly(user, registry.devices(instanceId));
+    const visibleDevices = visibleOnly(user, devices(instanceId));
     const tags = visibleOnly(user, registry.tags(instanceId));
     return reply.send({
       managed: {
-        devices: devices.length,
-        online: devices.filter((d) => d.online).length,
+        devices: visibleDevices.length,
+        online: visibleDevices.filter((d) => d.online).length,
         tags: tags.length,
       },
       note: '「已纳管」来自 @thinglinks 节点主动回报，含当前值与质量码；'

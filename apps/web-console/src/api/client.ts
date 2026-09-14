@@ -16,6 +16,7 @@ import type {
   EdgeMetrics, ReplayResult,
   DiagProbeResponse,
   FlowTemplate, FlowTemplateDetail, TemplateMetadataInput, TemplateApplyOptions, ApplyPreview, ApplyResult,
+  ModbusReadConnection, ProtocolDiagnosticTask,
   CatalogEntry, StoreListResult, ImportResult, InstanceInventory, ApplyPolicyResult,
   PlatformNodeMigration, ProtocolComponentStatus, InstanceProtocolStatus, CloudModelQuery, CloudModelQueryResult, EdgeCommandRecord,
 } from './types';
@@ -333,6 +334,19 @@ export const api = {
   diagProbe: (targets: string[], timeoutMs = 5000) =>
     request<DiagProbeResponse>('/api/diag/probe', {
       method: 'POST', body: JSON.stringify({ targets, timeoutMs }),
+    }),
+
+  startModbusDiagnostic: (instanceId: string, connection: ModbusReadConnection, signal?: AbortSignal) =>
+    request<{ task: ProtocolDiagnosticTask }>(`/api/instances/${encodeURIComponent(instanceId)}/protocol-diagnostics/modbus-tcp`, {
+      method: 'POST', body: JSON.stringify(connection), ...(signal ? { signal } : {}),
+    }),
+  protocolDiagnostics: (instanceId: string, signal?: AbortSignal) =>
+    request<{ tasks: ProtocolDiagnosticTask[] }>(`/api/instances/${encodeURIComponent(instanceId)}/protocol-diagnostics`, signal ? { signal } : {}),
+  protocolDiagnostic: (instanceId: string, taskId: string, signal?: AbortSignal) =>
+    request<{ task: ProtocolDiagnosticTask }>(`/api/instances/${encodeURIComponent(instanceId)}/protocol-diagnostics/${encodeURIComponent(taskId)}`, signal ? { signal } : {}),
+  cancelProtocolDiagnostic: (instanceId: string, taskId: string, signal?: AbortSignal) =>
+    request<{ task: ProtocolDiagnosticTask }>(`/api/instances/${encodeURIComponent(instanceId)}/protocol-diagnostics/${encodeURIComponent(taskId)}`, {
+      method: 'DELETE', ...(signal ? { signal } : {}),
     }),
 
   /**

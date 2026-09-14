@@ -25,6 +25,7 @@ import {
   InstanceService,
   ServiceError,
   type CreateInstanceInput,
+  type InstanceServiceOptions,
 } from './service.ts';
 import type { DockerClient } from './docker-client.ts';
 import {
@@ -107,6 +108,7 @@ function fixture(
       actor: string,
     ): Promise<{ phase: string }>;
   },
+  removalLifecycle?: InstanceServiceOptions['removalLifecycle'],
 ) {
   const db = openDb(':memory:');
   const repo = new InstanceRepo(db, deriveKey('service-gate-test', 'instance'));
@@ -156,6 +158,7 @@ function fixture(
     repo,
     docker,
     gate,
+    removalLifecycle,
     adminRuntime,
     instanceDataRoot: '/tmp/thinglinks-service-test-instances',
     platformPackages: { verifyForInstall: () => ({}) } as never,
@@ -1401,4 +1404,32 @@ test('audit-finalization failure reaches HTTP only as a controlled redacted comp
     await app.close();
     await f.close();
   }
+});
+
+
+test('diagnostic deletion hooks reject retained data before mutation and settle only after successful removal',async()=>{
+ let settled=0;const f=fixture(undefined,undefined,{beforeRemove:(_id,options)=>{if(!options.removeData)throw new ServiceError('先清理或同时删除实例数据');return true;},afterDataRemoved:()=>{assert.ok(f.calls.includes('remove:line-a'));assert.ok(f.repo.get('line-a'));settled++;}});
+ try{await assert.rejects(f.service.remove('line-a',{removeData:false,actor:'admin'}));assert.equal(f.calls.length,0);assert.ok(f.repo.get('line-a'));assert.equal(settled,0);await f.service.remove('line-a',{removeData:true,actor:'admin'});assert.equal(settled,1);assert.equal(f.repo.get('line-a'),undefined);}finally{f.db.close();}
+});
+test('removal or completion-hook failure retains the instance and does not claim a completed cleanup',async()=>{
+ for(const boundary of ['remove','settlement']as const){let settled=0;const f=fixture(undefined,undefined,{beforeRemove:()=>true,afterDataRemoved:()=>{if(boundary==='settlement')throw new Error('cleanup settlement failed');settled++;}});try{if(boundary==='remove')f.docker.remove=async()=>{throw new Error('partial removal');};await assert.rejects(f.service.remove('line-a',{removeData:true,actor:'admin'}));assert.ok(f.repo.get('line-a'));assert.equal(settled,0);}finally{f.db.close();}}
+});
+test('strict removal hook admits missing containers but refuses an ownership failure',async()=>{
+ for(const statusCode of [404,403]){let settled=0;const f=fixture(undefined,undefined,{beforeRemove:()=>true,afterDataRemoved:()=>{settled++;}});try{f.docker.assertManaged=async()=>{throw Object.assign(new Error('inspection failed'),{statusCode});};const removal=f.service.remove('line-a',{removeData:true,actor:'admin'});if(statusCode===404){await removal;assert.equal(settled,1);}else{await assert.rejects(removal);assert.equal(settled,0);assert.equal(f.calls.length,0);assert.ok(f.repo.get('line-a'));}}finally{f.db.close();}}
+});
+
+
+test('no outstanding diagnostic retains the original retain-data removal behavior without a purge hook',async()=>{
+ let settled=0;const f=fixture(undefined,undefined,{beforeRemove:()=>false,afterDataRemoved:()=>{settled++;}});try{await f.service.remove('line-a',{removeData:false,actor:'admin'});assert.equal(settled,0);assert.equal(f.repo.get('line-a'),undefined);}finally{f.db.close();}
+});
+
+test('public DELETE never returns success from a purge flag alone; completion proof is required',async()=>{
+ let verified=false;let settled=0;
+ const f=fixture(undefined,undefined,{beforeRemove:(_id,options)=>{if(!options.removeData)throw new ServiceError('请先清理或同时删除实例数据');return true;},afterDataRemoved:()=>{if(!verified)throw new Error('resource remains');settled++;}});
+ const app=Fastify({logger:false});registerInstances(app,{config:{basePath:''},service:f.service,guard:()=>({username:'admin',role:'admin'}),users:{grantFor:()=>undefined},fail:badRequest} as unknown as HttpContext);
+ try{
+  const retained=await app.inject({method:'DELETE',url:'/api/instances/line-a'});assert.equal(retained.statusCode,400);assert.match(retained.json().error,/同时删除实例数据/);assert.equal(f.calls.length,0);
+  const incomplete=await app.inject({method:'DELETE',url:'/api/instances/line-a?removeData=true'});assert.equal(incomplete.statusCode,400);assert.equal(settled,0);assert.ok(f.repo.get('line-a'));assert.doesNotMatch(incomplete.body,/resource remains/);
+  verified=true;const done=await app.inject({method:'DELETE',url:'/api/instances/line-a?removeData=true'});assert.equal(done.statusCode,204);assert.equal(settled,1);assert.equal(f.repo.get('line-a'),undefined);
+ }finally{await app.close();f.db.close();}
 });

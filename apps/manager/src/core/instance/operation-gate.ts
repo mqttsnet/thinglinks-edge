@@ -10,6 +10,8 @@ export type InstanceOperation =
   | 'same-image-rebuild'
   | 'apply-node-policy'
   | 'install-node'
+  | 'protocol-read'
+  | 'template-export'
   | 'flow-write'
   | 'proxy-write'
   | 'platform-migration'

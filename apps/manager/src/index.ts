@@ -1,3 +1,7 @@
+import { diagnosticRemovalLifecycle } from './core/protocols/diagnostics/removal.ts';
+import { ProtocolDiagnosticService } from './core/protocols/diagnostics/service.ts';
+import { ProtocolDiagnosticStore } from './core/protocols/diagnostics/store.ts';
+import { diagnosticAdmin, diagnosticGeneration, diagnosticRuntime } from './core/protocols/diagnostics/adapters.ts';
 /**
  * ThingLinks Edge Manager —— 入口。
  *
@@ -33,6 +37,9 @@ import { CloudConfigRepo } from './core/cloud/config-repo.ts';
 import { CloudRuntime } from './core/cloud/runtime.ts';
 import { CommandBridge } from './core/cloud/commands/bridge.ts';
 import { PresenceSynchronizer } from './core/cloud/presence/synchronizer.ts';
+import { PresenceObservers } from './core/edge/presence-observers/index.ts';
+import { PresenceObserverRuntime } from './core/edge/presence-observers/runtime.ts';
+import { FieldRegistry } from './core/edge/registry.ts';
 import { OutageLog } from './core/cloud/outage.ts';
 import { runPreflight, renderReport, adaptDocker } from './core/preflight/run.ts';
 import { readHostStats } from './core/health/host-stats.ts';
@@ -540,10 +547,17 @@ export async function main(overrides: InternalManagerOverrides = {}): Promise<vo
       return migrationHolder.service.completePendingStartUnderLease(instanceId, lease, actor);
     },
   };
+  const diagnosticStore = new ProtocolDiagnosticStore(db);
+  const protocolDiagnostics = new ProtocolDiagnosticService({
+    store: diagnosticStore, gate: operationGate,
+    admin: diagnosticAdmin(instanceAdmin.adminRuntime), runtime: diagnosticRuntime(repo, docker),
+    generationFor: id => diagnosticGeneration(repo, id),
+  });
   const service = new InstanceService({
     ...instanceAdmin.instanceServiceDeps,
     ...platformOperation.instanceServiceDeps,
     db, repo, docker, gate: operationGate,
+    removalLifecycle: diagnosticRemovalLifecycle(diagnosticStore, docker),
     instanceDataRoot: config.instanceDataRoot,
     platformPackages: platformNodeServices.platformPackages,
     pendingStartCompletion,
@@ -794,10 +808,17 @@ export async function main(overrides: InternalManagerOverrides = {}): Promise<vo
     db, cloud, listInstances: signal => service.list(signal),
     onError: message => { cloud.recordPresenceError(message); console.warn(`[presence] ${message}`); },
   });
+  const presenceObservers = new PresenceObservers(db);
+  const observerRuntime = new PresenceObserverRuntime({
+    observers: presenceObservers, registry: new FieldRegistry(db), presence,
+    listInstances: signal => service.list(signal),
+    onError: message => { console.warn(`[field-presence] ${message}`); },
+  });
 
   context.reconcileNetworks = reconcileNetworks;
   context.recoverInterrupted = async () => {
       const recovered = await migrationService.recoverInterrupted();
+      await protocolDiagnostics.recover();
       for (const result of recovered) {
         if (result.phase === 'manual_required') {
           console.warn(`[warn] 实例 ${result.instanceId} 的节点迁移需人工处理`);
@@ -807,6 +828,7 @@ export async function main(overrides: InternalManagerOverrides = {}): Promise<vo
   context.startBackground = async () => {
       commandBridge.start();
       presence.start();
+      observerRuntime.start();
       startMetrics();
       try {
         await cloud.apply(cloudConfig.get());
@@ -823,7 +845,7 @@ export async function main(overrides: InternalManagerOverrides = {}): Promise<vo
         config, db, auth, repo, service, operationGate, migrationService, proxySessions,
         upstreamFor: instanceUpstreamFor,
         spool, metrics, drainer, outages,
-        cloud, cloudConfig, commandBridge, presence,
+        cloud, cloudConfig, commandBridge, presence, presenceObservers, protocolDiagnostics,
         cloudSink: (payload) => cloud.publish(payload),
         webRoot: process.env['WEB_ROOT']?.trim() || undefined,
         nodeStore, nodeCatalog, valueHistory, nodeUpstream, nodeSources,
@@ -836,6 +858,7 @@ export async function main(overrides: InternalManagerOverrides = {}): Promise<vo
       });
       let editorServers: { close(): Promise<void> } | undefined;
       app.addHook('preClose', async () => { await editorServers?.close(); });
+      app.addHook('preClose', async () => { await observerRuntime.close(); });
       return {
         server: app,
         listen: async () => {
