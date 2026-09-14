@@ -279,6 +279,7 @@ test_summary "协议与串口工具契约" sh -c '
   cd "$1" && node --experimental-strip-types --test \
     scripts/prepare-protocol-seed.test.mjs \
     scripts/verify-protocol-components.test.mjs \
+    scripts/opcua-native/*.test.mjs \
     scripts/protocol-fixtures/*.test.mjs \
     scripts/protocol-wire-lab/serial/*.test.cjs
 ' _ "$REPO_ROOT"

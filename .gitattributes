@@ -7,3 +7,6 @@
 *.woff2 binary
 
 pnpm-lock.yaml linguist-generated=true -diff
+
+# This upstream fixture is verified byte-for-byte by the native patch regression.
+scripts/opcua-native/fixtures/ua_client_connect-v1.4.16.c -text -eol whitespace=cr-at-eol

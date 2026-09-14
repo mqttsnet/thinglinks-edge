@@ -134,6 +134,14 @@ export function assertContainerIsolation(
   if (!Array.isArray(environment) || !environment.every(value => typeof value === 'string')) {
     throw new SpecError('容器环境变量格式错误');
   }
+  // The optional compatibility artifact is supplied by a trusted image, never
+  // by writable instance data. Ordinary images leave this variable absent.
+  const nativeOverrides = environment.filter(value => value === 'OPCUA_OPEN62541_ADDON'
+    || value.startsWith('OPCUA_OPEN62541_ADDON='));
+  if (nativeOverrides.length > 1 || (nativeOverrides.length === 1
+    && nativeOverrides[0] !== 'OPCUA_OPEN62541_ADDON=/opt/thinglinks/opcua-native/opcua_open62541.node')) {
+    throw new SpecError('OPC UA 原生构件仅允许使用受管镜像内的固定只读路径');
+  }
   for (const expected of INSTANCE_STARTUP_ENV) {
     const prefix = expected.slice(0, expected.indexOf('=') + 1);
     const values = environment.filter(value => value.startsWith(prefix));
