@@ -71,7 +71,10 @@ test('observer ingestion orders samples and failures; healthy peers protect one 
     assert.equal((await f.send('uplink', f.event(a, 4, { temperature: 26 }))).statusCode, 202);
     assert.equal(f.online(), 1);
     assert.equal((await f.send('uplink', f.event(a, 3))).statusCode, 409);
-    assert.deepEqual(f.db.prepare('SELECT tag_id FROM field_tag ORDER BY tag_id').all(), [{ tag_id: 'humidity' }, { tag_id: 'legacy' }, { tag_id: 'temperature' }]);
+    assert.deepEqual(f.db.prepare('SELECT service_code,tag_id FROM field_tag ORDER BY tag_id,service_code').all(), [
+      { service_code: 'telemetry', tag_id: 'humidity' }, { service_code: '', tag_id: 'legacy' },
+      { service_code: 'telemetry', tag_id: 'legacy' }, { service_code: 'telemetry', tag_id: 'temperature' },
+    ]);
     const metrics = (await f.app.inject('/api/edge/metrics')).json();
     assert.equal(metrics.batch.pending, 4, 'three current samples and one legacy sample, no status/metadata/stale samples');
   } finally { await f.close(); }

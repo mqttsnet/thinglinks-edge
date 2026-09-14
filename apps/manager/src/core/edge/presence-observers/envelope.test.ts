@@ -29,3 +29,17 @@ test('report:false retains a real sample and its point values for local recordin
   const envelope = { __tlePresence: { ...meta, kind: 'sample', report: false }, values: { t: 1 } };
   assert.deepEqual(parsePresenceEnvelope(envelope), envelope);
 });
+
+test('one observation can carry distinct services with equal property names and a total 300-point bound', () => {
+  const sample = { __tlePresence: { ...meta, kind: 'sample' }, services: [
+    { serviceCode: 'A', values: { temperature: 21 } }, { serviceCode: 'B', values: { temperature: 294 } },
+  ] };
+  assert.deepEqual(parsePresenceEnvelope(sample), sample);
+  for (const services of [[], [...sample.services, sample.services[0]],
+    [{ serviceCode: '', values: { p: 1 } }], [{ serviceCode: 'A', values: {} }],
+    [{ serviceCode: 'A', values: { p: 1 }, extra: true }],
+    Array.from({ length: 33 }, (_, i) => ({ serviceCode: `s${i}`, values: { p: 1 } })),
+    [{ serviceCode: 'A', values: Object.fromEntries(Array.from({ length: 301 }, (_, i) => [`p${i}`, i])) }],
+  ]) assert.throws(() => parsePresenceEnvelope({ ...sample, services }), PresenceObserverError);
+  assert.throws(() => parsePresenceEnvelope({ ...sample, values: { t: 1 } }), PresenceObserverError);
+});

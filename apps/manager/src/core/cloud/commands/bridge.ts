@@ -4,7 +4,7 @@ import type { DownlinkCommand } from '../gateway.ts';
 import { midKey, normalizeMid } from '../mid.ts';
 import { validateModelCommand } from './model-validation.ts';
 import { COMMAND_SCHEMA } from './schema.ts';
-import { validateBinding, validateDownlink, validatePoll, validateResult } from './validation.ts';
+import { validateBindingBatch, validateDownlink, validatePoll, validateResult } from './validation.ts';
 import { CommandError, type CommandCloud, type CommandLimits, type CommandRecord, type CommandStatus, type LeasedCommand } from './types.ts';
 const DEFAULT_LIMITS: CommandLimits = { maxPending: 1000, maxResults: 1000, maxBindings: 1000, maxGateways: 32, bindingTtlMs: 60000, queueMs: 60000, leaseMs: 30000 };
 const COUNT_QUERIES = {
@@ -86,17 +86,36 @@ export class CommandBridge {
     registerBindings(instanceId: string, input: unknown): {
         accepted: number;
     } {
-        const binding = validateBinding(input), now = this.#now();
+        const { bindings, replace } = validateBindingBatch(input), now = this.#now();
         this.#db.transaction(() => {
             this.#db.prepare('DELETE FROM cloud_command_binding WHERE last_seen < ?').run(now - this.#limits.bindingTtlMs);
-            const exists = this.#db.prepare('SELECT 1 FROM cloud_command_binding WHERE instance_id=? AND consumer_id=? AND node_id=? AND service_code=?').get(instanceId, binding.consumerId, binding.nodeId, binding.serviceCode);
-            if (!exists && this.#count('bindings') >= this.#limits.maxBindings)
-                throw new CommandError('命令绑定数量超过上限', 503);
-            this.#db.prepare(`INSERT INTO cloud_command_binding(instance_id,consumer_id,node_id,service_code,commands_json,last_seen) VALUES (?,?,?,?,?,?)
+            if (replace) {
+                const scope = bindings[0]!;
+                this.#db.prepare('DELETE FROM cloud_command_binding WHERE instance_id=? AND consumer_id=? AND node_id=?')
+                    .run(instanceId, scope.consumerId, scope.nodeId);
+            }
+            for (const binding of bindings) {
+                const exists = this.#db.prepare('SELECT 1 FROM cloud_command_binding WHERE instance_id=? AND consumer_id=? AND node_id=? AND service_code=?').get(instanceId, binding.consumerId, binding.nodeId, binding.serviceCode);
+                if (!exists && this.#count('bindings') >= this.#limits.maxBindings)
+                    throw new CommandError('命令绑定数量超过上限', 503);
+                this.#db.prepare(`INSERT INTO cloud_command_binding(instance_id,consumer_id,node_id,service_code,commands_json,last_seen) VALUES (?,?,?,?,?,?)
     ON CONFLICT(instance_id,consumer_id,node_id,service_code) DO UPDATE SET commands_json=excluded.commands_json,last_seen=excluded.last_seen`)
-                .run(instanceId, binding.consumerId, binding.nodeId, binding.serviceCode, JSON.stringify(binding.commands), now);
+                    .run(instanceId, binding.consumerId, binding.nodeId, binding.serviceCode, JSON.stringify(binding.commands), now);
+            }
+            const scope = bindings[0]!;
+            const declared = new Map(bindings.map(binding => [binding.serviceCode, binding.commands]));
+            const queued = this.#db.prepare("SELECT * FROM cloud_command WHERE instance_id=? AND consumer_id=? AND device_id=? AND status='queued'")
+                .all(instanceId, scope.consumerId, scope.nodeId) as Row[];
+            for (const row of queued) {
+                if (!replace && !declared.has(row.service_code)) continue;
+                const command = declared.get(row.service_code)?.find(item => item.cmd === row.cmd);
+                const params = Object.keys(JSON.parse(row.params_json));
+                if (!command || params.length !== 1 || params[0] !== command.param)
+                    this.#terminal(row, 'rejected', '命令声明已移除或改变，旧命令不会在后续配置重新执行');
+            }
+            this.#prune();
         })();
-        return { accepted: binding.commands.length };
+        return { accepted: bindings.reduce((total, binding) => total + binding.commands.length, 0) };
     }
     async receive(command: DownlinkCommand): Promise<void> {
         const body = validateDownlink(command), now = this.#now();

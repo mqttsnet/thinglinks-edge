@@ -10,7 +10,7 @@
  * 而那种错误不会报错 —— 只会让某个接口悄悄变成谁都能调。
  */
 import type { FastifyInstance } from 'fastify';
-import { FieldRegistry } from '../../core/edge/registry.ts';
+import { FieldRegistry, fieldServiceCode } from '../../core/edge/registry.ts';
 import { probeFlows } from '../../core/edge/southbound.ts';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -47,10 +47,11 @@ export function registerField(api: FastifyInstance, ctx: HttpContext): void {
   });
 
   api.get(`${config.basePath}/api/field/tags`, async (req, reply) => {
-    const { instanceId, nodeId } = req.query as { instanceId?: string; nodeId?: string };
+    const { instanceId, nodeId, serviceCode } = req.query as { instanceId?: string; nodeId?: string; serviceCode?: string };
     const user = fieldGuard(req, reply, instanceId);
     if (!user) return;
-    return reply.send({ tags: visibleOnly(user, registry.tags(instanceId, nodeId)) });
+    try { return reply.send({ tags: visibleOnly(user, registry.tags(instanceId, nodeId, serviceCode)) }); }
+    catch (error) { return reply.code(400).send({ error: (error as Error).message }); }
   });
 
   /*
@@ -72,26 +73,29 @@ export function registerField(api: FastifyInstance, ctx: HttpContext): void {
    */
   api.get(`${config.basePath}/api/field/history`, async (req, reply) => {
     const q = req.query as {
-      instanceId?: string; nodeId?: string; tagId?: string;
+      instanceId?: string; nodeId?: string; tagId?: string; serviceCode?: string;
       since?: string; until?: string; limit?: string;
     };
     if (!q.instanceId || !q.nodeId || !q.tagId) {
       return reply.code(400).send({ error: '必须同时给出 instanceId、nodeId、tagId' });
     }
     if (!guard(req, reply, { csrf: false, need: 'instance:view', instance: q.instanceId })) return;
+    let serviceCode: string;
+    try { serviceCode = fieldServiceCode(q.serviceCode); }
+    catch (error) { return reply.code(400).send({ error: (error as Error).message }); }
 
     const history = ctx.valueHistory;
     if (!history?.enabled) {
       return reply.send({
-        enabled: false, points: [], oldest: null, rows: 0, maxRows: 0,
+        enabled: false, serviceCode, points: [], oldest: null, rows: 0, maxRows: 0,
         reason: '本部署未启用点位历史（EDGE_HISTORY_MAX_ROWS=0）',
       });
     }
     const limit = Number(q.limit ?? '500');
     return reply.send({
-      enabled: true,
+      enabled: true, serviceCode,
       ...history.series({
-        instanceId: q.instanceId, nodeId: q.nodeId, tagId: q.tagId,
+        instanceId: q.instanceId, nodeId: q.nodeId, tagId: q.tagId, serviceCode,
         since: q.since, until: q.until,
         limit: Number.isFinite(limit) ? limit : 500,
       }),

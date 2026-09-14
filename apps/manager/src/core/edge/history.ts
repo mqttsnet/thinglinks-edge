@@ -116,12 +116,13 @@ export class ValueHistory {
   append(
     instanceId: string, nodeId: string, tagId: string,
     p: { at: string; value: string; quality: string },
+    serviceCode = '',
   ): void {
     if (!this.enabled) return;
     this.#db.prepare(
-      `INSERT INTO field_value_history (instance_id, node_id, tag_id, at, value, quality)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    ).run(instanceId, nodeId, tagId, p.at, p.value, p.quality);
+      `INSERT INTO field_value_history (instance_id, node_id, tag_id, at, value, quality, service_code)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(instanceId, nodeId, tagId, p.at, p.value, p.quality, serviceCode);
     this.#sincePrune += 1;
   }
 
@@ -158,17 +159,17 @@ export class ValueHistory {
    * 而现场看趋势并不需要那个分辨率。
    */
   series(
-    q: { instanceId: string; nodeId: string; tagId: string;
+    q: { instanceId: string; nodeId: string; tagId: string; serviceCode?: string | undefined;
          since?: string | undefined; until?: string | undefined; limit?: number },
   ): SeriesResult {
     const limit = Math.min(Math.max(q.limit ?? 500, 1), 5000);
     const rows = this.#db.prepare(
       `SELECT at, value, quality FROM field_value_history
-        WHERE instance_id = ? AND node_id = ? AND tag_id = ?
+        WHERE instance_id = ? AND node_id = ? AND tag_id = ? AND service_code = ?
           AND (? IS NULL OR at >= ?) AND (? IS NULL OR at <= ?)
         ORDER BY at DESC LIMIT ?`,
     ).all(
-      q.instanceId, q.nodeId, q.tagId,
+      q.instanceId, q.nodeId, q.tagId, q.serviceCode ?? '',
       q.since ?? null, q.since ?? null,
       q.until ?? null, q.until ?? null,
       limit,

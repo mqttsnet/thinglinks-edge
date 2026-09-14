@@ -15,7 +15,7 @@ test('v12 database upgrades instance runtime and journal idempotently through cu
   ).run('line-a', 'Line A', '5.0.4-24-minimal', 512, 0.5,
     '/red/line-a/', 'secret', 'preserve me');
 
-  assert.equal(migrate(db), 20);
+  assert.equal(migrate(db), 21);
   const runtime = new InstanceRepo(db, Buffer.alloc(32, 1)).nodeRuntime('line-a');
   assert.deepEqual(runtime, {
     mode: 'legacy',
@@ -37,7 +37,7 @@ test('v12 database upgrades instance runtime and journal idempotently through cu
     { name: 'execution_lease_expires_at', dflt_value: '0', required: 1 },
     { name: 'execution_owner', dflt_value: "''", required: 1 },
   ]);
-  assert.equal(migrate(db), 20);
+  assert.equal(migrate(db), 21);
   const preserved = db.prepare(
     'SELECT name, notes FROM instance WHERE id = ?',
   ).get('line-a') as { name: string; notes: string };
@@ -48,12 +48,12 @@ test('migration target is validated and never downgrades a newer database', () =
   const db = new Database(':memory:');
   assert.throws(() => migrate(db, -1), /目标版本/);
   assert.throws(() => migrate(db, 13.5), /目标版本/);
-  assert.throws(() => migrate(db, 21), /目标版本/);
-  assert.equal(migrate(db), 20);
-  assert.equal(migrate(db, 12), 20);
+  assert.throws(() => migrate(db, 22), /目标版本/);
+  assert.equal(migrate(db), 21);
+  assert.equal(migrate(db, 12), 21);
   assert.equal(
     (db.prepare('SELECT version FROM schema_version').get() as { version: number }).version,
-    20,
+    21,
   );
 });
 
@@ -189,7 +189,7 @@ test('v15 adds trusted copy metadata without changing existing template categori
 test('v18 adds durable protocol cleanup intents without changing instance data',()=>{
  const db=new Database(':memory:');migrate(db,18);
  db.prepare('INSERT INTO editor_origin(instance_id,generation,port) VALUES(?,?,?)').run('preserved','generation',20001);
- assert.equal(migrate(db),20);
+ assert.equal(migrate(db),21);
  assert.equal((db.prepare('SELECT COUNT(*) n FROM editor_origin').get() as {n:number}).n,1);
  assert.equal((db.prepare('SELECT COUNT(*) n FROM protocol_diagnostic').get() as {n:number}).n,0);
  db.close();
@@ -199,7 +199,7 @@ test('v20 observer generation fences upgrade without changing existing device da
   const db = new Database(':memory:'); db.pragma('foreign_keys = ON'); migrate(db, 19);
   db.prepare("INSERT INTO instance(id,name,image_tag,mem_limit,cpu_limit,admin_root,cred_secret) VALUES('i','I','test',512,0.5,'/red/i/','test')").run();
   db.prepare("INSERT INTO field_device(instance_id,node_id,name,online,last_seen) VALUES('i','d','D',1,'2026-09-13T00:00:00Z')").run();
-  assert.equal(migrate(db), 20);
+  assert.equal(migrate(db), 21);
   assert.deepEqual(db.prepare("SELECT online,last_seen FROM field_device WHERE instance_id='i'").get(), { online: 1, last_seen: '2026-09-13T00:00:00Z' });
   db.prepare("INSERT INTO presence_observer_device(instance_id,node_id) VALUES('i','d')").run();
   db.prepare("INSERT INTO presence_observer(instance_id,node_id,observer_id) VALUES('i','d','observer')").run();

@@ -9,6 +9,9 @@ export type PresenceEnvelope = {
   __tlePresence: ObserverEventBase & { version: 1; observerId: string; kind: 'sample'; report?: boolean };
   values: Record<string, unknown>;
 } | {
+  __tlePresence: ObserverEventBase & { version: 1; observerId: string; kind: 'sample'; report?: boolean };
+  services: { serviceCode: string; values: Record<string, unknown> }[];
+} | {
   __tlePresence: ObserverEventBase & { version: 1; observerId: string; kind: 'status'; online: false };
 };
 

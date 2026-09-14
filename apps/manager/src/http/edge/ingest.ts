@@ -10,7 +10,7 @@
  *   · 实例 id **只从令牌反查**，绝不取自请求体 —— 否则实例 A 可以冒充实例 B 写台账
  */
 import type { FastifyInstance } from 'fastify';
-import { FieldRegistry } from '../../core/edge/registry.ts';
+import { FieldRegistry, fieldServiceCode } from '../../core/edge/registry.ts';
 import { PresenceObservers, PresenceObserverError, parsePresenceEnvelope } from '../../core/edge/presence-observers/index.ts';
 import { BatchOverflowError, MicroBatcher, type UplinkPoint } from '../../core/cloud/batch.ts';
 import { SpoolDrainer } from '../../core/spool/drainer.ts';
@@ -257,6 +257,7 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
 
     const nodeId = (b.nodeId ?? '').trim() || '_gateway';
     let pointCount = 0;
+    let recorded = 0;
     try {
       const envelope = parsePresenceEnvelope(b.data);
       if (envelope?.__tlePresence.kind === 'status') {
@@ -267,10 +268,14 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
         return reply.code(202).send({ accepted: 0, presence: state === undefined ? 'unknown' : state ? 'online' : 'offline' });
       }
       const data = envelope && 'values' in envelope ? envelope.values : b.data;
+      const eventTime = Date.now(), at = new Date(eventTime).toISOString();
+      const singleService = fieldServiceCode((b.serviceId ?? '').trim() || 'default');
       // Only unwrapped point values enter the telemetry batch/spool, never observation metadata.
-      const values = (typeof data === 'object' && !Array.isArray(data))
-        ? Object.entries(data as Record<string, unknown>).map(([tagId, value]) => ({ nodeId, tagId, value }))
-        : [{ nodeId, tagId: b.serviceId || 'value', value: data }];
+      const values = envelope && 'services' in envelope
+        ? envelope.services.flatMap(service => Object.entries(service.values).map(([tagId, value]) => ({ nodeId, serviceCode: service.serviceCode, tagId, value, at })))
+        : (typeof data === 'object' && !Array.isArray(data))
+          ? Object.entries(data as Record<string, unknown>).map(([tagId, value]) => ({ nodeId, serviceCode: singleService, tagId, value, at }))
+          : [{ nodeId, serviceCode: singleService, tagId: b.serviceId || 'value', value: data, at }];
       pointCount = values.length;
       const managed = observers.hasObservers(instanceId, nodeId);
       let accepted = 0;
@@ -285,6 +290,7 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
         accepted = registry.recordValues(instanceId, values, { updateOnline: !managed });
         if (accepted > 0 && !managed) ctx.presence?.observeUplink(instanceId, nodeId);
       }
+      recorded = accepted;
       if (envelope?.__tlePresence.kind === 'sample' && envelope.__tlePresence.report === false) {
         return reply.code(202).send({ accepted, batched: batcher.pending, cloud: 'unchanged' });
       }
@@ -313,14 +319,10 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
        * 发送时才打的话，断网补传的数据会带上补传那一刻的时间，
        * 云侧按 eventTime 排出来的顺序就是错的。
        */
-      const eventTime = Date.now();
-      const serviceCode = (b.serviceId ?? '').trim() || 'default';
-      for (const v of values) {
-        batcher.add({
-          deviceId: v.nodeId, serviceCode, eventTime,
+      batcher.addMany(values.map(v => ({
+          deviceId: v.nodeId, serviceCode: v.serviceCode, eventTime,
           data: { [v.tagId]: v.value },
-        } as UplinkPoint);
-      }
+        } as UplinkPoint)));
 
       return reply.code(202).send({
         accepted,
@@ -333,7 +335,7 @@ export function registerIngest(api: FastifyInstance, ctx: HttpContext): void {
         metrics.rejected += pointCount;
         metrics.lastError = e.message;
         return reply.code(503).header('retry-after', '5')
-          .send({ error: e.message, accepted: 0, cloud: 'saturated' });
+          .send({ error: e.message, accepted: recorded, cloud: 'saturated' });
       }
       return fail(reply, e);
     }

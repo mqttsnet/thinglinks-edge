@@ -175,6 +175,26 @@ export class MicroBatcher {
       || this.#queuedBytes >= this.limits.maxQueuedBytes;
   }
 
+  /** Reserve enough bounded queue capacity for the complete observation before adding a point. */
+  addMany(points: UplinkPoint[]): void {
+    if (this.#closed) throw new Error('批处理器已关闭');
+    let count = this.#buf.length, bytes = this.#bytes, queued = this.#queued, queuedBytes = this.#queuedBytes;
+    const reject = () => {
+      this.#rejected += points.length;
+      throw new BatchOverflowError('上行队列不足以接受本轮完整采集数据，已整体拒收');
+    };
+    for (const point of points) {
+      if (queued >= this.limits.maxQueuedBatches || queuedBytes >= this.limits.maxQueuedBytes) reject();
+      count++; bytes += Buffer.byteLength(JSON.stringify(point), 'utf8');
+      if (count >= this.limits.maxPoints || bytes >= this.limits.maxBytes) {
+        queued++; queuedBytes += bytes; count = 0; bytes = 0;
+      }
+    }
+    // Pending data will later seal too; reserve that final batch rather than exceeding capacity on its timer.
+    if (queued + (count > 0 ? 1 : 0) > this.limits.maxQueuedBatches || queuedBytes + bytes > this.limits.maxQueuedBytes) reject();
+    for (const point of points) this.add(point);
+  }
+
   /**
    * 入队一个点位。
    *
