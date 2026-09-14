@@ -11,6 +11,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { COMMAND_SCHEMA } from './cloud/commands/schema.ts';
 import { PRESENCE_SCHEMA } from './cloud/presence/schema.ts';
+import { PRESENCE_OBSERVERS_SCHEMA } from './edge/presence-observers/schema.ts';
 
 export type Db = Database.Database;
 
@@ -429,6 +430,8 @@ const MIGRATIONS: string[] = [
   );`,
   // v19 — durable single-read cleanup intents; never replay after restart.
   PROTOCOL_DIAGNOSTIC_SCHEMA,
+  // v20 — observer identity and persistent generation/sequence fences for live device presence.
+  PRESENCE_OBSERVERS_SCHEMA,
 ];
 export function openDb(file: string): Db {
   if (file !== ':memory:') mkdirSync(dirname(file), { recursive: true });

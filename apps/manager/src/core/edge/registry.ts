@@ -117,6 +117,12 @@ export class FieldRegistry {
     ).run(online ? 1 : 0, nowIso(), instanceId, nodeId);
   }
 
+  /** Observer aggregation changes presence without pretending that new device data arrived. */
+  setObservedOnline(instanceId: string, nodeId: string, online: boolean): void {
+    this.db.prepare('UPDATE field_device SET online = ? WHERE instance_id = ? AND node_id = ?')
+      .run(online ? 1 : 0, instanceId, nodeId);
+  }
+
   /** 定义一个点位。同样幂等 */
   upsertTag(instanceId: string, t: FieldTagInput): void {
     assertId(instanceId, 'instanceId');
@@ -139,7 +145,7 @@ export class FieldRegistry {
    * 未定义过的点位会**自动补一条定义**：现场常见先有值后补元数据，
    * 丢掉这类值会让界面出现「有设备没点位」的空洞。
    */
-  recordValues(instanceId: string, values: TagValueInput[]): number {
+  recordValues(instanceId: string, values: TagValueInput[], options: { updateOnline?: boolean } = {}): number {
     assertId(instanceId, 'instanceId');
     const upsertTag = this.db.prepare(
       `INSERT INTO field_tag (instance_id, node_id, tag_id) VALUES (?, ?, ?)
@@ -158,7 +164,9 @@ export class FieldRegistry {
       `UPDATE field_tag SET hist_at = ? WHERE instance_id = ? AND node_id = ? AND tag_id = ?`,
     );
     const touchDevice = this.db.prepare(
-      'UPDATE field_device SET online = 1, last_seen = ? WHERE instance_id = ? AND node_id = ?',
+      options.updateOnline === false
+        ? 'UPDATE field_device SET last_seen = ? WHERE instance_id = ? AND node_id = ?'
+        : 'UPDATE field_device SET online = 1, last_seen = ? WHERE instance_id = ? AND node_id = ?',
     );
 
     const run = this.db.transaction((items: TagValueInput[]) => {

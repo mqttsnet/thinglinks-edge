@@ -105,6 +105,53 @@ test('reconnect rechecks same gateway, change of gateway isolates previous candi
   } finally { await f.sync.close(); assert.equal(f.listeners.size, 0); f.db.close(); }
 });
 
+test('observer aggregate keeps healthy peers but cached evidence cannot revive a source after reconnect', async () => {
+  const f = fixture(); f.sync.start();
+  try {
+    f.sync.observeAggregate('i', 'd', true, true); await f.sync.runOnce();
+    f.sync.observeAggregate('i', 'd', true, false); await f.sync.runOnce();
+    assert.deepEqual(f.updates, [[{ deviceId: 'd', status: 'ONLINE' }]]);
+    f.change('g', false); f.change('g');
+    f.sync.observeAggregate('i', 'd', true, false); await f.sync.runOnce();
+    assert.equal(f.updates.length, 1, 'a failed peer must not turn cached good data into a fresh observation');
+    f.sync.observeAggregate('i', 'd', false, false); await f.sync.runOnce();
+    assert.equal(f.updates.at(-1)?.[0]?.status, 'OFFLINE');
+    f.sync.observeAggregate('i', 'd', undefined, false); await f.sync.runOnce();
+    assert.equal(f.updates.length, 2, 'unknown is not an online observation');
+    f.sync.observeAggregate('i', 'd', true, true); await f.sync.runOnce();
+    assert.equal(f.updates.at(-1)?.[0]?.status, 'ONLINE');
+  } finally { await f.sync.close(); f.db.close(); }
+});
+
+test('a stopped-container snapshot taken before fresh ingestion cannot overwrite that new evidence', async () => {
+  const f = fixture();
+  let delay = false; let resolve!: (rows: { id: string; running: boolean }[]) => void;
+  const sync = new PresenceSynchronizer({ db: f.db, cloud: f.cloud, listInstances: () => delay
+    ? new Promise(done => { resolve = done; }) : Promise.resolve([{ id: 'i', running: true }]) });
+  try {
+    sync.observeUplink('i', 'd'); await sync.runOnce();
+    delay = true; const pending = sync.runOnce(); await new Promise(done => setImmediate(done));
+    sync.observeUplink('i', 'd'); delay = false;
+    resolve([{ id: 'i', running: false }]); await pending;
+    assert.deepEqual(f.updates, [[{ deviceId: 'd', status: 'ONLINE' }]]);
+  } finally { await sync.close(); await f.sync.close(); f.db.close(); }
+});
+
+test('short container pause retains collector lease semantics instead of reporting an authoritative stop', async () => {
+  const f = fixture();
+  let state = 'running';
+  const sync = new PresenceSynchronizer({ db: f.db, cloud: f.cloud, listInstances: async () => [{ id: 'i', running: state === 'running', state }] });
+  try {
+    sync.observeUplink('i', 'd'); await sync.runOnce();
+    state = 'paused'; await sync.runOnce();
+    assert.deepEqual(f.updates, [[{ deviceId: 'd', status: 'ONLINE' }]]);
+    sync.observeAggregate('i', 'd', false, false); await sync.runOnce();
+    assert.equal(f.updates.at(-1)?.[0]?.status, 'OFFLINE', 'an expired collector lease still makes a paused source unavailable');
+    state = 'running'; sync.observeUplink('i', 'd'); await sync.runOnce();
+    assert.equal(f.updates.at(-1)?.[0]?.status, 'ONLINE');
+  } finally { await sync.close(); await f.sync.close(); f.db.close(); }
+});
+
 test('restart loads ownership-checked sources; stopped sources become OFFLINE and running sources require live data', async () => {
   const db = openDb(':memory:'); const first = fixture(db);
   first.sync.observeUplink('i', 'stopped'); first.sync.observeUplink('j', 'running'); await first.sync.runOnce(); await first.sync.close();

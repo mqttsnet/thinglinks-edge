@@ -9,7 +9,7 @@ export interface PresenceCloud {
   querySubDevices(deviceIds: string[], expectedGatewayId: string, signal?: AbortSignal): Promise<unknown>;
   updateSubDeviceStatus(statuses: { deviceId: string; status: PresenceState }[], expectedGatewayId: string, signal?: AbortSignal): Promise<unknown>;
 }
-interface Source { online: boolean | undefined }
+interface Source { online: boolean | undefined; activity: number }
 interface Device {
   sources: Map<string, Source>;
   revision: number;
@@ -26,7 +26,7 @@ interface Snapshot { id: string; device: Device; revision: number; status: Prese
 interface Options {
   db: Db;
   cloud: PresenceCloud;
-  listInstances(signal: AbortSignal): Promise<{ id: string; running: boolean }[]>;
+  listInstances(signal: AbortSignal): Promise<{ id: string; running: boolean; state?: string }[]>;
   now?: () => number;
   onError?: (message: string) => void;
   /** Polling only detects actual container stop/removal; it is not a device-silence timeout. */
@@ -81,7 +81,12 @@ export class PresenceSynchronizer {
   /** Explicit false only. A registration or status:true is not proof of live data. */
   observeOffline(instanceId: string, deviceId: string): void { this.#observe(instanceId, deviceId, false); }
 
-  #observe(instanceId: string, deviceId: string, online: boolean): void {
+  /** A peer's cached good state may preserve ONLINE, but only fresh accepted data may establish it. */
+  observeAggregate(instanceId: string, deviceId: string, online: boolean | undefined, freshData: boolean): void {
+    this.#observe(instanceId, deviceId, online, freshData);
+  }
+
+  #observe(instanceId: string, deviceId: string, online: boolean | undefined, freshData = online === true): void {
     if (this.#closed) return;
     this.#selectGateway();
     if (!this.#gatewayId || !instanceId || !deviceId || deviceId === '_gateway' || deviceId === this.#gatewayId) return;
@@ -94,10 +99,12 @@ export class PresenceSynchronizer {
     let source = device.sources.get(instanceId);
     if (!source) {
       if (this.#sources >= MAX_SOURCES) { this.#markConflict(deviceId, device); this.#error('子设备状态同步来源达到上限；该设备离线状态需人工核对'); return; }
-      source = { online: undefined }; device.sources.set(instanceId, source); this.#sources++;
+      source = { online: undefined, activity: 0 }; device.sources.set(instanceId, source); this.#sources++;
       device.sourcesDirty = true;
     }
-    if (online) device.observed++;
+    if (online === true && !freshData && source.online !== true) online = undefined;
+    source.activity++;
+    if (online === true && freshData) device.observed++;
     if (source.online !== online) {
       const before = this.#desired(device);
       source.online = online;
@@ -140,7 +147,7 @@ export class PresenceSynchronizer {
       let device = this.#devices.get(row.device_id);
       if (!device) { device = this.#newDevice(); this.#devices.set(row.device_id, device); }
       // A running instance after Manager restart is unknown until fresh live ingestion.
-      device.sources.set(row.instance_id, { online: undefined }); this.#sources++;
+      device.sources.set(row.instance_id, { online: undefined, activity: 0 }); this.#sources++;
       if (row.source_conflict) { device.offlineBlocked = true; this.#error('存在未完整跟踪的设备来源；该设备离线状态需人工核对'); }
     }
   }
@@ -152,14 +159,17 @@ export class PresenceSynchronizer {
   }
 
   async #reconcileInstances(epoch: number, signal: AbortSignal): Promise<boolean> {
-    let instances: { id: string; running: boolean }[];
+    const activity = new Map([...this.#devices.values()].flatMap(device =>
+      [...device.sources.values()].map(source => [source, source.activity] as const)));
+    let instances: { id: string; running: boolean; state?: string }[];
     try { instances = await withDeadline(current => this.#o.listInstances(current), signal, this.#o.instanceTimeoutMs ?? 3_000); }
     catch { this.#error('无法核对实例运行状态，本轮不推送子设备状态'); return false; }
     if (this.#closed || epoch !== this.#epoch) return false;
-    const running = new Set(instances.filter(instance => instance.running).map(instance => instance.id));
+    // A paused process retains its run; collector lease expiry handles a prolonged pause.
+    const running = new Set(instances.filter(instance => instance.running || instance.state === 'paused').map(instance => instance.id));
     for (const device of this.#devices.values()) {
       for (const [id, source] of device.sources) {
-        if (!running.has(id) && source.online !== false) {
+        if (!running.has(id) && source.online !== false && activity.get(source) === source.activity) {
           source.online = false; device.revision++; device.nextAttemptAt = 0;
         }
       }
