@@ -6,7 +6,8 @@
  */
 import bcrypt from 'bcryptjs';
 import { randomUUID } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { lstat, readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import type { Db } from '../db.ts';
 import { recordAudit } from '../db.ts';
 import { adminRootFor } from '../config.ts';
@@ -562,6 +563,28 @@ export class InstanceService {
     if (!this.o.repo.get(id)) throw new ServiceError(`实例 ${id} 不存在`);
   }
 
+  /** Deletion is successful only after every managed resource is observed absent. */
+  private async assertRemoved(id: string): Promise<void> {
+    try {
+      await this.o.docker.assertManaged(id);
+      throw new ServiceError(`实例 ${id} 的受管容器仍存在，未完成删除`);
+    } catch (error) {
+      if ((error as { statusCode?: number }).statusCode !== 404) throw error;
+    }
+    try {
+      await this.o.docker.raw.getNetwork(this.o.docker.instanceNetwork(id)).inspect();
+      throw new ServiceError(`实例 ${id} 的受管网络仍存在，未完成删除`);
+    } catch (error) {
+      if ((error as { statusCode?: number }).statusCode !== 404) throw error;
+    }
+    try {
+      await lstat(join(this.o.instanceDataRoot, id));
+      throw new ServiceError(`实例 ${id} 的数据目录仍存在，未完成删除`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+
   async start(id: string, actor: string): Promise<void> {
     return this.o.gate.run(id, 'start-instance',
       async (lease) => this.startUnderLease(id, lease, actor));
@@ -587,8 +610,30 @@ export class InstanceService {
       recordAudit(this.o.db, { actor, action: 'start-instance', target: id, result: 'ok' });
       return;
     }
-    await this.o.docker.assertManaged(id);
-    await this.o.docker.start(id);
+    try {
+      await this.o.docker.assertManaged(id);
+      await this.o.docker.start(id);
+    } catch (error) {
+      if ((error as { statusCode?: number }).statusCode !== 404) throw error;
+      const inst = this.o.repo.get(id);
+      if (!inst) throw new ServiceError(`实例 ${id} 不存在`);
+      const image = await this.o.docker.raw.getImage(this.o.docker.imageRef(inst.imageTag)).inspect() as { Id?: unknown };
+      if (typeof image.Id !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(image.Id)) {
+        throw new ServiceError(`实例 ${id} 容器缺失，且本机没有可验证的原镜像；请先恢复镜像后重试`);
+      }
+      await this.o.docker.recreateInstance({
+        spec: {
+          id, imageTag: inst.imageTag, memoryMb: inst.memLimit, cpus: inst.cpuLimit,
+          ports: this.o.repo.ports(id), adminRoot: inst.adminRoot,
+          ingestToken: this.o.repo.ingestToken(id),
+        },
+        settingsJs: this.#renderFor(id),
+        runtimeMode: inst.nodeRuntimeMode ?? 'legacy',
+        imageId: image.Id,
+        running: true,
+      });
+      await this.o.adminRuntime.waitReady(id, { timeoutMs: 30_000, intervalMs: 250 });
+    }
     recordAudit(this.o.db, { actor, action: 'start-instance', target: id, result: 'ok' });
   }
 
@@ -622,6 +667,9 @@ export class InstanceService {
   ): Promise<void> {
     this.o.gate.assertLease(lease, id, ['remove-instance']);
     this.assertExists(id);
+    if (!opts.removeData) {
+      throw new ServiceError('为避免保留数据脱离实例台账，删除实例必须同时删除数据；请先备份后重试。');
+    }
     const needsSettlement = await this.o.removalLifecycle?.beforeRemove(id, { removeData: opts.removeData });
     if (needsSettlement) {
       if (!opts.removeData) throw new ServiceError('请先清理诊断任务，或选择同时删除实例数据。');
@@ -631,13 +679,17 @@ export class InstanceService {
         });
         await this.o.docker.remove(id, { removeData: opts.removeData });
         if (opts.removeData) await this.o.removalLifecycle!.afterDataRemoved(id);
+        await this.assertRemoved(id);
       } catch {
         throw new ServiceError('实例资源或诊断记录尚未确认全部清理，已保留实例记录，请修复后重试删除。');
       }
     } else {
-      // Preserve existing integrations without the optional domain lifecycle.
-      await this.o.docker.assertManaged(id).catch(() => undefined);
-      await this.o.docker.remove(id, { removeData: opts.removeData }).catch(() => undefined);
+      // Without a diagnostic settlement hook, Docker cleanup is still fail-closed.
+      await this.o.docker.assertManaged(id).catch((error) => {
+        if ((error as { statusCode?: number }).statusCode !== 404) throw error;
+      });
+      await this.o.docker.remove(id, { removeData: opts.removeData });
+      await this.assertRemoved(id);
     }
     this.o.repo.remove(id);
     recordAudit(this.o.db, {

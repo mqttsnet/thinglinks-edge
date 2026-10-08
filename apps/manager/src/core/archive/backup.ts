@@ -22,7 +22,7 @@ import {
   hkdfSync,
   randomBytes,
 } from 'node:crypto';
-import { mkdtemp as makeTempDir, mkdir, readdir, readFile, writeFile, rm, stat } from 'node:fs/promises';
+import { lstat, mkdtemp as makeTempDir, mkdir, readdir, readFile, writeFile, rm, stat } from 'node:fs/promises';
 import { join, relative, sep, posix } from 'node:path';
 import { tmpdir } from 'node:os';
 import { tarArchive, untar, type TarEntry } from './tar.ts';
@@ -122,6 +122,10 @@ function openBackupArchive(archive: Buffer, key?: Buffer): Buffer {
 /** 目录内所有文件的相对路径（POSIX 风格，tar 里用它） */
 async function walk(root: string, base = root, excludeNodeModules = false): Promise<string[]> {
   const out: string[] = [];
+  const rootStat = await lstat(root);
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+    throw new BackupError(`实例目录不可信或含符号链接：${root}`);
+  }
   // A listed instance (including every nested directory) must be readable.
   // ENOENT is also an error: otherwise a disappearing instance looks backed up.
   const entries = await readdir(root, { withFileTypes: true });
@@ -130,6 +134,7 @@ async function walk(root: string, base = root, excludeNodeModules = false): Prom
     const full = join(root, e.name);
     if (e.isDirectory()) out.push(...await walk(full, base, excludeNodeModules));
     else if (e.isFile()) out.push(relative(base, full).split(sep).join(posix.sep));
+    else throw new BackupError(`实例目录含不支持的文件类型：${full}`);
   }
   return out;
 }
@@ -222,6 +227,8 @@ export interface RestoreOptions {
   key: Buffer;
   /** 跳过密钥指纹校验。**只应在明知凭据会失效时使用** */
   ignoreKeyMismatch?: boolean;
+  /** Restore must be guarded by the caller's live-writer check before staging. */
+  assertQuiesced?: () => Promise<void> | void;
 }
 
 /** Validate every destination before creating a transaction or touching live data. */
@@ -278,6 +285,8 @@ export async function restoreBackup(opts: RestoreOptions): Promise<BackupManifes
       '用错密钥恢复出来的系统能启动，但所有实例凭据都解不开 —— 请改用备份时的 MASTER_KEY。',
     );
   }
+
+  await opts.assertQuiesced?.();
 
   const entries = restoreEntries(archive, manifest);
   await withRestoreTransaction(opts.dataRoot, async (stageRoot) => {

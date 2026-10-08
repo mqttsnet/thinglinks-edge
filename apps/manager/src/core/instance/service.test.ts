@@ -115,22 +115,29 @@ function fixture(
   repo.create(record(), [], [{ username: 'admin', password: 'old-password', permissions: '*' }]);
   repo.setIngestToken('line-a', 'ingest-token');
   const calls: string[] = [];
+  let removed = false;
   const docker = {
-    raw: {},
+    raw: {
+      getNetwork: () => ({ inspect: async () => { throw Object.assign(new Error('missing'), { statusCode: 404 }); } }),
+    },
     imageRepo: 'nodered/node-red',
-    assertManaged: async (id: string) => { calls.push(`assertManaged:${id}`); },
+    assertManaged: async (id: string) => {
+      calls.push(`assertManaged:${id}`);
+      if (removed) throw Object.assign(new Error('container missing'), { statusCode: 404 });
+    },
     assertRestartable: async (id: string) => {
       calls.push(`assertRestartable:${id}`);
       return { settingsJs: 'original-settings-bytes', running: true };
     },
     start: async (id: string) => { calls.push(`start:${id}`); },
     stop: async (id: string) => { calls.push(`stop:${id}`); },
-    remove: async (id: string) => { calls.push(`remove:${id}`); },
+    remove: async (id: string) => { calls.push(`remove:${id}`); removed = true; },
     writeSettings: async (id: string) => { calls.push(`writeSettings:${id}`); },
     restart: async (id: string) => { calls.push(`restart:${id}`); },
     list: async () => [{ id: 'line-a', state: 'running', running: true }],
     assertImagePresent: async (image: string) => { calls.push(`assertImagePresent:${image}`); },
     imageRef: (tag: string) => `nodered/node-red:${tag}`,
+    instanceNetwork: (id: string) => `thinglinks-edge-${id}`,
     inspectMigrationRuntime: async () => ({
       running: true,
       imageId: `sha256:${'a'.repeat(64)}`,
@@ -663,6 +670,25 @@ test('pending public start surfaces failed verification and does not report a su
     0,
   );
   assert.equal(f.gate.current('line-a'), undefined);
+});
+
+test('start recreates a missing managed container from the persisted instance record', async () => {
+  const f = fixture();
+  f.docker.assertManaged = async () => {
+    throw Object.assign(new Error('container missing'), { statusCode: 404 });
+  };
+  (f.docker.raw as unknown as {
+    getImage: () => { inspect: () => Promise<{ Id: string }> };
+  }).getImage = () => ({ inspect: async () => ({ Id: `sha256:${'b'.repeat(64)}` }) });
+
+  await f.service.start('line-a', 'admin');
+
+  assert.ok(f.calls.some((call) => call.startsWith('recreate:line-a:true:sha256:')));
+  assert.ok(f.calls.includes('ready:line-a'));
+  assert.equal(
+    (f.db.prepare("SELECT COUNT(*) AS n FROM audit WHERE action = 'start-instance' AND result = 'ok'").get() as { n: number }).n,
+    1,
+  );
 });
 
 test('image upgrade and rollback both preserve the explicitly persisted npm runtime mode', async () => {
@@ -1419,8 +1445,8 @@ test('strict removal hook admits missing containers but refuses an ownership fai
 });
 
 
-test('no outstanding diagnostic retains the original retain-data removal behavior without a purge hook',async()=>{
- let settled=0;const f=fixture(undefined,undefined,{beforeRemove:()=>false,afterDataRemoved:()=>{settled++;}});try{await f.service.remove('line-a',{removeData:false,actor:'admin'});assert.equal(settled,0);assert.equal(f.repo.get('line-a'),undefined);}finally{f.db.close();}
+test('retaining data refuses deletion instead of orphaning the instance directory',async()=>{
+ let settled=0;const f=fixture(undefined,undefined,{beforeRemove:()=>false,afterDataRemoved:()=>{settled++;}});try{await assert.rejects(f.service.remove('line-a',{removeData:false,actor:'admin'}),/保留数据脱离实例台账/);assert.equal(settled,0);assert.ok(f.repo.get('line-a'));}finally{f.db.close();}
 });
 
 test('public DELETE never returns success from a purge flag alone; completion proof is required',async()=>{
@@ -1428,7 +1454,7 @@ test('public DELETE never returns success from a purge flag alone; completion pr
  const f=fixture(undefined,undefined,{beforeRemove:(_id,options)=>{if(!options.removeData)throw new ServiceError('请先清理或同时删除实例数据');return true;},afterDataRemoved:()=>{if(!verified)throw new Error('resource remains');settled++;}});
  const app=Fastify({logger:false});registerInstances(app,{config:{basePath:''},service:f.service,guard:()=>({username:'admin',role:'admin'}),users:{grantFor:()=>undefined},fail:badRequest} as unknown as HttpContext);
  try{
-  const retained=await app.inject({method:'DELETE',url:'/api/instances/line-a'});assert.equal(retained.statusCode,400);assert.match(retained.json().error,/同时删除实例数据/);assert.equal(f.calls.length,0);
+  const retained=await app.inject({method:'DELETE',url:'/api/instances/line-a'});assert.equal(retained.statusCode,400);assert.match(retained.json().error,/同时删除实例数据|保留数据脱离实例台账/);assert.equal(f.calls.length,0);
   const incomplete=await app.inject({method:'DELETE',url:'/api/instances/line-a?removeData=true'});assert.equal(incomplete.statusCode,400);assert.equal(settled,0);assert.ok(f.repo.get('line-a'));assert.doesNotMatch(incomplete.body,/resource remains/);
   verified=true;const done=await app.inject({method:'DELETE',url:'/api/instances/line-a?removeData=true'});assert.equal(done.statusCode,204);assert.equal(settled,1);assert.equal(f.repo.get('line-a'),undefined);
  }finally{await app.close();f.db.close();}

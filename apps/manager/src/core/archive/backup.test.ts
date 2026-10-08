@@ -289,6 +289,40 @@ test('备份安全回归：归档后段非法时正式数据库与流程必须�
   await assert.rejects(() => readFile(join(f.root, 'escaped.txt')), { code: 'ENOENT' });
 });
 
+test('备份拒绝实例根目录符号链接，不跟随到数据根外', async (t) => {
+  const f = await fixture(t);
+  const outside = join(f.root, 'outside-backup-root');
+  await mkdir(outside);
+  await writeFile(join(outside, 'outside-sentinel.txt'), 'must-not-leak');
+  await rm(join(f.instRoot, 'line-a'), { recursive: true, force: true });
+  await symlink(outside, join(f.instRoot, 'line-a'));
+
+  await assert.rejects(
+    () => createBackup({
+      db: f.db, key: KEY, instanceDataRoot: f.instRoot, schemaVersion: 2,
+      instances: [{ id: 'line-a', name: '一号线', imageTag: 'tag' }],
+    }),
+    /符号链接|不可信|实例目录/,
+  );
+});
+
+test('恢复在写入者未停机时先执行 quiescence 门禁并且不改数据', async (t) => {
+  const f = await fixture(t);
+  const archive = await createBackup({
+    db: f.db, key: KEY, instanceDataRoot: f.instRoot, schemaVersion: 2,
+    instances: [{ id: 'line-a', name: '一号线', imageTag: 'tag' }],
+  });
+  const target = join(f.root, 'restore-running');
+  await assert.rejects(
+    () => restoreBackup({
+      archive, dataRoot: target, key: KEY,
+      assertQuiesced: async () => { throw new BackupError('恢复要求所有 Manager 与实例写入者已停止'); },
+    }),
+    /写入者已停止/,
+  );
+  await assert.rejects(() => lstat(join(target, '.restore-transaction')));
+});
+
 for (const scope of ['文件', '实例目录', '数据根目录'] as const) {
   test(`备份安全回归：目标${scope}符号链接不会把恢复写到数据根外`, async (t) => {
     const f = await fixture(t);

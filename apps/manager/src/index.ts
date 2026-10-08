@@ -262,6 +262,39 @@ function resolveMetricsIntervalSec(): number {
   return n;
 }
 
+/** Restore is an offline cutover; fail closed if live writers cannot be ruled out. */
+export async function assertRestoreWritersStopped(config: Pick<ReturnType<typeof loadConfig>,
+  'instanceDataRoot' | 'portRange' | 'timezone'>): Promise<void> {
+  const docker = new DockerClient({
+    connection: dockerConnection(),
+    network: process.env['INSTANCE_NETWORK']?.trim() || 'thinglinks-edge',
+    imageRepo: process.env['NODE_RED_IMAGE_REPO']?.trim() || 'nodered/node-red',
+    portRange: config.portRange,
+    instanceDataRoot: config.instanceDataRoot,
+    timezone: config.timezone,
+  });
+  let statuses;
+  try {
+    statuses = await docker.list();
+  } catch (error) {
+    throw new Error(`恢复前无法确认 Node-RED 写入者已停止，已拒绝恢复：${(error as Error).message}`);
+  }
+  const running = statuses.filter((item) => item.running).map((item) => item.id).filter(Boolean);
+  if (running.length > 0) {
+    throw new Error(`恢复要求先停止运行中的 Node-RED 实例：${running.join('、')}`);
+  }
+  const managerName = process.env['MANAGER_CONTAINER']?.trim()
+    || `${process.env['EDGE_NAME_PREFIX']?.trim() || 'thinglinks-edge'}-manager`;
+  try {
+    const info = await docker.raw.getContainer(managerName).inspect() as { State?: { Running?: boolean } };
+    if (info.State?.Running === true) throw new Error(`恢复要求先停止运行中的 Manager：${managerName}`);
+  } catch (error) {
+    if ((error as { statusCode?: number }).statusCode === 404) return;
+    if (error instanceof Error && error.message.includes('恢复要求先停止')) throw error;
+    throw new Error(`恢复前无法确认 Manager 已停止，已拒绝恢复：${(error as Error).message}`);
+  }
+}
+
 /**
  * 恢复子命令：`node dist/index.js restore <备份文件> [--force]`
  *
@@ -280,6 +313,7 @@ async function runRestore(argv: string[]): Promise<void> {
     throw new Error('恢复要求 DATA_DIR 和 INSTANCE_DATA_ROOT 使用 EDGE_DATA_ROOT 下的标准布局');
   }
   if (recover) {
+    await assertRestoreWritersStopped(config);
     await recoverRestoreTransaction(config.dataRoot);
     console.log('[restore] 中断事务已处理；未提交事务已回滚，已提交事务已清理。');
     return;
@@ -291,6 +325,7 @@ async function runRestore(argv: string[]): Promise<void> {
   const manifest = await restoreBackup({
     archive, dataRoot: config.dataRoot, key,
     ignoreKeyMismatch: argv.includes('--force'),
+    assertQuiesced: () => assertRestoreWritersStopped(config),
   });
   console.log(`[restore] 已恢复到 ${config.dataRoot}`);
   console.log(`[restore] 备份时间 ${manifest.createdAt} · schema v${manifest.schemaVersion}`);
