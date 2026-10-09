@@ -7,10 +7,10 @@
  */
 import { constants } from 'node:fs';
 import {
-  lstat, mkdir, open, readdir, realpath, rename, rm, rmdir, unlink,
+  lstat, mkdir, open, readdir, readlink, realpath, rename, rm, rmdir, unlink,
 } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-import { dirname, isAbsolute, join, parse, resolve, sep } from 'node:path';
+import { dirname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
 
 const TRANSACTION = '.restore-transaction';
 const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
@@ -186,11 +186,28 @@ async function writeJournal(transaction: string, journal: Journal): Promise<void
   await syncDirectory(transaction);
 }
 
-async function syncTree(path: string): Promise<void> {
+async function syncTree(path: string, root: string, links: ReadonlyMap<string, string>): Promise<void> {
   const stat = await lstat(path);
-  if (stat.isSymbolicLink()) invalid('staging 含符号链接');
+  if (stat.isSymbolicLink()) {
+    const rel = relative(root, path).split(sep).join('/');
+    const parts = rel.split('/');
+    const target = links.get(rel);
+    if (target === undefined || parts[0] !== 'instances' || parts.length < 3
+      || !target || isAbsolute(target) || /^[a-zA-Z]:/.test(target) || target.includes('\\')
+      || await readlink(path) !== target) invalid('staging 含未验证符号链接');
+    const instanceRoot = join(root, 'instances', parts[1]!);
+    const actual = await realpath(path);
+    const within = relative(instanceRoot, actual);
+    if (within === '..' || within.startsWith(`..${sep}`) || isAbsolute(within)) invalid('staging 符号链接目标越界');
+    const current = await lstat(path);
+    if (!current.isSymbolicLink() || current.ino !== stat.ino || current.dev !== stat.dev
+      || current.ctimeMs !== stat.ctimeMs) invalid('staging 符号链接发生变化');
+    // Symlinks have no portable fsync handle. Their containing directory is synced
+    // by the caller; never open or sync their resolved target through this path.
+    return;
+  }
   if (stat.isDirectory()) {
-    for (const name of await readdir(path)) await syncTree(join(path, name));
+    for (const name of await readdir(path)) await syncTree(join(path, name), root, links);
     await syncDirectory(path);
   } else if (stat.isFile()) {
     const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -327,6 +344,7 @@ export async function recoverRestoreTransaction(dataRoot: string): Promise<void>
 export async function withRestoreTransaction(
   dataRoot: string,
   stage: (root: string) => Promise<void>,
+  options: { symlinks?: ReadonlyMap<string, string> } = {},
 ): Promise<void> {
   const root = (await dataDirectory(dataRoot, true))!;
   const transaction = join(root, TRANSACTION);
@@ -348,7 +366,7 @@ export async function withRestoreTransaction(
     if ((await readdir(temporary)).sort().join(',') !== 'instances,manager') invalid('staging 根含未知目录');
     await directory(join(temporary, 'manager'));
     if ((await readdir(join(temporary, 'manager'))).join(',') !== 'edge.db') invalid('staging Manager 内容不合法');
-    await syncTree(temporary);
+    await syncTree(temporary, temporary, options.symlinks ?? new Map());
     const manager = join(root, 'manager');
     if (!await optionalStat(manager)) await mkdir(manager, { mode: 0o770 });
     await directory(manager);

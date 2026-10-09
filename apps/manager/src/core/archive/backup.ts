@@ -22,13 +22,17 @@ import {
   hkdfSync,
   randomBytes,
 } from 'node:crypto';
-import { lstat, mkdtemp as makeTempDir, mkdir, readdir, readFile, writeFile, rm, stat } from 'node:fs/promises';
-import { join, relative, sep, posix } from 'node:path';
+import { chmod, mkdtemp as makeTempDir, mkdir, readFile, writeFile, rm, stat, symlink } from 'node:fs/promises';
+import { join, posix } from 'node:path';
 import { tmpdir } from 'node:os';
 import { tarArchive, untar, type TarEntry } from './tar.ts';
 import { withRestoreTransaction } from './restore-transaction.ts';
 import { assertValidId } from '../instance/container-spec.ts';
 import type { Db } from '../db.ts';
+import { snapshotInstance } from './backup-snapshot.ts';
+import { validateBackupLinks } from './backup-links.ts';
+
+const BACKUP_TAR_OPTIONS = { allowSymlinks: true } as const;
 
 /**
  * v2 encrypts the complete tar stream. The manifest is intentionally inside the
@@ -52,6 +56,8 @@ export interface BackupManifest {
   /** `MASTER_KEY` 派生密钥的指纹，不含密钥本身 */
   masterKeyFingerprint: string;
   instances: { id: string; name: string; imageTag: string }[];
+  /** Explicit directories preserve empty internal symlink targets. Older backups omit this. */
+  directories?: string[];
 }
 
 export class BackupError extends Error {
@@ -119,26 +125,6 @@ function openBackupArchive(archive: Buffer, key?: Buffer): Buffer {
   return decryptBackupArchive(archive, key);
 }
 
-/** 目录内所有文件的相对路径（POSIX 风格，tar 里用它） */
-async function walk(root: string, base = root, excludeNodeModules = false): Promise<string[]> {
-  const out: string[] = [];
-  const rootStat = await lstat(root);
-  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
-    throw new BackupError(`实例目录不可信或含符号链接：${root}`);
-  }
-  // A listed instance (including every nested directory) must be readable.
-  // ENOENT is also an error: otherwise a disappearing instance looks backed up.
-  const entries = await readdir(root, { withFileTypes: true });
-  for (const e of entries) {
-    if (excludeNodeModules && e.name === 'node_modules') continue;
-    const full = join(root, e.name);
-    if (e.isDirectory()) out.push(...await walk(full, base, excludeNodeModules));
-    else if (e.isFile()) out.push(relative(base, full).split(sep).join(posix.sep));
-    else throw new BackupError(`实例目录含不支持的文件类型：${full}`);
-  }
-  return out;
-}
-
 export interface CreateBackupOptions {
   db: Db;
   key: Buffer;
@@ -151,13 +137,14 @@ export interface CreateBackupOptions {
 
 export async function createBackup(opts: CreateBackupOptions): Promise<Buffer> {
   const entries: TarEntry[] = [];
+  const directories: string[] = [];
 
   // 1. 库的一致性快照。落到临时文件再读回来，避免与在用的库文件抢写
   const snapshotDir = await mkdtemp();
   const snapshot = join(snapshotDir, 'edge.db');
   try {
     await opts.db.backup(snapshot);
-    entries.push({ name: 'manager/edge.db', content: await readFile(snapshot) });
+    entries.push({ name: 'manager/edge.db', content: await readFile(snapshot), mode: 0o600 });
   } finally {
     await rm(snapshotDir, { recursive: true, force: true });
   }
@@ -166,13 +153,11 @@ export async function createBackup(opts: CreateBackupOptions): Promise<Buffer> {
   for (const inst of opts.instances) {
     assertValidId(inst.id);
     const dir = join(opts.instanceDataRoot, inst.id);
-    for (const rel of await walk(dir, dir, opts.excludeNodeModules)) {
-      entries.push({
-        name: `instances/${inst.id}/${rel}`,
-        content: await readFile(join(dir, rel.split(posix.sep).join(sep))),
-      });
-    }
+    const snapshot = await snapshotInstance(dir, `instances/${inst.id}`, opts.excludeNodeModules);
+    entries.push(...snapshot.entries);
+    directories.push(...snapshot.directories);
   }
+  validateBackupLinks(entries, directories);
 
   // 3. 清单放最后写、最前面读 —— 内容与实际归档一致
   const manifest: BackupManifest = {
@@ -182,10 +167,11 @@ export async function createBackup(opts: CreateBackupOptions): Promise<Buffer> {
     schemaVersion: opts.schemaVersion,
     masterKeyFingerprint: keyFingerprint(opts.key),
     instances: opts.instances,
+    directories,
   };
   entries.unshift({ name: 'manifest.json', content: JSON.stringify(manifest, null, 2) });
 
-  return encryptBackupArchive(tarArchive(entries), opts.key);
+  return encryptBackupArchive(tarArchive(entries, BACKUP_TAR_OPTIONS), opts.key);
 }
 
 async function mkdtemp(): Promise<string> {
@@ -193,9 +179,10 @@ async function mkdtemp(): Promise<string> {
 }
 
 function readManifestFromTar(archive: Buffer, encrypted: boolean): BackupManifest {
-  const entries = untar(archive);
+  const entries = untar(archive, BACKUP_TAR_OPTIONS);
   const m = entries.find((e) => e.name === 'manifest.json');
   if (!m) throw new BackupError('归档里没有 manifest.json，不是本平台的备份');
+  if (m.symlink !== undefined) throw new BackupError('manifest.json 必须是普通文件');
   let parsed: BackupManifest;
   try {
     parsed = JSON.parse((m.content as Buffer).toString('utf8')) as BackupManifest;
@@ -241,7 +228,7 @@ function restoreEntries(archive: Buffer, manifest: BackupManifest): TarEntry[] {
     if (ids.has(inst.id)) throw new BackupError('清单实例 id 重复');
     ids.add(inst.id);
   }
-  const entries = untar(archive);
+  const entries = untar(archive, BACKUP_TAR_OPTIONS);
   const names = new Set<string>();
   for (const entry of entries) {
     const parts = entry.name.split('/');
@@ -251,7 +238,10 @@ function restoreEntries(archive: Buffer, manifest: BackupManifest): TarEntry[] {
     }
     if (names.has(entry.name)) throw new BackupError(`归档含重复路径：${entry.name}`);
     names.add(entry.name);
-    if (entry.name === 'manifest.json' || entry.name === 'manager/edge.db') continue;
+    if (entry.name === 'manifest.json' || entry.name === 'manager/edge.db') {
+      if (entry.symlink !== undefined) throw new BackupError('清单与数据库必须是普通文件');
+      continue;
+    }
     if (parts[0] !== 'instances' || parts.length < 3 || !ids.has(parts[1]!)) {
       throw new BackupError(`归档含未知条目：${entry.name}`);
     }
@@ -265,6 +255,20 @@ function restoreEntries(archive: Buffer, manifest: BackupManifest): TarEntry[] {
       }
     }
   }
+  if (manifest.directories !== undefined && !Array.isArray(manifest.directories)) {
+    throw new BackupError('备份目录清单必须是数组');
+  }
+  const directories = new Set<string>();
+  for (const dir of manifest.directories ?? []) {
+    if (typeof dir !== 'string') throw new BackupError('备份目录路径无效');
+    const parts = dir.split('/');
+    if (dir.includes('\\') || dir.includes('\0') || parts.some(part => !part || part === '.' || part === '..')
+      || parts[0] !== 'instances' || parts.length < 2 || !ids.has(parts[1]!) || directories.has(dir)) {
+      throw new BackupError('备份目录路径无效或重复');
+    }
+    directories.add(dir);
+  }
+  validateBackupLinks(entries, [...directories]);
   return entries.filter((entry) => entry.name !== 'manifest.json');
 }
 
@@ -289,22 +293,36 @@ export async function restoreBackup(opts: RestoreOptions): Promise<BackupManifes
   await opts.assertQuiesced?.();
 
   const entries = restoreEntries(archive, manifest);
+  const links = validateBackupLinks(entries, manifest.directories ?? []);
   await withRestoreTransaction(opts.dataRoot, async (stageRoot) => {
     await mkdir(join(stageRoot, 'manager'), { recursive: true });
     await mkdir(join(stageRoot, 'instances'), { recursive: true });
     for (const inst of manifest.instances) {
       await mkdir(join(stageRoot, 'instances', inst.id));
     }
+    for (const directory of manifest.directories ?? []) await mkdir(join(stageRoot, directory), { recursive: true });
     for (const entry of entries) {
+      if (entry.symlink !== undefined) continue;
       const target = join(stageRoot, ...entry.name.split(posix.sep));
       await mkdir(join(target, '..'), { recursive: true });
       // The private staging tree contains only directories we created. Exclusive
       // creation never follows an existing file or symlink, even on a collision.
-      await writeFile(target, entry.content, { flag: 'wx', mode: 0o600 });
+      const rawMode = entry.mode;
+      const mode = typeof rawMode === 'number' && Number.isInteger(rawMode)
+        && rawMode >= 0 && rawMode <= 0o777 ? rawMode : 0o600;
+      await writeFile(target, entry.content, { flag: 'wx', mode });
+      await chmod(target, mode);
+    }
+    // No writes occur beneath a link: the entire namespace was validated first,
+    // all ordinary files/directories now exist, and links are created last.
+    for (const [name, target] of links) {
+      const path = join(stageRoot, name);
+      await mkdir(join(path, '..'), { recursive: true });
+      await symlink(target, path);
     }
     // WAL/SHM are deliberately absent: the transaction removes the old pair
     // with the same rollback guarantees as the database and instance tree.
-  });
+  }, { symlinks: links });
 
   return manifest;
 }
@@ -315,7 +333,7 @@ export async function inspectBackup(archive: Buffer, key?: Buffer): Promise<{
 }> {
   const encrypted = isEncryptedBackup(archive);
   const tar = openBackupArchive(archive, key);
-  const entries = untar(tar);
+  const entries = untar(tar, BACKUP_TAR_OPTIONS);
   return {
     manifest: readManifestFromTar(tar, encrypted),
     files: entries.length,
