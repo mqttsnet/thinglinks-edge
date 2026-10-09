@@ -63,6 +63,16 @@ test('连不上要抛错，不能伪装成「包不存在」', async () => {
   await assert.rejects(() => up.packument('a-node'), /所有节点源都取不到/);
 });
 
+test('packument/search 源响应重定向也不跟随，避免源端 SSRF', async () => {
+  const impl = (async (_url: string | URL, init?: RequestInit) => {
+    assert.equal(init?.redirect, 'manual');
+    return new Response(null, { status: 302, headers: { location: 'http://127.0.0.1:2375/info' } });
+  }) as unknown as typeof fetch;
+  const up = new UpstreamRegistry({ sources: () => [{ name: 'up', url: 'https://up.example' }], fetchImpl: impl });
+  await assert.rejects(() => up.packument('a-node'), /重定向/);
+  await assert.rejects(() => up.search('thinglinks'), /重定向/);
+});
+
 test('packument 有短期缓存，一次安装里不重复问', async () => {
   const body = pack('a-node', '1.0.0');
   const { impl, calls } = fakeUpstream({ 'a-node': { version: '1.0.0', body } });
@@ -113,8 +123,64 @@ test('校验值本身：integrity 与 shasum 两种都认', () => {
   assert.throws(() => assertIntegrity('m', '1', b, undefined, 'deadbeef'), NodePolicyError);
 });
 
-test('上游没给校验值时放行 —— 少数私服确实不返回，一律拒会让那些现场彻底装不上', () => {
-  assert.doesNotThrow(() => assertIntegrity('m', '1', Buffer.from('x')));
+test('上游没给校验值时拒绝 —— 缺少完整性证明不能把包写入本地缓存', () => {
+  assert.throws(() => assertIntegrity('m', '1', Buffer.from('x')), /完整性校验/);
+});
+
+test('integrity 只有未知算法时拒绝，而不是静默跳过', () => {
+  assert.throws(() => assertIntegrity('m', '1', Buffer.from('x'), 'md5-AAAA'), /完整性校验/);
+});
+
+test('包体 URL 必须落在已配置源的 origin，禁止通过 packument SSRF', async () => {
+  const body = pack('a-node', '1.0.0');
+  const impl = (async (url: string | URL) => {
+    const value = String(url);
+    if (value === 'https://up.example/a-node') return new Response(JSON.stringify({
+      name: 'a-node', versions: { '1.0.0': {
+        name: 'a-node', version: '1.0.0',
+        dist: { tarball: 'http://127.0.0.1:2375/info', integrity: sri(body) },
+      } },
+    }), { status: 200 });
+    throw new Error(`unexpected fetch ${value}`);
+  }) as unknown as typeof fetch;
+  const up = new UpstreamRegistry({ sources: () => [{ name: 'up', url: 'https://up.example' }], fetchImpl: impl });
+  await assert.rejects(() => up.tarball('a-node', '1.0.0'), /包体地址.*源|origin/);
+});
+
+test('包体跨源重定向拒绝，且不跟随到第二个 origin', async () => {
+  const body = pack('a-node', '1.0.0');
+  const calls: string[] = [];
+  const impl = (async (url: string | URL, init?: RequestInit) => {
+    calls.push(String(url));
+    if (String(url) === 'https://up.example/a-node') return new Response(JSON.stringify({
+      name: 'a-node', versions: { '1.0.0': {
+        name: 'a-node', version: '1.0.0',
+        dist: { tarball: 'https://up.example/a.tgz', integrity: sri(body) },
+      } },
+    }), { status: 200 });
+    assert.equal(init?.redirect, 'manual');
+    return new Response(null, { status: 302, headers: { location: 'http://127.0.0.1:2375/info' } });
+  }) as unknown as typeof fetch;
+  const up = new UpstreamRegistry({ sources: () => [{ name: 'up', url: 'https://up.example' }], fetchImpl: impl });
+  await assert.rejects(() => up.tarball('a-node', '1.0.0'), /重定向/);
+  assert.deepEqual(calls, ['https://up.example/a-node', 'https://up.example/a.tgz']);
+});
+
+test('包体响应超过上限时在缓存前拒绝', async () => {
+  const body = pack('a-node', '1.0.0');
+  const impl = (async (url: string | URL) => {
+    if (String(url).endsWith('/a-node')) return new Response(JSON.stringify({
+      name: 'a-node', versions: { '1.0.0': {
+        name: 'a-node', version: '1.0.0',
+        dist: { tarball: 'https://up.example/a.tgz', integrity: sri(body) },
+      } },
+    }), { status: 200 });
+    return new Response(new ReadableStream({
+      start(controller) { controller.enqueue(new Uint8Array(70 * 1024 * 1024)); controller.close(); },
+    }), { status: 200 });
+  }) as unknown as typeof fetch;
+  const up = new UpstreamRegistry({ sources: () => [{ name: 'up', url: 'https://up.example' }], fetchImpl: impl });
+  await assert.rejects(() => up.tarball('a-node', '1.0.0'), /大小限制/);
 });
 
 // ── 多源与搜索 ──────────────────────────────────────────

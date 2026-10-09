@@ -239,6 +239,15 @@ export function installModeFromEnv(env: NodeJS.ProcessEnv = process.env): Instal
  */
 export function registryEnv(registryUrl: string): string[] {
   if (!registryUrl) return [];
+  let strictSsl = true;
+  try {
+    // The bundled registry is intentionally plain HTTP inside the private Docker
+    // network. Every HTTPS source keeps npm's certificate verification enabled.
+    strictSsl = new URL(registryUrl).protocol !== 'http:';
+  } catch {
+    // Invalid/relative registry values are rejected by the instance boundary;
+    // keep the safer TLS default while producing the other fixed settings.
+  }
   return [
     `NPM_CONFIG_REGISTRY=${registryUrl}`,
     /*
@@ -246,7 +255,7 @@ export function registryEnv(registryUrl: string): string[] {
      * npm 对非 https 源默认只警告不拒绝，但把这条显式写出来，
      * 免得将来换了 npm 大版本收紧策略时，故障现象又是一句「装不上」。
      */
-    'NPM_CONFIG_STRICT_SSL=false',
+    ...(strictSsl ? [] : ['NPM_CONFIG_STRICT_SSL=false']),
     // 离线现场没有审计源可查；不关掉会让每次安装多等一次必然失败的请求
     'NPM_CONFIG_AUDIT=false',
     'NPM_CONFIG_FUND=false',

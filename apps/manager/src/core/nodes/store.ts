@@ -23,6 +23,12 @@ import { untar } from '../archive/tar.ts';
 import { assertModuleName, NodePolicyError } from './policy.ts';
 import { PLATFORM_COMMON_PACKAGE, PLATFORM_NODE_PACKAGE } from './platform-contract.ts';
 
+/** Bound both compressed input and the expanded archive before parsing metadata. */
+export const MAX_PACKAGE_TGZ_BYTES = 64 * 1024 * 1024;
+export const MAX_PACKAGE_TAR_BYTES = 128 * 1024 * 1024;
+export const MAX_PACKAGE_ENTRIES = 10_000;
+export const MAX_PACKAGE_ENTRY_BYTES = 16 * 1024 * 1024;
+
 /** 从 tgz 里读出来的包元数据 */
 export interface PackageMeta {
   name: string;
@@ -87,18 +93,28 @@ const ROOT_PKG_JSON = /^[^/]+\/package\.json$/;
 
 /** 解析一个 .tgz，读出元数据。文件损坏或不是 npm 包时抛错 */
 export function readPackage(tgz: Buffer): Omit<PackageMeta, 'updatedAt'> {
+  if (tgz.length > MAX_PACKAGE_TGZ_BYTES) {
+    throw new NodePolicyError(`压缩包大小超过 ${MAX_PACKAGE_TGZ_BYTES} 字节`);
+  }
   let tar: Buffer;
   try {
-    tar = gunzipSync(tgz);
+    tar = gunzipSync(tgz, { maxOutputLength: MAX_PACKAGE_TAR_BYTES });
   } catch (e) {
-    throw new NodePolicyError(`不是有效的 gzip 文件：${(e as Error).message}`);
+    throw new NodePolicyError(`不是有效的 gzip 文件或解压后超过 tar 大小上限：${(e as Error).message}`);
   }
+
+  if (tar.length > MAX_PACKAGE_TAR_BYTES) throw new NodePolicyError(`解压后的 tar 超过 ${MAX_PACKAGE_TAR_BYTES} 字节`);
 
   let entries;
   try {
     entries = untar(tar);
   } catch (e) {
     throw new NodePolicyError(`tar 解析失败：${(e as Error).message}`);
+  }
+
+  if (entries.length > MAX_PACKAGE_ENTRIES) throw new NodePolicyError(`tar 条目数量超过 ${MAX_PACKAGE_ENTRIES}`);
+  if (entries.some(entry => Buffer.byteLength(entry.content) > MAX_PACKAGE_ENTRY_BYTES)) {
+    throw new NodePolicyError(`tar 单个条目超过 ${MAX_PACKAGE_ENTRY_BYTES} 字节`);
   }
 
   const candidates = entries.filter((f) => ROOT_PKG_JSON.test(f.name));

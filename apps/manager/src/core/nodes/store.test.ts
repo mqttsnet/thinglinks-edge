@@ -6,7 +6,10 @@ import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { createHash } from 'node:crypto';
 import { tarArchive } from '../archive/tar.ts';
-import { NodeStore, readPackage, compareVersions, closureGaps, closureReport } from './store.ts';
+import {
+  NodeStore, readPackage, compareVersions, closureGaps, closureReport,
+  MAX_PACKAGE_TGZ_BYTES, MAX_PACKAGE_TAR_BYTES, MAX_PACKAGE_ENTRIES,
+} from './store.ts';
 import { NodePolicyError } from './policy.ts';
 import { PLATFORM_COMMON_PACKAGE, PLATFORM_NODE_PACKAGE } from './platform-contract.ts';
 
@@ -258,6 +261,25 @@ test('安装生命周期、bin 与平台约束从原始包安全保留', () => {
   assert.equal(absent.scripts, undefined);
   assert.equal(absent.bin, undefined);
   assert.equal(absent.os, undefined);
+});
+
+test('压缩包本身超过上限时拒绝，不进入解析器', () => {
+  assert.throws(() => readPackage(Buffer.alloc(MAX_PACKAGE_TGZ_BYTES + 1)), /压缩包大小/);
+});
+
+test('gzip 解压后的 tar 超过上限时拒绝', () => {
+  const payload = Buffer.alloc(MAX_PACKAGE_TAR_BYTES + 1, 0x41);
+  const compressed = gzipSync(payload, { level: 9 });
+  assert.ok(compressed.length < MAX_PACKAGE_TGZ_BYTES);
+  assert.throws(() => readPackage(compressed), /解压后.*大小|超过.*tar/);
+});
+
+test('tar 条目数量超过上限时拒绝', () => {
+  const entries = Array.from({ length: MAX_PACKAGE_ENTRIES + 1 }, (_, index) => ({
+    name: `package/files/${index}.txt`, content: 'x',
+  }));
+  entries.push({ name: 'package/package.json', content: JSON.stringify({ name: 'many-files', version: '1.0.0' }) });
+  assert.throws(() => readPackage(gzipSync(tarArchive(entries))), /条目数量/);
 });
 
 test('可选依赖的缺口单独报，不和必需依赖混在一起', () => {
