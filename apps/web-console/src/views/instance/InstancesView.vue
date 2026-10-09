@@ -195,15 +195,15 @@ function confirmRemove(inst: Instance) {
   dialog.warning({
     title: `删除实例 · ${inst.name}`,
     content: () => h('div', [
-      h('p', `将停止并移除容器，释放 ${inst.ports.length} 个端口。此操作不可撤销。`),
+      h('p', '将停止并移除运行容器。默认保留流程、凭据、实例记录和端口配置；之后点击“启动”可按原配置重建。'),
       h(NCheckbox, {
         checked: removeData.value,
         'onUpdate:checked': (v: boolean) => { removeData.value = v; },
-      }, { default: () => '同时删除数据卷（流程与凭据将永久丢失）' }),
+      }, { default: () => '同时删除实例记录和数据（流程与凭据将永久丢失，释放端口配置）' }),
     ]),
-    positiveText: '删除',
+    positiveText: '确认移除',
     negativeText: '取消',
-    onPositiveClick: () => act(() => api.removeInstance(inst.id, removeData.value), '实例已删除'),
+    onPositiveClick: () => act(() => api.removeInstance(inst.id, removeData.value), removeData.value ? '实例及数据已删除' : '运行资源已移除，数据和实例记录已保留'),
   });
 }
 

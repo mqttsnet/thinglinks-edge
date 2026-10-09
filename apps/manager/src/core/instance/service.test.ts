@@ -1445,8 +1445,12 @@ test('strict removal hook admits missing containers but refuses an ownership fai
 });
 
 
-test('retaining data refuses deletion instead of orphaning the instance directory',async()=>{
- let settled=0;const f=fixture(undefined,undefined,{beforeRemove:()=>false,afterDataRemoved:()=>{settled++;}});try{await assert.rejects(f.service.remove('line-a',{removeData:false,actor:'admin'}),/保留数据脱离实例台账/);assert.equal(settled,0);assert.ok(f.repo.get('line-a'));}finally{f.db.close();}
+test('retaining data removes runtime resources but preserves data and the instance ledger',async()=>{
+ let settled=0;const f=fixture(undefined,undefined,{beforeRemove:()=>false,afterDataRemoved:()=>{settled++;}});
+ const dataRoot = '/tmp/thinglinks-service-test-instances/line-a';
+ mkdirSync(dataRoot, { recursive: true }); writeFileSync(join(dataRoot, 'flows.json'), '[]');
+ try{await f.service.remove('line-a',{removeData:false,actor:'admin'});assert.equal(settled,0);assert.ok(f.repo.get('line-a'));assert.equal(existsSync(join(dataRoot,'flows.json')),true);assert.ok(f.calls.includes('remove:line-a'));}
+ finally{rmSync('/tmp/thinglinks-service-test-instances',{recursive:true,force:true});f.db.close();}
 });
 
 test('public DELETE never returns success from a purge flag alone; completion proof is required',async()=>{

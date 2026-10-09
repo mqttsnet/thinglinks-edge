@@ -1291,79 +1291,106 @@ export class DockerClient {
   private async detachManager(networkRef: Docker.Network, instanceId: string): Promise<void> {
     const mgr = this.opts.managerContainer;
     if (!mgr) return;
+    let managerId: string | undefined;
     try {
       const manager = await this.docker.getContainer(mgr).inspect();
-      await networkRef.disconnect({ Container: manager.Id, Force: true });
+      managerId = manager.Id;
+      if (!DockerClient.hasContainer(await networkRef.inspect(), managerId)) return;
+      await networkRef.disconnect({ Container: managerId, Force: true });
     } catch (e) {
-      const error = e as Error & { statusCode?: number };
-      if (error.statusCode !== 404) {
-        console.warn(`[warn] 实例网络 ${this.instanceNetwork(instanceId)} 未能摘除 Manager：${error.message}`);
+      // A concurrent detach can produce a daemon error even though the endpoint
+      // is already gone. Decide from a fresh inspect, never from error text.
+      if (managerId) {
+        try {
+          if (!DockerClient.hasContainer(await networkRef.inspect(), managerId)) return;
+        } catch (inspectionError) {
+          if ((inspectionError as { statusCode?: number }).statusCode === 404) return;
+        }
+      } else if ((e as { statusCode?: number }).statusCode === 404) {
+        return;
       }
+      throw new Error(`实例网络 ${this.instanceNetwork(instanceId)} 未能摘除 Manager`, { cause: e });
     }
   }
 
   /**
    * 拆除实例。
    *
-   * 三步各自独立：容器、网络、数据目录。**不要**改回「前一步抛错就中断」的写法 ——
-   * 曾经因为容器已被手工删掉，第一步抛错，数据目录那步压根没执行，
-   * 用户以为连数据一起删了，其实还躺在盘上，且没有任何提示。
-   * 容器删除的真实失败仍会在最后抛出，只是不再连累后面的清理。
+   * 先完成容器与网络的归属核验和删除，再按调用方选择清理数据目录。
+   * 任一资源无法核验、删除或确认消失时立即失败，数据目录保持不动；
+   * 容器已经被手工删除（404）仍允许继续清理受管网络和数据。
    */
   async remove(instanceId: string, opts: { removeData: boolean }): Promise<void> {
-    let containerError: Error | null = null;
+    assertValidId(instanceId);
+    let ownedContainer: Docker.ContainerInspectInfo | undefined;
     try {
       const container = await this.docker.getContainer(containerName(instanceId)).inspect();
       const labels = container.Config.Labels ?? {};
-      if (labels[MANAGED_LABEL] !== 'true' || labels[INSTANCE_LABEL] !== instanceId) {
-        console.warn(
-          `[warn] 容器 ${containerName(instanceId)} 归属不匹配，保留不动：` +
-          `需要 ${MANAGED_LABEL}=true 且 ${INSTANCE_LABEL}=${instanceId}`,
+      if (labels[MANAGED_LABEL] !== 'true' || labels[INSTANCE_LABEL] !== instanceId
+        || container.Name !== `/${containerName(instanceId)}` || !/^[a-f0-9]{64}$/.test(container.Id)) {
+        throw new Error(
+          `容器 ${containerName(instanceId)} 归属不匹配，拒绝删除或清理实例数据`,
         );
-      } else {
-        await this.docker.getContainer(container.Id).remove({ force: true });
       }
+      ownedContainer = container;
     } catch (e) {
-      const error = e as Error & { statusCode?: number };
-      // 404 = 已经不在了，属于期望结果而非失败
-      if (error.statusCode !== 404) {
-        containerError = error;
-        console.warn(`[warn] 容器 ${containerName(instanceId)} 未能核验或删除，保留不动：${error.message}`);
-      }
+      if ((e as { statusCode?: number }).statusCode !== 404) throw e;
     }
 
-    // 网络名不是权限边界。只有核验过标签归属的 network ID 才允许摘端点或删除。
+    // Preflight both resources before the first mutation. A foreign network
+    // sharing this name must not cause a partially removed instance.
     let ownedNetwork: Docker.NetworkInspectInfo | undefined;
     try {
       ownedNetwork = await this.assertOwnedNetwork(instanceId);
-    } catch (e) {
-      if ((e as { statusCode?: number }).statusCode !== 404) {
-        console.warn(`[warn] 实例网络 ${this.instanceNetwork(instanceId)} 未能核验归属，保留不动：${(e as Error).message}`);
+      if (ownedNetwork.Name !== this.instanceNetwork(instanceId) || !/^[a-f0-9]{64}$/.test(ownedNetwork.Id)) {
+        throw new Error(`实例网络 ${this.instanceNetwork(instanceId)} 标识不可信，拒绝删除`);
       }
+    } catch (e) {
+      if ((e as { statusCode?: number }).statusCode !== 404) throw e;
     }
+
+    const assertAbsent = async (inspect: () => Promise<unknown>, description: string): Promise<void> => {
+      try { await inspect(); }
+      catch (e) {
+        if ((e as { statusCode?: number }).statusCode === 404) return;
+        throw e;
+      }
+      throw new Error(`${description}删除后仍可见，拒绝清理实例数据`);
+    };
+    if (ownedContainer) {
+      const ref = this.docker.getContainer(ownedContainer.Id);
+      try { await ref.remove({ force: true }); }
+      catch (e) {
+        if ((e as { statusCode?: number }).statusCode !== 404) throw e;
+      }
+      // DELETE 404 is not proof of absence (a proxy may reject an operation).
+      await assertAbsent(() => ref.inspect(), '容器');
+    }
+    await assertAbsent(() => this.docker.getContainer(containerName(instanceId)).inspect(), '实例容器');
+
     if (ownedNetwork) {
       const networkRef = this.docker.getNetwork(ownedNetwork.Id);
       await this.detachManager(networkRef, instanceId);
-      await networkRef.remove()
-        .catch((e: Error & { statusCode?: number }) => {
-          if (e.statusCode !== 404) {
-            console.warn(`[warn] 实例网络 ${this.instanceNetwork(instanceId)} 未能回收：${e.message}`);
-          }
-        });
+      try {
+        await networkRef.remove();
+      } catch (e) {
+        if ((e as { statusCode?: number }).statusCode !== 404) throw e;
+      }
+      await assertAbsent(() => networkRef.inspect(), '网络');
     }
+    await assertAbsent(() => this.docker.getNetwork(this.instanceNetwork(instanceId)).inspect(), '实例网络');
 
     if (opts.removeData) {
+      // Network detach/delete awaits can give an external actor time to create
+      // a new container using this instance name. Never erase its data blindly.
+      await assertAbsent(() => this.docker.getContainer(containerName(instanceId)).inspect(), '实例容器');
       // 目录是我们自己建的宿主路径，直接删。不要指望 docker 帮忙回收 ——
       // 具名卷那套语义在 bind 上不成立，实测 volume rm 根本不动宿主目录内容。
       await rm(instanceDataDir(this.opts.instanceDataRoot, instanceId), {
         recursive: true,
         force: true,
-      }).catch((e: Error) =>
-        console.warn(`[warn] 实例数据目录未能删除：${e.message}`),
-      );
+      });
     }
-
-    if (containerError) throw containerError;
   }
 
   /**

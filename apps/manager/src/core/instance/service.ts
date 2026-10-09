@@ -6,7 +6,7 @@
  */
 import bcrypt from 'bcryptjs';
 import { randomUUID } from 'node:crypto';
-import { lstat, readFile } from 'node:fs/promises';
+import { lstat, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Db } from '../db.ts';
 import { recordAudit } from '../db.ts';
@@ -563,8 +563,8 @@ export class InstanceService {
     if (!this.o.repo.get(id)) throw new ServiceError(`实例 ${id} 不存在`);
   }
 
-  /** Deletion is successful only after every managed resource is observed absent. */
-  private async assertRemoved(id: string): Promise<void> {
+  /** Deletion is successful only after every managed runtime resource is observed absent. */
+  private async assertRuntimeRemoved(id: string): Promise<void> {
     try {
       await this.o.docker.assertManaged(id);
       throw new ServiceError(`实例 ${id} 的受管容器仍存在，未完成删除`);
@@ -577,11 +577,34 @@ export class InstanceService {
     } catch (error) {
       if ((error as { statusCode?: number }).statusCode !== 404) throw error;
     }
+  }
+
+  private async removeDataDirectory(id: string): Promise<void> {
+    const path = join(this.o.instanceDataRoot, id);
     try {
-      await lstat(join(this.o.instanceDataRoot, id));
+      const stat = await lstat(path);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) {
+        throw new ServiceError(`实例 ${id} 的数据目录不是受管普通目录，拒绝删除`);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw error;
+    }
+    await rm(path, { recursive: true, force: false });
+    try {
+      await lstat(path);
       throw new ServiceError(`实例 ${id} 的数据目录仍存在，未完成删除`);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+
+  private async assertRetainedDataDirectory(id: string): Promise<void> {
+    const path = join(this.o.instanceDataRoot, id);
+    let stat;
+    try { stat = await lstat(path); } catch { throw new ServiceError(`实例 ${id} 的数据目录不存在，不能保留数据删除`); }
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new ServiceError(`实例 ${id} 的数据目录不是受管普通目录，不能保留数据删除`);
     }
   }
 
@@ -667,9 +690,6 @@ export class InstanceService {
   ): Promise<void> {
     this.o.gate.assertLease(lease, id, ['remove-instance']);
     this.assertExists(id);
-    if (!opts.removeData) {
-      throw new ServiceError('为避免保留数据脱离实例台账，删除实例必须同时删除数据；请先备份后重试。');
-    }
     const needsSettlement = await this.o.removalLifecycle?.beforeRemove(id, { removeData: opts.removeData });
     if (needsSettlement) {
       if (!opts.removeData) throw new ServiceError('请先清理诊断任务，或选择同时删除实例数据。');
@@ -677,9 +697,12 @@ export class InstanceService {
         await this.o.docker.assertManaged(id).catch(error => {
           if ((error as { statusCode?: number }).statusCode !== 404) throw error;
         });
-        await this.o.docker.remove(id, { removeData: opts.removeData });
-        if (opts.removeData) await this.o.removalLifecycle!.afterDataRemoved(id);
-        await this.assertRemoved(id);
+        await this.o.docker.remove(id, { removeData: false });
+        await this.assertRuntimeRemoved(id);
+        if (opts.removeData) {
+          await this.removeDataDirectory(id);
+          await this.o.removalLifecycle!.afterDataRemoved(id);
+        } else await this.assertRetainedDataDirectory(id);
       } catch {
         throw new ServiceError('实例资源或诊断记录尚未确认全部清理，已保留实例记录，请修复后重试删除。');
       }
@@ -688,13 +711,15 @@ export class InstanceService {
       await this.o.docker.assertManaged(id).catch((error) => {
         if ((error as { statusCode?: number }).statusCode !== 404) throw error;
       });
-      await this.o.docker.remove(id, { removeData: opts.removeData });
-      await this.assertRemoved(id);
+      await this.o.docker.remove(id, { removeData: false });
+      await this.assertRuntimeRemoved(id);
+      if (opts.removeData) await this.removeDataDirectory(id);
+      else await this.assertRetainedDataDirectory(id);
     }
-    this.o.repo.remove(id);
+    if (opts.removeData) this.o.repo.remove(id);
     recordAudit(this.o.db, {
       actor: opts.actor, action: 'remove-instance', target: id,
-      detail: opts.removeData ? '含数据卷' : '保留数据卷', result: 'ok',
+      detail: opts.removeData ? '含数据卷' : '仅清理运行资源，保留实例数据与台账', result: 'ok',
     });
   }
 
