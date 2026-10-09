@@ -56,7 +56,7 @@ test('rejected requests never reach daemon mutation; successful create has pinne
       return;
     }
     if (req.url === '/containers/tle-manager/json') {
-      res.end(JSON.stringify({ Id: '4'.repeat(64), Name: '/tle-manager', NetworkSettings: { Networks: { control: { IPAddress: '127.0.0.1' } } } })); return;
+      res.end(JSON.stringify({ Id: '4'.repeat(64), Name: '/tle-manager', State: { Running: true }, NetworkSettings: { Networks: { control: { IPAddress: '127.0.0.1' } } } })); return;
     }
     if (req.url === '/info') { res.end(JSON.stringify({ MemTotal: 8 * 1024 ** 3, NCPU: 4 })); return; }
     if (req.url?.startsWith('/containers/json?')) { res.end('[]'); return; }
@@ -121,7 +121,7 @@ test('rejected requests never reach daemon mutation; successful create has pinne
 test('caller IP must belong to the configured Manager; health is local and read only', async t => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'tle-policy-peer-')));
   t.after(() => rm(root, { recursive: true, force: true }));
-  const upstream = createServer((req, res) => res.end(req.url === '/networks' ? '[]' : JSON.stringify({ Name: '/tle-manager', Id: 'a'.repeat(64),
+  const upstream = createServer((req, res) => res.end(req.url === '/networks' ? '[]' : JSON.stringify({ Name: '/tle-manager', Id: 'a'.repeat(64), State: { Running: true },
     NetworkSettings: { Networks: { control: { IPAddress: '10.10.0.2' } } } })));
   upstream.listen(0, '127.0.0.1'); await once(upstream, 'listening');
   const proxy = createDockerPolicyServer({ ...NETWORK_POLICY_DEFAULTS, dataRoot: root, networkPrefix: 'tle-test', managerContainer: 'tle-manager',
@@ -195,7 +195,7 @@ test('real Docker SDK inventory awaits immutable inspect and retains owned Deskt
   const summary={Id:id,Names:['/tle-nr-line-a'],Labels:labels,State:'running',Image:'nodered/node-red:5.0.4-24-minimal',Ports:[{IP:'127.0.0.1',PrivatePort:15001,PublicPort:30064,Type:'tcp'}],Mounts:[{Type:'bind',Source:'/host_mnt'+join(root,'line-a'),Destination:'/data'}]};
   const seen:string[]=[]; let inspectFails=false;
   const upstream=createServer((req,res)=>{seen.push(req.url!);res.setHeader('content-type','application/json');
-    if(req.url==='/containers/tle-manager/json'){res.end(JSON.stringify({Id:managerId,Name:'/tle-manager',NetworkSettings:{Networks:{control:{IPAddress:'127.0.0.1'}}}}));return;}
+    if(req.url==='/containers/tle-manager/json'){res.end(JSON.stringify({Id:managerId,Name:'/tle-manager',State:{Running:true},NetworkSettings:{Networks:{control:{IPAddress:'127.0.0.1'}}}}));return;}
     if(req.url==='/networks'){res.end('[]');return;}
     if(req.url?.startsWith('/containers/json?')){res.end(JSON.stringify([summary]));return;}
     if(req.url===`/containers/${id}/json`){if(inspectFails){res.writeHead(500).end(JSON.stringify({message:'private daemon body'}));return;}setTimeout(()=>res.end(JSON.stringify({Id:id,Name:'/tle-nr-line-a',Config:{...options,Labels:labels},HostConfig:options['HostConfig'],Mounts:[{Type:'bind',Source:join(root,'line-a'),Destination:'/data'}]})),20);return;}

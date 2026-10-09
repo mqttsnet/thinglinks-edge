@@ -11,7 +11,10 @@
 
 恢复和中断恢复均为离线操作：停止 Manager、所有目标 Node-RED 实例及其他数据写入者，
 并确保只运行一个恢复进程。实例是兄弟容器，`docker compose stop manager` 不会停止实例。
-这些前提需由运维保证；启动门禁用于阻止未完成事务被使用，不能替代跨进程停机协调。
+保留已停止的 Manager 容器作为维护身份依据，保持 `docker-proxy` 与 `network-isolation` 服务运行；
+不要使用 `docker compose down` 替代停止。CLI 通过策略代理核查本部署的数据写入容器，
+运行、暂停、重启中或状态不明时均拒绝恢复。维护容器只获准查询写入者状态，不能调用 Docker 修改接口。
+停止宿主上的其他文件写入程序、确保恢复期间无人重新启动服务，仍由运维负责。
 
 CLI 要求标准布局：`DATA_DIR=<EDGE_DATA_ROOT>/manager`、
 `INSTANCE_DATA_ROOT=<EDGE_DATA_ROOT>/instances`。非标准布局会在读取归档前拒绝。
@@ -26,9 +29,13 @@ CLI 要求标准布局：`DATA_DIR=<EDGE_DATA_ROOT>/manager`、
 因此这不是所有 Manager 配置、缓存和运行数据的完整机器镜像。
 
 ```sh
-docker compose run --rm --entrypoint node manager \
+docker compose run --rm --no-deps --entrypoint node manager \
   dist/index.js restore /path/to/backup.tle-backup
 ```
+
+该命令使用原部署的 Compose 项目、Manager 镜像及数据挂载；备份文件路径必须在维护容器内可读。
+维护进程需使用 Compose 提供的 `DOCKER_HOST` 策略代理地址；直接连接宿主 Docker socket 的恢复方式
+不再支持，不能用它跳过写入者检查。策略代理不可达、镜像或部署身份不一致时会拒绝恢复。
 
 ## 中断恢复
 
@@ -40,7 +47,7 @@ docker compose run --rm --entrypoint node manager \
 断电、进程终止或回滚失败后，保留现场与事务日志，继续保持 Manager 和实例停止，执行：
 
 ```sh
-docker compose run --rm --entrypoint node manager \
+docker compose run --rm --no-deps --entrypoint node manager \
   dist/index.js restore --recover
 ```
 

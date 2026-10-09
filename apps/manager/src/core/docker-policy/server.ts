@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { NetworkIntentStore } from './network-intents.ts';
 import { NetworkCoordinator } from './network-coordinator.ts';
 import { UnixNetworkGuardClient, type NetworkGuardClient } from './network-guard.ts';
+import { authorizeRestorePeer, restoreWriterSnapshot, RESTORE_WRITERS_PATH } from './restore-maintenance.ts';
 
 const MAX_REQUEST_BYTES = 4 * 1024 ** 2;
 const MAX_JSON_BYTES = 8 * 1024 ** 2;
@@ -92,15 +93,19 @@ class DaemonConnectionClient {
 
 function normalizeIp(ip: string): string { return ip.startsWith('::ffff:') ? ip.slice(7) : ip; }
 
-async function authorizePeer(config: PolicyConfig, client: DaemonConnectionClient, request: IncomingMessage, signal: AbortSignal): Promise<void> {
+async function authorizePeer(config: PolicyConfig, client: DaemonConnectionClient, request: IncomingMessage, signal: AbortSignal): Promise<string | undefined> {
   const manager = object(await client.json(`/containers/${config.managerContainer}/json`, signal));
   demand(manager['Name'] === `/${config.managerContainer}`);
   const networks = object(object(manager['NetworkSettings'])['Networks']);
   const peer = normalizeIp(request.socket.remoteAddress ?? '');
-  demand(peer && Object.values(networks).some(value => {
+  const state = object(manager['State']);
+  if (state['Running'] === true && peer && Object.values(networks).some(value => {
     const network = object(value);
     return [network['IPAddress'], network['GlobalIPv6Address']].some(ip => typeof ip === 'string' && ip.length > 0 && normalizeIp(ip) === peer);
-  }));
+  })) return undefined;
+  // A oneoff never receives normal Manager authority, including on GET routes.
+  demand(request.method === 'GET' && request.url === RESTORE_WRITERS_PATH && peer);
+  return authorizeRestorePeer(config, { json: path => client.json(path, signal) }, manager, peer);
 }
 
 /** No request headers, arbitrary paths, or failed daemon response bodies are forwarded. */
@@ -200,8 +205,17 @@ export function createDockerPolicyServer(config: PolicyConfig, connection: Daemo
       demand(request.headers['content-encoding'] === undefined || request.headers['content-encoding'] === 'identity');
       const length = Number(request.headers['content-length'] ?? 0);
       if (!Number.isSafeInteger(length) || length < 0 || length > MAX_REQUEST_BYTES) throw new PolicyDenied(413);
-      await authorizePeer(config, client, request, controller.signal);
+      const maintenanceId = await authorizePeer(config, client, request, controller.signal);
       const body = await readBody(request, controller.signal);
+      if (request.method === 'GET' && request.url === RESTORE_WRITERS_PATH) {
+        demand(body.length === 0);
+        const snapshot = await restoreWriterSnapshot(config,
+          { json: path => client.json(path, controller.signal) }, maintenanceId);
+        response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+        response.end(JSON.stringify(snapshot));
+        return;
+      }
+      demand(maintenanceId === undefined);
       if (!['GET', 'HEAD'].includes(request.method ?? '')) {
         if (!recoveryComplete) throw new PolicyDenied(503);
         releaseMutation = await takeMutation(controller.signal);

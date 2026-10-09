@@ -72,6 +72,8 @@ import { restoreBackup } from './core/archive/backup.ts';
 import { assertNoRestoreTransaction, recoverRestoreTransaction } from './core/archive/restore-transaction.ts';
 import { existsSync } from 'node:fs';
 import { hostname } from 'node:os';
+import { request as httpRequest } from 'node:http';
+import { RESTORE_WRITERS_PATH } from './core/docker-policy/restore-maintenance.ts';
 
 // 版本定义搬到 core/version.ts，让 http 层能直接引用而不成环。
 // 本文件内部也要用 describe()，所以先 import 再复导出 —— 只写 export…from
@@ -262,36 +264,51 @@ function resolveMetricsIntervalSec(): number {
   return n;
 }
 
-/** Restore is an offline cutover; fail closed if live writers cannot be ruled out. */
-export async function assertRestoreWritersStopped(config: Pick<ReturnType<typeof loadConfig>,
-  'instanceDataRoot' | 'portRange' | 'timezone'>): Promise<void> {
-  const docker = new DockerClient({
-    connection: dockerConnection(),
-    network: process.env['INSTANCE_NETWORK']?.trim() || 'thinglinks-edge',
-    imageRepo: process.env['NODE_RED_IMAGE_REPO']?.trim() || 'nodered/node-red',
-    portRange: config.portRange,
-    instanceDataRoot: config.instanceDataRoot,
-    timezone: config.timezone,
+/** Only the policy endpoint can authenticate a stopped Manager's Compose restore oneoff. */
+async function readRestoreWriterSnapshot(): Promise<unknown> {
+  const connection = dockerConnection();
+  if (!connection || 'socketPath' in connection) {
+    throw new Error('恢复须通过部署的 Docker 策略代理；请按离线恢复文档使用 Compose 维护命令');
+  }
+  return new Promise((resolve, reject) => {
+    const request = httpRequest({ ...connection, method: 'GET', path: RESTORE_WRITERS_PATH,
+      signal: AbortSignal.timeout(10_000) }, response => {
+      void (async () => {
+        if (response.statusCode !== 200) { response.destroy(); throw new Error('维护身份或写入者状态未通过策略服务校验'); }
+        const chunks: Buffer[] = []; let bytes = 0;
+        for await (const chunk of response) {
+          bytes += chunk.length;
+          if (bytes > 1024 * 1024) { response.destroy(); throw new Error('写入者状态响应过大'); }
+          chunks.push(Buffer.from(chunk));
+        }
+        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown);
+      })().catch(reject);
+    });
+    request.once('error', reject);
+    request.end();
   });
-  let statuses;
-  try {
-    statuses = await docker.list();
-  } catch (error) {
-    throw new Error(`恢复前无法确认 Node-RED 写入者已停止，已拒绝恢复：${(error as Error).message}`);
+}
+
+/** Fail closed for paused/restarting/unknown writers, not only Docker's running flag. */
+export async function assertRestoreWritersStopped(config: Pick<ReturnType<typeof loadConfig>,
+  'instanceDataRoot' | 'portRange' | 'timezone'>, readSnapshot = readRestoreWriterSnapshot): Promise<void> {
+  let raw: unknown;
+  try { raw = await readSnapshot(); }
+  catch (error) {
+    if (error instanceof Error && error.message.startsWith('恢复须通过部署的 Docker 策略代理')) throw error;
+    throw new Error('恢复前无法核实 Manager 与实例写入者已停止，已拒绝恢复', { cause: error });
   }
-  const running = statuses.filter((item) => item.running).map((item) => item.id).filter(Boolean);
-  if (running.length > 0) {
-    throw new Error(`恢复要求先停止运行中的 Node-RED 实例：${running.join('、')}`);
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('恢复写入者状态不完整，已拒绝恢复');
+  const snapshot = raw as { version?: unknown; instanceDataRoot?: unknown; writers?: unknown };
+  if (snapshot.version !== 1 || snapshot.instanceDataRoot !== config.instanceDataRoot || !Array.isArray(snapshot.writers)) {
+    throw new Error('恢复写入者状态与当前部署不匹配，已拒绝恢复');
   }
-  const managerName = process.env['MANAGER_CONTAINER']?.trim()
-    || `${process.env['EDGE_NAME_PREFIX']?.trim() || 'thinglinks-edge'}-manager`;
-  try {
-    const info = await docker.raw.getContainer(managerName).inspect() as { State?: { Running?: boolean } };
-    if (info.State?.Running === true) throw new Error(`恢复要求先停止运行中的 Manager：${managerName}`);
-  } catch (error) {
-    if ((error as { statusCode?: number }).statusCode === 404) return;
-    if (error instanceof Error && error.message.includes('恢复要求先停止')) throw error;
-    throw new Error(`恢复前无法确认 Manager 已停止，已拒绝恢复：${(error as Error).message}`);
+  for (const item of snapshot.writers) {
+    const writer = item as { id?: unknown; name?: unknown; state?: unknown; stopped?: unknown } | null;
+    if (!writer || typeof writer.id !== 'string' || !/^[a-f0-9]{64}$/.test(writer.id)
+      || typeof writer.name !== 'string' || writer.stopped !== true || !['exited', 'created'].includes(String(writer.state))) {
+      throw new Error('恢复要求先停止所有 Manager、实例及其他挂载本部署数据的写入者；暂停或重启中仍不允许恢复');
+    }
   }
 }
 
