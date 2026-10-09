@@ -9,8 +9,11 @@ import { useRouter, useRoute } from 'vue-router';
 import { api, ApiError } from '../../api/client';
 import type { ImageOption, Instance, PortRecord } from '../../api/types';
 import FieldHelp from '../../components/FieldHelp.vue';
+import RefreshButton from '../../components/RefreshButton.vue';
+import { createRefreshTask } from '../../api/refresh-task';
 import EditorAccessDialog from './EditorAccessDialog.vue';
 import DeviceHttpBindingsDialog from './DeviceHttpBindingsDialog.vue';
+import { editorEntryProps } from './editor-entry';
 import { can, canOperate, loadPermissions } from '../../api/permissions';
 
 const router = useRouter();
@@ -22,23 +25,32 @@ const dialog = useDialog();
 
 const instances = ref<Instance[]>([]);
 const loading = ref(true);
+const refreshing = ref(false);
+const refreshError = ref('');
+const refreshTask = createRefreshTask();
 let timer: number | undefined;
 
-async function refresh(quiet = false) {
-  if (!quiet) loading.value = true;
-  try {
-    instances.value = (await api.instances()).instances;
-    if (typeof route.query.editor === 'string') {
-      const target = instances.value.find(instance => instance.id === route.query.editor);
-      if (target) editorAccess.value?.open(target);
-      const query = { ...route.query }; delete query.editor;
-      void router.replace({ query });
+function refresh(quiet = false, replace = false): Promise<void> {
+  return refreshTask.run(async current => {
+    refreshing.value = true;
+    if (!quiet && !instances.value.length) loading.value = true;
+    try {
+      const response = await api.instances();
+      if (!current()) return;
+      instances.value = response.instances;
+      refreshError.value = '';
+      if (typeof route.query.editor === 'string') {
+        const target = instances.value.find(instance => instance.id === route.query.editor);
+        if (target) editorAccess.value?.open(target);
+        const query = { ...route.query }; delete query.editor;
+        void router.replace({ query });
+      }
+    } catch (e) {
+      if (current()) refreshError.value = e instanceof ApiError ? e.message : '实例刷新失败';
+    } finally {
+      if (current()) { loading.value = false; refreshing.value = false; }
     }
-  } catch (e) {
-    if (!quiet) message.error(e instanceof ApiError ? e.message : '加载失败');
-  } finally {
-    loading.value = false;
-  }
+  }, replace);
 }
 
 onMounted(() => {
@@ -46,7 +58,7 @@ onMounted(() => {
   void refresh();
   timer = window.setInterval(() => void refresh(true), 5000);
 });
-onUnmounted(() => { if (timer) clearInterval(timer); });
+onUnmounted(() => { refreshTask.dispose(); if (timer) clearInterval(timer); });
 
 // ── 搜索 ────────────────────────────────────────────────
 
@@ -177,7 +189,7 @@ async function submitCreate() {
     showCreate.value = false;
     form.value.editorPassword = ''; form.value.confirmEditorPassword = '';
     message.success('实例已创建，正在拉起容器');
-    await refresh();
+    await refresh(false, true);
   } catch (e) {
     message.error(e instanceof ApiError ? e.message : '创建失败');
   } finally {
@@ -188,7 +200,7 @@ async function submitCreate() {
 // ── 操作 ────────────────────────────────────────────────
 
 async function act(fn: () => Promise<void>, ok: string) {
-  try { await fn(); message.success(ok); await refresh(); }
+  try { await fn(); message.success(ok); await refresh(false, true); }
   catch (e) { message.error(e instanceof ApiError ? e.message : '操作失败'); }
 }
 
@@ -275,7 +287,7 @@ async function upgradeImage(inst: Instance) {
       try {
         const r = await api.upgradeInstanceImage(inst.id, picked.value);
         message.success(`已从 ${r.from} 升级到 ${r.to}`);
-        await refresh();
+        await refresh(false, true);
       } catch (e) {
         // 后端失败时已经回滚并把实例跑起来了，措辞不要让人以为实例没了
         message.error(e instanceof ApiError ? e.message : '升级失败，实例保持原版本运行');
@@ -297,7 +309,7 @@ function resetPassword(inst: Instance) {
           content: () => h('code', { class: 'mono', style: 'word-break:break-all' }, password),
           positiveText: '我已记录',
         });
-        await refresh();
+        await refresh(false, true);
       } catch (e) {
         message.error(e instanceof ApiError ? e.message : '重置失败');
       }
@@ -364,13 +376,15 @@ function onMore(key: string | number, inst: Instance): void {
       <div class="tools">
         <NInput v-model:value="keyword" clearable size="small" class="search"
                 placeholder="搜索名称 / ID / 版本 / 端口 / 路径" />
+        <RefreshButton :loading="refreshing" label="刷新实例" @click="refresh()" />
         <NButton v-if="can('instance:create')" type="primary" @click="openCreate">+ 新建实例</NButton>
       </div>
     </div>
 
+    <NAlert v-if="refreshError" type="error" :bordered="false">{{ refreshError }}<template v-if="instances.length">，当前保留上次读取的数据。</template></NAlert>
     <NSpin :show="loading">
       <!-- 空列表有两种成因，说法必须分开：没实例 vs 有实例但没授权给你 -->
-      <NEmpty v-if="!loading && instances.length === 0" style="padding: 60px 0"
+      <NEmpty v-if="!loading && !refreshError && instances.length === 0" style="padding: 60px 0"
               :description="can('instance:create') ? '还没有实例' : '还没有被授权可访问的实例'">
         <template #extra>
           <NButton v-if="can('instance:create')" size="small" @click="openCreate">创建第一个实例</NButton>
@@ -378,7 +392,7 @@ function onMore(key: string | number, inst: Instance): void {
         </template>
       </NEmpty>
 
-      <template v-else>
+      <template v-else-if="instances.length > 0">
         <NEmpty v-if="filtered.length === 0"
                 :description="`没有匹配「${keyword.trim()}」的实例`" style="padding: 48px 0">
           <template #extra><NButton size="small" @click="keyword = ''">清空搜索</NButton></template>
@@ -410,8 +424,7 @@ function onMore(key: string | number, inst: Instance): void {
                 <NButton v-if="!i.running" size="tiny" @click="act(() => api.startInstance(i.id), '已启动')">启动</NButton>
                 <NButton v-else size="tiny" @click="act(() => api.stopInstance(i.id), '已停止')">停止</NButton>
               </template>
-              <NButton size="tiny" type="primary" :disabled="!i.running"
-                       @click="editorAccess?.open(i)">打开编辑器</NButton>
+              <NButton v-bind="editorEntryProps(router, i)" size="tiny" type="primary">打开编辑器</NButton>
               <NButton size="tiny" @click="router.push(`/instances/${i.id}/logs`)">日志</NButton>
               <NDropdown v-if="moreOptions(i).length" trigger="click" :options="moreOptions(i)"
                          @select="(k) => onMore(k, i)">
@@ -613,7 +626,7 @@ function onMore(key: string | number, inst: Instance): void {
 .ttl { min-width: 220px; }
 .bar h2 { margin: 0; font-size: 23px; font-weight: 650; letter-spacing: -.02em; color: var(--primary); }
 .bar .sub { margin: 2px 0 0; color: var(--muted); font-size: 12.5px; }
-.tools { display: flex; align-items: center; gap: 10px; margin-left: auto; }
+.tools { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-left: auto; }
 .search { width: 250px; max-width: 100%; }
 .muted { color: var(--muted); }
 .hint { font-size: 12px; color: var(--muted); line-height: 1.6; }

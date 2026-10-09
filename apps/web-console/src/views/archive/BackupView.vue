@@ -13,6 +13,7 @@ import { NButton, NCard, NSpin, NAlert, NSpace, NTag, useMessage } from 'naive-u
 import { api, ApiError } from '../../api/client';
 import type { BackupInspect } from '../../api/types';
 import FieldHelp from '../../components/FieldHelp.vue';
+import RefreshButton from '../../components/RefreshButton.vue';
 
 const message = useMessage();
 const loading = ref(true);
@@ -73,7 +74,10 @@ onMounted(refresh);
         <h2>备份</h2>
         <p class="sub">把管理台数据库与全部实例数据打包带走；恢复走命令行</p>
       </div>
-      <NButton type="primary" :loading="working" @click="download">立即备份并下载</NButton>
+      <NSpace>
+        <RefreshButton :loading="loading" :disabled="working" label="刷新备份内容" @click="refresh" />
+        <NButton type="primary" :loading="working" :disabled="loading" @click="download">立即备份并下载</NButton>
+      </NSpace>
     </div>
 
     <NSpin :show="loading">
@@ -91,7 +95,6 @@ onMounted(refresh);
                 <code>MASTER_KEY</code> 不会写入备份；文件仍须按敏感资料保管，不要放进代码仓或公共网盘。</p>
             </FieldHelp>
           </h3>
-          <NButton size="small" quaternary :loading="loading" @click="refresh">刷新</NButton>
         </div>
 
         <div class="kv">

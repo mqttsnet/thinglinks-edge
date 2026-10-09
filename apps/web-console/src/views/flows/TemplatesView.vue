@@ -10,6 +10,7 @@ import { useTemplateLibrary } from './composables/useTemplateLibrary';
 import TemplateFilters from './components/TemplateFilters.vue';
 import TemplateEditDialog from './components/TemplateEditDialog.vue';
 import TemplateDeployDialog from './components/TemplateDeployDialog.vue';
+import RefreshButton from '../../components/RefreshButton.vue';
 const message = useMessage();
 const { templates, instances, loading, error, instanceError, filters, filtered, protocolOptions, refresh, remove, download } = useTemplateLibrary();
 const manage = computed(() => can('template:manage'));
@@ -40,7 +41,7 @@ onMounted(refresh);
   <div class="page">
     <div class="bar">
       <div><h2>流程模板</h2><p class="sub">按协议选择采集方案，配置设备和点位后部署到实例</p></div>
-      <NSpace><NButton size="small" :loading="loading" @click="refresh">刷新</NButton>
+      <NSpace><RefreshButton :loading="loading" label="刷新模板" @click="refresh" />
         <NButton v-if="manage" type="primary" size="small" @click="editor?.open()">新建模板</NButton></NSpace>
     </div>
     <TemplateFilters v-model:value="filters" :protocols="protocolOptions" />

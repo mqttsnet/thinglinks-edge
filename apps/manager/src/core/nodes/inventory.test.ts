@@ -207,3 +207,99 @@ test('healthy published platform assertion rejects extra, duplicate, disabled, a
     ...healthy, nodeSets: [{ ...healthy.nodeSets[0]!, err: 'boom' }, ...healthy.nodeSets.slice(1)],
   }), /error/i);
 });
+
+test('inventory shares one deadline across authentication and a slow response body', async () => {
+  let calls = 0;
+  const fetchImpl = (async (_url: string, init: RequestInit) => {
+    calls++;
+    if (calls === 1) {
+      await new Promise(resolve => setTimeout(resolve, 15));
+      return new Response('{"access_token":"t"}');
+    }
+    return new Response(new ReadableStream({
+      start(controller) {
+        init.signal?.addEventListener('abort', () => controller.error(new Error('aborted')), { once: true });
+      },
+    }));
+  }) as typeof fetch;
+  const begin = performance.now();
+  const result = await inventoryOf('slow', target, new Set(), fetchImpl, { timeoutMs: 40 });
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /超时/);
+  assert.ok(performance.now() - begin < 250);
+  assert.equal(calls, 2);
+});
+
+test('inventory deadline does not start an anonymous retry after authentication expires', async () => {
+  let calls = 0;
+  const fetchImpl = (async () => { calls++; return await new Promise(() => {}); }) as typeof fetch;
+  const result = await inventoryOf('slow', target, new Set(), fetchImpl, { timeoutMs: 20 });
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /超时/);
+  assert.equal(calls, 1);
+});
+
+test('inventory batch skips stopped/missing instances and limits running probes to four', async () => {
+  const { inventoryBatch } = await import('./inventory.ts');
+  const ids = ['stopped', 'missing', ...Array.from({ length: 9 }, (_, n) => `running-${n}`)];
+  let snapshots = 0;
+  let active = 0;
+  let maxActive = 0;
+  const probed: string[] = [];
+  const result = await inventoryBatch(ids, {
+    list: async () => {
+      snapshots++;
+      return ids.map(id => ({ id, state: id.startsWith('running') ? 'running' : id === 'missing' ? 'missing' : 'exited', running: id.startsWith('running') }));
+    },
+    read: async (id) => {
+      probed.push(id);
+      active++; maxActive = Math.max(maxActive, active);
+      await new Promise(resolve => setTimeout(resolve, 10));
+      active--;
+      return { instanceId: id, ok: true, reason: '', modules: [], unapproved: 0 };
+    },
+  });
+  assert.equal(snapshots, 1);
+  assert.equal(maxActive, 4);
+  assert.equal(probed.length, 9);
+  assert.deepEqual(result.map(item => item.instanceId), ids);
+  assert.match(result[0]!.reason, /未运行/);
+  assert.match(result[1]!.reason, /不存在/);
+});
+
+test('inventory batch returns unknown for a failed or timed-out state snapshot without probing', async () => {
+  const { inventoryBatch } = await import('./inventory.ts');
+  let probes = 0;
+  for (const list of [async () => { throw new Error('private Docker failure'); }, async () => await new Promise<never>(() => {})]) {
+    const result = await inventoryBatch(['a'], { list, read: async () => { probes++; throw new Error('unexpected'); } }, { stateTimeoutMs: 20, timeoutMs: 60 });
+    assert.equal(result[0]?.ok, false);
+    assert.match(result[0]!.reason, /无法确认实例运行状态/);
+    assert.doesNotMatch(result[0]!.reason, /private/);
+  }
+  assert.equal(probes, 0);
+});
+
+test('inventory batch has one overall deadline and does not probe queued instances after expiry', async () => {
+  const { inventoryBatch } = await import('./inventory.ts');
+  const ids = Array.from({ length: 12 }, (_, n) => String(n));
+  let probes = 0;
+  const begin = performance.now();
+  const result = await inventoryBatch(ids, {
+    list: async () => ids.map(id => ({ id, running: true, state: 'running' })),
+    read: async () => { probes++; return await new Promise<never>(() => {}); },
+  }, { timeoutMs: 25 });
+  assert.equal(probes, 4);
+  assert.equal(result.length, 12);
+  assert.ok(result.every(item => !item.ok && /超时/.test(item.reason)));
+  assert.ok(performance.now() - begin < 250);
+});
+
+test('inventory reports an unrecognized runtime state as unknown rather than stopped', async () => {
+  const { inventoryBatch } = await import('./inventory.ts');
+  const result = await inventoryBatch(['a'], {
+    list: async () => [{ id: 'a', state: 'unknown', running: false }],
+    read: async () => { throw new Error('must not probe unknown'); },
+  });
+  assert.match(result[0]!.reason, /无法确认实例运行状态/);
+  assert.doesNotMatch(result[0]!.reason, /未运行/);
+});

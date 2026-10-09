@@ -24,6 +24,8 @@ import TrendChart, { type TrendSeries } from '../../components/TrendChart.vue';
 import RingGauge from '../../components/RingGauge.vue';
 import StatusStrip from '../../components/StatusStrip.vue';
 import FieldHelp from '../../components/FieldHelp.vue';
+import RefreshButton from '../../components/RefreshButton.vue';
+import { createRefreshTask } from '../../api/refresh-task';
 
 const router = useRouter();
 const message = useMessage();
@@ -32,6 +34,11 @@ const summary = ref<HealthSummary | null>(null);
 const host = ref<HostStats | null>(null);
 const list = ref<InstanceHealth[]>([]);
 const loading = ref(true);
+const manualRefreshing = ref(false);
+const healthError = ref('');
+const trendError = ref('');
+const healthTask = createRefreshTask();
+const trendTask = createRefreshTask();
 
 const RANGES: { value: MetricsRange; label: string }[] = [
   { value: '10m', label: '10 分钟' },
@@ -45,21 +52,41 @@ const trend = ref<MetricsSeries | null>(null);
 let healthTimer: number | undefined;
 let trendTimer: number | undefined;
 
-async function refresh(quiet = false) {
-  try {
-    const r = await api.health();
-    summary.value = r.summary; host.value = r.host; list.value = r.instances;
-  } catch (e) {
-    if (!quiet) message.error(e instanceof ApiError ? e.message : '加载失败');
-  } finally { loading.value = false; }
+function refresh(quiet = false): Promise<void> {
+  return healthTask.run(async current => {
+    try {
+      const r = await api.health();
+      if (!current()) return;
+      summary.value = r.summary; host.value = r.host; list.value = r.instances;
+      healthError.value = '';
+    } catch (e) {
+      if (current()) {
+        healthError.value = e instanceof ApiError ? e.message : '健康状态加载失败';
+        if (!quiet) message.error(healthError.value);
+      }
+    } finally { if (current()) loading.value = false; }
+  });
 }
 
-async function loadTrend(quiet = false) {
-  try {
-    trend.value = await api.metrics(range.value);
-  } catch (e) {
-    if (!quiet) message.error(e instanceof ApiError ? e.message : '趋势加载失败');
-  }
+function loadTrend(quiet = false, replace = false): Promise<void> {
+  return trendTask.run(async current => {
+    try {
+      const result = await api.metrics(range.value);
+      if (current()) { trend.value = result; trendError.value = ''; }
+    } catch (e) {
+      if (current()) {
+        trendError.value = e instanceof ApiError ? e.message : '趋势加载失败';
+        if (!quiet) message.error(trendError.value);
+      }
+    }
+  }, replace);
+}
+
+async function refreshHealth() {
+  if (manualRefreshing.value) return;
+  manualRefreshing.value = true;
+  try { await Promise.all([refresh(), loadTrend()]); }
+  finally { manualRefreshing.value = false; }
 }
 
 onMounted(() => {
@@ -70,10 +97,11 @@ onMounted(() => {
   trendTimer = window.setInterval(() => void loadTrend(true), 15000);
 });
 onUnmounted(() => {
+  healthTask.dispose(); trendTask.dispose();
   if (healthTimer) clearInterval(healthTimer);
   if (trendTimer) clearInterval(trendTimer);
 });
-watch(range, () => void loadTrend());
+watch(range, () => { trend.value = null; void loadTrend(false, true); });
 
 // ── 曲线数据 ────────────────────────────────────────────
 
@@ -105,6 +133,7 @@ function statusPoints(id: string) {
  * 都显示成「暂无数据」的话，运维只能靠猜。
  */
 const emptyText = computed(() => {
+  if (trendError.value) return '趋势读取失败，请刷新重试';
   if (!trend.value) return '正在加载趋势数据…';
   if (!trend.value.enabled) return '未启用指标采样：Manager 的 EDGE_METRICS_INTERVAL_SEC 设为 0，趋势曲线不可用';
   if (points.value.length === 0) return '正在累计数据 —— 历史只存在 Manager 内存里，重启后从零开始';
@@ -182,12 +211,16 @@ const shares = computed(() => {
         </p>
       </div>
       <div class="rng">
+        <RefreshButton :loading="manualRefreshing" label="刷新健康数据" @click="refreshHealth" />
         <NRadioGroup v-model:value="range" size="small">
           <NRadioButton v-for="r in RANGES" :key="r.value" :value="r.value" :label="r.label" />
         </NRadioGroup>
         <span v-if="sinceText" class="since">{{ sinceText }}</span>
       </div>
     </div>
+
+    <NAlert v-if="healthError" type="error" :bordered="false">{{ healthError }}，可点击刷新重试。<template v-if="summary">当前保留上次读取的状态。</template></NAlert>
+    <NAlert v-if="trendError" type="warning" :bordered="false">{{ trendError }}，可点击刷新重试。</NAlert>
 
     <NSpin :show="loading">
       <div v-if="summary" class="kpis">
@@ -249,7 +282,7 @@ const shares = computed(() => {
         </NAlert>
       </NCard>
 
-      <NEmpty v-if="!loading && list.length === 0" description="还没有实例" style="padding: 40px 0">
+      <NEmpty v-if="summary && !loading && !healthError && list.length === 0" description="还没有实例" style="padding: 40px 0">
         <template #extra>
           <NButton size="small" type="primary" @click="router.push({ name: 'instances' })">
             创建第一个实例
@@ -257,7 +290,7 @@ const shares = computed(() => {
         </template>
       </NEmpty>
 
-      <template v-else>
+      <template v-else-if="list.length > 0">
         <div class="sect">
           <h3>实例</h3>
           <span class="lgd">

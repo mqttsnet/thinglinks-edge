@@ -27,11 +27,15 @@ import type {
   Instance, FieldDeviceRecord, FieldTagRecord, FieldSummary, ProbeResult,
 } from '../../api/types';
 import FieldHelp from '../../components/FieldHelp.vue';
+import RefreshButton from '../../components/RefreshButton.vue';
 
 const router = useRouter();
 const message = useMessage();
 
 const loading = ref(true);
+const manualRefreshing = ref(false);
+const refreshError = ref('');
+const instanceRefreshError = ref('');
 const instances = ref<Instance[]>([]);
 /** 空串 = 跨实例聚合。后端按登录者的授权逐条过滤，这里拿到多少就是他能看多少 */
 const scope = ref('');
@@ -58,6 +62,9 @@ const keyOf = (d: { instanceId: string; nodeId: string }) => `${d.instanceId}/${
 const expanded = ref<Set<string>>(new Set());
 const tagsOf = ref<Map<string, FieldTagRecord[]>>(new Map());
 const tagsBusy = ref<Set<string>>(new Set());
+const tagErrors = ref<Map<string, string>>(new Map());
+const tagRequests = new Map<string, Promise<void>>();
+let tagGeneration = 0;
 
 const serviceScopes = ref<Map<string, string>>(new Map());
 const tagPages = ref<Map<string, number>>(new Map());
@@ -74,20 +81,32 @@ function selectTagPage(device: FieldDeviceRecord, page: number) {
   closeTrend();
 }
 
-async function loadTags(d: FieldDeviceRecord, quiet = false) {
+function loadTags(d: FieldDeviceRecord, quiet = false): Promise<void> {
   const k = keyOf(d);
-  if (tagsBusy.value.has(k)) return;
+  const active = tagRequests.get(k);
+  if (active) return active;
+  const generation = tagGeneration;
   tagsBusy.value = new Set(tagsBusy.value).add(k);
-  try {
-    const r = await api.fieldTags(d.instanceId, d.nodeId);
-    tagsOf.value = new Map(tagsOf.value).set(k, r.tags);
-  } catch (e) {
-    if (!quiet) message.error(e instanceof ApiError ? e.message : '点位加载失败');
-  } finally {
-    const s = new Set(tagsBusy.value);
-    s.delete(k);
-    tagsBusy.value = s;
-  }
+  const request = (async () => {
+    try {
+      const r = await api.fieldTags(d.instanceId, d.nodeId);
+      if (generation !== tagGeneration) return;
+      tagsOf.value = new Map(tagsOf.value).set(k, r.tags);
+      const errors = new Map(tagErrors.value); errors.delete(k); tagErrors.value = errors;
+    } catch (e) {
+      if (generation !== tagGeneration) return;
+      const error = e instanceof ApiError ? e.message : '点位加载失败';
+      tagErrors.value = new Map(tagErrors.value).set(k, error);
+      if (!quiet) message.error(error);
+    }
+  })().finally(() => {
+    if (tagRequests.get(k) === request) tagRequests.delete(k);
+    if (generation === tagGeneration) {
+      const busy = new Set(tagsBusy.value); busy.delete(k); tagsBusy.value = busy;
+    }
+  });
+  tagRequests.set(k, request);
+  return request;
 }
 
 async function toggle(d: FieldDeviceRecord) {
@@ -105,14 +124,17 @@ async function toggle(d: FieldDeviceRecord) {
 
 const instanceRefresh = createFieldRefreshTask();
 const deviceRefresh = createFieldRefreshTask();
-function load(quiet = false): Promise<void> {
-  // 两路读取互不阻塞；慢请求由后续轮询复用，失败时保留最近确认的实例状态。
-  void instanceRefresh.run(async (current) => {
+function loadInstances(): Promise<void> {
+  return instanceRefresh.run(async (current) => {
     try {
       const r = await api.instances();
-      if (current()) instances.value = r.instances;
-    } catch { /* 实例状态读取失败不影响已采集值 */ }
+      if (current()) { instances.value = r.instances; instanceRefreshError.value = ''; }
+    } catch { if (current()) instanceRefreshError.value = '实例状态刷新失败，当前保留上次状态；采集值仍可独立刷新。'; }
   });
+}
+function load(quiet = false, replace = false): Promise<void> {
+  // 两路读取互不阻塞；慢请求由后续轮询复用，失败时保留最近确认的实例状态。
+  void loadInstances();
   return deviceRefresh.run(async (current) => {
     try {
       const id = scope.value || undefined;
@@ -120,21 +142,40 @@ function load(quiet = false): Promise<void> {
       if (!current()) return;
       summary.value = s;
       devices.value = d.devices;
+      refreshError.value = '';
 
       // 展开着的设备跟着一起刷 —— 点位当前值本来就是这一页要盯的东西
       const alive = new Set(d.devices.map(keyOf));
-      for (const k of expanded.value) {
+      for (const k of manualRefreshing.value ? [] : expanded.value) {
         if (!alive.has(k)) continue;
         const dev = d.devices.find((x) => keyOf(x) === k);
         // 点位请求有自己的 busy 守卫；慢点位不占用台账刷新任务。
         if (dev) void loadTags(dev, true);
       }
     } catch (e) {
-      if (current() && !quiet) message.error(e instanceof ApiError ? e.message : '加载失败');
+      if (current()) {
+        refreshError.value = e instanceof ApiError ? e.message : '现场设备刷新失败';
+        if (!quiet) message.error(refreshError.value);
+      }
     } finally {
       if (current()) loading.value = false;
     }
-  }, !quiet);
+  }, replace);
+}
+
+async function refreshField() {
+  if (manualRefreshing.value) return;
+  const generation = tagGeneration;
+  manualRefreshing.value = true;
+  try {
+    const instanceRequest = loadInstances();
+    await load();
+    if (generation !== tagGeneration) return;
+    await Promise.all([instanceRequest, ...devices.value.filter(d => expanded.value.has(keyOf(d))).map(d => loadTags(d))]);
+    if (generation !== tagGeneration) return;
+    const selected = [...tagsOf.value.values()].flat().find(tag => fieldTagKey(tag) === openTag.value);
+    if (selected) await toggleTrend(selected, true);
+  } finally { manualRefreshing.value = false; }
 }
 
 async function onScopeChange(v: string) {
@@ -143,10 +184,11 @@ async function onScopeChange(v: string) {
   probe.value = null;
   probeNote.value = '';
   expanded.value = new Set();
+  tagGeneration++; tagRequests.clear(); tagsBusy.value = new Set(); tagErrors.value = new Map();
   tagsOf.value = new Map();
   serviceScopes.value = new Map(); tagPages.value = new Map(); closeTrend();
   loading.value = true;
-  await load();
+  await load(false, true);
 }
 
 let timer: number | undefined;
@@ -155,6 +197,7 @@ onMounted(() => {
   timer = window.setInterval(() => void load(true), 10_000);
 });
 onBeforeUnmount(() => {
+  tagGeneration++; tagRequests.clear();
   instanceRefresh.dispose();
   deviceRefresh.dispose();
   if (timer !== undefined) window.clearInterval(timer);
@@ -207,9 +250,9 @@ const histBusy = ref(false);
 let historyGeneration = 0;
 function closeTrend() { historyGeneration++; openTag.value = ''; hist.value = null; histBusy.value = false; }
 
-async function toggleTrend(tag: FieldTagRecord): Promise<void> {
+async function toggleTrend(tag: FieldTagRecord, force = false): Promise<void> {
   const k = fieldTagKey(tag);
-  if (openTag.value === k) { closeTrend(); return; }
+  if (openTag.value === k && !force) { closeTrend(); return; }
   const generation = ++historyGeneration;
   openTag.value = k;
   hist.value = null;
@@ -273,7 +316,11 @@ function qualityBad(q: string): boolean {
       </div>
       <NSelect :value="scope" :options="scopeOptions" size="small" class="scope"
                :consistent-menu-width="false" @update:value="onScopeChange" />
+      <RefreshButton :loading="manualRefreshing" label="刷新设备数据" @click="refreshField" />
     </div>
+
+    <NAlert v-if="refreshError" type="error" :bordered="false">{{ refreshError }}，可点击刷新重试。</NAlert>
+    <NAlert v-if="instanceRefreshError" type="warning" :bordered="false">{{ instanceRefreshError }}</NAlert>
 
     <NSpin :show="loading">
       <!-- ── 已纳管 ── -->
@@ -300,7 +347,7 @@ function qualityBad(q: string): boolean {
           </div>
         </div>
 
-        <NEmpty v-if="devices.length === 0 && !loading"
+        <NEmpty v-if="summary && devices.length === 0 && !loading && !refreshError"
                 description="还没有设备回报上来" style="padding: 30px 0">
           <template #extra>
             <p class="empty-tip">
@@ -313,7 +360,8 @@ function qualityBad(q: string): boolean {
 
         <div v-else class="list">
           <div v-for="d in devices" :key="keyOf(d)" class="dev">
-            <div class="head" @click="toggle(d)">
+            <button type="button" class="head" :aria-expanded="expanded.has(keyOf(d))"
+                    :aria-label="`${expanded.has(keyOf(d)) ? '收起' : '查看'}设备 ${d.name} 的点位`" @click="toggle(d)">
               <span class="caret" :class="{ open: expanded.has(keyOf(d)) }">›</span>
               <span class="dot" :class="{ on: deviceStatus(d).online }"
                     :title="deviceStatus(d).label" :aria-label="deviceStatus(d).label"></span>
@@ -326,14 +374,15 @@ function qualityBad(q: string): boolean {
               <span v-if="d.address" class="mono addr">{{ d.address }}</span>
               <span v-if="!scope" class="mono inst" title="所属实例">{{ d.instanceId }}</span>
               <span class="seen" :title="fmtAbs(d.lastSeen)">{{ fmtAgo(d.lastSeen) }}</span>
-            </div>
+            </button>
 
             <div v-if="expanded.has(keyOf(d))" class="tags">
+              <NAlert v-if="tagErrors.get(keyOf(d))" type="error" :bordered="false">{{ tagErrors.get(keyOf(d)) }}，已保留上次点位数据；点击刷新可重试。</NAlert>
               <NAlert v-if="deviceStatus(d).instanceUnavailable" type="default" :bordered="false" class="last-values-note">
                 {{ deviceStatus(d).label }}。以下保留最后一次采集值，可结合更新时间查看。
               </NAlert>
               <NSpin :show="tagsBusy.has(keyOf(d)) && !tagsOf.has(keyOf(d))" size="small">
-                <NEmpty v-if="(tagsOf.get(keyOf(d)) ?? []).length === 0 && !tagsBusy.has(keyOf(d))"
+                <NEmpty v-if="tagsOf.has(keyOf(d)) && (tagsOf.get(keyOf(d)) ?? []).length === 0 && !tagsBusy.has(keyOf(d)) && !tagErrors.has(keyOf(d))"
                         description="这台设备还没有点位" size="small" style="padding: 16px 0" />
                 <div v-else class="service-selector">
                   <NSelect :value="serviceScopes.get(keyOf(d)) ?? '*'" :options="fieldServiceOptions(tagsOf.get(keyOf(d)) ?? [])"
@@ -341,7 +390,7 @@ function qualityBad(q: string): boolean {
                 </div>
                 <table v-if="tagPage(d).total">
                   <thead>
-                    <tr><th>点位</th><th>标识</th><th class="r">{{ deviceStatus(d).instanceUnavailable ? '最后采集值' : '当前值' }}</th><th>质量</th><th>更新</th><th></th></tr>
+                    <tr><th>点位</th><th class="point-id">标识</th><th class="r">{{ deviceStatus(d).instanceUnavailable ? '最后采集值' : '当前值' }}</th><th class="point-quality">质量</th><th class="point-updated">更新</th><th class="r trend-action">操作</th></tr>
                   </thead>
                   <tbody>
                     <template v-for="({ value: t }, position) in tagPage(d).items" :key="fieldTagKey(t)">
@@ -349,28 +398,43 @@ function qualityBad(q: string): boolean {
                       <td colspan="6">{{ fieldServiceLabel(t.serviceCode || '') }}</td>
                     </tr>
                     <tr>
-                      <td>{{ t.name || t.tagId }}</td>
-                      <td class="mono muted">{{ t.tagId }}</td>
+                      <td class="point-name">{{ t.name || t.tagId }}
+                        <span v-if="t.name && t.name !== t.tagId" class="compact-meta mono">{{ t.tagId }}</span>
+                        <span class="compact-meta" :class="{ 'quality-warning': qualityBad(t.quality) }">{{ t.quality || 'good' }} · {{ fmtAgo(t.lastAt) }}</span>
+                      </td>
+                      <td class="mono muted point-id">{{ t.tagId }}</td>
                       <td class="r">
                         <FieldValue :value="t.lastValue" />
                         <span v-if="t.unit" class="unit">{{ t.unit }}</span>
                       </td>
-                      <td>
+                      <td class="point-quality">
                         <NTag v-if="qualityBad(t.quality)" size="tiny" type="warning">
                           {{ t.quality }}
                         </NTag>
                         <span v-else class="muted">good</span>
                       </td>
-                      <td class="muted" :title="fmtAbs(t.lastAt)">{{ fmtAgo(t.lastAt) }}</td>
-                      <td class="r">
-                        <NButton size="tiny" quaternary
-                                 :aria-label="`${fieldServiceLabel(t.serviceCode || '')} ${t.tagId} 趋势`" @click="toggleTrend(t)">
-                          {{ openTag === fieldTagKey(t) ? '收起' : '趋势' }}
+                      <td class="muted point-updated" :title="fmtAbs(t.lastAt)">{{ fmtAgo(t.lastAt) }}</td>
+                      <td class="r trend-action">
+                        <NButton size="small" type="primary" class="trend-button"
+                                 :ghost="openTag !== fieldTagKey(t)"
+                                 :class="{ 'is-open': openTag === fieldTagKey(t) }"
+                                 :aria-expanded="openTag === fieldTagKey(t)"
+                                 :aria-label="`${fieldServiceLabel(t.serviceCode || '')} ${t.tagId} ${openTag === fieldTagKey(t) ? '收起趋势' : '查看趋势'}`"
+                                 @click="toggleTrend(t)">
+                          <template #icon>
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                 stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                              <path v-if="openTag === fieldTagKey(t)" d="m6 15 6-6 6 6" />
+                              <path v-else d="M4 4v16h16M7 14l4-4 4 3 5-7" />
+                            </svg>
+                          </template>
+                          {{ openTag === fieldTagKey(t) ? '收起趋势' : '查看趋势' }}
                         </NButton>
                       </td>
                     </tr>
                     <tr v-if="openTag === fieldTagKey(t)" class="trend">
                       <td colspan="6">
+                        <div class="trend-content">
                         <NSpin :show="histBusy" size="small">
                           <!-- 未启用要说清是配置关掉的，不是采集坏了 -->
                           <NAlert v-if="hist && !hist.enabled" type="default" :bordered="false">
@@ -391,6 +455,7 @@ function qualityBad(q: string): boolean {
                             </p>
                           </template>
                         </NSpin>
+                        </div>
                       </td>
                     </tr>
                     </template>
@@ -517,9 +582,11 @@ function qualityBad(q: string): boolean {
 .dev:last-child { border-bottom: none; }
 .head {
   display: flex; align-items: center; gap: 10px; padding: 10px 0;
+  width: 100%; border: 0; background: transparent; color: inherit; font: inherit; text-align: left;
   cursor: pointer; user-select: none;
 }
 .head:hover { background: var(--hover); }
+.head:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 .caret { color: var(--muted); transition: transform .15s; font-size: 15px; line-height: 1; }
 .caret.open { transform: rotate(90deg); }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
@@ -535,6 +602,12 @@ function qualityBad(q: string): boolean {
 .service-selector { max-width: 420px; margin: 8px 0 12px; }
 .service-group td { color: var(--primary); font-weight: 600; background: var(--sidebar); }
 .tag-pagination { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin: 12px 0; }
+.trend-action { width: 1%; white-space: nowrap; }
+.compact-meta { display: none; }
+.trend-button { min-width: 104px; }
+.trend-button:not(.is-open) { background: rgba(var(--primary-glow), .06); }
+.trend-button:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.trend-content { contain: inline-size; }
 .trend > td { padding: 10px 6px 14px; }
 .trend .hint { margin: 8px 0 0; font-size: 12px; color: var(--text-3); line-height: 1.7; }
 .more, .note, .idle { margin: 10px 0 0; font-size: 12px; color: var(--muted); }
@@ -559,5 +632,14 @@ tbody tr:last-child td { border-bottom: none; }
 @media (max-width: 700px) {
   .addr, .inst { display: none; }
   .nums { width: 100%; margin-left: 0; }
+  .tags { padding-left: 0; }
+  .tags .point-id, .tags .point-quality, .tags .point-updated { display: none; }
+  .tags th, .tags td { padding-left: 4px; padding-right: 4px; }
+  .point-name { overflow-wrap: anywhere; }
+  .compact-meta { display: block; font-size: 11px; color: var(--muted); }
+  .compact-meta.quality-warning { color: var(--warning); }
+  .head { flex-wrap: wrap; gap: 6px; }
+  .head .id { overflow-wrap: anywhere; }
+  .trend-button { min-width: 96px; }
 }
 </style>

@@ -336,3 +336,62 @@ test('同一个包既是必需又是可选时按必需算 —— 那是更该先
       { missing: ['both'], missingOptional: [] });
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('request-local store snapshot parses each latest package once and preserves closure gaps', async () => {
+  const dir = tmp();
+  try {
+    const store = new NodeStore(dir);
+    store.add(pack(nodePkg('root-a', '1.0.0', { shared: '*' })));
+    store.add(pack(nodePkg('root-b', '1.0.0', { shared: '*' })));
+    store.add(pack({ name: 'shared', version: '1.0.0', dependencies: { absent: '*' }, optionalDependencies: { optional: '*' } }));
+    let reads = 0;
+    const original = store.metaAsync.bind(store);
+    store.metaAsync = async (...args) => { reads += 1; return original(...args); };
+    const view = await store.latestSnapshot();
+    for (const module of view.modules()) {
+      assert.deepEqual(closureReport(view, module, '1.0.0'), closureReport(store, module, '1.0.0'));
+      assert.deepEqual(view.meta(module, '1.0.0'), store.meta(module, '1.0.0'));
+    }
+    assert.equal(reads, 3);
+    store.add(pack({ name: 'shared', version: '1.0.0', dependencies: { changed: '*' } }));
+    assert.deepEqual(closureReport(view, 'root-a', '1.0.0').missing, ['absent']);
+    assert.deepEqual(closureReport(await store.latestSnapshot(), 'root-a', '1.0.0').missing, ['changed']);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('async store metadata keeps integrity validation and yields to other requests', async () => {
+  const dir = tmp();
+  try {
+    const store = new NodeStore(dir);
+    store.add(pack(nodePkg('valid', '1.0.0')));
+    let yielded = false;
+    setImmediate(() => { yielded = true; });
+    assert.deepEqual(await store.metaAsync('valid', '1.0.0'), store.meta('valid', '1.0.0'));
+    assert.equal(yielded, true);
+    assert.equal(await store.metaAsync('missing', '1.0.0'), undefined);
+    const { writeFileSync } = await import('node:fs');
+    writeFileSync(join(dir, 'valid', '1.0.0.tgz'), Buffer.from('broken archive'));
+    await assert.rejects(store.latestSnapshot(), /不是有效的 gzip/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('snapshot fails if an enumerated dependency disappears before its metadata is read', async () => {
+  const dir = tmp();
+  try {
+    const store = new NodeStore(dir);
+    store.add(pack(nodePkg('a-root', '1.0.0', { 'z-dependency': '*' })));
+    store.add(pack({ name: 'z-dependency', version: '1.0.0' }));
+    const read = store.metaAsync.bind(store);
+    let removed = false;
+    store.metaAsync = async (module, version) => {
+      if (!removed) {
+        removed = true;
+        rmSync(join(dir, 'z-dependency', '1.0.0.tgz'));
+      }
+      return read(module, version);
+    };
+    await assert.rejects(store.latestSnapshot(), /包库.*变化.*刷新/);
+    // A new request must read the current directory and report the real gap.
+    assert.deepEqual(closureReport(await store.latestSnapshot(), 'a-root', '1.0.0').missing, ['z-dependency']);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

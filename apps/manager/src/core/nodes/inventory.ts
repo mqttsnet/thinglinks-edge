@@ -160,9 +160,26 @@ export async function inventoryOf(
   target: AdminTarget,
   approved: ReadonlySet<string>,
   fetchImpl: FetchLike = fetch,
+  options: { timeoutMs?: number; signal?: AbortSignal } = {},
 ): Promise<InstanceInventory> {
+  const controller = new AbortController();
+  const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
+  const timeoutMs = options.timeoutMs ?? 5_000;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  // Use one budget for auth, nodes, and body consumption. The Admin API client's
+  // legacy anonymous fallback remains unchanged for other callers; after this
+  // request expires it must not start another network attempt.
+  const boundedFetch: FetchLike = async (input, init) => {
+    signal.throwIfAborted();
+    return fetchImpl(input, {
+      ...init,
+      signal: init?.signal ? AbortSignal.any([signal, init.signal]) : signal,
+    });
+  };
   try {
-    const inventory = aggregateNodeSets(await getInstalledNodeSets(target, fetchImpl));
+    const inventory = aggregateNodeSets(await untilAborted(
+      getInstalledNodeSets(target, boundedFetch, timeoutMs), signal,
+    ));
     const items = inventory.modules.map((module) => ({
       ...module, compliance: classify(module, approved),
     }));
@@ -174,7 +191,82 @@ export async function inventoryOf(
       unapproved: items.filter((item) => item.compliance === 'unapproved').length,
     };
   } catch (e) {
+    if (signal.aborted) return unavailableInventory(instanceId, '读取节点清单超时，请稍后刷新');
     const reason = e instanceof AdminApiError ? e.message : `读取失败：${(e as Error).message}`;
-    return { instanceId, ok: false, reason, modules: [], unapproved: 0 };
+    return unavailableInventory(instanceId, reason);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function unavailableInventory(instanceId: string, reason: string): InstanceInventory {
+  return { instanceId, ok: false, reason, modules: [], unapproved: 0 };
+}
+
+/** Also settle promptly when an adapter ignores cancellation; native fetch/Docker are aborted too. */
+function untilAborted<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(new Error('读取超时'));
+    if (signal.aborted) abort();
+    else signal.addEventListener('abort', abort, { once: true });
+    work.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
+  });
+}
+
+type InventoryRuntimeState = { id: string; state: string; running: boolean };
+
+/** Read-only batch: authorize IDs before calling; no startup, installation, or state mutation. */
+export async function inventoryBatch(
+  ids: readonly string[],
+  deps: {
+    list: (signal: AbortSignal) => Promise<InventoryRuntimeState[]>;
+    read: (id: string, signal: AbortSignal) => Promise<InstanceInventory>;
+  },
+  options: { timeoutMs?: number; stateTimeoutMs?: number } = {},
+): Promise<InstanceInventory[]> {
+  if (ids.length === 0) return [];
+  const deadline = new AbortController();
+  const timer = setTimeout(() => deadline.abort(), options.timeoutMs ?? 8_000);
+  try {
+    const stateDeadline = new AbortController();
+    const stateSignal = AbortSignal.any([deadline.signal, stateDeadline.signal]);
+    const stateTimer = setTimeout(() => stateDeadline.abort(), options.stateTimeoutMs ?? 2_000);
+    let states: Map<string, InventoryRuntimeState>;
+    try {
+      states = new Map((await untilAborted(deps.list(stateSignal), stateSignal)).map(state => [state.id, state]));
+    } catch {
+      return ids.map(id => unavailableInventory(id, '无法确认实例运行状态，请稍后刷新'));
+    } finally {
+      clearTimeout(stateTimer);
+    }
+    const out = new Array<InstanceInventory>(ids.length);
+    let next = 0;
+    const worker = async () => {
+      while (next < ids.length) {
+        const index = next++;
+        const id = ids[index]!;
+        const state = states.get(id);
+        if (!state || state.state === 'missing') {
+          out[index] = unavailableInventory(id, '实例容器不存在，无法读取节点清单');
+        } else if (!state.running && ['created', 'exited', 'dead', 'paused', 'restarting', 'removing'].includes(state.state)) {
+          out[index] = unavailableInventory(id, `实例未运行（${state.state}），启动后可刷新节点清单`);
+        } else if (!state.running || state.state !== 'running') {
+          out[index] = unavailableInventory(id, '无法确认实例运行状态，请稍后刷新');
+        } else if (deadline.signal.aborted) {
+          out[index] = unavailableInventory(id, '读取节点清单超时，请稍后刷新');
+        } else {
+          try {
+            out[index] = await untilAborted(deps.read(id, deadline.signal), deadline.signal);
+          } catch {
+            out[index] = unavailableInventory(id, deadline.signal.aborted
+              ? '读取节点清单超时，请稍后刷新' : '读取节点清单失败，请稍后刷新');
+          }
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(ids.length, 4) }, worker));
+    return out;
+  } finally {
+    clearTimeout(timer);
   }
 }
