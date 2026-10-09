@@ -12,11 +12,13 @@ Edge 的隔离单位是 Node-RED 实例。一个实例中的节点共享 Node.js
 
 ## Docker 执行策略服务
 
-Manager 不直接挂载 Docker socket。`docker-proxy` 使用与 Manager 相同的发行镜像，运行 `dist/docker-policy-main.js`，在独立网络中接收 Manager 的请求。只有该服务挂载 socket；socket 的只读挂载本身不等于 Docker API 只读授权。
+Manager 不直接挂载 Docker socket。`docker-proxy` 运行 `dist/docker-policy-main.js`，在独立网络中接收 Manager 的请求。只有该服务挂载 socket；socket 的只读挂载本身不等于 Docker API 只读授权。
 
 执行策略会核对允许的 API、容器和网络的受管归属、镜像范围、数据目录及创建参数。启动或重启前还会核对实际容器的隔离配置，防止通过旧容器或手工改动的容器绕过创建约束。实例网络不能直接访问策略服务；Manager 需要连接实例网络以提供反代和组件源。
 
-部署时保持 Manager、Docker 策略和网络隔离三个服务使用同一发行镜像，并保持数据根、网络前缀、实例镜像范围及设备端口范围一致。不要将 `PROXY_IMAGE` 设置为旧的 `wollomatic/socket-proxy`；旧组件没有这套请求体与资源归属校验。`NETWORK_IMAGE` 同样默认沿用 `MANAGER_IMAGE`。离线包的 `imageRoles` 显式区分三个角色，同一镜像只导出一次，三个角色的镜像 ID 必须相同。
+部署时保持 Manager、Docker 策略和网络隔离三个服务来自同一发行版本，并保持数据根、网络前缀、实例镜像范围及设备端口范围一致。策略和网络服务应使用发行包配套的最小 `POLICY_IMAGE`；它只包含两个策略入口及必要的 Node.js 内置依赖，不包含 Manager、Web 控制台、业务数据库或 npm。不要将 `PROXY_IMAGE` 设置为旧的 `wollomatic/socket-proxy`；旧组件没有这套请求体与资源归属校验。主 Compose 文件在未设置策略镜像时暂时回退到 `MANAGER_IMAGE`，仅用于兼容旧现场；新部署和升级必须显式填写 `POLICY_IMAGE`，或分别填写 `PROXY_IMAGE`、`NETWORK_IMAGE`。本地源码构建使用 `docker-compose.build.yml`，它从 `apps/manager/Dockerfile.policy` 生成独立的 `thinglinks-edge-policy:dev`。离线包的 `imageRoles` 显式区分三个角色，并按包内清单校验每个角色的镜像引用。
+
+构建覆盖文件给两个策略服务都配置了构建入口，单独构建任一角色也可从源码生成镜像。两个角色在该覆盖文件中统一使用 `POLICY_IMAGE`，不使用旧的分角色镜像覆盖；启动时继续带构建覆盖文件，或同步主 Compose 的镜像配置。离线包允许旧版三角色共享一个镜像，也允许 Manager 与策略使用两个镜像，但 Docker 策略与网络隔离必须共享同一个策略 Config ID。校验器独立固定 Manager 和策略的 Config ID，再核对包内镜像字节、角色、配置引用；安装器拒绝将包内另一个角色的镜像调换过来。
 
 ## 网络保护组件与部署约束
 
@@ -24,7 +26,7 @@ Manager 不直接挂载 Docker socket。`docker-proxy` 使用与 Manager 相同�
 
 `network-isolation` 运行 `dist/network-isolation-main.js`，使用 Docker 宿主网络命名空间，以 root 运行但只增加 `NET_ADMIN` capability，不使用 `privileged`。它只挂载私有 `edge-network-control` 卷，不挂载 Docker socket 或实例数据。业务 Node-RED 实例仍不获得 host 网络或 `NET_ADMIN`。
 
-Docker 策略服务通过该私有卷中的 Unix socket 请求受限的网络保护操作；其独立的 `edge-policy-state` 卷记录尚未完成的网络操作。Manager 和 Node-RED 都不能挂载这两个私有控制/状态卷。网络创建前要持久化操作意图，确认资源归属、不可变 ID 和网络保护就绪后才完成发布；不确定状态需要核对恢复，不能直接清掉记录或猜测删除网络。
+Docker 策略服务通过该私有卷中的 Unix socket 请求受限的网络保护操作；其独立的 `edge-policy-state` 卷记录尚未完成的网络操作。Manager 和 Node-RED 都不能挂载这两个私有控制/状态卷。生产部署应使用 `POLICY_IMAGE` 指向只包含策略与防火墙入口的最小镜像；它不应复用 Manager 镜像。网络创建前要持久化操作意图，确认资源归属、不可变 ID 和网络保护就绪后才完成发布；不确定状态需要核对恢复，不能直接清掉记录或猜测删除网络。
 
 网络操作还带有由可信数据根和网络前缀生成的部署归属标识。共享 Docker 主机上的不同部署必须使用独立配置和状态卷；更改数据根或网络前缀属于受控迁移，不能靠删掉状态卷或借用另一部署的网络绕过归属校验。
 

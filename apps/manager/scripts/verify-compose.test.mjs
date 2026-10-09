@@ -53,6 +53,22 @@ test('default Compose uses the Manager release for the Docker policy service and
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('both policy roles can build independently and use one policy artifact despite legacy role overrides', () => {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'tle-compose-policy-build-'));
+  try {
+    const envFile = join(root, 'empty.env'); writeFileSync(envFile, 'POLICY_IMAGE=fixture/policy:1\nPROXY_IMAGE=fixture/proxy:old\nNETWORK_IMAGE=fixture/network:old\n', { mode: 0o600 });
+    const repo = join(dirname(SCRIPT), '../../..');
+    const parsed = JSON.parse(execFileSync('docker', ['compose', '-f', join(repo, 'docker-compose.yml'),
+      '-f', join(repo, 'docker-compose.build.yml'), '--env-file', envFile, 'config', '--format', 'json'],
+    { encoding: 'utf8', env: { PATH: process.env.PATH } }));
+    for (const role of ['docker-proxy', 'network-isolation']) {
+      assert.equal(parsed.services[role].build?.dockerfile, 'apps/manager/Dockerfile.policy', role);
+    }
+    assert.equal(parsed.services['docker-proxy'].image, 'fixture/policy:1');
+    assert.equal(parsed.services['network-isolation'].image, 'fixture/policy:1');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('healthy bootstrap completes before the historical instance network is corrupted', () => {
   const source = readFileSync(SCRIPT, 'utf8');
   const brokenCreate = source.indexOf('const brokenCreated = await fetch');

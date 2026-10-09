@@ -34,10 +34,10 @@ done
 # 版本号取自 manager 的 package.json —— 与镜像标签同源，避免两处各写一个
 VERSION="$(node -p "require('./apps/manager/package.json').version")"
 MANAGER_IMAGE="${MANAGER_IMAGE:-mqttsnet/thinglinks-edge:${VERSION}}"
-# Docker policy and Manager ship in the same release artifact. A legacy socket
-# endpoint filter cannot run the new parameter/ownership policy entrypoint.
-PROXY_IMAGE="${PROXY_IMAGE:-$MANAGER_IMAGE}"
-NETWORK_IMAGE="${NETWORK_IMAGE:-$MANAGER_IMAGE}"
+# Both privileged roles share the release policy image. Manager fallback keeps
+# older single-image releases installable; new releases set POLICY_IMAGE.
+PROXY_IMAGE="${PROXY_IMAGE:-${POLICY_IMAGE:-$MANAGER_IMAGE}}"
+NETWORK_IMAGE="${NETWORK_IMAGE:-${POLICY_IMAGE:-$MANAGER_IMAGE}}"
 INIT_IMAGE="${INIT_IMAGE:-alpine:3.22}"
 NODE_RED_REPO="${NODE_RED_IMAGE_REPO:-nodered/node-red}"
 ALLOWED_IMAGE_TAGS="${ALLOWED_IMAGE_TAGS:-5.0.7-24-minimal,5.0.4-24-minimal,4.1.13-22-minimal}"
@@ -154,6 +154,7 @@ services:
 YAML
 
 cp scripts/offline/install.sh "${STAGE}/install.sh"
+cp scripts/offline/image-roles.mjs "${STAGE}/image-roles.mjs"
 cp scripts/offline/README.md "${STAGE}/README.md"
 cp docs/guides/instance-isolation.md "${STAGE}/INSTANCE-ISOLATION.md"
 chmod +x "${STAGE}/install.sh"
@@ -180,15 +181,13 @@ if [ -n "$NODE_SEED_DIR" ]; then
 fi
 
 # 4) 清单：装了什么、什么架构、什么时候打的。现场核对与售后追溯都靠它
-node -e '
-const { createHash } = require("node:crypto");
-const { readdirSync, readFileSync, existsSync, writeFileSync } = require("node:fs");
+node --input-type=module -e '
+import { createHash } from "node:crypto";
+import { readdirSync, readFileSync, existsSync, writeFileSync } from "node:fs";
+import { assertImageRoles } from "./scripts/offline/image-roles.mjs";
 const [stage, version, arch, indexPath, ...roleImages] = process.argv.slice(1);
 const imageIndex = JSON.parse(readFileSync(indexPath, "utf8"));
 const images = [...new Set(roleImages)];
-if ([roleImages[1], roleImages[2]].some(image => imageIndex[roleImages[0]].id !== imageIndex[image].id)) {
-  throw new Error("Docker 执行策略与网络隔离服务必须与 Manager 使用同一发行构件，不能替换为旧代理或其他镜像");
-}
 const seedDir = `${stage}/node-seed`;
 const nodeSeed = existsSync(seedDir)
   ? readdirSync(seedDir).filter((f) => f.endsWith(".tgz")).sort()
@@ -197,7 +196,7 @@ const nodeSeedIntegrity = Object.fromEntries(nodeSeed.map((file) => [
   file,
   `sha512-${createHash("sha512").update(readFileSync(`${seedDir}/${file}`)).digest("base64")}`,
 ]));
-writeFileSync(`${stage}/manifest.json`, JSON.stringify({
+const manifest = {
   product: "thinglinks-edge",
   version, platform: `linux/${arch}`,
   createdAt: new Date().toISOString(),
@@ -207,14 +206,16 @@ writeFileSync(`${stage}/manifest.json`, JSON.stringify({
   nodeSeed,
   // 与 Manager 的固定 SRI 合同可以直接对照；SHA256SUMS 另管整个离线包传输完整性
   nodeSeedIntegrity,
-}, null, 2) + "\n");
+};
+assertImageRoles(manifest);
+writeFileSync(`${stage}/manifest.json`, JSON.stringify(manifest, null, 2) + "\n");
 ' "$STAGE" "$VERSION" "$ARCH" "$IMAGE_INDEX" "${IMAGES[@]}"
 rm -f "$IMAGE_INDEX"
 
 # 5) 校验和 —— 见约束 3。节点包也要进校验：U 盘拷坏一个 tgz，
 #    现场表现是「这个节点导入失败」，同样看不出是文件坏了
 ( cd "$STAGE" && shasum -a 256 images.tar docker-compose.yml docker-compose.offline.yml \
-    install.sh README.md INSTANCE-ISOLATION.md manifest.json .env.example \
+    install.sh image-roles.mjs README.md INSTANCE-ISOLATION.md manifest.json .env.example \
     $(find changelogs -type f 2>/dev/null | sort) \
     $(find node-seed -type f \( -name '*.tgz' -o -name 'protocol-seed-manifest.json' \) 2>/dev/null | sort) \
     > SHA256SUMS )

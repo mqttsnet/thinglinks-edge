@@ -36,8 +36,8 @@ const INSTANCE_LABEL = 'com.mqttsnet.thinglinks-edge.instance';
 const COMPOSE_PROJECT_LABEL = 'com.docker.compose.project';
 const COMPOSE_SERVICE_LABEL = 'com.docker.compose.service';
 const REVIEWED_MANAGER_IMAGE = process.env.MANAGER_IMAGE?.trim() ?? '';
-const PROXY_IMAGE = process.env.PROXY_IMAGE?.trim() || REVIEWED_MANAGER_IMAGE;
-const NETWORK_IMAGE = process.env.NETWORK_IMAGE?.trim() || REVIEWED_MANAGER_IMAGE;
+const PROXY_IMAGE = process.env.PROXY_IMAGE?.trim() || process.env.POLICY_IMAGE?.trim() || REVIEWED_MANAGER_IMAGE;
+const NETWORK_IMAGE = process.env.NETWORK_IMAGE?.trim() || process.env.POLICY_IMAGE?.trim() || REVIEWED_MANAGER_IMAGE;
 const NODE_IMAGE = 'nodered/node-red:5.0.7-24-minimal';
 const PROJECT = `tle-compose-${RUN_ID}`;
 /*
@@ -132,7 +132,7 @@ const composeEnvironment = () => {
     'INSTANCE_NETWORK', 'ALLOWED_IMAGE_TAGS', 'EDGE_DATA_ROOT', 'EDGE_NAME_PREFIX',
     'INSTANCE_PORT_MIN', 'INSTANCE_PORT_MAX', 'EDITOR_PORT_MIN', 'EDITOR_PORT_MAX', 'EDGE_NODE_INSTALL_POLICY',
     'EDGE_NPM_UPSTREAM', 'NODE_RED_IMAGE_REPO',
-    'MANAGER_IMAGE', 'PROXY_IMAGE', 'NETWORK_IMAGE', 'INIT_IMAGE',
+    'MANAGER_IMAGE', 'POLICY_IMAGE', 'PROXY_IMAGE', 'NETWORK_IMAGE', 'INIT_IMAGE',
     'PROTECTED_HOST_IPS', 'ALLOWED_HOST_ENDPOINTS', 'NETWORK_HEALTH_PORT',
   ]) delete env[key];
   if (managerImageId) env.MANAGER_IMAGE = managerImageId;
@@ -532,8 +532,7 @@ async function main() {
     resolveImage(NETWORK_IMAGE, 'NETWORK_IMAGE'),
     resolveImage(NODE_IMAGE, 'NODE_IMAGE'),
   ]);
-  assert.equal(proxyImageId, managerImageId, 'Docker policy service must use the same reviewed release artifact as Manager');
-  assert.equal(networkImageId, managerImageId, 'Network isolation must use the same reviewed release artifact as Manager');
+  assert.equal(proxyImageId, networkImageId, 'Docker policy and network isolation must share the same reviewed policy artifact');
   const [apiMajor, apiMinor] = (await raw.version()).ApiVersion.split('.').map(Number);
   const gatewayPrioritySupported = apiMajor > 1 || (apiMajor === 1 && apiMinor >= 48);
   // The reviewed Manager image is Alpine-based, has no ENTRYPOINT override,
@@ -831,12 +830,12 @@ async function main() {
   });
   check('特权集中在代理上：只有它挂 socket，且是只读',
         (proxyInfo.Mounts ?? []).some((m) => String(m.Source).includes('docker.sock') && m.RW === false));
-  check('代理运行同一发行构件的参数与资源归属策略入口', proxyInfo.Image === managerImageId
+  check('代理运行精确指定的策略镜像与入口', proxyInfo.Image === proxyImageId
     && JSON.stringify(proxyInfo.Config.Cmd) === JSON.stringify(['node', 'dist/docker-policy-main.js']));
   const controllerInfo = await captureContainer(NET_CONTROLLER, {
     [COMPOSE_PROJECT_LABEL]: PROJECT, [COMPOSE_SERVICE_LABEL]: 'network-isolation',
   });
-  check('网络保护组件仅获 NET_ADMIN 与私有控制卷，不挂载 socket 或实例数据', controllerInfo.Image === managerImageId
+  check('网络保护组件仅获 NET_ADMIN 与私有控制卷，不挂载 socket 或实例数据', controllerInfo.Image === networkImageId
     && controllerInfo.HostConfig.NetworkMode === 'host' && !controllerInfo.HostConfig.Privileged
     && JSON.stringify(controllerInfo.HostConfig.CapDrop) === JSON.stringify(['ALL'])
     && JSON.stringify((controllerInfo.HostConfig.CapAdd ?? []).map(cap => cap.replace(/^CAP_/, ''))) === JSON.stringify(['NET_ADMIN'])

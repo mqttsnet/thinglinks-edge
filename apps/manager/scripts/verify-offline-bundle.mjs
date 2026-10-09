@@ -17,6 +17,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { assertImageRoles, assertComposeImageRoles } from '../../../scripts/offline/image-roles.mjs';
 
 const REQUIRED = [
   'images.tar',
@@ -155,26 +156,7 @@ export function singleConfigId(archive, expectedArchitecture) {
   return `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
 }
 
-/** Role references stay explicit when Manager and Docker policy share a single archive image. */
-export function bundleImageRoles(manifest) {
-  assert.ok(Array.isArray(manifest.images) && manifest.images.length >= 3, 'bundle manifest images missing');
-  const refs = manifest.images.map(item => item.image);
-  assert.equal(new Set(refs).size, refs.length, 'bundle manifest images must be unique');
-  const roles = manifest.imageRoles;
-  assert.ok(roles && typeof roles.manager === 'string' && typeof roles.dockerProxy === 'string'
-    && typeof roles.networkIsolation === 'string'
-    && typeof roles.initData === 'string' && Array.isArray(roles.nodeRed) && roles.nodeRed.length > 0,
-  'bundle manifest imageRoles missing');
-  const referenced = [roles.manager, roles.dockerProxy, roles.networkIsolation, roles.initData, ...roles.nodeRed];
-  assert.deepEqual([...new Set(referenced)].sort(), [...refs].sort(), 'bundle image roles must reference exactly its exported images');
-  assert.equal(new Set(roles.nodeRed).size, roles.nodeRed.length, 'duplicate Node-RED role images');
-  const byRef = new Map(manifest.images.map(item => [item.image, item]));
-  assert.equal(byRef.get(roles.dockerProxy).id, byRef.get(roles.manager).id,
-    'Docker 执行策略服务必须与 Manager 使用同一发行构件');
-  assert.equal(byRef.get(roles.networkIsolation).id, byRef.get(roles.manager).id,
-    '网络隔离服务必须与 Manager 使用同一发行构件');
-  return roles;
-}
+export const bundleImageRoles = assertImageRoles;
 
 export function assertNetworkIsolationDeployment(services) {
   const controller = services['network-isolation'];
@@ -224,6 +206,7 @@ function cleanComposeEnvironment() {
   const env = { ...process.env, MASTER_KEY: 'bundle-contract-probe' };
   for (const key of [
     'MANAGER_IMAGE',
+    'POLICY_IMAGE',
     'PROXY_IMAGE',
     'NETWORK_IMAGE',
     'INIT_IMAGE',
@@ -265,13 +248,15 @@ function checksumPaths(text) {
   return paths;
 }
 
-export function verifyOfflineBundle(bundleArg, expectedManagerTag, expectedManagerConfigId) {
+export function verifyOfflineBundle(bundleArg, expectedManagerTag, expectedManagerConfigId, expectedPolicyConfigId = expectedManagerConfigId) {
   assert.ok(bundleArg && expectedManagerTag && expectedManagerConfigId,
-    'usage: verify-offline-bundle.mjs <bundle> <manager-tag> <manager-config-id>');
+    'usage: verify-offline-bundle.mjs <bundle> <manager-tag> <manager-config-id> [policy-config-id]');
   assert.doesNotMatch(expectedManagerTag, /^sha256:|@sha256:/,
     'manager bundle reference must be a named tag');
   assert.match(expectedManagerConfigId, /^sha256:[0-9a-f]{64}$/,
     'manager config must be an immutable sha256 ID');
+  assert.match(expectedPolicyConfigId, /^sha256:[0-9a-f]{64}$/,
+    'policy config must be an independently captured immutable sha256 ID');
 
   const bundle = resolve(bundleArg);
   const runId = process.env.TLE_VERIFY_RUN_ID ?? 'standalone';
@@ -369,6 +354,10 @@ export function verifyOfflineBundle(bundleArg, expectedManagerTag, expectedManag
     check('manifest Manager tag 与 descriptor 归档 Config ID 同源', () => {
       assert.deepEqual(manager, { image: expectedManagerTag, id: expectedManagerConfigId });
     });
+    check('策略角色与独立提供的 Config ID 同源', () => {
+      const policy = manifest.images.find(item => item.image === roles.dockerProxy);
+      assert.equal(policy.id, expectedPolicyConfigId, '策略镜像必须匹配提供的 Config ID');
+    });
 
     const imagesTar = join(packageRoot, 'images.tar');
     const imageRefs = manifest.images.map((item) => item.image);
@@ -410,11 +399,7 @@ export function verifyOfflineBundle(bundleArg, expectedManagerTag, expectedManag
     const compose = JSON.parse(composeText);
     const services = compose.services ?? {};
     check('compose 解析引用 images.tar 同一组 tag', () => {
-      assert.equal(services.manager?.image, roles.manager);
-      assert.equal(services['docker-proxy']?.image, roles.dockerProxy);
-      assert.equal(services['network-isolation']?.image, roles.networkIsolation);
-      assert.equal(services['init-data']?.image, roles.initData);
-      assert.equal(services['node-red-image']?.image, roles.nodeRed[0]);
+      assertComposeImageRoles(manifest, services);
       assert.deepEqual(services['docker-proxy']?.command, ['node', 'dist/docker-policy-main.js'], 'Docker 执行策略入口必须保留');
       for (const service of ['manager', 'docker-proxy', 'network-isolation', 'init-data', 'node-red-image']) {
         assert.ok(repoTags.has(services[service]?.image), service);
@@ -443,7 +428,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1
       const id = singleConfigId(process.argv[3], process.argv[4]);
       process.stdout.write(`${id}\n`);
     } else {
-      verifyOfflineBundle(process.argv[2], process.argv[3], process.argv[4]);
+      verifyOfflineBundle(process.argv[2], process.argv[3], process.argv[4], process.argv[5]);
     }
   } catch (error) {
     console.error(`verify-offline-bundle failed: ${error.message}`);

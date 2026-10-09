@@ -17,9 +17,12 @@ x-initial-password: &initial-password ""
 # 默认值与固定命名完全一致，生产不需要设置它。
 services:
   # 可信网络保护组件：只给它 NET_ADMIN，业务 Node-RED 实例不获得该权限。
+  # POLICY_IMAGE 应是只包含策略/防火墙入口的最小镜像，不应复用 Manager 业务镜像。
+  # 未显式设置时暂时回退 MANAGER_IMAGE 只为兼容旧现场；新部署和升级必须在
+  # .env 中填写与发行包配套的策略镜像。构建覆盖文件会自动使用本地 policy:dev。
   # 首次部署应确认宿主支持已验证的 iptables(nf_tables) 后端；不支持时不会放行新实例。
   network-isolation:
-    image: ${NETWORK_IMAGE:-${MANAGER_IMAGE:-mqttsnet/thinglinks-edge:1.0.1}}
+    image: ${NETWORK_IMAGE:-${POLICY_IMAGE:-${MANAGER_IMAGE:-mqttsnet/thinglinks-edge:1.0.1}}}
     container_name: ${EDGE_NAME_PREFIX:-thinglinks-edge}-network-isolation
     command: ["node", "dist/network-isolation-main.js"]
     restart: unless-stopped
@@ -50,8 +53,10 @@ services:
       retries: 3
 
   # 独立 Docker 执行策略服务。只有它持有 socket；请求体、资源归属及镜像均需校验。
+  # POLICY_IMAGE 应是只包含策略入口的最小镜像，不应复用 Manager 业务镜像。
+  # 未显式设置时暂时回退 MANAGER_IMAGE 只为兼容旧现场，见上方说明。
   docker-proxy:
-    image: ${PROXY_IMAGE:-${MANAGER_IMAGE:-mqttsnet/thinglinks-edge:1.0.1}}
+    image: ${PROXY_IMAGE:-${POLICY_IMAGE:-${MANAGER_IMAGE:-mqttsnet/thinglinks-edge:1.0.1}}}
     container_name: ${EDGE_NAME_PREFIX:-thinglinks-edge}-docker-proxy
     restart: unless-stopped
     command: ["node", "dist/docker-policy-main.js"]

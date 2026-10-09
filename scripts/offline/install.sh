@@ -78,6 +78,33 @@ if [ "$ASSUME_YES" = "0" ] && ! grep -q '^INITIAL_PASSWORD=.\+' .env && [ -z "${
   export INITIAL_PASSWORD
 fi
 
+# Before copying seed data or starting services, verify both package membership
+# and each precise role. With a separate policy image, "some image in this
+# package" is not sufficient: it must not silently run as Manager or vice versa.
+PACKAGE_IMAGES="$(sed -n 's/^[[:space:]]*"image": "\([^"]*\)".*/\1/p' manifest.json)"
+[ -n "$PACKAGE_IMAGES" ] || die "安装包未声明镜像清单，请重新生成离线包"
+COMPOSE_IMAGES="$(docker compose -f docker-compose.yml -f docker-compose.offline.yml config --images)" \
+  || die "Compose 镜像配置无法解析，请检查 .env"
+while IFS= read -r IMAGE_REF; do
+  [ -n "$IMAGE_REF" ] || continue
+  printf '%s\n' "$PACKAGE_IMAGES" | grep -Fqx "$IMAGE_REF" \
+    || die "Compose 引用了包外镜像 ${IMAGE_REF}。请按本包 .env.example 更新镜像配置"
+done <<< "$COMPOSE_IMAGES"
+PACKAGE_MANAGER_IMAGE="$(sed -n 's/^[[:space:]]*"manager": "\([^"]*\)".*/\1/p' manifest.json)"
+[ -n "$PACKAGE_MANAGER_IMAGE" ] && printf '%s\n' "$PACKAGE_IMAGES" | grep -Fqx "$PACKAGE_MANAGER_IMAGE" \
+  || die "安装包 Manager 角色未绑定镜像清单"
+[ -f image-roles.mjs ] && [ ! -L image-roles.mjs ] || die "安装包缺少角色校验器，请重新生成离线包"
+# No host Node.js dependency: run only the pure JSON validator in the bundled
+# Manager image. Compose JSON (which contains credentials) stays on stdin and
+# is never written to a file or printed. No socket, data root or network access.
+docker compose -f docker-compose.yml -f docker-compose.offline.yml config --format json \
+  | docker run --rm -i --network none --read-only --cap-drop ALL \
+      --security-opt no-new-privileges:true --user 1000:1000 --entrypoint node \
+      -v "$(pwd)/manifest.json:/verify/manifest.json:ro" \
+      -v "$(pwd)/image-roles.mjs:/verify/image-roles.mjs:ro" \
+      "$PACKAGE_MANAGER_IMAGE" /verify/image-roles.mjs /verify/manifest.json \
+  || die "Compose 与离线包镜像角色不一致，请按本包 .env.example 更新配置"
+
 # ── 4. 预置节点包（01 号文 5.7）─────────────────────────
 #
 # 拷进 <EDGE_DATA_ROOT>/manager/npm-seed/，Manager 启动时自动扫进私有源。
@@ -110,17 +137,6 @@ fi
 # ── 5. 起服务 ────────────────────────────────────────────
 say ""
 say "── 启动 ──"
-# Existing .env files can still point to an older Manager or socket-proxy image.
-# Never let an installed host tag silently replace an image from this delivery.
-PACKAGE_IMAGES="$(sed -n 's/^[[:space:]]*"image": "\([^"]*\)".*/\1/p' manifest.json)"
-[ -n "$PACKAGE_IMAGES" ] || die "安装包未声明镜像清单，请重新生成离线包"
-COMPOSE_IMAGES="$(docker compose -f docker-compose.yml -f docker-compose.offline.yml config --images)" \
-  || die "Compose 镜像配置无法解析，请检查 .env"
-while IFS= read -r IMAGE_REF; do
-  [ -n "$IMAGE_REF" ] || continue
-  printf '%s\n' "$PACKAGE_IMAGES" | grep -Fqx "$IMAGE_REF" \
-    || die "Compose 引用了包外镜像 ${IMAGE_REF}。请按本包 .env.example 更新 MANAGER_IMAGE、PROXY_IMAGE、NETWORK_IMAGE 等镜像配置；三个服务必须使用同一发行构件"
-done <<< "$COMPOSE_IMAGES"
 # offline 覆盖层让「镜像没 load 进去」当场失败，而不是去连网拉
 docker compose -f docker-compose.yml -f docker-compose.offline.yml up -d
 

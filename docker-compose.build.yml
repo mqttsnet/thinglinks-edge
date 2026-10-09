@@ -7,10 +7,29 @@
 # （它会认为这个服务归你自己构建），而现场升级走的正是 pull。
 # 主文件保持「纯拉取」，构建能力放在这里叠加，两条路径各自干净。
 #
-# image 与主文件写成同一个值：构建产物直接顶掉本地那份同名镜像，
-# 于是 `docker compose up -d`（不带 -f 覆盖）跑的就是你刚编的东西，
-# 不会出现「以为在测新代码、其实跑的是拉下来的旧镜像」。
+# Manager 仍使用主文件的镜像引用。独立策略镜像未设置 POLICY_IMAGE 时使用
+# thinglinks-edge-policy:dev；启动时继续带本覆盖文件，或将对应镜像写入 .env。
+x-policy-build: &policy-build
+  context: .
+  dockerfile: apps/manager/Dockerfile.policy
+  args:
+    IMAGE_VERSION: dev
+
 services:
+  # Build the privileged helpers as a separate image. The main compose file
+  # keeps its published-image defaults for normal upgrades; this override is
+  # the reproducible local-source path and never tags the result as Manager.
+  # Both roles deliberately share POLICY_IMAGE here. Separate PROXY_IMAGE and
+  # NETWORK_IMAGE overrides remain available in the image-only main file, but
+  # must not make Compose build two distinct service-labelled policy artifacts.
+  network-isolation:
+    build: *policy-build
+    image: ${POLICY_IMAGE:-thinglinks-edge-policy:dev}
+
+  docker-proxy:
+    build: *policy-build
+    image: ${POLICY_IMAGE:-thinglinks-edge-policy:dev}
+
   manager:
     build:
       context: .

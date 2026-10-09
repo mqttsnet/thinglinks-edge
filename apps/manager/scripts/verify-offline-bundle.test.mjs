@@ -61,6 +61,7 @@ function fixture({
   proxyCommand = ['node', 'dist/docker-policy-main.js'],
   networkImage = MANAGER,
   networkCapabilities = ['NET_ADMIN'],
+  expectedPolicyId,
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'tle-offline-contract-test-'));
   const bin = join(root, 'bin');
@@ -214,7 +215,7 @@ printf '%s\\n' '${JSON.stringify({ services: {
     bundle,
     tarCalls() { return readFileSync(tarLog, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)); },
     run() {
-      return spawnSync(process.execPath, [VERIFY, bundle, MANAGER, MANAGER_ID], {
+      return spawnSync(process.execPath, [VERIFY, bundle, MANAGER, MANAGER_ID, ...(expectedPolicyId ? [expectedPolicyId] : [])], {
         encoding: 'utf8',
         env: {
           ...process.env,
@@ -238,6 +239,27 @@ test('exact bundle 的 RepoTags、manifest、env 与 compose config 构成同一
     assert.doesNotMatch(result.stdout, /0\/0 通过/);
   } finally {
     bed.cleanup();
+  }
+});
+
+test('separate shared policy image is accepted only with its independently pinned Config ID', () => {
+  const policy = 'fixture/edge-policy:1';
+  const id = bufferId(configBytes(policy, 1));
+  const bed = fixture({ proxyImage: policy, networkImage: policy, expectedPolicyId: id });
+  try {
+    const result = bed.run();
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  } finally { bed.cleanup(); }
+});
+
+test('self-consistent replacement of both policy roles is rejected without the expected policy Config ID', () => {
+  for (const expectedPolicyId of [undefined, `sha256:${'b'.repeat(64)}`]) {
+    const bed = fixture({ proxyImage: 'fixture/edge-policy:1', networkImage: 'fixture/edge-policy:1', expectedPolicyId });
+    try {
+      const result = bed.run();
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /策略.*Config ID/);
+    } finally { bed.cleanup(); }
   }
 });
 

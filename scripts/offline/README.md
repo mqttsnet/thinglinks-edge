@@ -48,7 +48,11 @@ changelogs/                 变更说明
 白名单之外的版本在离线现场没有镜像，创建会被当场拒绝并说明原因。
 `nodeSeed` 与 `nodeSeedIntegrity` 还会列出随包节点的文件名和原始 SHA-512 SRI；
 平台 Edge/common 两个固定包可以据此与发布合同逐字核对。
-`imageRoles` 指明 Manager、Docker 执行策略、网络隔离、初始化和 Node-RED 的角色引用；`images` 是去重后的镜像清单。前三个角色必须使用相同镜像 ID，不能把旧 socket-proxy 或其他网络工具镜像替换进来。
+`imageRoles` 指明 Manager、Docker 执行策略、网络隔离、初始化和 Node-RED 的角色引用；`images` 是去重后的镜像清单。Docker 策略与网络隔离必须共享同一个策略 Config ID；Manager 可以使用不同镜像。旧版三个角色共享同一镜像仍兼容，不能把旧 socket-proxy 或其他网络工具镜像替换进来。
+
+构建双镜像包时设置 `MANAGER_IMAGE` 与 `POLICY_IMAGE`，打包工具将后者分配给两个策略角色。独立内容校验使用 `verify-offline-bundle.mjs <包> <Manager tag> <Manager Config ID> <策略 Config ID>`；两个 Config ID 都应从已审查镜像单独取证，不能从待检包反推。省略最后一个参数仅适用于旧的单镜像包。Config ID 是 `docker save` 内 Config 字节的 SHA-256，可能不同于 Docker Desktop 显示的 OCI descriptor ID。
+
+安装器会在无网络、只读、无额外权限的临时容器中运行随包的 `image-roles.mjs`，逐个核对 Compose 服务的镜像角色。该容器只读取包内清单和校验脚本，不挂载 Docker socket 或业务数据；解析后的 Compose 配置通过标准输入传入，不写入文件或日志。安装机器不需要额外安装 Node.js。
 
 网络隔离组件使用 Docker 宿主网络与 `NET_ADMIN`，只挂载私有控制卷；Docker 策略另有私有状态卷，Manager/Node-RED 不挂载这些卷。包校验会明确核对该权限边界；安装完成和健康检查不等于已完成现场防火墙验收。
 
@@ -97,7 +101,7 @@ npm 会去公网找它的依赖 —— 表现是「包明明在源里，还是�
 
 ## 升级
 
-拿到新版本离线包后，保留原 `.env`、主密钥与数据目录，并按新包 `.env.example` 更新镜像和端口配置，再运行 `install.sh`。尤其要移除旧的 `PROXY_IMAGE=wollomatic/socket-proxy:...`，`PROXY_IMAGE` 和 `NETWORK_IMAGE` 必须与 Manager 来自同一构件；安装器拒绝包外镜像，避免旧配置悄悄运行旧组件。
+拿到新版本离线包后，保留原 `.env`、主密钥与数据目录，并按新包 `.env.example` 更新镜像和端口配置，再运行 `install.sh`。尤其要移除旧的 `PROXY_IMAGE=wollomatic/socket-proxy:...`，`PROXY_IMAGE` 和 `NETWORK_IMAGE` 必须指向包内的策略角色；安装器同时拒绝包外镜像和包内角色错配，避免旧配置悄悄运行旧组件。
 
 升级前先做备份。更新 Manager 不会主动停止现有实例；旧实例下一次启动或重启若不符合新隔离约束，应安排维护窗口重建，并重新验证采集和控制，不要放松隔离参数绕过检查。
 

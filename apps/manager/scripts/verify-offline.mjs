@@ -51,7 +51,7 @@ const SEED_BASE = 'node-red-contrib-tle-offline-seed';
 export function offlineInstallEnvironment(parent, project) {
   const env = { ...parent, COMPOSE_PROJECT_NAME: project };
   for (const key of [
-    'MANAGER_IMAGE', 'PROXY_IMAGE', 'NETWORK_IMAGE', 'INIT_IMAGE', 'NODE_RED_IMAGE_REPO', 'NODE_RED_BOOTSTRAP_IMAGE', 'ALLOWED_IMAGE_TAGS',
+    'MANAGER_IMAGE', 'POLICY_IMAGE', 'PROXY_IMAGE', 'NETWORK_IMAGE', 'INIT_IMAGE', 'NODE_RED_IMAGE_REPO', 'NODE_RED_BOOTSTRAP_IMAGE', 'ALLOWED_IMAGE_TAGS',
     'EXTERNAL_URL', 'BIND_ADDR', 'HOST_PORT', 'EDITOR_PORT_MIN', 'EDITOR_PORT_MAX', 'INSTANCE_PORT_MIN', 'INSTANCE_PORT_MAX',
     'INSTANCE_NETWORK', 'EDGE_NAME_PREFIX', 'EDGE_DATA_ROOT', 'MASTER_KEY', 'MASTER_KEY_FILE', 'INITIAL_PASSWORD',
     'COMPOSE_INITIAL_PASSWORD', 'ADMIN_SETUP_MODE', 'SETUP_WINDOW_MIN', 'COMPOSE_FILE', 'COMPOSE_PROFILES',
@@ -378,7 +378,10 @@ function readBundleManifest(bundle) {
   const manifest = JSON.parse(manifestText);
   const roles = bundleImageRoles(manifest);
   const manager = manifest.images.find(item => item.image === roles.manager);
-  command(process.execPath, [VERIFY_BUNDLE, bundle, manager.image, manager.id], {
+  const policy = manifest.images.find(item => item.image === roles.dockerProxy);
+  // This pass checks bundle consistency, not publisher authenticity. verify-all
+  // separately pins both Config IDs from the reviewed local image descriptors.
+  command(process.execPath, [VERIFY_BUNDLE, bundle, manager.image, manager.id, policy.id], {
     stdio: 'pipe',
     env: { ...process.env },
   });
@@ -617,10 +620,12 @@ export async function runVerification() {
       buildFallback: async () => {
         const version = JSON.parse(readFileSync(join(REPO, 'apps/manager/package.json'), 'utf8')).version;
         const realManager = process.env.MANAGER_IMAGE ?? `mqttsnet/thinglinks-edge:${version}`;
+        const realPolicy = process.env.PROXY_IMAGE || process.env.POLICY_IMAGE || realManager;
+        const realNetwork = process.env.NETWORK_IMAGE || process.env.POLICY_IMAGE || realManager;
         for (const [src, dst] of [
           [realManager, imageAliases.manager],
-          [realManager, imageAliases.proxy],
-          [realManager, imageAliases.network],
+          [realPolicy, imageAliases.proxy],
+          [realNetwork, imageAliases.network],
           ['alpine:3.22', imageAliases.init],
         ]) {
           const sourceId = await createTrackedImageAlias(imageAdapters, aliasLedger, src, dst);

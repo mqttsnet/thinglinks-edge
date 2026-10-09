@@ -6,14 +6,17 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-function fixture({ policyHealthy = true, networkHealthy = true, foreignImage = false, nodeRepo = 'nodered/node-red' } = {}) {
+function fixture({ policyHealthy = true, networkHealthy = true, foreignImage = false, nodeRepo = 'nodered/node-red', separatePolicy = false, swapPolicyRole = false } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'tle-offline-install-test-'));
   const bin = join(root, 'bin'); mkdirSync(bin);
   copyFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../../scripts/offline/install.sh'), join(root, 'install.sh'));
+  copyFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../../scripts/offline/image-roles.mjs'), join(root, 'image-roles.mjs'));
+  const policy = separatePolicy ? 'fixture/policy:1' : 'fixture/manager:1';
   writeFileSync(join(root, 'manifest.json'), JSON.stringify({ platform: 'linux/amd64', images: [
-    { image: 'fixture/manager:1', id: 'fixture-manager-id' }, { image: 'fixture/init:1', id: 'fixture-init-id' },
-    { image: `${nodeRepo}:fixture`, id: 'fixture-node-id' },
-  ], imageRoles: { manager: 'fixture/manager:1', dockerProxy: 'fixture/manager:1', networkIsolation: 'fixture/manager:1',
+    { image: 'fixture/manager:1', id: `sha256:${'a'.repeat(64)}` }, { image: 'fixture/init:1', id: `sha256:${'c'.repeat(64)}` },
+    { image: `${nodeRepo}:fixture`, id: `sha256:${'d'.repeat(64)}` },
+    ...(separatePolicy ? [{ image: policy, id: `sha256:${'b'.repeat(64)}` }] : []),
+  ], imageRoles: { manager: 'fixture/manager:1', dockerProxy: policy, networkIsolation: policy,
     initData: 'fixture/init:1', nodeRed: [`${nodeRepo}:fixture`] } }, null, 2));
   writeFileSync(join(root, '.env'), 'EXTERNAL_URL=http://127.0.0.1:19100\nINITIAL_PASSWORD=local-fixture-password\n');
   const executable = (name, body) => { const path = join(bin, name); writeFileSync(path, `#!/bin/sh\nset -e\n${body}\n`); chmodSync(path, 0o755); };
@@ -24,7 +27,12 @@ case "$*" in
   'compose version') exit 0 ;;
   'version --format {{.Server.Arch}}') echo amd64 ;;
   'load -i images.tar') echo 'Loaded fixture image' ;;
-  *'config --images') printf '%s\\n' fixture/manager:1 fixture/init:1 ${foreignImage ? 'legacy/proxy:1' : `${nodeRepo}:fixture`} ;;
+  *'config --images') printf '%s\\n' fixture/manager:1 fixture/init:1 ${policy} ${foreignImage ? 'legacy/proxy:1' : `${nodeRepo}:fixture`} ;;
+  *'config --format json') printf '%s\\n' '${JSON.stringify({ services: {
+    manager: { image: 'fixture/manager:1' }, 'docker-proxy': { image: swapPolicyRole ? 'fixture/manager:1' : policy },
+    'network-isolation': { image: policy }, 'init-data': { image: 'fixture/init:1' }, 'node-red-image': { image: `${nodeRepo}:fixture` },
+  } })}' ;;
+  run*'/verify/image-roles.mjs /verify/manifest.json') exec '${process.execPath}' '${join(root, 'image-roles.mjs')}' '${join(root, 'manifest.json')}' ;;
   *'up -d') touch '${join(root, 'started')}' ;;
   *'ps'*'docker-proxy'*) echo 'fixture-docker-proxy Up (${policyHealthy ? 'healthy' : 'unhealthy'})' ;;
   *'ps'*'network-isolation'*) echo 'fixture-network-isolation Up (${networkHealthy ? 'healthy' : 'unhealthy'})' ;;
@@ -83,4 +91,18 @@ test('offline installation must not report success when the host network isolati
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /network-isolation/);
   } finally { f.cleanup(); }
+});
+
+test('separate policy image is installable but package-contained role swaps fail before startup', () => {
+  for (const swapPolicyRole of [false, true]) {
+    const f = fixture({ separatePolicy: true, swapPolicyRole });
+    try {
+      const result = f.run();
+      if (swapPolicyRole) {
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /角色不一致/);
+        assert.equal(existsSync(join(f.root, 'started')), false);
+      } else assert.equal(result.status, 0, result.stderr);
+    } finally { f.cleanup(); }
+  }
 });

@@ -1,0 +1,52 @@
+#
+# Dedicated runtime for the two privileged policy boundaries. The final image
+# deliberately has no Manager application, web bundle, database, or npm
+# dependencies. The compile stage makes a clean checkout reproducible: build
+# the image from source instead of copying a developer's `dist/` directory.
+
+# TypeScript emits platform-independent JavaScript. Build on the native build
+# platform so a multi-arch build does not emulate the target architecture.
+FROM --platform=$BUILDPLATFORM node:24.19.0-alpine AS builder
+WORKDIR /repo
+
+RUN apk add --no-cache bash curl \
+  && corepack enable
+
+# Keep the dependency layer reproducible and independent of source changes.
+# The Manager is the only workspace package needed for this compile; the
+# selected policy modules import Node built-ins only at runtime.
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY apps/manager/package.json apps/manager/package.json
+RUN pnpm install --frozen-lockfile --filter @thinglinks-edge/manager --ignore-scripts
+
+COPY tsconfig.base.json ./
+COPY apps/manager/tsconfig.json apps/manager/tsconfig.policy.json apps/manager/
+COPY apps/manager/src apps/manager/src
+RUN rm -rf apps/manager/dist \
+  && pnpm --filter @thinglinks-edge/manager exec tsc -p tsconfig.policy.json
+
+# Keep only the import closure of the two entrypoints. Do not replace these
+# explicit copies with the whole dist directory: a future import change should
+# expand this privileged image only with an intentional review.
+FROM node:24.19.0-alpine AS runtime
+RUN apk add --no-cache iptables iproute2 nftables \
+  && rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack \
+  && rm -f /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack
+
+WORKDIR /app
+COPY --from=builder /repo/apps/manager/dist/docker-policy-main.js ./dist/docker-policy-main.js
+COPY --from=builder /repo/apps/manager/dist/network-isolation-main.js ./dist/network-isolation-main.js
+COPY --from=builder /repo/apps/manager/dist/core/docker-policy ./dist/core/docker-policy
+COPY --from=builder /repo/apps/manager/dist/core/network-isolation ./dist/core/network-isolation
+COPY --from=builder /repo/apps/manager/dist/core/instance/container-isolation.js ./dist/core/instance/container-isolation.js
+COPY --from=builder /repo/apps/manager/dist/core/instance/container-spec.js ./dist/core/instance/container-spec.js
+COPY --from=builder /repo/apps/manager/dist/core/instance/network-bootstrap.js ./dist/core/instance/network-bootstrap.js
+COPY --from=builder /repo/apps/manager/dist/core/instance/resource-budget.js ./dist/core/instance/resource-budget.js
+COPY --from=builder /repo/apps/manager/dist/core/archive/tar.js ./dist/core/archive/tar.js
+COPY --from=builder /repo/apps/manager/dist/core/nodes/policy.js ./dist/core/nodes/policy.js
+
+ENV NODE_ENV=production
+USER node
+
+# Compose supplies the entrypoint for each role. Keeping the image command
+# empty prevents one role's command from accidentally being reused by another.
