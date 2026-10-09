@@ -435,6 +435,41 @@ const MIGRATIONS: string[] = [
   PRESENCE_OBSERVERS_SCHEMA,
   // v21 — service-qualified point identities; preserve ambiguous legacy history separately.
   SERVICE_SCOPED_FIELDS_SCHEMA,
+  // v22 —— device HTTP ingress bindings and durable replay/rate-limit state.
+  `
+  CREATE TABLE device_http_binding (
+    id                    TEXT PRIMARY KEY,
+    instance_id           TEXT NOT NULL REFERENCES instance(id) ON DELETE CASCADE,
+    target_path           TEXT NOT NULL,
+    device_id             TEXT NOT NULL,
+    secret_enc            TEXT NOT NULL,
+    enabled               INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+    max_body_bytes        INTEGER NOT NULL DEFAULT 1048576 CHECK (max_body_bytes BETWEEN 1024 AND 8388608),
+    rate_limit_per_minute INTEGER NOT NULL DEFAULT 60 CHECK (rate_limit_per_minute BETWEEN 1 AND 6000),
+    created_by            TEXT NOT NULL DEFAULT '',
+    created_at            TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at            TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (instance_id, target_path, device_id)
+  );
+  CREATE INDEX idx_device_http_binding_instance ON device_http_binding(instance_id);
+
+  CREATE TABLE device_http_nonce (
+    binding_id TEXT NOT NULL REFERENCES device_http_binding(id) ON DELETE CASCADE,
+    nonce      TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (binding_id, nonce)
+  );
+  CREATE INDEX idx_device_http_nonce_expiry ON device_http_nonce(expires_at);
+
+  CREATE TABLE device_http_rate (
+    binding_id    TEXT PRIMARY KEY REFERENCES device_http_binding(id) ON DELETE CASCADE,
+    window_start  INTEGER NOT NULL,
+    request_count INTEGER NOT NULL
+  );
+  `,
+  // v23 — existing URL-only bindings fail closed until explicitly recreated.
+  `ALTER TABLE device_http_binding ADD COLUMN flow_revision TEXT NOT NULL DEFAULT '';`,
 ];
 export function openDb(file: string): Db {
   if (file !== ':memory:') mkdirSync(dirname(file), { recursive: true });

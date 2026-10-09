@@ -10,11 +10,13 @@ import { api, ApiError } from '../../api/client';
 import type { ImageOption, Instance, PortRecord } from '../../api/types';
 import FieldHelp from '../../components/FieldHelp.vue';
 import EditorAccessDialog from './EditorAccessDialog.vue';
+import DeviceHttpBindingsDialog from './DeviceHttpBindingsDialog.vue';
 import { can, canOperate, loadPermissions } from '../../api/permissions';
 
 const router = useRouter();
 const route = useRoute();
 const editorAccess = ref<InstanceType<typeof EditorAccessDialog>>();
+const deviceHttpBindings = ref<InstanceType<typeof DeviceHttpBindingsDialog>>();
 const message = useMessage();
 const dialog = useDialog();
 
@@ -334,6 +336,7 @@ function moreOptions(inst: Instance) {
   const items: { label: string; key: string; props?: Record<string, string> }[] = [];
   if (canOperate(inst.id)) {
     items.push({ label: '升级版本', key: 'upgrade' });
+    items.push({ label: '设备 HTTP 接入', key: 'device-http' });
   }
   if (can('instance:credentials')) items.push({ label: '重置编辑器口令', key: 'reset' });
   // 删除是不可逆的，收进菜单后更要保住红色警示 —— 原先它是一个红色按钮
@@ -345,6 +348,7 @@ function moreOptions(inst: Instance) {
 
 function onMore(key: string | number, inst: Instance): void {
   if (key === 'upgrade') upgradeImage(inst);
+  if (key === 'device-http') void deviceHttpBindings.value?.open(inst);
   if (key === 'reset') resetPassword(inst);
   if (key === 'remove') confirmRemove(inst);
 }
@@ -424,6 +428,7 @@ function onMore(key: string | number, inst: Instance): void {
     </NSpin>
 
     <EditorAccessDialog ref="editorAccess" />
+    <DeviceHttpBindingsDialog ref="deviceHttpBindings" />
     <NModal v-model:show="showCreate" preset="card" title="新建实例" style="max-width: 780px">
       <NForm label-placement="top">
         <NSpace :size="14">

@@ -39,7 +39,7 @@ test('HTTP guidance explains GET, JSON field paths, certificate verification and
   assert.match(httpPollRecipe.notes.join('\n'), /证书.*校验/);
   assert.match(httpReceiveRecipe.parameters.find(item => item.key === 'path')!.description!, /httpNodeRoot/);
   assert.match(httpReceiveRecipe.notes.join('\n'), /basePath.*\/red\/\{实例\}\/api/);
-  assert.match(httpReceiveRecipe.notes.join('\n'), /受保护/);
+  assert.match(httpReceiveRecipe.notes.join('\n'), /设备 HTTP 接入.*HMAC.*HTTPS/);
   assert.match(httpReceiveRecipe.notes.join('\n'), /1880.*编辑器/);
   assert.match(httpReceiveRecipe.notes.join('\n'), /202.*不代表/);
 });

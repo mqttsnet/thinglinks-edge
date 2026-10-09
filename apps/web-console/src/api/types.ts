@@ -84,6 +84,17 @@ export interface Instance {
   openUrl: string;
 }
 
+export interface DeviceHttpBinding {
+  id: string;
+  instanceId: string;
+  targetPath: string;
+  deviceId: string;
+  enabled: boolean;
+  maxBodyBytes: number;
+  rateLimitPerMinute: number;
+  requiresRebind?: boolean;
+}
+
 export interface ContainerHealth {
   state: string;
   running: boolean;

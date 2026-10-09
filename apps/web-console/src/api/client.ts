@@ -19,6 +19,7 @@ import type {
   ModbusReadConnection, ProtocolDiagnosticTask,
   CatalogEntry, StoreListResult, ImportResult, InstanceInventory, ApplyPolicyResult,
   PlatformNodeMigration, ProtocolComponentStatus, InstanceProtocolStatus, CloudModelQuery, CloudModelQueryResult, EdgeCommandRecord,
+  DeviceHttpBinding,
 } from './types';
 import { filenameFrom } from './filename';
 import { fieldQuery } from './field-query';
@@ -93,6 +94,27 @@ export const api = {
   setup: (username: string, password: string, installToken?: string) =>
     request<{ user: SessionUser }>('/api/setup', {
       method: 'POST', body: JSON.stringify({ username, password, ...(installToken ? { installToken } : {}) }),
+    }),
+
+  deviceHttpBindings: (instanceId: string) =>
+    request<{ bindings: DeviceHttpBinding[] }>(`/api/instances/${encodeURIComponent(instanceId)}/device-http-bindings`),
+  createDeviceHttpBinding: (instanceId: string, input: {
+    id: string; targetPath: string; deviceId: string; maxBodyBytes?: number; rateLimitPerMinute?: number;
+  }) => request<{ binding: DeviceHttpBinding; secret: string }>(
+    `/api/instances/${encodeURIComponent(instanceId)}/device-http-bindings`,
+    { method: 'POST', body: JSON.stringify(input) },
+  ),
+  rotateDeviceHttpBinding: (instanceId: string, bindingId: string) =>
+    request<{ secret: string }>(`/api/instances/${encodeURIComponent(instanceId)}/device-http-bindings/${encodeURIComponent(bindingId)}/rotate`, {
+      method: 'POST', body: '{}',
+    }),
+  revalidateDeviceHttpBinding: (instanceId: string, bindingId: string) =>
+    request<void>(`/api/instances/${encodeURIComponent(instanceId)}/device-http-bindings/${encodeURIComponent(bindingId)}/revalidate`, {
+      method: 'POST', body: '{}',
+    }),
+  deleteDeviceHttpBinding: (instanceId: string, bindingId: string) =>
+    request<void>(`/api/instances/${encodeURIComponent(instanceId)}/device-http-bindings/${encodeURIComponent(bindingId)}`, {
+      method: 'DELETE', body: '{}',
     }),
 
   login: (username: string, password: string) =>

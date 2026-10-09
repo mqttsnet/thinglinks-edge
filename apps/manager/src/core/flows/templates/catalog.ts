@@ -1,3 +1,4 @@
+import { DEVICE_ID_PATTERN } from '../../edge/device-identity.ts';
 import { TemplateError, type FlowTemplate, type FlowTemplateWithContent } from '../types.ts';
 import { summarize } from '../parse.ts';
 import { parameterDefaults, validateParameters } from './parameters.ts';
@@ -90,7 +91,7 @@ export function renderBuiltinTemplate(id: string, input: unknown): FlowTemplateW
   const recipe = byId.get(id);
   if (!recipe) return undefined;
   const p = validateParameters(recipe.parameters, input);
-  if (!/^[a-zA-Z0-9_][a-zA-Z0-9_.:-]{0,127}$/.test(String(p.nodeId)))
+  if (!DEVICE_ID_PATTERN.test(String(p.nodeId)))
     throw new TemplateError('子设备标识格式不合法');
   if (String(p.serviceCode ?? '').trim()) resolveServiceCode(p.serviceCode);
   resolvePoints(p.points as Record<string, unknown>[], p.serviceCode);

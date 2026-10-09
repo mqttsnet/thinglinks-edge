@@ -32,7 +32,7 @@ test('v21 preserves legacy current values and history without guessing a service
   db.prepare("INSERT INTO field_value_history(instance_id,node_id,tag_id,at,value) VALUES('i','d','temperature','old-at','19')").run();
   const oldRow = db.prepare('SELECT rowid FROM field_value_history').get();
   try {
-    assert.equal(migrate(db), 21);
+    assert.equal(migrate(db), 23);
     const registry = new FieldRegistry(db);
     assert.deepEqual(registry.tags('i', 'd', '').map(p => [p.serviceCode, p.lastValue, p.name]), [['', 19, 'old']]);
     assert.deepEqual(db.prepare('SELECT rowid FROM field_value_history').get(), oldRow);

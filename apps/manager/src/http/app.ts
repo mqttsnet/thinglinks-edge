@@ -18,6 +18,7 @@ import { registerInstances } from './instance/crud.ts';
 import { registerMetrics } from './health/metrics.ts';
 import { registerSso } from './instance/sso.ts';
 import { registerIngest } from './edge/ingest.ts';
+import { registerDeviceIngress } from './edge/device-ingress.ts';
 import { registerField } from './edge/field.ts';
 import { registerBackup } from './archive/backup.ts';
 import { registerCloud } from './cloud/config.ts';
@@ -104,6 +105,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     registerSso(api, ctx);
     registerEditorAccess(api, ctx);
     registerIngest(api, ctx);
+    registerDeviceIngress(api, ctx);
     registerField(api, ctx);
     registerBackup(api, ctx);
     registerCloud(api, ctx);
