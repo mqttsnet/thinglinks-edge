@@ -90,9 +90,9 @@ export const api = {
   setupState: () => request<SetupState>('/api/setup'),
 
   /** 首次设置。成功即登录，直接回会话 */
-  setup: (username: string, password: string) =>
+  setup: (username: string, password: string, installToken?: string) =>
     request<{ user: SessionUser }>('/api/setup', {
-      method: 'POST', body: JSON.stringify({ username, password }),
+      method: 'POST', body: JSON.stringify({ username, password, ...(installToken ? { installToken } : {}) }),
     }),
 
   login: (username: string, password: string) =>

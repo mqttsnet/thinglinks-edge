@@ -138,7 +138,9 @@ These are optional advanced overrides in `.env`. Ordinary deployments edit only 
 | `MASTER_KEY` | *(empty)* | Legacy environment key. New deployments automatically generate a private key file; existing values preserve the encryption identity. |
 | `MASTER_KEY_FILE` | `<EDGE_DATA_ROOT>/.master.key` | Persistent private key, generated only for a fresh deployment. Store it separately and securely; business backups exclude it. |
 | `INITIAL_PASSWORD` | *(empty)* | Optional legacy environment override for the chosen initial admin password. New accounts require at least 12 characters; existing accounts are unchanged. |
-| `ADMIN_SETUP_MODE` | `password` in Compose | Refuses fresh startup without the chosen password. `browser` retains legacy local/trusted-network browser setup. |
+| `ADMIN_SETUP_MODE` | `password` in Compose | Refuses fresh startup without the chosen password. `browser` requires `SETUP_INSTALL_TOKEN` for every first-setup request, including loopback proxies. |
+| `SETUP_INSTALL_TOKEN` | *(empty)* | Installation token required for browser-mode first setup. Keep it out of screenshots and logs; it is rejected after the first admin is created. |
+| `TRUST_PROXY` | *(empty)* | Trusted reverse-proxy IP/CIDR list for client-IP handling and login rate limits. Empty means the Manager uses the direct socket address and does not trust forwarded headers. Invalid entries, `true` and `/0` are rejected at startup. |
 | `EDGE_DATA_ROOT` | `/data01/mqttsnet/thinglinks-edge` | Host persistence root. The Manager database and every instance's `/data` live under it — one directory to back up, one to look at when troubleshooting. |
 | `TZ` | `Asia/Shanghai` | Timezone for the Manager **and** every instance it creates. Node-RED's official image defaults to UTC; leaving this unset silently skews scheduled flows, shift logic and log timestamps. |
 | `HOST_PORT` / `BIND_ADDR` | `19100` / `0.0.0.0` | Published port. Set `BIND_ADDR=127.0.0.1` when using a host reverse proxy. |

@@ -10,6 +10,7 @@ import { registerEdgeProtocolDiagnostics } from './edge/protocol-diagnostics.ts'
 import Fastify, { type FastifyInstance } from 'fastify';
 import cookie from '@fastify/cookie';
 import { existsSync } from 'node:fs';
+import { isIP } from 'node:net';
 import { join } from 'node:path';
 import { createContext, type ServerDeps } from './context.ts';
 import { registerSession } from './auth/session.ts';
@@ -41,9 +42,34 @@ import { registerEditorAccess } from './instance/editor-access.ts';
 
 export type { ServerDeps } from './context.ts';
 
+/**
+ * Trust forwarded client addresses only when the deployment names its proxy.
+ * An omitted value is fail-closed so a directly exposed Manager cannot accept attacker supplied
+ * X-Forwarded-For values as login-rate-limit identities.
+ */
+export function trustProxySetting(env: NodeJS.ProcessEnv = process.env): boolean | string[] {
+  const raw = env['TRUST_PROXY']?.trim();
+  if (!raw || raw.toLowerCase() === 'false') return false;
+  const values = [...new Set(raw.split(',').map(value => value.trim().toLowerCase()))];
+  const valid = values.length > 0 && values.every(value => {
+    if (['loopback', 'linklocal', 'uniquelocal'].includes(value.toLowerCase())) return true;
+    const slash = value.indexOf('/');
+    const address = slash < 0 ? value : value.slice(0, slash);
+    if (isIP(address) === 0) return false;
+    if (slash < 0) return true;
+    const suffix = value.slice(slash + 1);
+    if (!/^\d{1,3}$/.test(suffix)) return false;
+    const prefix = Number(suffix);
+    // /0 等价于信任所有转发来源，无法形成可审计的代理边界。
+    return Number.isInteger(prefix) && prefix > 0 && prefix <= (isIP(address) === 4 ? 32 : 128);
+  });
+  if (!valid) throw new Error('TRUST_PROXY 必须填写代理的 IP、非零 CIDR 或 loopback/linklocal/uniquelocal；不能设为 true 或任意网段');
+  return values;
+}
+
 export function buildServer(deps: ServerDeps): FastifyInstance {
   const ctx = createContext(deps);
-  const app = Fastify({ logger: false, trustProxy: true });
+  const app = Fastify({ logger: false, trustProxy: trustProxySetting() });
 
   app.register(cookie);
   registerEditorOriginGate(app, ctx);

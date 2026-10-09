@@ -163,6 +163,8 @@ services:
       # 默认禁止对网络开放匿名首次认领；无初始密码的新部署不会开始监听。
       ADMIN_SETUP_MODE: ${ADMIN_SETUP_MODE:-password}
       SETUP_WINDOW_MIN: ${SETUP_WINDOW_MIN:-0}
+      SETUP_INSTALL_TOKEN: ${SETUP_INSTALL_TOKEN:-}
+      TRUST_PROXY: ${TRUST_PROXY:-}
       # 显式给容器名，不要依赖回退。Manager 要把自己接入每个实例的独立网络，
       # 未配置时它退回读 hostname；compose 不设 hostname 时那正好是容器短 id，
       # network connect 也认，于是「碰巧能用」—— 但只要这里加了 hostname:，

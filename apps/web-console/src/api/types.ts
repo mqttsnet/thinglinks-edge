@@ -16,6 +16,9 @@ export interface SetupState {
   expired: boolean;
   /** 窗口剩余秒数；0 表示不限时 */
   expiresInSec: number;
+  /** 浏览器首次设置时，页面必须额外提交安装口令。 */
+  requiresInstallToken?: boolean;
+  installTokenConfigured?: boolean;
 }
 
 // ── 系统设置与两步验证 ────────────────────────────────
