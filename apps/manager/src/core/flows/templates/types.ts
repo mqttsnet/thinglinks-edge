@@ -4,6 +4,8 @@ export type { NodeRequirement } from '../../protocols/types.ts';
 
 /** Declarative data only. Recipe builders never execute parameter expressions. */
 export interface TemplateParameter {
+  /** Text identities such as OPC UA string NodeIds may contain significant spaces. */
+  preserveWhitespace?: boolean;
   /** Current capability restriction; an enabled legacy boolean may only be turned off. */
   disabledReason?: string;
   key: string;
@@ -30,6 +32,8 @@ export interface TemplateRecipe {
   requirements: NodeRequirement[];
   parameters: TemplateParameter[];
   notes: string[];
+  /** Only for disabled catalogue examples; never applied to configured renders. */
+  previewParameters?: Record<string, unknown>;
   /** Explicitly enable a separately delivered controller while preserving legacy recipe limits. */
   controlSupported?: boolean;
   build(parameters: Record<string, unknown>): FlowNode[];

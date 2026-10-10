@@ -19,6 +19,26 @@ const fields: TemplateParameter[] = [
 ];
 const input = () => ({ host: ' 192.168.1.10 ', points: [{ property: 'temperature' }] });
 
+test('conditional required fields follow the selected mode including its default', () => {
+  const conditional: TemplateParameter[] = [
+    { key: 'host', label: '地址', type: 'text', required: true, default: '', visibleWhen: { key: 'mode', value: 'client' } },
+    { key: 'mode', label: '模式', type: 'select', default: 'server', options: [{ label: '服务端', value: 'server' }, { label: '客户端', value: 'client' }] },
+  ];
+  assert.equal(validateParameters(conditional, {}).host, '');
+  assert.equal(validateParameters(conditional, { host: '   ' }).host, '');
+  assert.throws(() => validateParameters(conditional, { mode: 'client' }), /地址/);
+  assert.throws(() => validateParameters(conditional, { mode: 'client', host: ' ' }), /地址/);
+  assert.throws(() => validateParameters(conditional, { host: 123 }), /文本/);
+  assert.equal(validateParameters(conditional, { mode: 'client', host: '192.0.2.1' }).host, '192.0.2.1');
+});
+
+test('identity text can opt into preserving significant whitespace while ordinary fields remain trimmed', () => {
+  const schema: TemplateParameter[] = [{ key: 'source', label: 'NodeId', type: 'text', required: true, preserveWhitespace: true }];
+  assert.equal(validateParameters(schema, { source: 'ns=2;s=Temperature ' }).source, 'ns=2;s=Temperature ');
+  assert.throws(() => validateParameters(schema, { source: '   ' }), /不能为空/);
+  assert.equal(validateParameters([{ ...schema[0]!, preserveWhitespace: false }], { source: 'x ' }).source, 'x');
+});
+
 test('defaults are copied and checked parameters preserve explicit values', () => {
   const result = validateParameters(fields, input());
   assert.deepEqual(result, {

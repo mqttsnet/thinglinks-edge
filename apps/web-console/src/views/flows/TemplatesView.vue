@@ -10,6 +10,7 @@ import { useTemplateLibrary } from './composables/useTemplateLibrary';
 import TemplateFilters from './components/TemplateFilters.vue';
 import TemplateEditDialog from './components/TemplateEditDialog.vue';
 import TemplateDeployDialog from './components/TemplateDeployDialog.vue';
+import RefreshButton from '../../components/RefreshButton.vue';
 const message = useMessage();
 const { templates, instances, loading, error, instanceError, filters, filtered, protocolOptions, refresh, remove, download } = useTemplateLibrary();
 const manage = computed(() => can('template:manage'));
@@ -18,6 +19,11 @@ const deployer = ref<InstanceType<typeof TemplateDeployDialog>>();
 function sourceLabel(template: FlowTemplate) {
   if (template.derivedFrom) return `内置模板副本 · ${template.derivedFrom.revision}`;
   return template.source === 'upload' ? '文件导入' : instances.value.find((item) => item.id === template.source)?.name ?? template.source;
+}
+function controlLabel(template: FlowTemplate): string {
+  if (!isBuiltin(template)) return '';
+  const field = template.parameters?.find(item => item.key === 'downlinkEnabled');
+  return field ? (field.disabledReason ? '仅采集' : '可选控制') : '';
 }
 async function downloadTemplate(template: FlowTemplate) {
   try { await download(template); }
@@ -35,7 +41,7 @@ onMounted(refresh);
   <div class="page">
     <div class="bar">
       <div><h2>流程模板</h2><p class="sub">按协议选择采集方案，配置设备和点位后部署到实例</p></div>
-      <NSpace><NButton size="small" :loading="loading" @click="refresh">刷新</NButton>
+      <NSpace><RefreshButton :loading="loading" label="刷新模板" @click="refresh" />
         <NButton v-if="manage" type="primary" size="small" @click="editor?.open()">新建模板</NButton></NSpace>
     </div>
     <TemplateFilters v-model:value="filters" :protocols="protocolOptions" />
@@ -52,6 +58,7 @@ onMounted(refresh);
               <NTag size="small" :type="isBuiltin(template) ? 'info' : 'default'" :bordered="false">{{ isBuiltin(template) ? '内置' : '我的模板' }}</NTag>
               <NTag size="small" :bordered="false">{{ categoryLabel(template.category) }}</NTag>
               <NTag v-for="protocol in template.protocols" :key="protocol" size="small" :bordered="false">{{ protocol }}</NTag>
+              <NTag v-if="controlLabel(template)" size="small" :bordered="false">{{ controlLabel(template) }}</NTag>
             </div>
             <NSpace :size="8" class="actions">
               <NButton v-if="!isBuiltin(template)" size="tiny" secondary @click="downloadTemplate(template)">下载</NButton>

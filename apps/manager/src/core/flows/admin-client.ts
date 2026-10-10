@@ -29,6 +29,15 @@ export class AdminApiError extends Error {
   }
 }
 
+export const MANAGED_FLOW_RESPONSE_MAX_BYTES = 1_048_576;
+
+export class ManagedFlowResponseTooLargeError extends AdminApiError {
+  constructor() {
+    super('实例流程数据超过本次可安全读取的大小限制');
+    this.name = 'ManagedFlowResponseTooLargeError';
+  }
+}
+
 export interface AdminTarget {
   /** 实例上游基址，如 http://tle-nr-line-a:1880 */
   upstream: string;
@@ -125,6 +134,121 @@ export async function getFlows(
 }
 
 export interface FlowSnapshot { rev: string; flows: FlowNode[] }
+
+export interface SingleFlowConfig {
+  id?: string;
+  label?: string;
+  disabled?: boolean;
+  info?: string;
+  env?: unknown[];
+  nodes: FlowNode[];
+  configs?: FlowNode[];
+  [key: string]: unknown;
+}
+
+function singleFlowId(id: unknown): asserts id is string {
+  if (typeof id !== 'string' || !/^[a-zA-Z0-9_.-]{1,128}$/.test(id) || id === 'global') {
+    throw new AdminApiError('单个流程标识不合法');
+  }
+}
+
+async function singleFlowRequest(
+  target: AdminTarget, method: 'GET' | 'POST' | 'DELETE', path: string,
+  flow: SingleFlowConfig | undefined, fetchImpl: FetchLike, timeoutMs: number,
+  responseLimit = MANAGED_FLOW_RESPONSE_MAX_BYTES,
+): Promise<unknown> {
+  const controller = new AbortController();
+  const signal = controller.signal;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const readBounded = async (response: Response, limit: number, flowList = false): Promise<unknown> => {
+    const reader = response.body?.getReader();
+    if (!reader) throw new AdminApiError('受管实例响应格式无效');
+    let size = 0;
+    const chunks: Uint8Array[] = [];
+    for (;;) {
+      const item = await reader.read();
+      if (item.done) break;
+      size += item.value.length;
+      if (size > limit) {
+        await reader.cancel();
+        throw flowList ? new ManagedFlowResponseTooLargeError() : new AdminApiError('受管实例响应超过大小限制');
+      }
+      chunks.push(item.value);
+    }
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  };
+  try {
+    // Bound authentication and operation by one absolute deadline, without anonymous fallback.
+    const auth = await fetchImpl(`${target.upstream}${target.adminRoot}auth/token`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, signal,
+      body: JSON.stringify({ client_id: 'node-red-editor', grant_type: 'password', scope: '*', username: target.username, password: target.password }),
+    });
+    if (!auth.ok) throw new AdminApiError(`向实例换取令牌失败（HTTP ${auth.status}）`, auth.status);
+    const body = await readBounded(auth, 32_768) as { access_token?: unknown } | null;
+    const token = body?.access_token;
+    if (typeof token !== 'string' || !token || token.length > 8192 || /[\s\r\n]/.test(token)) {
+      throw new AdminApiError('实例返回的令牌格式无效');
+    }
+    const response = await fetchImpl(`${target.upstream}${target.adminRoot}${path}`, {
+      method, headers: { authorization: `Bearer ${token}`, accept: 'application/json', 'content-type': 'application/json' },
+      ...(flow ? { body: JSON.stringify(flow) } : {}), signal,
+    });
+    if (!response.ok) throw new AdminApiError(`单个流程操作失败（HTTP ${response.status}）`, response.status);
+    if (method === 'DELETE') return undefined;
+    return await readBounded(response, responseLimit, path === 'flows');
+  } catch (error) {
+    if (error instanceof AdminApiError) throw error;
+    throw new AdminApiError('单个流程操作失败或响应格式无效');
+  } finally {
+    clearTimeout(timer);
+    // Non-success and DELETE responses can have an unread body. Release that connection too.
+    controller.abort();
+  }
+}
+
+/** Node-RED serializes this operation and deploys only changed tabs. Its returned tab ID is authoritative. */
+export async function createSingleFlow(
+  target: AdminTarget, flow: SingleFlowConfig, fetchImpl: FetchLike = fetch, timeoutMs = DEFAULT_TIMEOUT_MS,
+): Promise<{ id: string }> {
+  if (!Array.isArray(flow.nodes)) throw new AdminApiError('单个流程格式无效');
+  const value = await singleFlowRequest(target, 'POST', 'flow', flow, fetchImpl, timeoutMs) as { id?: unknown } | null;
+  singleFlowId(value?.id);
+  return { id: value.id };
+}
+
+export async function getSingleFlow(
+  target: AdminTarget, id: string, fetchImpl: FetchLike = fetch, timeoutMs = DEFAULT_TIMEOUT_MS,
+): Promise<SingleFlowConfig & { id: string }> {
+  singleFlowId(id);
+  const value = await singleFlowRequest(target, 'GET', `flow/${encodeURIComponent(id)}`, undefined, fetchImpl, timeoutMs) as SingleFlowConfig | null;
+  if (!value || value.id !== id) throw new AdminApiError('单个流程响应标识不一致');
+  if (!Array.isArray(value.nodes) || (value.configs !== undefined && !Array.isArray(value.configs))) {
+    throw new AdminApiError('单个流程响应格式无效');
+  }
+  return value as SingleFlowConfig & { id: string };
+}
+
+/** The caller must verify persisted ownership against getSingleFlow before deleting this exact tab. */
+export async function deleteSingleFlow(
+  target: AdminTarget, id: string, fetchImpl: FetchLike = fetch, timeoutMs = DEFAULT_TIMEOUT_MS,
+): Promise<void> {
+  singleFlowId(id);
+  await singleFlowRequest(target, 'DELETE', `flow/${encodeURIComponent(id)}`, undefined, fetchImpl, timeoutMs);
+}
+
+/** Read-only discovery for crash recovery. It never accepts an anonymous authentication fallback. */
+export async function listFlowsAuthenticated(
+  target: AdminTarget, fetchImpl: FetchLike = fetch, timeoutMs = DEFAULT_TIMEOUT_MS,
+  reservedBytes = 0,
+): Promise<FlowNode[]> {
+  if (!Number.isSafeInteger(reservedBytes) || reservedBytes < 0 || reservedBytes > MANAGED_FLOW_RESPONSE_MAX_BYTES) {
+    throw new AdminApiError('流程读取预留容量无效');
+  }
+  const value = await singleFlowRequest(target, 'GET', 'flows', undefined, fetchImpl, timeoutMs,
+    MANAGED_FLOW_RESPONSE_MAX_BYTES - reservedBytes);
+  try { return parseFlows(value); }
+  catch { throw new AdminApiError('受管实例流程清单格式无效'); }
+}
 
 /** v2 revision is mandatory here: omitting it would force an editor overwrite. */
 export async function getFlowSnapshot(
@@ -352,6 +476,24 @@ export async function getInstalledModules(
   timeoutMs = DEFAULT_TIMEOUT_MS,
 ): Promise<InstalledModule[]> {
   const sets = await getInstalledNodeSets(t, fetchImpl, timeoutMs);
+  const byModule = new Map<string, InstalledNodeSet[]>();
+  for (const set of sets) {
+    if (!set.module) continue;
+    const current = byModule.get(set.module) ?? [];
+    current.push(set);
+    byModule.set(set.module, current);
+  }
+  return [...byModule.entries()]
+    .map(([module, moduleSets]) => moduleFromNodeSets(module, moduleSets))
+    .sort((a, b) => a.module.localeCompare(b.module));
+}
+
+/** Diagnostics cannot treat a failed authentication or unbounded response as module readiness evidence. */
+export async function getInstalledModulesAuthenticated(
+  target: AdminTarget, fetchImpl: FetchLike = fetch, timeoutMs = DEFAULT_TIMEOUT_MS,
+): Promise<InstalledModule[]> {
+  const value = await singleFlowRequest(target, 'GET', 'nodes', undefined, fetchImpl, timeoutMs);
+  const sets = parseNodeSets(JSON.stringify(value));
   const byModule = new Map<string, InstalledNodeSet[]>();
   for (const set of sets) {
     if (!set.module) continue;

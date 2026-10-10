@@ -47,6 +47,16 @@ test('端口范围非法时拒绝', () => {
   assert.throws(() => loadConfig(base({ LISTEN_PORT: 'abc' })), ConfigError);
 });
 
+test('editor origin ports are bounded and separate from management and protocol ports', () => {
+  assert.deepEqual(loadConfig(base()).editorPortRange, { min: 19200, max: 19263 });
+  for (const over of [
+    { EDITOR_PORT_MIN: '19300', EDITOR_PORT_MAX: '19200' },
+    { EDITOR_PORT_MIN: '19100', EDITOR_PORT_MAX: '19200' },
+    { EDITOR_PORT_MIN: '30000', EDITOR_PORT_MAX: '30001' },
+    { EDITOR_PORT_MIN: '19000', EDITOR_PORT_MAX: '20000' },
+  ]) assert.throws(() => loadConfig(base(over)), ConfigError);
+});
+
 test('normalizeBasePath 归一各种写法', () => {
   assert.equal(normalizeBasePath('/'), '');
   assert.equal(normalizeBasePath(''), '');

@@ -78,6 +78,16 @@ function readTextField(header: Buffer, offset: number, len: number): string {
   return bytes.subarray(0, nul < 0 ? bytes.length : nul).toString('utf8');
 }
 
+function readOctalField(header: Buffer, offset: number, len: number, label: string): number {
+  const value = header.subarray(offset, offset + len).toString('utf8')
+    .replace(/\0.*$/, '').trim();
+  if (value === '') return 0;
+  if (!/^[0-7]+$/.test(value)) throw new Error(`tar ${label} 字段非法`);
+  const parsed = Number.parseInt(value, 8);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) throw new Error(`tar ${label} 字段非法`);
+  return parsed;
+}
+
 function paxRecord(key: string, value: string): Buffer {
   assertWellFormedUtf16(key, 'PAX key');
   assertWellFormedUtf16(value, 'PAX value');
@@ -125,14 +135,19 @@ export interface TarOwner {
 export interface TarEntry extends TarOwner {
   name: string;
   content: string | Buffer;
+  /** Opt-in archive metadata; never followed by the TAR reader/writer. */
+  symlink?: string;
 }
+
+export interface TarOptions { allowSymlinks?: boolean }
 
 /** 一个 USTAR 头 + 数据 + 补齐，不含结尾空块。 */
 function ustarMember(
   path: { name: string; prefix: string },
   data: Buffer,
   opts: TarOwner,
-  typeflag: '0' | 'x',
+  typeflag: '0' | 'x' | '2',
+  linkname = '',
 ): Buffer {
   const { mode = 0o644, uid = 0, gid = 0 } = opts;
 
@@ -144,6 +159,7 @@ function ustarMember(
   writeOctal(header, 124, 12, data.length);
   writeOctal(header, 136, 12, Math.floor(Date.now() / 1000));
   header.write(typeflag, 156);
+  if (linkname) writeTextField(header, 157, 100, linkname, 'USTAR linkname');
   header.write('ustar\0', 257, 'utf8');
   header.write('00', 263, 'utf8');
   writeTextField(header, 345, USTAR_PREFIX_BYTES, path.prefix, 'USTAR prefix');
@@ -162,7 +178,7 @@ function ustarMember(
 }
 
 /** 单个逻辑文件；超出 USTAR 时先写本地 PAX path，再写安全占位普通头。 */
-function tarMember(name: string, content: string | Buffer, opts: TarOwner = {}): Buffer {
+function tarMember(name: string, content: string | Buffer, opts: TarOwner = {}, symlink?: string): Buffer {
   const data = Buffer.isBuffer(content) ? content : Buffer.from(content, 'utf8');
   assertWellFormedUtf16(name, '文件名');
   const nameBytes = Buffer.from(name, 'utf8');
@@ -170,16 +186,30 @@ function tarMember(name: string, content: string | Buffer, opts: TarOwner = {}):
     throw new Error(`文件名过长或非法（PAX 路径上限 ${PAX_PATH_BYTES} 字节）：${name}`);
   }
   const ustar = splitUstarPath(name);
-  if (ustar) return ustarMember(ustar, data, opts, '0');
+  const typeflag = symlink === undefined ? '0' : '2';
+  if (symlink !== undefined) {
+    assertWellFormedUtf16(symlink, '链接目标');
+    if (!symlink || Buffer.byteLength(symlink) > PAX_PATH_BYTES || symlink.includes('\0') || data.length) {
+      throw new Error('tar 符号链接目标或内容非法');
+    }
+  }
+  const longLink = symlink !== undefined && Buffer.byteLength(symlink) > 100;
+  if (ustar && !longLink) return ustarMember(ustar, data, opts, typeflag, symlink);
 
-  const pathRecord = paxPathRecord(name);
+  const pathRecord = Buffer.concat([
+    ...(!ustar ? [paxPathRecord(name)] : []),
+    ...(longLink ? [paxRecord('linkpath', symlink!)] : []),
+  ]);
+  if (pathRecord.length > PAX_HEADER_BYTES) throw new Error('PAX header 过长');
   const digest = createHash('sha256').update(name).digest('hex').slice(0, 32);
   const paxName = splitUstarPath(`PaxHeaders/${digest}`);
   const placeholder = splitUstarPath(`PaxFiles/${digest}`);
   if (!paxName || !placeholder) throw new Error('PAX 占位路径构造失败');
   return Buffer.concat([
     ustarMember(paxName, pathRecord, { ...opts, mode: 0o600 }, 'x'),
-    ustarMember(placeholder, data, opts, '0'),
+    // libarchive treats a type-2 header with an empty linkname as a regular file
+    // before applying PAX; a nonempty placeholder keeps the type unambiguous.
+    ustarMember(ustar ?? placeholder, data, opts, typeflag, longLink ? 'PaxLink' : symlink),
   ]);
 }
 
@@ -192,9 +222,12 @@ export function tarFile(name: string, content: string | Buffer, opts: TarOwner =
 }
 
 /** 打包多个文件。条目顺序即归档顺序，解包时按同序还原 */
-export function tarArchive(entries: TarEntry[]): Buffer {
+export function tarArchive(entries: TarEntry[], options: TarOptions = {}): Buffer {
   return Buffer.concat([
-    ...entries.map((e) => tarMember(e.name, e.content, e)),
+    ...entries.map((e) => {
+      if (e.symlink !== undefined && !options.allowSymlinks) throw new Error('tar 符号链接必须显式启用');
+      return tarMember(e.name, e.content, e, e.symlink);
+    }),
     TRAILER(),
   ]);
 }
@@ -210,12 +243,13 @@ function decodePaxText(bytes: Buffer, label: string): string {
   }
 }
 
-function parsePaxHeader(content: Buffer): { path?: string } {
+function parsePaxHeader(content: Buffer): { path?: string; linkpath?: string } {
   if (content.length === 0 || content.length > PAX_HEADER_BYTES) {
     throw new Error(`PAX header 大小非法或超过 ${PAX_HEADER_BYTES} 字节`);
   }
   let offset = 0;
   let path: string | undefined;
+  let linkpath: string | undefined;
   while (offset < content.length) {
     const space = content.indexOf(0x20, offset);
     if (space < 0) throw new Error('PAX record 缺少长度分隔符');
@@ -245,31 +279,33 @@ function parsePaxHeader(content: Buffer): { path?: string } {
       keyBytes.length > PAX_KEY_BYTES
       || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(key)
     ) throw new Error('PAX record key 非法');
-    if (key === 'path') {
-      if (path !== undefined) throw new Error('PAX path 重复');
+    if (key === 'path' || key === 'linkpath') {
+      if ((key === 'path' ? path : linkpath) !== undefined) throw new Error(`PAX ${key} 重复`);
       if (valueBytes.length === 0 || valueBytes.length > PAX_PATH_BYTES) {
         throw new Error('PAX path 大小非法');
       }
-      path = decodePaxText(valueBytes, 'path');
+      if (key === 'path') path = decodePaxText(valueBytes, 'path');
+      else linkpath = decodePaxText(valueBytes, 'linkpath');
     }
     // 未使用的安全 key 仍经过长度/NUL/UTF-8 校验，再有界忽略。
     else decodePaxText(valueBytes, `value ${key}`);
     offset = end;
   }
-  return path === undefined ? {} : { path };
+  return { ...(path === undefined ? {} : { path }), ...(linkpath === undefined ? {} : { linkpath }) };
 }
 
 /**
  * 解包。
  *
- * 只认普通文件（typeflag `0` / `\0`）和紧邻其后的本地 PAX `x` path。
- * 目录、链接及其它类型仍跳过；PAX 严格绑定下一普通文件且只生效一次。
+ * 默认仅返回普通文件（typeflag `0` / `\0`）；普通调用方不会得到可还原链接。
+ * 备份显式启用 allowSymlinks 后才返回 typeflag `2` 与 PAX linkpath，
+ * 并拒绝硬链接及特殊条目。PAX 只绑定紧邻的一个普通文件或已启用的符号链接。
  * 校验和不符直接抛错：备份文件损坏必须当场知道，而不是恢复出半个系统。
  */
-export function untar(archive: Buffer): TarEntry[] {
+export function untar(archive: Buffer, options: TarOptions = {}): TarEntry[] {
   const out: TarEntry[] = [];
   let off = 0;
-  let pendingPax: { path?: string } | undefined;
+  let pendingPax: { path?: string; linkpath?: string } | undefined;
   while (off + BLOCK <= archive.length) {
     const header = archive.subarray(off, off + BLOCK);
     if (header.every((b) => b === 0)) {
@@ -295,6 +331,9 @@ export function untar(archive: Buffer): TarEntry[] {
       header.subarray(124, 136).toString('utf8').replace(/\0.*$/, '').trim() || '0', 8);
     if (!Number.isSafeInteger(size) || size < 0) throw new Error('tar 条目大小非法');
     const typeflag = String.fromCharCode(header[156] ?? 0x30);
+    const mode = readOctalField(header, 100, 8, 'mode');
+    const uid = readOctalField(header, 108, 8, 'uid');
+    const gid = readOctalField(header, 116, 8, 'gid');
     const start = off + BLOCK;
     if (start + size > archive.length) throw new Error('tar 条目内容被截断');
     const regular = typeflag === '0' || typeflag === '\0' || header[156] === 0;
@@ -302,13 +341,25 @@ export function untar(archive: Buffer): TarEntry[] {
       if (pendingPax) throw new Error('PAX header 未绑定文件前重复出现');
       pendingPax = parsePaxHeader(archive.subarray(start, start + size));
     } else if (regular) {
+      if (pendingPax?.linkpath !== undefined) throw new Error('PAX linkpath 只能绑定符号链接');
       out.push({
         name: pendingPax?.path ?? name,
         content: archive.subarray(start, start + size),
+        mode,
+        uid,
+        gid,
       });
+      pendingPax = undefined;
+    } else if (typeflag === '2' && options.allowSymlinks) {
+      if (size !== 0) throw new Error('tar 符号链接不能包含文件内容');
+      const symlink = pendingPax?.linkpath ?? readTextField(header, 157, 100);
+      if (!symlink) throw new Error('tar 符号链接目标为空');
+      out.push({ name: pendingPax?.path ?? name, content: Buffer.alloc(0), symlink, mode, uid, gid });
       pendingPax = undefined;
     } else if (pendingPax) {
       throw new Error('PAX header 后的条目不是普通文件');
+    } else if (options.allowSymlinks && typeflag !== '5') {
+      throw new Error('备份 tar 包含不支持的条目类型');
     }
     off = start + Math.ceil(size / BLOCK) * BLOCK;
   }

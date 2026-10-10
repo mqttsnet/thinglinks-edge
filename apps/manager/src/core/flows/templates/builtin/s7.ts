@@ -1,4 +1,6 @@
 import type { TemplateRecipe } from '../types.ts';
+import { validateS7Points } from '../industrial-address.ts';
+import { rawPointMappings, resolvePoints } from '../service-mapping.ts';
 import {
   identityFields,
   hostField,
@@ -19,26 +21,34 @@ export const s7Recipe: TemplateRecipe = {
   description: '通过 S7 连接读取变量表，支持定时上报与变化上报。',
   category: 'industrial',
   protocols: ['s7'],
-  revision: '1.0.0',
+  revision: '1.3.0',
+  previewParameters: { host: '192.0.2.20', nodeId: 'example-s7', serviceCode: 'telemetry' },
   requirements: requirements('s7'),
   parameters: [
     ...identityFields,
-    { ...hostField, required: true, default: '127.0.0.1' },
-    portField(102),
-    { key: 'rack', label: '机架号 Rack', type: 'number', default: 0, min: 0, max: 7 },
-    { key: 'slot', label: '槽号 Slot', type: 'number', default: 1, min: 0, max: 31 },
-    intervalField,
-    { key: 'changesOnly', label: '仅在变量变化时上报', type: 'boolean', default: false },
-    pointTable({ sourceLabel: 'PLC 变量地址', sourceDefault: 'DB1,REAL0' }),
+    { ...hostField, required: true, default: '', description: '填写实例可访问的 PLC IP 或主机名，不带协议或路径。127.0.0.1 指实例自身。' },
+    { ...portField(102), description: 'PLC 的 ISO-on-TCP 端口通常为 102；主动采集不需要给实例新增入站端口映射。' },
+    { key: 'rack', label: '机架号 Rack', type: 'number', default: 0, min: 0, max: 7, description: '按 PLC 硬件组态填写机架号，不是机架数量；模板不会自动修改 PLC 配置。' },
+    { key: 'slot', label: '槽号 Slot', type: 'number', default: 1, min: 0, max: 31, description: '填写 CPU 的实际槽号。不同 CPU、LOGO 与项目组态可能不同，不能只根据系列名推断。' },
+    { ...intervalField, description: 'PLC 变量表的采集周期；结合点位数量和请求超时配置，过短周期可能增加设备负担。' },
+    { key: 'timeoutMs', label: 'S7 请求超时（毫秒）', type: 'number', default: 3000, min: 100, max: 60000, group: 'advanced', description: '填写 100–60000 的整数。交给现成节点的请求超时，不等于整个 TCP/ISO-on-TCP 连接建立的总时限。' },
+    { key: 'changesOnly', label: '变化上报并定期同步', type: 'boolean', default: false, description: '开启后变化值即时上报，每 60 秒随下一次成功采样完整同步一次；每次采集仍维持通信状态及本地采样记录。关闭后每次成功采样均上报云端。' },
+    { ...pointTable({ sourceLabel: 'PLC 变量地址', sourceDefault: 'DB1,REAL0' }), description: '使用 NodeS7 地址：DB1,REAL0（浮点）、DB1,INT4（整数）、DB1,X6.0（位）、DB1,STRING8.20（文本）。偏移是字节；地址决定 PLC 原始类型，映射类型决定上报转换。' },
   ],
   notes: [
     ...notes,
+    '变化上报保留每 60 秒一次完整同步兜底；状态观察请求失败会重试，不把本地节点透传当作云端受理回执。',
+    '设备在线表示最近采集通信可用。明确连接失败或连续不可采集窗口后上报离线；重新取得有效样本后恢复。停止/删除采集流程以 60 秒观察租约到期作为兜底，实例停止由平台独立确认。',
     'S7-1200/1500 需按现场策略允许 PUT/GET，并确认数据块访问方式及地址；本模板不会修改 PLC 配置。',
+    '部分 S7-1200/1500 数据块需要关闭优化块访问才可按绝对字节地址读取，请由现场负责人按 PLC 项目策略确认。此节点使用基础 S7 通信，不代表支持所有新 CPU 安全模式。',
+    '采集保留现成节点支持的标量别名与 CHAR 文本数组。数值/位/STRING 数组及日期时间需在自定义流程转换；已有控制仍受其独立地址和类型限制。',
   ],
   build(p) {
     const remote = host(p.host),
       port = integer(p.port, '端口');
     const points = pointsOf(p);
+    validateS7Points(points);
+    const raw = rawPointMappings(resolvePoints(points, p.serviceCode));
     return pipeline(
       p,
       'S7 PLC 采集',
@@ -46,7 +56,7 @@ export const s7Recipe: TemplateRecipe = {
       `${remote}:${port}`,
       [
         {
-          id: 'connection',
+          id: 'connection', z: 'tab',
           type: 's7 endpoint',
           transport: 'iso-on-tcp',
           address: remote,
@@ -61,9 +71,9 @@ export const s7Recipe: TemplateRecipe = {
           adapter: '',
           busaddr: 2,
           cycletime: Number(p.interval) * 1000,
-          timeout: 3000,
+          timeout: integer(p.timeoutMs, 'S7 请求超时'),
           name: 'S7 连接',
-          vartable: points.map((point) => ({ name: String(point.property), addr: String(point.source) })),
+          vartable: raw.reads.map((point) => ({ name: point.alias, addr: point.source })),
         },
         {
           id: 'input',
@@ -73,14 +83,15 @@ export const s7Recipe: TemplateRecipe = {
           endpoint: 'connection',
           mode: 'all',
           variable: '',
-          diff: p.changesOnly,
+          diff: false,
           x: 160,
           y: 160,
           wires: [['decode']],
         },
       ],
       'json',
-      points.map((point) => ({ ...point, source: point.property })),
+      raw.points.map((point) => ({ ...point, source: point.rawAlias })),
+      { protocol: 's7', sourceIds: ['input', 'connection'], changesOnly: p.changesOnly === true, failureWindowMs: Math.ceil(Math.max(10000, Number(p.interval) * 3000 + Number(p.timeoutMs))) },
     );
   },
 };

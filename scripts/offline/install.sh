@@ -78,6 +78,33 @@ if [ "$ASSUME_YES" = "0" ] && ! grep -q '^INITIAL_PASSWORD=.\+' .env && [ -z "${
   export INITIAL_PASSWORD
 fi
 
+# Before copying seed data or starting services, verify both package membership
+# and each precise role. With a separate policy image, "some image in this
+# package" is not sufficient: it must not silently run as Manager or vice versa.
+PACKAGE_IMAGES="$(sed -n 's/^[[:space:]]*"image": "\([^"]*\)".*/\1/p' manifest.json)"
+[ -n "$PACKAGE_IMAGES" ] || die "安装包未声明镜像清单，请重新生成离线包"
+COMPOSE_IMAGES="$(docker compose -f docker-compose.yml -f docker-compose.offline.yml config --images)" \
+  || die "Compose 镜像配置无法解析，请检查 .env"
+while IFS= read -r IMAGE_REF; do
+  [ -n "$IMAGE_REF" ] || continue
+  printf '%s\n' "$PACKAGE_IMAGES" | grep -Fqx "$IMAGE_REF" \
+    || die "Compose 引用了包外镜像 ${IMAGE_REF}。请按本包 .env.example 更新镜像配置"
+done <<< "$COMPOSE_IMAGES"
+PACKAGE_MANAGER_IMAGE="$(sed -n 's/^[[:space:]]*"manager": "\([^"]*\)".*/\1/p' manifest.json)"
+[ -n "$PACKAGE_MANAGER_IMAGE" ] && printf '%s\n' "$PACKAGE_IMAGES" | grep -Fqx "$PACKAGE_MANAGER_IMAGE" \
+  || die "安装包 Manager 角色未绑定镜像清单"
+[ -f image-roles.mjs ] && [ ! -L image-roles.mjs ] || die "安装包缺少角色校验器，请重新生成离线包"
+# No host Node.js dependency: run only the pure JSON validator in the bundled
+# Manager image. Compose JSON (which contains credentials) stays on stdin and
+# is never written to a file or printed. No socket, data root or network access.
+docker compose -f docker-compose.yml -f docker-compose.offline.yml config --format json \
+  | docker run --rm -i --network none --read-only --cap-drop ALL \
+      --security-opt no-new-privileges:true --user 1000:1000 --entrypoint node \
+      -v "$(pwd)/manifest.json:/verify/manifest.json:ro" \
+      -v "$(pwd)/image-roles.mjs:/verify/image-roles.mjs:ro" \
+      "$PACKAGE_MANAGER_IMAGE" /verify/image-roles.mjs /verify/manifest.json \
+  || die "Compose 与离线包镜像角色不一致，请按本包 .env.example 更新配置"
+
 # ── 4. 预置节点包（01 号文 5.7）─────────────────────────
 #
 # 拷进 <EDGE_DATA_ROOT>/manager/npm-seed/，Manager 启动时自动扫进私有源。
@@ -117,19 +144,25 @@ say ""
 printf '  等待健康检查'
 HEALTHY=0
 for _ in $(seq 1 60); do
-  state="$(docker compose ps --format '{{.Name}} {{.Status}}' 2>/dev/null | grep manager || true)"
-  case "$state" in
-    *"(healthy)"*) HEALTHY=1; say ""; say "  ✓ ${state}"; break ;;
+  state="$(docker compose ps --format '{{.Name}} {{.Status}}' manager 2>/dev/null || true)"
+  policy_state="$(docker compose ps --format '{{.Name}} {{.Status}}' docker-proxy 2>/dev/null || true)"
+  network_state="$(docker compose ps --format '{{.Name}} {{.Status}}' network-isolation 2>/dev/null || true)"
+  case "$state|$policy_state|$network_state" in
+    *"(healthy)"*"|"*"(healthy)"*"|"*"(healthy)"*) HEALTHY=1; say ""; say "  ✓ Manager、Docker 执行策略与网络隔离服务均已就绪"; break ;;
   esac
   printf '.'
   sleep 2
 done
-[ "$HEALTHY" = "1" ] || die "Manager 未就绪，请检查访问地址、初始密码和 docker compose logs manager"
+[ "$HEALTHY" = "1" ] || die "Manager、docker-proxy 或 network-isolation 未就绪。请检查同版本镜像、网络后端、端口配置，并查看 docker compose logs manager docker-proxy network-isolation"
 
 say ""
 say "── 完成 ──"
 say "  控制台： $(grep '^EXTERNAL_URL=' .env | cut -d= -f2-)"
 say "  首次部署请使用 admin 和刚才配置的密码登录；已有账号保持不变。"
+say "  编辑器使用独立端口（默认 19200–19263）；请放通配置范围，HTTPS 反代需逐端口转发到相同后端端口。"
+say "  请始终使用 EXTERNAL_URL 的主机名访问；localhost 与 127.0.0.1 的登录 Cookie 不通用。"
+say "  网络保护组件在 Docker 宿主网络中运行，仅它获得 NET_ADMIN；Mac 原生宿主 IP 需明确配置为 PROTECTED_HOST_IPS。"
+say "  宿主服务例外通过 ALLOWED_HOST_ENDPOINTS 的精确 IPv4/端口/协议 JSON 配置，网络变化后需重新验证。"
 say ""
 if [ -d node-seed ]; then
   # 不在这里逐个列名字：一个节点包连着十几个依赖包，列出来是几十行噪音。
@@ -138,6 +171,10 @@ if [ -d node-seed ]; then
   say ""
 fi
 say "  实例镜像已随包装好，创建实例时可直接选："
-grep -o '"nodered/node-red:[^"]*"' manifest.json | tr -d '"' | sed 's/^/    /'
+awk '
+  /"nodeRed"[[:space:]]*:[[:space:]]*\[/ { in_nodes = 1; next }
+  in_nodes && /\]/ { in_nodes = 0; next }
+  in_nodes { sub(/^[[:space:]]*"/, ""); sub(/"[,]?[[:space:]]*$/, ""); print "    " $0 }
+' manifest.json
 say ""
 say "  自检（建议装完跑一次）： docker compose exec manager node dist/index.js preflight"

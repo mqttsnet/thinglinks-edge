@@ -11,17 +11,33 @@
  *
  * 元数据不落库，每次从 tgz 现读。理由是**它们必须永远一致**：
  * 库里记 1.2.3、盘上其实是 1.2.4 的话，npm 会在下载完成后校验失败，
- * 而那个错误信息（integrity mismatch）完全指不到根因。现读虽然慢一点，
- * 但源头只有一个，不存在对不上的可能。节点包总共也就几十个，慢不到哪去。
+ * 而那个错误信息（integrity mismatch）完全指不到根因。列表请求在本次请求内
+ * 复用最新版本的读取结果，下一次刷新仍重新读取文件，不维护跨请求的元数据缓存。
  */
 import { createHash } from 'node:crypto';
-import { gunzipSync } from 'node:zlib';
+import { gunzipSync, gunzip } from 'node:zlib';
+import { readFile, stat } from 'node:fs/promises';
+import { setImmediate as yieldToRequests } from 'node:timers/promises';
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, rmSync, existsSync }
   from 'node:fs';
 import { join, dirname } from 'node:path';
 import { untar } from '../archive/tar.ts';
 import { assertModuleName, NodePolicyError } from './policy.ts';
 import { PLATFORM_COMMON_PACKAGE, PLATFORM_NODE_PACKAGE } from './platform-contract.ts';
+
+/** Bound both compressed input and the expanded archive before parsing metadata. */
+export const MAX_PACKAGE_TGZ_BYTES = 64 * 1024 * 1024;
+export const MAX_PACKAGE_TAR_BYTES = 128 * 1024 * 1024;
+export const MAX_PACKAGE_ENTRIES = 10_000;
+export const MAX_PACKAGE_ENTRY_BYTES = 16 * 1024 * 1024;
+
+/** A listing must not claim a complete dependency closure after an observed archive vanished. */
+export class NodeStoreChangedError extends Error {
+  constructor() {
+    super('离线包库在读取期间发生变化，请刷新后重试');
+    this.name = 'NodeStoreChangedError';
+  }
+}
 
 /** 从 tgz 里读出来的包元数据 */
 export interface PackageMeta {
@@ -87,18 +103,31 @@ const ROOT_PKG_JSON = /^[^/]+\/package\.json$/;
 
 /** 解析一个 .tgz，读出元数据。文件损坏或不是 npm 包时抛错 */
 export function readPackage(tgz: Buffer): Omit<PackageMeta, 'updatedAt'> {
+  if (tgz.length > MAX_PACKAGE_TGZ_BYTES) {
+    throw new NodePolicyError(`压缩包大小超过 ${MAX_PACKAGE_TGZ_BYTES} 字节`);
+  }
   let tar: Buffer;
   try {
-    tar = gunzipSync(tgz);
+    tar = gunzipSync(tgz, { maxOutputLength: MAX_PACKAGE_TAR_BYTES });
   } catch (e) {
-    throw new NodePolicyError(`不是有效的 gzip 文件：${(e as Error).message}`);
+    throw new NodePolicyError(`不是有效的 gzip 文件或解压后超过 tar 大小上限：${(e as Error).message}`);
   }
+  return packageMetadata(tgz, tar);
+}
+
+/** Sync installation reads and asynchronous catalogue reads share exactly the same validation. */
+function packageMetadata(tgz: Buffer, tar: Buffer): Omit<PackageMeta, 'updatedAt'> {
+  if (tar.length > MAX_PACKAGE_TAR_BYTES) throw new NodePolicyError(`解压后的 tar 超过 ${MAX_PACKAGE_TAR_BYTES} 字节`);
 
   let entries;
   try {
     entries = untar(tar);
   } catch (e) {
     throw new NodePolicyError(`tar 解析失败：${(e as Error).message}`);
+  }
+  if (entries.length > MAX_PACKAGE_ENTRIES) throw new NodePolicyError(`tar 条目数量超过 ${MAX_PACKAGE_ENTRIES}`);
+  if (entries.some(entry => Buffer.byteLength(entry.content) > MAX_PACKAGE_ENTRY_BYTES)) {
+    throw new NodePolicyError(`tar 单个条目超过 ${MAX_PACKAGE_ENTRY_BYTES} 字节`);
   }
 
   const candidates = entries.filter((f) => ROOT_PKG_JSON.test(f.name));
@@ -297,7 +326,61 @@ export class NodeStore {
       updatedAt: statSync(file).mtime.toISOString(),
     };
   }
+
+  /** 列表读取不在主线程同步读盘/解压；解析和完整性校验与安装路径一致。 */
+  async metaAsync(module: string, version: string): Promise<PackageMeta | undefined> {
+    const file = this.#pathOf(module, version);
+    let tgz: Buffer;
+    let updatedAt: string;
+    try {
+      const info = await stat(file);
+      if (info.size > MAX_PACKAGE_TGZ_BYTES) {
+        throw new NodePolicyError(`压缩包大小超过 ${MAX_PACKAGE_TGZ_BYTES} 字节`);
+      }
+      tgz = await readFile(file);
+      updatedAt = info.mtime.toISOString();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw error;
+    }
+    if (tgz.length > MAX_PACKAGE_TGZ_BYTES) {
+      throw new NodePolicyError(`压缩包大小超过 ${MAX_PACKAGE_TGZ_BYTES} 字节`);
+    }
+    const tar = await new Promise<Buffer>((resolve, reject) => {
+      gunzip(tgz, { maxOutputLength: MAX_PACKAGE_TAR_BYTES }, (error, result) => {
+        if (error) reject(new NodePolicyError(`不是有效的 gzip 文件或解压后超过 tar 大小上限：${error.message}`));
+        else resolve(result);
+      });
+    });
+    return { ...packageMetadata(tgz, tar), updatedAt };
+  }
+
+  /**
+   * 仅用于列表的请求内快照：枚举所有版本，但只解析每个包的最新版本。
+   * 依赖闭包本就只遍历最新版本。同一个依赖被多个根引用也只解包一次，
+   * 包间让出事件循环，让批准清单等轻量请求及时返回。
+   */
+  async latestSnapshot(): Promise<LatestStoreSnapshot> {
+    const modules = this.modules();
+    const versions = new Map(modules.map(module => [module, this.versions(module)]));
+    const metadata = new Map<string, PackageMeta>();
+    for (const module of modules) {
+      const latest = versions.get(module)?.at(-1);
+      if (latest === undefined) continue;
+      const meta = await this.metaAsync(module, latest);
+      if (!meta) throw new NodeStoreChangedError();
+      metadata.set(`${module}@${latest}`, meta);
+      await yieldToRequests();
+    }
+    return {
+      modules: () => modules,
+      versions: module => versions.get(module) ?? [],
+      meta: (module, version) => metadata.get(`${module}@${version}`),
+    };
+  }
 }
+
+export type LatestStoreSnapshot = Pick<NodeStore, 'modules' | 'versions' | 'meta'>;
 
 /**
  * semver 排序。只比数字段，预发布标记一律排在同版本正式版之前。
@@ -351,7 +434,7 @@ export interface ClosureReport {
 }
 
 export function closureReport(
-  store: NodeStore, module: string, version: string,
+  store: Pick<NodeStore, 'versions' | 'meta'>, module: string, version: string,
 ): ClosureReport {
   const missing = new Set<string>();
   const missingOptional = new Set<string>();

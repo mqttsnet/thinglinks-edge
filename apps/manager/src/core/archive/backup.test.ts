@@ -1,6 +1,6 @@
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import fsPromises, { mkdtemp, mkdir, writeFile, readFile, rm, symlink, lstat } from 'node:fs/promises';
+import fsPromises, { chmod, mkdtemp, mkdir, writeFile, readFile, rm, symlink, lstat, stat } from 'node:fs/promises';
 import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -287,6 +287,54 @@ test('备份安全回归：归档后段非法时正式数据库与流程必须�
   assert.deepEqual(await readFile(flowPath), flowBefore,
     '拒绝归档必须保留整个旧实例数据');
   await assert.rejects(() => readFile(join(f.root, 'escaped.txt')), { code: 'ENOENT' });
+});
+
+test('备份拒绝实例根目录符号链接，不跟随到数据根外', async (t) => {
+  const f = await fixture(t);
+  const outside = join(f.root, 'outside-backup-root');
+  await mkdir(outside);
+  await writeFile(join(outside, 'outside-sentinel.txt'), 'must-not-leak');
+  await rm(join(f.instRoot, 'line-a'), { recursive: true, force: true });
+  await symlink(outside, join(f.instRoot, 'line-a'));
+
+  await assert.rejects(
+    () => createBackup({
+      db: f.db, key: KEY, instanceDataRoot: f.instRoot, schemaVersion: 2,
+      instances: [{ id: 'line-a', name: '一号线', imageTag: 'tag' }],
+    }),
+    /符号链接|不可信|实例目录/,
+  );
+});
+
+test('备份恢复保留受管文件的可执行模式', async (t) => {
+  const f = await fixture(t);
+  const script = join(f.instRoot, 'line-a', 'node-red-helper.sh');
+  await writeFile(script, '#!/bin/sh\nexit 0\n');
+  await chmod(script, 0o755);
+  const archive = await createBackup({
+    db: f.db, key: KEY, instanceDataRoot: f.instRoot, schemaVersion: 2,
+    instances: [{ id: 'line-a', name: '一号线', imageTag: 'tag' }],
+  });
+  const target = join(f.root, 'restore-mode');
+  await restoreBackup({ archive, dataRoot: target, key: KEY });
+  assert.equal((await stat(join(target, 'instances', 'line-a', 'node-red-helper.sh'))).mode & 0o777, 0o755);
+});
+
+test('恢复在写入者未停机时先执行 quiescence 门禁并且不改数据', async (t) => {
+  const f = await fixture(t);
+  const archive = await createBackup({
+    db: f.db, key: KEY, instanceDataRoot: f.instRoot, schemaVersion: 2,
+    instances: [{ id: 'line-a', name: '一号线', imageTag: 'tag' }],
+  });
+  const target = join(f.root, 'restore-running');
+  await assert.rejects(
+    () => restoreBackup({
+      archive, dataRoot: target, key: KEY,
+      assertQuiesced: async () => { throw new BackupError('恢复要求所有 Manager 与实例写入者已停止'); },
+    }),
+    /写入者已停止/,
+  );
+  await assert.rejects(() => lstat(join(target, '.restore-transaction')));
 });
 
 for (const scope of ['文件', '实例目录', '数据根目录'] as const) {

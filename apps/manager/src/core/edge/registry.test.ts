@@ -76,6 +76,21 @@ test('质量码缺省为 good，可显式覆盖', () => {
   assert.equal(q['b'], 'bad');
 });
 
+test('observer-controlled values and state transitions preserve the last data time', () => {
+  const { db, reg } = fresh();
+  try {
+    reg.upsertDevice('line-a', { nodeId: 'p', name: 'Device' });
+    reg.recordValues('line-a', [{ nodeId: 'p', tagId: 't', value: 7, at: '2026-09-14T00:00:00.000Z' }], { updateOnline: false });
+    assert.equal(reg.devices('line-a')[0]!.online, false);
+    reg.setObservedOnline('line-a', 'p', true);
+    assert.equal(reg.devices('line-a')[0]!.online, true);
+    reg.setObservedOnline('line-a', 'p', false);
+    assert.equal(reg.devices('line-a')[0]!.online, false);
+    assert.equal(reg.devices('line-a')[0]!.lastSeen, '2026-09-14T00:00:00.000Z');
+    assert.equal(reg.tags('line-a')[0]!.lastValue, 7);
+  } finally { db.close(); }
+});
+
 test('删除实例时台账随之清空（外键级联）', () => {
   const { db, reg } = fresh();
   reg.upsertDevice('line-a', { nodeId: 'plc-1', name: 'x' });

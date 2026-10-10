@@ -88,3 +88,122 @@ test('register is idempotent and unregister is safe to repeat', async () => {
   assert.equal(registry.count('line-a'), 0);
   await registry.closeAndDrain('line-a', { code: 1012, timeoutMs: 10 });
 });
+
+test('revoking an instance grant closes only that user on that instance', () => {
+  const registry = new ProxySessionRegistry();
+  const closed: string[] = [];
+  const registrations: Array<() => void> = [];
+  for (const [username, instanceId] of [['alice', 'line-a'], ['alice', 'line-b'], ['bob', 'line-a']]) {
+    const authorization = registry.authorize({ username: username!, instanceId: instanceId!, sessionId: username! }, () => true);
+    const unregister = authorization.register({ close: () => { closed.push(`${username}@${instanceId}`); } });
+    assert.ok(unregister);
+    registrations.push(unregister);
+  }
+  registry.closeUser('alice', 'line-a');
+  assert.deepEqual(closed, ['alice@line-a']);
+  assert.equal(registry.count('line-a'), 1);
+  assert.equal(registry.count('line-b'), 1);
+  registrations.forEach((unregister) => unregister());
+});
+
+test('logout closes only the matching login session, including pending upgrades', () => {
+  const registry = new ProxySessionRegistry();
+  const closed: string[] = [];
+  const pending = registry.authorize({ username: 'alice', instanceId: 'line-a', sessionId: 'old' }, () => true);
+  const other = registry.authorize({ username: 'alice', instanceId: 'line-a', sessionId: 'other' }, () => true);
+  const unregister = other.register({ close: () => { closed.push('other'); } });
+  assert.ok(unregister);
+  registry.closeSession('old');
+  pending.register({ close: () => { closed.push('old'); } });
+  assert.deepEqual(closed, ['old']);
+  assert.equal(registry.count('line-a'), 1);
+  unregister();
+});
+
+test('regrant cannot revive an upgrade authorized before the revocation', () => {
+  const registry = new ProxySessionRegistry();
+  let allowed = true;
+  const pending = registry.authorize({ username: 'alice', instanceId: 'line-a', sessionId: 'sid' }, () => allowed);
+  allowed = false;
+  registry.closeUser('alice', 'line-a');
+  allowed = true;
+  const codes: number[] = [];
+  pending.register({ close: (code) => { codes.push(code); } });
+  assert.deepEqual(codes, [1008]);
+  assert.equal(registry.count('line-a'), 0);
+});
+
+test('registration rechecks authorization and closes an expired upgrade', () => {
+  const registry = new ProxySessionRegistry();
+  let allowed = true;
+  const pending = registry.authorize({ username: 'alice', instanceId: 'line-a', sessionId: 'sid' }, () => allowed);
+  allowed = false;
+  const codes: number[] = [];
+  pending.register({ close: (code) => { codes.push(code); } });
+  assert.deepEqual(codes, [1008]);
+  assert.equal(registry.count('line-a'), 0);
+});
+
+test('authorization checks close expired sessions without requiring client traffic', async () => {
+  const registry = new ProxySessionRegistry({ authorizationCheckMs: 5 });
+  let allowed = true;
+  let closed!: () => void;
+  const closure = new Promise<void>((resolve) => { closed = resolve; });
+  const pending = registry.authorize({ username: 'alice', instanceId: 'line-a', sessionId: 'sid' }, () => allowed);
+  const unregister = pending.register({ close: () => { closed(); } });
+  assert.ok(unregister);
+  const deadline = setTimeout(() => closed(), 500);
+  allowed = false;
+  try {
+    await closure;
+    assert.equal(registry.count('line-a'), 0);
+  } finally {
+    clearTimeout(deadline);
+    unregister();
+  }
+});
+
+test('revocation terminates uncooperative sockets and continues if a close throws', () => {
+  const registry = new ProxySessionRegistry();
+  const terminated: string[] = [];
+  for (const id of ['a', 'b']) {
+    registry.authorize({ username: 'alice', instanceId: 'line-a', sessionId: id }, () => true)
+      .register({ close: () => { throw new Error('closed socket'); }, terminate: () => { terminated.push(id); } });
+  }
+  assert.doesNotThrow(() => registry.closeUser('alice'));
+  assert.deepEqual(terminated, ['a', 'b']);
+  assert.equal(registry.count('line-a'), 0);
+});
+
+test('closing one editor session preserves another instance and notifies related capabilities', () => {
+  const registry = new ProxySessionRegistry();
+  const closed: string[] = [];
+  const notifications: unknown[] = [];
+  const removeListener = registry.onRevoked((target) => { notifications.push(target); });
+  const releases: Array<() => void> = [];
+  for (const instanceId of ['line-a', 'line-b']) {
+    const release = registry.authorize({ username: 'alice', sessionId: 'sid', instanceId }, () => true)
+      .register({ close: () => { closed.push(instanceId); } });
+    assert.ok(release);
+    releases.push(release);
+  }
+  registry.closeSession('sid', 'line-a');
+  assert.deepEqual(closed, ['line-a']);
+  assert.deepEqual(notifications, [{ sessionId: 'sid', instanceId: 'line-a' }]);
+  registry.closeUser('nobody', 'line-a');
+  assert.deepEqual(notifications[1], { username: 'nobody', instanceId: 'line-a' });
+  removeListener();
+  releases.forEach((release) => release());
+});
+
+test('authorization tickets cannot replace a tracked connection with an untracked one', () => {
+  const registry = new ProxySessionRegistry();
+  const closed: string[] = [];
+  const ticket = registry.authorize({ username: 'alice', sessionId: 'sid', instanceId: 'line-a' }, () => true);
+  const first = { close: () => { closed.push('first'); } };
+  const release = ticket.register(first);
+  assert.equal(ticket.register(first), release);
+  ticket.register({ close: () => { closed.push('second'); } });
+  assert.deepEqual(closed, ['first', 'second']);
+  assert.equal(registry.count('line-a'), 0);
+});

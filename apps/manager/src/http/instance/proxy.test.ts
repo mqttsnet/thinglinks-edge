@@ -9,7 +9,15 @@ import {
 } from 'node:http';
 import { once } from 'node:events';
 import type { Socket } from 'node:net';
-import Fastify from 'fastify';
+import fastify from 'fastify';
+import { EditorAccessStore } from '../../core/auth/editor-access.ts';
+
+function Fastify(options: { logger: boolean }) {
+  const app = fastify(options);
+  // These proxy unit fixtures authenticate a synthetic Manager session.
+  app.addHook('onRequest', (req, _reply, done) => { req.cookies = { tle_sid: 'fake-session' }; done(); });
+  return app;
+}
 import WebSocket, { WebSocketServer } from 'ws';
 import { openDb } from '../../core/db.ts';
 import { deriveKey } from '../../core/auth/crypto.ts';
@@ -96,7 +104,12 @@ function proxyContext(
   existingRepo?: InstanceRepo,
 ): HttpContext {
   const repo = existingRepo ?? proxyRepository();
+  const editorAccess = new EditorAccessStore({ credentialFor: (id) => repo.credentials(id)[0] });
+  editorAccess.grant({ sessionId: 'fake-session', username: 'admin', instanceId: 'line-a', scope: '*' });
+  const currentUser = () => ({ username: 'admin', role: 'admin', mustChangePassword: false, mustEnroll2fa: false, totpEnabled: false });
   return {
+    editorAccess,
+    auth: { peek: currentUser },
     config: {
       basePath: '',
       externalUrl: 'http://127.0.0.1:19100',
@@ -454,5 +467,213 @@ test('existing WebSocket receives 1012 and unregisters before snapshot continuat
     });
     upstreamSockets.close();
     await closeServer(upstream);
+  }
+});
+
+test('HTTP proxy does not expose Manager credentials or let an instance set shared-origin cookies', async () => {
+  const upstream = createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json', 'set-cookie': ['tle_sid=forged; Path=/', 'flow_session=foreign; Path=/'] });
+    res.end(JSON.stringify(req.headers));
+  });
+  const port = await listen(upstream);
+  const app = Fastify({ logger: false });
+  registerProxy(app, proxyContext(`http://127.0.0.1:${port}`, new InstanceOperationGate({ assertAllowed: () => undefined })));
+  try {
+    for (const path of ['/red/line-a/flows', '/red/line-a/api/report']) {
+      const response = await app.inject({ url: path, headers: {
+        cookie: 'tle_sid=fake-manager-session; tle_csrf=fake-csrf; another_instance=fake-cookie',
+        'x-csrf-token': 'fake-csrf', 'x-forwarded-user': 'admin', 'x-forwarded-for': '127.0.0.1',
+        'x-real-ip': '127.0.0.1', 'x-auth-request-user': 'admin', forwarded: 'for=127.0.0.1',
+        authorization: 'Bearer instance-or-device-token', 'x-device-key': 'fake-device-key',
+      } });
+      assert.equal(response.statusCode, 200);
+      const seen = response.json();
+      for (const name of ['cookie', 'x-csrf-token', 'x-forwarded-user', 'x-forwarded-for', 'x-real-ip', 'x-auth-request-user', 'forwarded']) {
+        assert.equal(seen[name], undefined, `${path} must strip ${name}`);
+      }
+      assert.equal(seen.authorization, 'Bearer instance-or-device-token');
+      assert.equal(seen['x-device-key'], 'fake-device-key');
+      assert.equal(response.headers['set-cookie'], undefined);
+    }
+  } finally { await app.close(); await closeServer(upstream); }
+});
+
+test('WebSocket proxy isolates credentials while retaining explicit instance authentication', async () => {
+  const seen = deferred<IncomingMessage>();
+  const upstream = createServer();
+  const upstreamRawSockets = trackServerConnections(upstream);
+  const upstreamSockets = new WebSocketServer({ server: upstream });
+  upstreamSockets.on('headers', (headers) => headers.push('Set-Cookie: tle_sid=forged; Path=/'));
+  upstreamSockets.on('connection', (_socket, req) => seen.resolve(req));
+  const port = await listen(upstream);
+  const app = Fastify({ logger: false });
+  const closeManagerServer = app.server.close.bind(app.server);
+  const managerSockets = trackConnections(app);
+  registerProxy(app, proxyContext(`http://127.0.0.1:${port}`, new InstanceOperationGate({ assertAllowed: () => undefined })));
+  const client = new WebSocket(await websocketUrl(app), { headers: {
+    cookie: 'tle_sid=fake-manager-session; tle_csrf=fake-csrf',
+    'x-csrf-token': 'fake-csrf', 'x-forwarded-user': 'admin', authorization: 'Bearer instance-token',
+  } });
+  const upgrade = once(client, 'upgrade');
+  try {
+    await once(client, 'open');
+    const request = await seen.promise;
+    assert.equal(request.headers.cookie, undefined);
+    assert.equal(request.headers['x-csrf-token'], undefined);
+    assert.equal(request.headers['x-forwarded-user'], undefined);
+    assert.equal(request.headers.authorization, 'Bearer instance-token');
+    const [response] = await upgrade as [IncomingMessage];
+    assert.equal(response.headers['set-cookie'], undefined);
+  } finally {
+    client.terminate(); terminateWebSockets(upstreamSockets);
+    for (const socket of managerSockets) socket.destroy();
+    for (const socket of upstreamRawSockets) socket.destroy();
+    await nextTurn();
+    await new Promise<void>((resolve, reject) => closeManagerServer((error) => error ? reject(error) : resolve()));
+    upstreamSockets.close(); await closeServer(upstream);
+  }
+});
+
+test('proxy refuses pending two-factor enrollment before contacting the instance', async () => {
+  let hits = 0;
+  const upstream = createServer((_req, res) => { hits++; res.end('unexpected'); });
+  const port = await listen(upstream);
+  const app = Fastify({ logger: false });
+  const ctx = proxyContext(`http://127.0.0.1:${port}`, new InstanceOperationGate({ assertAllowed: () => undefined }));
+  const user = ctx.currentUser({} as never)!;
+  ctx.currentUser = () => ({ ...user, mustEnroll2fa: true });
+  registerProxy(app, ctx);
+  try {
+    const response = await app.inject({ url: '/red/line-a/flows' });
+    assert.equal(response.statusCode, 403);
+    assert.equal(response.json().code, 'TOTP_ENROLL_REQUIRED');
+    assert.equal(hits, 0);
+  } finally { await app.close(); await closeServer(upstream); }
+});
+
+test('editor password lease gates direct reads, writes and WebSocket without stopping flow ingress', async () => {
+  let hits = 0;
+  const upstream = createServer((_req, res) => { hits++; res.end('ok'); });
+  const port = await listen(upstream);
+  const app = Fastify({ logger: false });
+  const ctx = proxyContext(`http://127.0.0.1:${port}`, new InstanceOperationGate({ assertAllowed: () => undefined }));
+  registerProxy(app, ctx);
+  ctx.editorAccess.revokeSession('fake-session');
+  try {
+    for (const input of [
+      { url: '/red/line-a/flows' },
+      { method: 'POST' as const, url: '/red/line-a/flows', payload: '{}' },
+      { url: '/red/line-a/comms', headers: { upgrade: 'websocket', connection: 'Upgrade' } },
+    ]) {
+      const response = await app.inject(input);
+      assert.equal(response.statusCode, 403);
+      assert.equal(response.json().code, 'EDITOR_PASSWORD_REQUIRED');
+    }
+    assert.equal(hits, 0);
+    assert.equal((await app.inject({ url: '/red/line-a/api/report' })).statusCode, 200);
+    assert.equal(hits, 1);
+  } finally { await app.close(); await closeServer(upstream); }
+});
+
+test('expired editor or Manager sessions navigate back to the absolute management origin', async () => {
+  for (const managerExpired of [false, true]) {
+    const app = Fastify({ logger: false });
+    const ctx = proxyContext('http://127.0.0.1:1', new InstanceOperationGate({ assertAllowed: () => undefined }));
+    ctx.editorAccess.revokeSession('fake-session');
+    if (managerExpired) ctx.currentUser = () => undefined;
+    registerProxy(app, ctx);
+    try {
+      const navigation = await app.inject({ url: '/red/line-a/', headers: { accept: 'text/html', 'sec-fetch-mode': 'navigate' } });
+      assert.equal(navigation.statusCode, 302);
+      assert.equal(navigation.headers.location, 'http://127.0.0.1:19100/instances?editor=line-a');
+      const api = await app.inject({ url: '/red/line-a/flows' });
+      assert.equal(api.statusCode, managerExpired ? 401 : 403);
+    } finally { await app.close(); }
+  }
+});
+
+test('flow documents have an opaque browser origin and cannot register shared-origin service workers', async () => {
+  let hits = 0;
+  const upstream = createServer((_req, res) => { hits++; res.writeHead(200, { 'content-type': 'text/html', 'service-worker-allowed': '/' }); res.end('<script>localStorage.getItem("another-instance")</script>'); });
+  const port = await listen(upstream);
+  const app = Fastify({ logger: false });
+  registerProxy(app, proxyContext(`http://127.0.0.1:${port}`, new InstanceOperationGate({ assertAllowed: () => undefined })));
+  try {
+    const response = await app.inject('/red/line-a/api/dashboard');
+    const csp = response.headers['content-security-policy'];
+    assert.equal(typeof csp, 'string');
+    assert.match(csp as string, /(?:^|;)\s*sandbox allow-scripts(?:;|$)/);
+    assert.ok(!(csp as string).includes('allow-same-origin'));
+    assert.equal(response.headers['service-worker-allowed'], undefined);
+    const worker = await app.inject({ url: '/red/line-a/api/worker.js', headers: { 'service-worker': 'script' } });
+    assert.equal(worker.statusCode, 403);
+    assert.equal(hits, 1);
+  } finally { await app.close(); await closeServer(upstream); }
+});
+
+test('flow GET cannot be used as a write bypass by a read-only account', async () => {
+  let hits = 0;
+  const upstream = createServer((_req, res) => { hits++; res.end('unexpected'); });
+  const port = await listen(upstream);
+  const app = Fastify({ logger: false });
+  const ctx = proxyContext(`http://127.0.0.1:${port}`, new InstanceOperationGate({ assertAllowed: () => undefined }));
+  ctx.currentUser = () => ({ username: 'viewer', role: 'viewer', mustChangePassword: false, mustEnroll2fa: false, totpEnabled: false });
+  ctx.users = { grantFor: () => 'view' } as unknown as HttpContext['users'];
+  registerProxy(app, ctx);
+  try {
+    assert.equal((await app.inject('/red/line-a/api/operate')).statusCode, 403);
+    assert.equal(hits, 0);
+  } finally { await app.close(); await closeServer(upstream); }
+});
+
+test('native editor logout also invalidates the outer password lease', async () => {
+  const upstream = createServer((_req, res) => { res.writeHead(200, { 'cache-control': 'public, max-age=3600' }); res.end('{}'); });
+  const port = await listen(upstream);
+  const app = Fastify({ logger: false });
+  const ctx = proxyContext(`http://127.0.0.1:${port}`, new InstanceOperationGate({ assertAllowed: () => undefined }));
+  registerProxy(app, ctx);
+  try {
+    const response = await app.inject({ method: 'POST', url: '/red/line-a/auth/revoke', payload: { token: 'fake-node-red-token' } });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.headers['cache-control'], 'no-store');
+    const after = await app.inject('/red/line-a/flows');
+    assert.equal(after.statusCode, 403);
+    assert.equal(after.json().code, 'EDITOR_PASSWORD_REQUIRED');
+  } finally { await app.close(); await closeServer(upstream); }
+});
+
+test('revocation during a delayed upstream handshake discards buffered writes', async () => {
+  const pendingUpgrade = deferred<{ req: IncomingMessage; socket: Socket; head: Buffer }>();
+  const upstream = createServer();
+  const upstreamRawSockets = trackServerConnections(upstream);
+  const upstreamSockets = new WebSocketServer({ noServer: true });
+  let writes = 0;
+  upstreamSockets.on('connection', (socket) => { socket.on('message', () => { writes++; }); });
+  upstream.on('upgrade', (req, socket, head) => pendingUpgrade.resolve({ req, socket: socket as Socket, head }));
+  const port = await listen(upstream);
+  const app = Fastify({ logger: false });
+  const closeManagerServer = app.server.close.bind(app.server);
+  const managerSockets = trackConnections(app);
+  const sessions = new ProxySessionRegistry();
+  registerProxy(app, proxyContext(`http://127.0.0.1:${port}`, new InstanceOperationGate({ assertAllowed: () => undefined }), sessions));
+  const client = new WebSocket(await websocketUrl(app));
+  try {
+    await once(client, 'open');
+    const pending = await pendingUpgrade.promise;
+    sessions.closeSession('fake-session');
+    client.send('must-not-reach-device');
+    await nextTurn();
+    upstreamSockets.handleUpgrade(pending.req, pending.socket, pending.head, (socket) => upstreamSockets.emit('connection', socket, pending.req));
+    await waitFor(() => client.readyState === WebSocket.CLOSED);
+    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    assert.equal(writes, 0);
+    assert.equal(sessions.count('line-a'), 0);
+  } finally {
+    client.terminate(); terminateWebSockets(upstreamSockets);
+    for (const socket of managerSockets) socket.destroy();
+    for (const socket of upstreamRawSockets) socket.destroy();
+    await nextTurn();
+    await new Promise<void>((resolve, reject) => closeManagerServer((error) => error ? reject(error) : resolve()));
+    upstreamSockets.close(); await closeServer(upstream);
   }
 });

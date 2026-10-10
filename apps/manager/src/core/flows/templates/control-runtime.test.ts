@@ -1,142 +1,75 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { runInNewContext } from 'node:vm';
-import {
-  bindingPollScript,
-  nextCommandScript,
-  claimCommandScript,
-  commandResultScript,
-  resultDeliveredScript,
-  networkAckScript,
-} from './control-runtime.ts';
+import { commandResultScript, networkAckScript } from './control-runtime.ts';
 
-const config = {
-  nodeId: 'device-1',
-  serviceCode: 'env',
-  commands: [{ cmd: 'setTemp', param: 'value', property: 'temperature' }],
-};
-function harness() {
-  const store = new Map<string, unknown>();
+const command = { id: 'job-1', leaseToken: 'lease-1' };
+const marker = { run: 'run-1', sequence: 1, kind: 'execution' };
+function classify(protocol: string, success: boolean, msg: Record<string, unknown> = {}) {
   const errors: string[] = [];
-  const context = {
-    Buffer,
-    Date,
-    node: { id: 'consumer-1', error: (s: string) => errors.push(s), send: () => {} },
-    flow: { get: (k: string) => store.get(k), set: (k: string, v: unknown) => store.set(k, v) },
-    env: {
-      get: (k: string) => ({ TLE_MANAGER_URL: 'http://manager', TLE_INGEST_TOKEN: 'fixture-token' })[k],
-    },
-  };
-  return {
-    store,
-    errors,
-    run(script: string, msg: Record<string, unknown> = {}) {
-      return runInNewContext(`(function(msg){${script}})(msg)`, { ...context, msg });
-    },
-  };
+  const input = { _tleCommand: command, _tleControl: marker, ...msg };
+  const output = runInNewContext(`(function(msg){${commandResultScript(protocol, success)}})(msg)`,
+    { msg: input, Buffer, node: { error: (message: string) => errors.push(message) },
+      flow: { get() { assert.fail('result classification must be pure'); }, set() { assert.fail('result classification must be pure'); } } });
+  return { output, errors };
 }
-test('binding and polling use instance identity, never a device-controlled URL', () => {
-  const h = harness();
-  const binding = h.run(bindingPollScript(config))[0];
-  assert.equal(binding.payload.consumerId, 'consumer-1');
-  assert.equal(binding.url, 'http://manager/api/edge/command-bindings');
-  const next = h.run(nextCommandScript(config), { ...binding, statusCode: 200 });
-  assert.equal(next.url, 'http://manager/api/edge/commands/next');
-  assert.equal(next.payload.consumerId, 'consumer-1');
-});
-test('leased command prevents overlapping polls and retains retryable execution result', () => {
-  const h = harness();
-  const command = {
-    id: 'job-1',
-    leaseToken: 'lease-1', leaseDeadline: Date.now() + 30000,
-    mid: 1,
-    deviceIdentification: 'device-1',
-    serviceCode: 'env',
-    cmd: 'setTemp',
-    params: { value: 30 },
-  };
-  h.run(claimCommandScript(), { statusCode: 200, payload: { command } });
-  assert.equal(h.run(bindingPollScript(config)), null);
-  const response = h.run(commandResultScript('s7', true), { _tleCommand: command, payload: 30 });
-  assert.equal(response.payload.ok, true);
-  assert.equal(response.url, 'http://manager/api/edge/commands/job-1/result');
-  h.run(resultDeliveredScript(), { ...response, statusCode: 503 });
-  const retried = h.run(bindingPollScript(config));
-  assert.equal(retried[0], null);
-  assert.equal(retried[1].payload.leaseToken, 'lease-1');
-  h.run(resultDeliveredScript(), { ...response, statusCode: 200 });
-  assert.ok(h.run(bindingPollScript(config))[0]);
-});
-test('a write failure yields failed receipt and an unrelated reply cannot acknowledge a command', () => {
-  const h = harness();
-  const command = { id: 'job-1', leaseToken: 'lease-1', leaseDeadline: Date.now() + 30000, params: { value: 30 } };
-  h.run(claimCommandScript(), { statusCode: 200, payload: { command } });
-  const reply = h.run(commandResultScript('http', true), {
-    _tleCommand: command,
-    statusCode: 202,
-    payload: { ok: true },
-  });
-  assert.equal(reply.payload.ok, false);
-  assert.equal(h.run(commandResultScript('s7', true), { payload: 30 }), null);
+
+test('protocol results preserve exact command correlation without sending a receipt independently', () => {
+  const reply = classify('s7', true, { payload: 30 }).output;
+  assert.deepEqual(JSON.parse(JSON.stringify(reply._tleExecutionResult)), { id: 'job-1', leaseToken: 'lease-1', ok: true });
+  assert.deepEqual(reply._tleControl, marker);
+  assert.equal(reply.url, undefined); assert.equal(reply.headers, undefined);
+  assert.equal(classify('s7', true, { _tleCommand: undefined }).output, null);
 });
 
-test('TCP and UDP acknowledgement scripts compile and correlate both successful and failed replies', () => {
-  for (const protocol of ['tcp', 'udp'] as const)
-    for (const ok of [true, false]) {
-      const h = harness(),
-        command = { id: 'job-1', leaseToken: 'lease-1', leaseDeadline: Date.now() + 30000, params: { value: 30 } };
-      h.run(claimCommandScript(), { statusCode: 200, payload: { command } });
-      assert.equal(
-        h.run(networkAckScript(protocol), { payload: Buffer.from('{"requestId":"other","ok":true}') }),
-        null,
-      );
-      const result = h.run(networkAckScript(protocol), {
-        payload: Buffer.from(JSON.stringify({ requestId: 'job-1', ok })),
-      });
-      assert.equal(result.payload.ok, ok);
-      assert.equal(result.payload.leaseToken, 'lease-1');
-    }
-});
-
-test('claim requires a valid unexpired absolute Manager lease deadline without granting a fresh local lease', () => {
-  const now = Date.now();
-  for (const leaseDeadline of [undefined, null, String(now + 30000), Number.NaN, Infinity, 0, now - 1, Number.MAX_SAFE_INTEGER + 1, now + 0.5]) {
-    const h = harness();
-    const command = { id: 'job-deadline', leaseToken: 'lease', leaseDeadline, params: { value: 1 } };
-    assert.equal(h.run(claimCommandScript(), { statusCode: 200, payload: { command } }), null);
-    assert.equal(h.store.get('__tle_control_pending'), undefined);
-    assert.ok(h.errors.some(error => error.includes('租约')));
-  }
-  const h = harness(), command = { id: 'job-deadline', leaseToken: 'lease', leaseDeadline: now + 30000, params: { value: 1 } };
-  const claimed = h.run(claimCommandScript(), { statusCode: 200, payload: { command } });
-  assert.equal(claimed._tleCommand.leaseDeadline, command.leaseDeadline);
-  assert.equal((h.store.get('__tle_control_pending') as { command: typeof command }).command.leaseDeadline, command.leaseDeadline);
-});
-
-test('unknown device errors never stringify structured objects or forward credential-bearing detail', () => {
-  for (const message of [
-    { code: 'TIMEOUT', credentials: { password: 'fixture-sensitive-value' } },
-    { toString: () => { throw new Error('object must not be coerced'); } },
-    '[object Object]',
-    'Connection failed: password=fixture-sensitive-value token=fixture-token-value',
-  ]) {
-    const h = harness(), command = { id: 'error-case', leaseToken: 'lease', leaseDeadline: Date.now() + 30000, params: { value: 5 } };
-    h.run(claimCommandScript(), { statusCode: 200, payload: { command } });
-    const reply = h.run(commandResultScript('modbus-tcp', false), { _tleCommand: command, _tleWriteAttempted: true, error: { message } });
-    assert.equal(reply.payload.ok, false); assert.equal(reply.payload.unknown, true);
-    assert.match(reply.payload.error, /^设备执行结果未知：/);
-    assert.doesNotMatch(reply.payload.error, /\[object Object\]|fixture-sensitive-value|fixture-token-value|credentials/);
-    assert.equal(h.store.get('__tle_control_pending'), undefined);
-    assert.ok(h.store.get('__tle_control_result'), 'only the receipt remains retryable');
+test('HTTP execution needs HTTP 200 and strict positive acknowledgement', () => {
+  for (const [statusCode, ack, ok, unknown] of [[200, true, true, undefined], [200, false, false, undefined],
+    [202, true, false, true], [500, true, false, true], [200, undefined, false, true]]) {
+    const result = classify('http', true, { statusCode, payload: { ok: ack } }).output._tleExecutionResult;
+    assert.equal(result.ok, ok); assert.equal(result.unknown, unknown);
   }
 });
 
-test('safe error summaries preserve timeout and explicit failure semantics without copying raw details', () => {
+test('OPC UA confirmation still requires a bounded Good status code', () => {
+  assert.equal(classify('opcua', true, { payload: { value: 0 } }).output._tleExecutionResult.ok, true);
+  for (const payload of ['Good', -1, 0x80000000, NaN, { statusCode: 'Good' }])
+    assert.equal(classify('opcua', true, { payload }).output._tleExecutionResult.ok, false);
+});
+
+test('driver failures remain unknown after a possible write but explicit rejection is failure', () => {
   for (const attempted of [true, false]) {
-    const h = harness(), command = { id: 'timeout-case', leaseToken: 'lease', leaseDeadline: Date.now() + 30000, params: { value: 5 } };
-    h.run(claimCommandScript(), { statusCode: 200, payload: { command } });
-    const reply = h.run(commandResultScript('modbus-tcp', false), { _tleCommand: command, _tleWriteAttempted: attempted, error: { message: 'Error: Batch write failed: BadTimeout' } });
-    assert.equal(reply.payload.ok, false); assert.equal(reply.payload.unknown, attempted ? true : undefined);
-    assert.match(reply.payload.error, /超时/);
+    const result = classify('s7', false, { _tleWriteAttempted: attempted, error: { message: 'device timed out' } }).output._tleExecutionResult;
+    assert.equal(result.ok, false); assert.equal(result.unknown, attempted ? true : undefined);
+    assert.match(result.error, /超时/);
   }
+  const explicit = classify('opcua', false, { _tleWriteAttempted: true, _tleExplicitRejection: true,
+    error: { message: 'BadNotWritable' } }).output._tleExecutionResult;
+  assert.equal(explicit.unknown, undefined);
+});
+
+test('structured or credential-bearing errors never enter receipt detail', () => {
+  for (const message of [{ password: 'fixture-sensitive' }, { toString() { throw Error('must not coerce'); } },
+    'Connection failed password=fixture-sensitive token=fixture-token']) {
+    const result = classify('s7', false, { _tleWriteAttempted: true, error: { message } }).output._tleExecutionResult;
+    assert.equal(result.unknown, true);
+    assert.doesNotMatch(result.error, /fixture-sensitive|fixture-token|\[object Object\]/);
+  }
+});
+
+test('TCP and UDP parsing only yield id/ack; the private controller decides which lease may complete', () => {
+  for (const protocol of ['tcp', 'udp'] as const) {
+    const script = networkAckScript(protocol);
+    for (const ok of [true, false, undefined]) {
+      const result = runInNewContext(`(function(msg){${script}})(msg)`, { Buffer,
+        msg: { payload: Buffer.from(JSON.stringify({ requestId: 'job-1', ok })) }, node: { error() {} } });
+      assert.equal(result._tleNetworkAck.id, 'job-1'); assert.equal(result._tleNetworkAck.ok, ok);
+      assert.equal(result._tleCommand, undefined); assert.equal(result.url, undefined);
+    }
+  }
+});
+
+test('native result wrappers retain the execution generation marker with nested command correlation', () => {
+  const result = classify('s7', true, { _tleCommand: undefined, _tleControl: undefined,
+    input: { _tleCommand: command, _tleControl: marker } }).output;
+  assert.deepEqual(result._tleControl, marker); assert.equal(result._tleExecutionResult.id, command.id);
 });

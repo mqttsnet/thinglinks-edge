@@ -18,10 +18,15 @@ const unavailableInstanceLabels = new Map([
 
 /** 只用明确的实例状态覆盖展示；不更改台账，也不从 lastSeen 推算超时。 */
 export function fieldDeviceStatus(
-  device: Pick<FieldDeviceRecord, 'online'>,
+  device: Pick<FieldDeviceRecord, 'online' | 'presenceState'>,
   instance?: Pick<Instance, 'state' | 'running'>,
 ): FieldDeviceStatus {
   const label = instance?.running === false ? unavailableInstanceLabels.get(instance.state) : undefined;
   if (label) return { online: false, label, instanceUnavailable: true };
+  if (device.presenceState === 'unknown') return { online: false, label: '等待采集确认', instanceUnavailable: false };
+  if (device.presenceState) {
+    const online = device.presenceState === 'online';
+    return { online, label: online ? '在线' : '离线', instanceUnavailable: false };
+  }
   return { online: device.online, label: device.online ? '在线' : '离线', instanceUnavailable: false };
 }

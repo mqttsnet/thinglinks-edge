@@ -260,6 +260,7 @@ pnpm --filter @thinglinks-edge/web-console build >/dev/null 2>&1 \
   && echo "  console 构建 ✓" || { echo "  console 构建 ✗"; exit 1; }
 test_summary "验证脚本跨平台" node --test scripts/verify-temp-parent.test.mjs
 test_summary "离线包构建契约" node --test scripts/build-offline-bundle.test.mjs
+test_summary "离线安装安全与隔离工装" node --test scripts/offline-install.test.mjs scripts/verify-instance-isolation.test.mjs
 test_summary "离线包解析契约" node --test scripts/verify-offline-bundle.test.mjs
 test_summary "真实实例夹具契约" node --test \
   scripts/real-instance-fixture.test.mjs \
@@ -278,6 +279,7 @@ test_summary "协议与串口工具契约" sh -c '
   cd "$1" && node --experimental-strip-types --test \
     scripts/prepare-protocol-seed.test.mjs \
     scripts/verify-protocol-components.test.mjs \
+    scripts/opcua-native/*.test.mjs \
     scripts/protocol-fixtures/*.test.mjs \
     scripts/protocol-wire-lab/serial/*.test.cjs
 ' _ "$REPO_ROOT"
@@ -451,6 +453,29 @@ if ! bundle_manager_ref_stable; then
 fi
 echo "  descriptor $MANAGER_IMAGE -> config $RUNTIME_CONFIG_ID"
 
+# A separate policy image is independently captured before inspecting bundle
+# bytes. Never infer its expected identity from the bundle being verified.
+BUNDLE_POLICY_IMAGE=${PROXY_IMAGE:-${POLICY_IMAGE:-$BUNDLE_MANAGER_IMAGE}}
+BUNDLE_NETWORK_IMAGE=${NETWORK_IMAGE:-${POLICY_IMAGE:-$BUNDLE_MANAGER_IMAGE}}
+POLICY_DESCRIPTOR_ID=$(image_id "$BUNDLE_POLICY_IMAGE")
+NETWORK_DESCRIPTOR_ID=$(image_id "$BUNDLE_NETWORK_IMAGE")
+policy_refs_stable() {
+  [ "$(image_id "$BUNDLE_POLICY_IMAGE")" = "$POLICY_DESCRIPTOR_ID" ] \
+    && [ "$(image_id "$BUNDLE_NETWORK_IMAGE")" = "$NETWORK_DESCRIPTOR_ID" ]
+}
+if [ "$POLICY_DESCRIPTOR_ID" = "$MANAGER_IMAGE" ]; then
+  POLICY_CONFIG_ID=$RUNTIME_CONFIG_ID
+else
+  POLICY_REFERENCE_TAR="$ARTIFACT_ROOT/policy-by-id.tar"
+  [ ! -e "$POLICY_REFERENCE_TAR" ] || { echo "policy reference tar 已存在" >&2; exit 1; }
+  docker save -o "$POLICY_REFERENCE_TAR" "$POLICY_DESCRIPTOR_ID"
+  [ -f "$POLICY_REFERENCE_TAR" ] && [ ! -L "$POLICY_REFERENCE_TAR" ] || exit 1
+  POLICY_CONFIG_ID=$(node scripts/verify-offline-bundle.mjs \
+    --single-config-id "$POLICY_REFERENCE_TAR" "$RUNTIME_ARCH")
+  rm -f "$POLICY_REFERENCE_TAR"
+fi
+policy_refs_stable || { echo "策略镜像 tag 在取证中变化" >&2; exit 1; }
+
 CREATED_SEED_EXPORT_ID=$(docker create \
   --label "$VERIFY_RUN_LABEL=$VERIFY_RUN_ID" \
   "$TLE_PLATFORM_BUILDER_IMAGE")
@@ -471,8 +496,10 @@ if ! bundle_manager_ref_stable; then
   echo "bundle Manager tag 在打包前已不再指向已验证 runtime" >&2
   exit 1
 fi
+policy_refs_stable || { echo "策略镜像 tag 在打包前变化" >&2; exit 1; }
 MANAGER_IMAGE="$BUNDLE_MANAGER_IMAGE" \
-PROXY_IMAGE="${PROXY_IMAGE:-wollomatic/socket-proxy:1.13.1}" \
+PROXY_IMAGE="$BUNDLE_POLICY_IMAGE" \
+NETWORK_IMAGE="$BUNDLE_NETWORK_IMAGE" \
 INIT_IMAGE="${INIT_IMAGE:-alpine:3.22}" \
 NODE_RED_IMAGE_REPO='nodered/node-red' \
 ALLOWED_IMAGE_TAGS='5.0.4-24-minimal' \
@@ -482,6 +509,7 @@ if ! bundle_manager_ref_stable; then
   echo "bundle Manager tag 在打包后已不再指向已验证 runtime" >&2
   exit 1
 fi
+policy_refs_stable || { echo "策略镜像 tag 在打包后变化" >&2; exit 1; }
 set -- "$OFFLINE_DIR"/thinglinks-edge-offline-*-linux-*.tar.gz
 if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
   echo "offline bundle 产物数量不是 1：$OFFLINE_DIR" >&2
@@ -492,7 +520,7 @@ export TLE_PLATFORM_OFFLINE_BUNDLE
 echo "  offline $TLE_PLATFORM_OFFLINE_BUNDLE"
 
 if BUNDLE_CONTRACT_OUT=$(node scripts/verify-offline-bundle.mjs \
-    "$TLE_PLATFORM_OFFLINE_BUNDLE" "$BUNDLE_MANAGER_IMAGE" "$RUNTIME_CONFIG_ID" 2>&1); then
+    "$TLE_PLATFORM_OFFLINE_BUNDLE" "$BUNDLE_MANAGER_IMAGE" "$RUNTIME_CONFIG_ID" "$POLICY_CONFIG_ID" 2>&1); then
   BUNDLE_CONTRACT_STATUS=0
 else
   BUNDLE_CONTRACT_STATUS=$?

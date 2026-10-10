@@ -43,6 +43,26 @@ export function validateBinding(value: unknown): CommandBindingInput {
         throw new CommandError('命令映射重复'); seen.add(cmd); return { cmd, param }; });
     return { ...poll, commands };
 }
+/** Batch heartbeats replace one consumer's complete service declaration; legacy requests are incremental. */
+export function validateBindingBatch(value: unknown): { bindings: CommandBindingInput[]; replace: boolean } {
+    const b = object(value);
+    if (!Object.hasOwn(b, 'services')) return { bindings: [validateBinding(b)], replace: false };
+    keys(b, ['consumerId', 'nodeId', 'services']);
+    const consumerId = code(b.consumerId, 'consumerId'), nodeId = code(b.nodeId, 'nodeId');
+    if (!Array.isArray(b.services) || b.services.length < 1 || b.services.length > 32)
+        throw new CommandError('services需要1至32项');
+    const seen = new Set<string>();
+    const bindings = b.services.map(raw => {
+        const item = object(raw); keys(item, ['serviceCode', 'commands']);
+        const binding = validateBinding({ consumerId, nodeId, serviceCode: item.serviceCode, commands: item.commands });
+        if (seen.has(binding.serviceCode)) throw new CommandError('服务声明重复');
+        seen.add(binding.serviceCode);
+        return binding;
+    });
+    if (bindings.reduce((total, binding) => total + binding.commands.length, 0) > 64)
+        throw new CommandError('命令映射总数不能超过64项');
+    return { bindings, replace: true };
+}
 export function validateDownlink(command: DownlinkCommand) {
     try { normalizeMid(command.mid); } catch { throw new CommandError('mid必须是精确的正Long整数'); }
     code(command.gatewayId, 'gatewayId');

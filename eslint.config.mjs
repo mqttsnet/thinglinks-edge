@@ -25,6 +25,7 @@ export default tseslint.config(
     // 构建产物与依赖不参与检查
     ignores: [
       '**/dist/**', '**/node_modules/**', '**/target/**',
+      'tasks/**',                     // 忽略的任务草稿与临时验收工装，不属于产品源码
       'apps/manager/scripts/**',      // 验证脚本是 .mjs 工装，另有约定，不套 TS 规则
     ],
   },

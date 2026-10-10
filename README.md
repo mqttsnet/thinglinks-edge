@@ -49,11 +49,11 @@ Select the diagram to view it at full size. Diagram labels are in Chinese. Candi
 | Feature | Description |
 | --- | --- |
 | **Instance Hosting** | Independent Node-RED containers; a Manager upgrade does not automatically restart instances |
-| **Built-in Reverse Proxy** | One authenticated management/editor entry; application ports are configured per instance |
-| **Passwordless Editor Entry** | Open any instance editor from the console without re-entering instance credentials |
+| **Built-in Reverse Proxy** | Authenticated instance proxying with a separate browser origin for each editor |
+| **Independent Editor Password** | Set and confirm an instance password at creation, then verify it when opening the editor; platform permissions still apply |
 | **Three-layer Health Probes** | Container / application / flow, combined into one verdict that catches "process alive but not working" |
-| **Network Isolation** | One network per instance — instances cannot reach each other |
-| **Restricted Docker Endpoint** | The Manager never touches the host socket; every Docker call passes a per-method regex allowlist |
+| **Network Isolation** | Dedicated instance networks and controlled host/peer access; requires deployment and on-site verification of the network protection component |
+| **Restricted Docker Endpoint** | Manager has no host socket mount; an independent policy service validates resource ownership, images and container parameters |
 | **Runtime Mount Prefix** | One image serves `/` or any enterprise sub-path — no rebuild |
 | **Cloud-Edge Collaboration** | Virtual gateway, sub-device registration, micro-batching, offline spool and replay — configured from the console, applied without a restart |
 | **Field Inventory** | Devices, current point values, quality codes and update timestamps reported by ThingLinks nodes |
@@ -88,16 +88,16 @@ exact same command. Nothing is compiled on the site machine; it only needs Docke
 docker compose up -d
 ```
 
-Open that address and log in as **admin** with your chosen password, then create a Node-RED instance. A fresh deployment without a valid password does not open the listener. Upgrades with existing accounts neither require an initial password nor reset accounts.
+Open that address and log in as **admin** with your chosen password. Set and confirm an independent editor password when creating a Node-RED instance, then verify it again when opening the ready instance's editor. A fresh deployment without a valid management password does not open the listener. Upgrades with existing accounts neither require an initial password nor reset accounts.
 No source checkout, Node.js installation, `.env`, manual encryption key, Docker group lookup, or separate default Node-RED pull is required.
-Compose prepares the data directory and pulls all required images, including Node-RED 5.0.7.
+Compose prepares the data directory and pulls all required images, including Node-RED 5.0.7. Manager, Docker execution policy and network isolation use the same release artifact.
 
 The dedicated data root defaults to `/data01/mqttsnet/thinglinks-edge`. On first startup,
 Manager creates `<data root>/.master.key` with mode 0600 and reuses it after restarts and upgrades.
 **Keep the key file separately and securely; business backups do not contain it.** If data already exists
 but its key is missing, startup fails instead of generating a replacement.
 
-Port 19100 is published by default. Keep the configuration file private because it contains the initial password.
+The management port 19100 and independent editor ports 19200–19263 are published by default. See the [instance isolation guide](docs/guides/instance-isolation.md) for network backend, Mac host address and HTTPS forwarding requirements. Keep the configuration file private because it contains the initial password.
 Use [.env.example](.env.example) only for advanced settings such as a reverse proxy, rootless Docker,
 custom paths or offline operation. Existing `.env` files and `MASTER_KEY` values remain valid and keep
 the same encryption identity. Other Node-RED versions still need their corresponding images prepared.
@@ -262,7 +262,7 @@ thinglinks-edge/
 │   │   │   ├── core/             Domain: config, crypto, db, auth, instances,
 │   │   │   │                     ports, health, container spec, docker client
 │   │   │   ├── http/             HTTP layer: app assembly, session, instances,
-│   │   │   │                     SSO, reverse proxy, console hosting
+│   │   │   │                     editor verification, reverse proxy, console hosting
 │   │   │   └── index.ts          Entrypoint
 │   │   ├── scripts/              Real-container verification suite
 │   │   └── Dockerfile
@@ -284,10 +284,10 @@ cd apps/manager && pnpm verify
 
 | Suite | Covers |
 | --- | --- |
-| `verify-authz` | Privilege-escalation attempts across roles, grant matrix, proxy and SSO |
+| `verify-authz` | Privilege-escalation attempts across roles, grant matrix, proxy and editor entry |
 | `verify-container-guard` | Container-creation whitelist enforced against real Docker |
 | `verify-instance` | Instance creation, `settings.js` delivery, mount prefix — root and sub-path |
-| `verify-proxy` | Reverse proxy, static assets, WebSocket, passwordless entry — root and sub-path |
+| `verify-proxy` | Reverse proxy, static assets, WebSocket, instance-password verification and isolated-origin handoff — root and sub-path |
 | `verify-api` | Instance CRUD lifecycle and log decoding |
 | `verify-health` | Three-layer probes |
 | `verify-isolation` | Instance-to-instance network isolation |

@@ -74,6 +74,71 @@ export interface SearchHit {
  * 「装最新版」装到旧的，而那种错极难查。
  */
 const PACKUMENT_TTL_MS = 30_000;
+/** Packuments are metadata; never allow a broken registry to buffer unbounded JSON. */
+export const MAX_UPSTREAM_PACKUMENT_BYTES = 8 * 1024 * 1024;
+/** Keep the registry cache bounded even when a source returns a huge tarball. */
+export const MAX_UPSTREAM_TARBALL_BYTES = 64 * 1024 * 1024;
+
+function configuredOrigins(sources: Array<{ url: string }>): Set<string> {
+  const origins = new Set<string>();
+  for (const source of sources) {
+    try {
+      const url = new URL(source.url);
+      if (url.protocol === 'http:' || url.protocol === 'https:') origins.add(url.origin);
+    } catch { /* Source validation happens at persistence; fail closed here too. */ }
+  }
+  return origins;
+}
+
+function assertTarballUrl(raw: string, origins: Set<string>): URL {
+  let url: URL;
+  try { url = new URL(raw); }
+  catch { throw new NodePolicyError('上游包体地址不是合法 URL'); }
+  if (!['http:', 'https:'].includes(url.protocol) || !origins.has(url.origin)) {
+    throw new NodePolicyError('上游包体地址必须属于已配置节点源 origin，已拒绝跨源请求');
+  }
+  return url;
+}
+
+async function boundedBody(response: Response, maxBytes: number, signal?: AbortSignal): Promise<Buffer> {
+  const length = response.headers.get('content-length');
+  if (length !== null && /^\d+$/.test(length) && Number(length) > maxBytes) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new NodePolicyError(`上游响应超过大小限制（${maxBytes} 字节）`);
+  }
+  if (!response.body) {
+    const body = Buffer.from(await response.arrayBuffer());
+    if (body.length > maxBytes) throw new NodePolicyError(`上游响应超过大小限制（${maxBytes} 字节）`);
+    return body;
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  const abort = () => { void reader.cancel().catch(() => undefined); };
+  signal?.addEventListener('abort', abort, { once: true });
+  try {
+    while (true) {
+      const item = await reader.read();
+      if (item.done) break;
+      size += item.value.byteLength;
+      if (size > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new NodePolicyError(`上游响应超过大小限制（${maxBytes} 字节）`);
+      }
+      chunks.push(item.value);
+    }
+    return Buffer.concat(chunks, size);
+  } finally {
+    signal?.removeEventListener('abort', abort);
+    reader.releaseLock();
+  }
+}
+
+async function boundedJson(response: Response): Promise<UpstreamPackument> {
+  const body = await boundedBody(response, MAX_UPSTREAM_PACKUMENT_BYTES);
+  try { return JSON.parse(body.toString('utf8')) as UpstreamPackument; }
+  catch { throw new NodePolicyError('上游 packument 不是合法 JSON'); }
+}
 
 function isExactModuleQuery(value: string): boolean {
   try {
@@ -143,7 +208,19 @@ export class UpstreamRegistry {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), this.#timeoutMs);
     try {
-      return await this.#fetch(url, { signal: ac.signal });
+      const requested = new URL(url);
+      const response = await this.#fetch(url, { signal: ac.signal, redirect: 'manual' });
+      if (response.status >= 300 && response.status < 400) {
+        await response.body?.cancel().catch(() => undefined);
+        throw new NodePolicyError('节点源响应被重定向，已拒绝跨源请求');
+      }
+      const responseOrigin = response.url ? new URL(response.url).origin : requested.origin;
+      if (responseOrigin !== requested.origin || !configuredOrigins(this.#sources()).has(responseOrigin)) {
+        await response.body?.cancel().catch(() => undefined);
+        throw new NodePolicyError('节点源响应 origin 与已配置源不一致');
+      }
+      const body = await boundedBody(response, MAX_UPSTREAM_PACKUMENT_BYTES, ac.signal);
+      return new Response(body, { status: response.status, headers: response.headers });
     } finally {
       clearTimeout(timer);
     }
@@ -165,7 +242,7 @@ export class UpstreamRegistry {
             errors.push(`${src.name}: HTTP ${res.status}`);
             continue;
           }
-          const doc = await res.json() as UpstreamPackument;
+          const doc = await boundedJson(res);
           const latest = doc['dist-tags']?.latest;
           const manifestName = latest ? doc.versions[latest]?.name : undefined;
           if (doc.name !== q || (manifestName !== undefined && manifestName !== q)) {
@@ -191,7 +268,7 @@ export class UpstreamRegistry {
           + `&size=${Math.min(Math.max(size, 1), 50)}`;
         const res = await this.#get(url);
         if (!res.ok) continue;
-        const body = await res.json() as {
+        const body = await boundedJson(res) as unknown as {
           objects?: Array<{ package?: {
             name?: string; version?: string; description?: string;
             keywords?: string[]; date?: string;
@@ -241,7 +318,7 @@ export class UpstreamRegistry {
       }
       if (res.status === 404) continue;            // 这个源没有，问下一个
       if (!res.ok) { errors.push(`${src.name}: HTTP ${res.status}`); continue; }
-      const doc = await res.json() as UpstreamPackument;
+      const doc = await boundedJson(res);
       this.#cache.set(module, { at: Date.now(), doc });
       return doc;
     }
@@ -276,33 +353,34 @@ export class UpstreamRegistry {
     const manifest = doc?.versions?.[version];
     if (!manifest) return undefined;
 
-    const url = manifest.dist?.tarball;
-    if (!url) throw new NodePolicyError(`上游 packument 里 ${module}@${version} 没有包体地址`);
+    const rawUrl = manifest.dist?.tarball;
+    if (!rawUrl) throw new NodePolicyError(`上游 packument 里 ${module}@${version} 没有包体地址`);
+    const url = assertTarballUrl(rawUrl, configuredOrigins(this.#sources()));
 
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), this.#timeoutMs);
-    let res: Response;
     try {
-      res = await this.#fetch(url, { signal: ac.signal });
-    } catch (e) {
-      throw new NodePolicyError(`下载 ${module}@${version} 失败：${(e as Error).message}`);
-    } finally {
-      clearTimeout(timer);
-    }
-    if (res.status === 404) return undefined;
-    if (!res.ok) throw new NodePolicyError(`下载 ${module}@${version} 返回 HTTP ${res.status}`);
+      const res = await this.#fetch(url, { signal: ac.signal, redirect: 'manual' });
+      if (res.status >= 300 && res.status < 400) {
+        await res.body?.cancel().catch(() => undefined);
+        throw new NodePolicyError(`下载 ${module}@${version} 被重定向，已拒绝跨源请求`);
+      }
+      if (res.status === 404) return undefined;
+      if (!res.ok) throw new NodePolicyError(`下载 ${module}@${version} 返回 HTTP ${res.status}`);
 
-    const body = Buffer.from(await res.arrayBuffer());
-    assertIntegrity(module, version, body, manifest.dist?.integrity, manifest.dist?.shasum);
-    return body;
+      const body = await boundedBody(res, MAX_UPSTREAM_TARBALL_BYTES, ac.signal);
+      assertIntegrity(module, version, body, manifest.dist?.integrity, manifest.dist?.shasum);
+      return body;
+    } catch (e) {
+      if (e instanceof NodePolicyError) throw e;
+      throw new NodePolicyError(`下载 ${module}@${version} 失败：${(e as Error).message}`);
+    } finally { clearTimeout(timer); }
   }
 }
 
 /**
- * 比对上游声明的校验值。
- *
- * 上游没给校验值时**放行**并不理想，但拒绝更糟：少数私有 registry 确实不返回
- * integrity，一律拒会让那些现场彻底装不上。给了就必须对得上。
+ * 比对上游声明的校验值。没有受支持的完整性声明就拒绝入库；节点包会执行安装
+ * 生命周期脚本，宁可要求私有源补齐 SRI，也不能把未证明的字节写入现场缓存。
  */
 export function assertIntegrity(
   module: string, version: string, body: Buffer,
@@ -322,6 +400,7 @@ export function assertIntegrity(
       }
       return;
     }
+    throw new NodePolicyError(`${module}@${version} 完整性校验格式不受支持`);
   }
   if (shasum) {
     const got = createHash('sha1').update(body).digest('hex');
@@ -330,5 +409,7 @@ export function assertIntegrity(
         `${module}@${version} 校验失败：上游声明 shasum ${shasum}，实际 ${got}。已拒绝入库`,
       );
     }
+    return;
   }
+  throw new NodePolicyError(`${module}@${version} 缺少完整性校验，已拒绝入库`);
 }

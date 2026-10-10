@@ -1,3 +1,7 @@
+import { diagnosticRemovalLifecycle } from './core/protocols/diagnostics/removal.ts';
+import { ProtocolDiagnosticService } from './core/protocols/diagnostics/service.ts';
+import { ProtocolDiagnosticStore } from './core/protocols/diagnostics/store.ts';
+import { diagnosticAdmin, diagnosticGeneration, diagnosticRuntime } from './core/protocols/diagnostics/adapters.ts';
 /**
  * ThingLinks Edge Manager —— 入口。
  *
@@ -5,6 +9,7 @@
  * 其余能力（南向接入、云边协同、告警）按实施计划后置。
  */
 import { loadConfig } from './core/config.ts';
+import { startEditorOriginServers } from './http/editor-origin-server.ts';
 import { openDb } from './core/db.ts';
 import { deriveKey } from './core/auth/crypto.ts';
 import { loadMasterKey } from './core/auth/master-key.ts';
@@ -32,6 +37,9 @@ import { CloudConfigRepo } from './core/cloud/config-repo.ts';
 import { CloudRuntime } from './core/cloud/runtime.ts';
 import { CommandBridge } from './core/cloud/commands/bridge.ts';
 import { PresenceSynchronizer } from './core/cloud/presence/synchronizer.ts';
+import { PresenceObservers } from './core/edge/presence-observers/index.ts';
+import { PresenceObserverRuntime } from './core/edge/presence-observers/runtime.ts';
+import { FieldRegistry } from './core/edge/registry.ts';
 import { OutageLog } from './core/cloud/outage.ts';
 import { runPreflight, renderReport, adaptDocker } from './core/preflight/run.ts';
 import { readHostStats } from './core/health/host-stats.ts';
@@ -64,6 +72,8 @@ import { restoreBackup } from './core/archive/backup.ts';
 import { assertNoRestoreTransaction, recoverRestoreTransaction } from './core/archive/restore-transaction.ts';
 import { existsSync } from 'node:fs';
 import { hostname } from 'node:os';
+import { request as httpRequest } from 'node:http';
+import { RESTORE_WRITERS_PATH } from './core/docker-policy/restore-maintenance.ts';
 
 // 版本定义搬到 core/version.ts，让 http 层能直接引用而不成环。
 // 本文件内部也要用 describe()，所以先 import 再复导出 —— 只写 export…from
@@ -254,6 +264,54 @@ function resolveMetricsIntervalSec(): number {
   return n;
 }
 
+/** Only the policy endpoint can authenticate a stopped Manager's Compose restore oneoff. */
+async function readRestoreWriterSnapshot(): Promise<unknown> {
+  const connection = dockerConnection();
+  if (!connection || 'socketPath' in connection) {
+    throw new Error('恢复须通过部署的 Docker 策略代理；请按离线恢复文档使用 Compose 维护命令');
+  }
+  return new Promise((resolve, reject) => {
+    const request = httpRequest({ ...connection, method: 'GET', path: RESTORE_WRITERS_PATH,
+      signal: AbortSignal.timeout(10_000) }, response => {
+      void (async () => {
+        if (response.statusCode !== 200) { response.destroy(); throw new Error('维护身份或写入者状态未通过策略服务校验'); }
+        const chunks: Buffer[] = []; let bytes = 0;
+        for await (const chunk of response) {
+          bytes += chunk.length;
+          if (bytes > 1024 * 1024) { response.destroy(); throw new Error('写入者状态响应过大'); }
+          chunks.push(Buffer.from(chunk));
+        }
+        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown);
+      })().catch(reject);
+    });
+    request.once('error', reject);
+    request.end();
+  });
+}
+
+/** Fail closed for paused/restarting/unknown writers, not only Docker's running flag. */
+export async function assertRestoreWritersStopped(config: Pick<ReturnType<typeof loadConfig>,
+  'instanceDataRoot' | 'portRange' | 'timezone'>, readSnapshot = readRestoreWriterSnapshot): Promise<void> {
+  let raw: unknown;
+  try { raw = await readSnapshot(); }
+  catch (error) {
+    if (error instanceof Error && error.message.startsWith('恢复须通过部署的 Docker 策略代理')) throw error;
+    throw new Error('恢复前无法核实 Manager 与实例写入者已停止，已拒绝恢复', { cause: error });
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('恢复写入者状态不完整，已拒绝恢复');
+  const snapshot = raw as { version?: unknown; instanceDataRoot?: unknown; writers?: unknown };
+  if (snapshot.version !== 1 || snapshot.instanceDataRoot !== config.instanceDataRoot || !Array.isArray(snapshot.writers)) {
+    throw new Error('恢复写入者状态与当前部署不匹配，已拒绝恢复');
+  }
+  for (const item of snapshot.writers) {
+    const writer = item as { id?: unknown; name?: unknown; state?: unknown; stopped?: unknown } | null;
+    if (!writer || typeof writer.id !== 'string' || !/^[a-f0-9]{64}$/.test(writer.id)
+      || typeof writer.name !== 'string' || writer.stopped !== true || !['exited', 'created'].includes(String(writer.state))) {
+      throw new Error('恢复要求先停止所有 Manager、实例及其他挂载本部署数据的写入者；暂停或重启中仍不允许恢复');
+    }
+  }
+}
+
 /**
  * 恢复子命令：`node dist/index.js restore <备份文件> [--force]`
  *
@@ -272,6 +330,7 @@ async function runRestore(argv: string[]): Promise<void> {
     throw new Error('恢复要求 DATA_DIR 和 INSTANCE_DATA_ROOT 使用 EDGE_DATA_ROOT 下的标准布局');
   }
   if (recover) {
+    await assertRestoreWritersStopped(config);
     await recoverRestoreTransaction(config.dataRoot);
     console.log('[restore] 中断事务已处理；未提交事务已回滚，已提交事务已清理。');
     return;
@@ -283,6 +342,7 @@ async function runRestore(argv: string[]): Promise<void> {
   const manifest = await restoreBackup({
     archive, dataRoot: config.dataRoot, key,
     ignoreKeyMismatch: argv.includes('--force'),
+    assertQuiesced: () => assertRestoreWritersStopped(config),
   });
   console.log(`[restore] 已恢复到 ${config.dataRoot}`);
   console.log(`[restore] 备份时间 ${manifest.createdAt} · schema v${manifest.schemaVersion}`);
@@ -539,10 +599,17 @@ export async function main(overrides: InternalManagerOverrides = {}): Promise<vo
       return migrationHolder.service.completePendingStartUnderLease(instanceId, lease, actor);
     },
   };
+  const diagnosticStore = new ProtocolDiagnosticStore(db);
+  const protocolDiagnostics = new ProtocolDiagnosticService({
+    store: diagnosticStore, gate: operationGate,
+    admin: diagnosticAdmin(instanceAdmin.adminRuntime), runtime: diagnosticRuntime(repo, docker),
+    generationFor: id => diagnosticGeneration(repo, id),
+  });
   const service = new InstanceService({
     ...instanceAdmin.instanceServiceDeps,
     ...platformOperation.instanceServiceDeps,
     db, repo, docker, gate: operationGate,
+    removalLifecycle: diagnosticRemovalLifecycle(diagnosticStore, docker),
     instanceDataRoot: config.instanceDataRoot,
     platformPackages: platformNodeServices.platformPackages,
     pendingStartCompletion,
@@ -793,10 +860,17 @@ export async function main(overrides: InternalManagerOverrides = {}): Promise<vo
     db, cloud, listInstances: signal => service.list(signal),
     onError: message => { cloud.recordPresenceError(message); console.warn(`[presence] ${message}`); },
   });
+  const presenceObservers = new PresenceObservers(db);
+  const observerRuntime = new PresenceObserverRuntime({
+    observers: presenceObservers, registry: new FieldRegistry(db), presence,
+    listInstances: signal => service.list(signal),
+    onError: message => { console.warn(`[field-presence] ${message}`); },
+  });
 
   context.reconcileNetworks = reconcileNetworks;
   context.recoverInterrupted = async () => {
       const recovered = await migrationService.recoverInterrupted();
+      await protocolDiagnostics.recover();
       for (const result of recovered) {
         if (result.phase === 'manual_required') {
           console.warn(`[warn] 实例 ${result.instanceId} 的节点迁移需人工处理`);
@@ -806,6 +880,7 @@ export async function main(overrides: InternalManagerOverrides = {}): Promise<vo
   context.startBackground = async () => {
       commandBridge.start();
       presence.start();
+      observerRuntime.start();
       startMetrics();
       try {
         await cloud.apply(cloudConfig.get());
@@ -822,7 +897,7 @@ export async function main(overrides: InternalManagerOverrides = {}): Promise<vo
         config, db, auth, repo, service, operationGate, migrationService, proxySessions,
         upstreamFor: instanceUpstreamFor,
         spool, metrics, drainer, outages,
-        cloud, cloudConfig, commandBridge, presence,
+        cloud, cloudConfig, commandBridge, presence, presenceObservers, protocolDiagnostics,
         cloudSink: (payload) => cloud.publish(payload),
         webRoot: process.env['WEB_ROOT']?.trim() || undefined,
         nodeStore, nodeCatalog, valueHistory, nodeUpstream, nodeSources,
@@ -833,10 +908,19 @@ export async function main(overrides: InternalManagerOverrides = {}): Promise<vo
          */
         npmRegistryUrl,
       });
+      let editorServers: { close(): Promise<void> } | undefined;
+      app.addHook('preClose', async () => { await editorServers?.close(); });
+      app.addHook('preClose', async () => { await observerRuntime.close(); });
       return {
         server: app,
         listen: async () => {
-          await app.listen({ host: config.listenAddr, port: config.listenPort });
+          try {
+            editorServers = await startEditorOriginServers(app, { host: config.listenAddr, portRange: config.editorPortRange });
+            await app.listen({ host: config.listenAddr, port: config.listenPort });
+          } catch (error) {
+            await app.close();
+            throw error;
+          }
           console.log(
             `[ready] ${describe()} 监听 ${config.listenAddr}:${config.listenPort}` +
               ` · 外部地址 ${config.externalUrl}` +

@@ -37,6 +37,7 @@ export interface FieldDeviceRecord {
 
 export interface FieldTagInput {
   nodeId: string;
+  serviceCode?: string | undefined;
   tagId: string;
   name?: string;
   unit?: string;
@@ -46,6 +47,7 @@ export interface FieldTagInput {
 export interface FieldTagRecord {
   instanceId: string;
   nodeId: string;
+  serviceCode: string;
   tagId: string;
   name: string;
   unit: string;
@@ -58,6 +60,7 @@ export interface FieldTagRecord {
 
 export interface TagValueInput {
   nodeId: string;
+  serviceCode?: string | undefined;
   tagId: string;
   value: unknown;
   /** 质量码，留空按 good 处理 */
@@ -74,6 +77,13 @@ export class RegistryError extends Error {
 }
 
 const nowIso = () => new Date().toISOString();
+
+export function fieldServiceCode(value: unknown): string {
+  if (value === undefined || value === '') return '';
+  if (typeof value !== 'string' || !/^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,127}$/.test(value)
+    || ['__proto__', 'constructor', 'prototype'].includes(value)) throw new RegistryError('服务编码格式无效');
+  return value;
+}
 
 function assertId(value: string, what: string): string {
   if (typeof value !== 'string' || value.trim() === '') {
@@ -117,17 +127,24 @@ export class FieldRegistry {
     ).run(online ? 1 : 0, nowIso(), instanceId, nodeId);
   }
 
+  /** Observer aggregation changes presence without pretending that new device data arrived. */
+  setObservedOnline(instanceId: string, nodeId: string, online: boolean): void {
+    this.db.prepare('UPDATE field_device SET online = ? WHERE instance_id = ? AND node_id = ?')
+      .run(online ? 1 : 0, instanceId, nodeId);
+  }
+
   /** 定义一个点位。同样幂等 */
   upsertTag(instanceId: string, t: FieldTagInput): void {
     assertId(instanceId, 'instanceId');
     assertId(t.nodeId, 'nodeId');
     assertId(t.tagId, 'tagId');
+    const serviceCode = fieldServiceCode(t.serviceCode);
     this.db.prepare(
-      `INSERT INTO field_tag (instance_id, node_id, tag_id, name, unit, data_type)
-       VALUES (?, ?, ?, ?, ?, ?)
-       ON CONFLICT(instance_id, node_id, tag_id) DO UPDATE SET
+      `INSERT INTO field_tag (instance_id, node_id, service_code, tag_id, name, unit, data_type)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(instance_id, node_id, service_code, tag_id) DO UPDATE SET
          name = excluded.name, unit = excluded.unit, data_type = excluded.data_type`,
-    ).run(instanceId, t.nodeId, t.tagId, t.name ?? t.tagId, t.unit ?? '', t.dataType ?? '');
+    ).run(instanceId, t.nodeId, serviceCode, t.tagId, t.name ?? t.tagId, t.unit ?? '', t.dataType ?? '');
   }
 
   /**
@@ -139,36 +156,39 @@ export class FieldRegistry {
    * 未定义过的点位会**自动补一条定义**：现场常见先有值后补元数据，
    * 丢掉这类值会让界面出现「有设备没点位」的空洞。
    */
-  recordValues(instanceId: string, values: TagValueInput[]): number {
+  recordValues(instanceId: string, values: TagValueInput[], options: { updateOnline?: boolean } = {}): number {
     assertId(instanceId, 'instanceId');
     const upsertTag = this.db.prepare(
-      `INSERT INTO field_tag (instance_id, node_id, tag_id) VALUES (?, ?, ?)
-       ON CONFLICT(instance_id, node_id, tag_id) DO NOTHING`,
+      `INSERT INTO field_tag (instance_id, node_id, service_code, tag_id) VALUES (?, ?, ?, ?)
+       ON CONFLICT(instance_id, node_id, service_code, tag_id) DO NOTHING`,
     );
     const setValue = this.db.prepare(
       `UPDATE field_tag SET last_value = ?, quality = ?, last_at = ?
-       WHERE instance_id = ? AND node_id = ? AND tag_id = ?`,
+       WHERE instance_id = ? AND node_id = ? AND service_code = ? AND tag_id = ?`,
     );
     // 上一条的值 / 质量 / 上次存历史的时刻 —— 一次查表就够，见 history.ts 的说明
     const prevOf = this.db.prepare(
       `SELECT last_value AS value, quality, hist_at AS histAt FROM field_tag
-        WHERE instance_id = ? AND node_id = ? AND tag_id = ?`,
+        WHERE instance_id = ? AND node_id = ? AND service_code = ? AND tag_id = ?`,
     );
     const markHist = this.db.prepare(
-      `UPDATE field_tag SET hist_at = ? WHERE instance_id = ? AND node_id = ? AND tag_id = ?`,
+      `UPDATE field_tag SET hist_at = ? WHERE instance_id = ? AND node_id = ? AND service_code = ? AND tag_id = ?`,
     );
     const touchDevice = this.db.prepare(
-      'UPDATE field_device SET online = 1, last_seen = ? WHERE instance_id = ? AND node_id = ?',
+      options.updateOnline === false
+        ? 'UPDATE field_device SET last_seen = ? WHERE instance_id = ? AND node_id = ?'
+        : 'UPDATE field_device SET online = 1, last_seen = ? WHERE instance_id = ? AND node_id = ?',
     );
 
     const run = this.db.transaction((items: TagValueInput[]) => {
       for (const v of items) {
         assertId(v.nodeId, 'nodeId');
         assertId(v.tagId, 'tagId');
+        const serviceCode = fieldServiceCode(v.serviceCode);
         const at = v.at ?? nowIso();
         const encoded = JSON.stringify(v.value ?? null);
         const quality = v.quality ?? 'good';
-        upsertTag.run(instanceId, v.nodeId, v.tagId);
+        upsertTag.run(instanceId, v.nodeId, serviceCode, v.tagId);
 
         /*
          * 历史要在 setValue **之前**判断：setValue 一跑，上一条的值就没了，
@@ -176,7 +196,7 @@ export class FieldRegistry {
          * 于是历史表按最大速率增长 —— 而现象只是磁盘悄悄变满。
          */
         if (this.history?.enabled) {
-          const prev = prevOf.get(instanceId, v.nodeId, v.tagId) as
+          const prev = prevOf.get(instanceId, v.nodeId, serviceCode, v.tagId) as
             { value?: string | null; quality?: string | null; histAt?: string | null } | undefined;
           const store = shouldStore(
             {
@@ -188,12 +208,12 @@ export class FieldRegistry {
             this.history.limits,
           );
           if (store) {
-            this.history.append(instanceId, v.nodeId, v.tagId, { at, value: encoded, quality });
-            markHist.run(at, instanceId, v.nodeId, v.tagId);
+            this.history.append(instanceId, v.nodeId, v.tagId, { at, value: encoded, quality }, serviceCode);
+            markHist.run(at, instanceId, v.nodeId, serviceCode, v.tagId);
           }
         }
 
-        setValue.run(encoded, quality, at, instanceId, v.nodeId, v.tagId);
+        setValue.run(encoded, quality, at, instanceId, v.nodeId, serviceCode, v.tagId);
         // 有值上来说明设备是活的
         touchDevice.run(at, instanceId, v.nodeId);
       }
@@ -223,17 +243,19 @@ export class FieldRegistry {
     }));
   }
 
-  tags(instanceId?: string, nodeId?: string): FieldTagRecord[] {
+  tags(instanceId?: string, nodeId?: string, serviceCode?: string): FieldTagRecord[] {
     const where: string[] = [];
     const args: string[] = [];
     if (instanceId) { where.push('instance_id = ?'); args.push(instanceId); }
     if (nodeId) { where.push('node_id = ?'); args.push(nodeId); }
+    if (serviceCode !== undefined) { where.push('service_code = ?'); args.push(fieldServiceCode(serviceCode)); }
     const sql = `SELECT * FROM field_tag${where.length ? ' WHERE ' + where.join(' AND ') : ''}`
-      + ' ORDER BY node_id, tag_id';
+      + ' ORDER BY node_id, service_code, tag_id';
     const rows = this.db.prepare(sql).all(...args) as Record<string, unknown>[];
     return rows.map((r) => ({
       instanceId: String(r['instance_id']),
       nodeId: String(r['node_id']),
+      serviceCode: String(r['service_code']),
       tagId: String(r['tag_id']),
       name: String(r['name']),
       unit: String(r['unit']),

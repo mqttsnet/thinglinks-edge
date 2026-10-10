@@ -55,3 +55,24 @@ test('autocomplete stores protocol codes while displaying human readable names',
     { value: 'environment', label: 'environment', displayLabel: '环境数据（environment）' },
   ]);
 });
+
+const multiModel: CloudProductModel = { ...model, services: [...(model.services ?? []), {
+  serviceCode: 'environment', serviceName: '环境', properties: [{ propertyCode: 'voltage', propertyName: '另一组电压', datatype: 'float' }],
+  commands: [{ commandCode: 'set', requests: [{ parameterCode: 'value', datatype: 'float' }], responses: [] }],
+}] };
+test('row service scopes point, command and parameter suggestions without erasing the default', () => {
+  assert.equal(modelFieldOptions('serviceCode', values, multiModel, 'points').length, 2);
+  assert.deepEqual(modelFieldOptions('property', values, multiModel, 'points', { serviceCode: 'environment' }).map(x => x.value), ['voltage']);
+  assert.deepEqual(modelFieldOptions('param', values, multiModel, 'commands', { serviceCode: 'environment', cmd: 'set' }).map(x => x.value), ['value']);
+  const mapped = { ...values, points: [{ property: 'setpoint' }, { serviceCode: 'environment', property: 'voltage' }] };
+  assert.deepEqual(modelFieldOptions('property', mapped, multiModel, 'commands', { targetServiceCode: 'environment' }).map(x => x.value), ['voltage']);
+});
+test('cross-service identical property names remain distinct and command targets match the selected target service', () => {
+  const configured = { serviceCode: '', points: [
+    { serviceCode: 'electrical', property: 'voltage' }, { serviceCode: 'environment', property: 'voltage' },
+  ], downlinkEnabled: true, commands: [{ serviceCode: 'environment', cmd: 'set', param: 'value', targetServiceCode: 'electrical', property: 'voltage' }] };
+  assert.deepEqual(mappingIssues(configured, multiModel), []);
+  assert.ok(mappingIssues({ ...configured, points: [...configured.points, configured.points[0]] }, multiModel).some(x => /重复/.test(x)));
+  assert.ok(mappingIssues({ ...configured, commands: [{ ...configured.commands[0], targetServiceCode: 'missing' }] }, multiModel).some(x => /missing/.test(x)));
+  assert.ok(mappingIssues({ serviceCode: '', points: [{ property: 'voltage' }] }, null).some(x => /服务/.test(x)));
+});

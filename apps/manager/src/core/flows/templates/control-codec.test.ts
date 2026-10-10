@@ -29,6 +29,33 @@ const command = (params: unknown = { value: 12 }, over: Record<string, unknown> 
   params,
   ...over,
 });
+
+test('same command and property names remain distinct across services and use the exact target point', () => {
+  const config = options({
+    points: [
+      { ...point('number', 'motor.speed'), serviceCode: 'motor', scale: 2 },
+      { ...point('number', 'fan.speed'), serviceCode: 'fan', scale: 4 },
+    ],
+    mappings: [
+      { serviceCode: 'motor', cmd: 'setSpeed', param: 'value', property: 'speed' },
+      { serviceCode: 'fan', cmd: 'setSpeed', param: 'value', property: 'speed' },
+    ],
+    commandUrl: 'http://device.local/control',
+  });
+  assert.deepEqual(execute('http', config, command({ value: 20 })).result?.payload, { motor: { speed: 10 } });
+  assert.deepEqual(execute('http', config, command({ value: 20 }, { serviceCode: 'fan' })).result?.payload, { fan: { speed: 5 } });
+  assert.equal(execute('http', config, command({ value: 20 }, { serviceCode: 'missing' })).result, null);
+});
+
+test('an explicit cross-service command target resolves through its target service', () => {
+  const config = options({ serviceCode: '', commandUrl: 'http://device.local/control',
+    points: [{ ...point('number', 'actuator.speed'), serviceCode: 'actuator', scale: 2 }],
+    mappings: [{ serviceCode: 'control', targetServiceCode: 'actuator', cmd: 'setSpeed', param: 'value', property: 'speed' }],
+  });
+  assert.deepEqual(execute('http', config, command({ value: 20 }, { serviceCode: 'control' })).result?.payload, { actuator: { speed: 10 } });
+  assert.equal(execute('http', { ...config, mappings: [{ ...config.mappings[0]!, targetServiceCode: 'missing' }] },
+    command({ value: 20 }, { serviceCode: 'control' })).result, null);
+});
 function execute(
   protocol: string,
   config = options(),

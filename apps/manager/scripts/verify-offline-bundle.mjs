@@ -17,6 +17,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { assertImageRoles, assertComposeImageRoles } from '../../../scripts/offline/image-roles.mjs';
 
 const REQUIRED = [
   'images.tar',
@@ -155,6 +156,34 @@ export function singleConfigId(archive, expectedArchitecture) {
   return `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
 }
 
+export const bundleImageRoles = assertImageRoles;
+
+export function assertNetworkIsolationDeployment(services) {
+  const controller = services['network-isolation'];
+  assert.ok(controller, 'network-isolation service missing');
+  assert.deepEqual(controller.command, ['node', 'dist/network-isolation-main.js'], 'network-isolation entrypoint must be explicit');
+  assert.equal(controller.network_mode, 'host', 'network-isolation must use the host network namespace');
+  assert.equal(controller.user, '0:0');
+  assert.equal(controller.read_only, true);
+  assert.notEqual(controller.privileged, true);
+  assert.deepEqual(controller.cap_drop, ['ALL']);
+  assert.deepEqual(controller.cap_add, ['NET_ADMIN'], 'network-isolation must add only NET_ADMIN');
+  assert.deepEqual(controller.security_opt, ['no-new-privileges:true']);
+  assert.equal(controller.volumes?.length, 1, 'network-isolation may mount only its private control volume');
+  const control = controller.volumes[0];
+  assert.equal(control.type, 'volume');
+  assert.equal(control.source, 'edge-network-control');
+  assert.equal(control.target, '/run/tle-network');
+  const policy = services['docker-proxy'];
+  assert.ok(policy?.volumes?.some(volume => volume.type === 'volume' && volume.source === control.source && volume.target === control.target));
+  assert.ok(policy.volumes.some(volume => volume.type === 'volume' && volume.source === 'edge-policy-state' && volume.target === '/var/lib/tle-policy'));
+  assert.ok(!(services.manager?.volumes ?? []).some(volume => ['edge-network-control', 'edge-policy-state'].includes(volume.source)),
+    'Manager must not mount private network control or policy state');
+  assert.equal(controller.environment?.TLE_NET_CONTROL_SOCKET, '/run/tle-network/control.sock');
+  assert.equal(policy.environment?.TLE_POLICY_NETWORK_SOCKET, '/run/tle-network/control.sock');
+  assert.equal(String(controller.environment?.TLE_NET_HEALTH_PORT), String(policy.environment?.TLE_POLICY_NETWORK_HEALTH_PORT));
+}
+
 function uniqueSuffix(entries, suffix) {
   const matches = entries.filter((entry) => entry.endsWith(`/${suffix}`));
   assert.equal(matches.length, 1, `bundle must contain exactly one ${suffix}`);
@@ -177,7 +206,9 @@ function cleanComposeEnvironment() {
   const env = { ...process.env, MASTER_KEY: 'bundle-contract-probe' };
   for (const key of [
     'MANAGER_IMAGE',
+    'POLICY_IMAGE',
     'PROXY_IMAGE',
+    'NETWORK_IMAGE',
     'INIT_IMAGE',
     'NODE_RED_IMAGE_REPO',
     'NODE_RED_BOOTSTRAP_IMAGE',
@@ -217,13 +248,15 @@ function checksumPaths(text) {
   return paths;
 }
 
-export function verifyOfflineBundle(bundleArg, expectedManagerTag, expectedManagerConfigId) {
+export function verifyOfflineBundle(bundleArg, expectedManagerTag, expectedManagerConfigId, expectedPolicyConfigId = expectedManagerConfigId) {
   assert.ok(bundleArg && expectedManagerTag && expectedManagerConfigId,
-    'usage: verify-offline-bundle.mjs <bundle> <manager-tag> <manager-config-id>');
+    'usage: verify-offline-bundle.mjs <bundle> <manager-tag> <manager-config-id> [policy-config-id]');
   assert.doesNotMatch(expectedManagerTag, /^sha256:|@sha256:/,
     'manager bundle reference must be a named tag');
   assert.match(expectedManagerConfigId, /^sha256:[0-9a-f]{64}$/,
     'manager config must be an immutable sha256 ID');
+  assert.match(expectedPolicyConfigId, /^sha256:[0-9a-f]{64}$/,
+    'policy config must be an independently captured immutable sha256 ID');
 
   const bundle = resolve(bundleArg);
   const runId = process.env.TLE_VERIFY_RUN_ID ?? 'standalone';
@@ -316,11 +349,14 @@ export function verifyOfflineBundle(bundleArg, expectedManagerTag, expectedManag
     });
 
     const manifest = JSON.parse(readFileSync(join(packageRoot, 'manifest.json'), 'utf8'));
-    assert.ok(Array.isArray(manifest.images) && manifest.images.length >= 4,
-      'bundle manifest images missing');
-    const manager = manifest.images[0];
+    const roles = bundleImageRoles(manifest);
+    const manager = manifest.images.find(item => item.image === roles.manager);
     check('manifest Manager tag 与 descriptor 归档 Config ID 同源', () => {
       assert.deepEqual(manager, { image: expectedManagerTag, id: expectedManagerConfigId });
+    });
+    check('策略角色与独立提供的 Config ID 同源', () => {
+      const policy = manifest.images.find(item => item.image === roles.dockerProxy);
+      assert.equal(policy.id, expectedPolicyConfigId, '策略镜像必须匹配提供的 Config ID');
     });
 
     const imagesTar = join(packageRoot, 'images.tar');
@@ -346,11 +382,12 @@ export function verifyOfflineBundle(bundleArg, expectedManagerTag, expectedManag
       .map((tag) => tag.trim()).filter(Boolean);
     const nodeRepo = env.get('NODE_RED_IMAGE_REPO') ?? '';
     check('.env.example 与 manifest 镜像一致', () => {
-      assert.equal(env.get('MANAGER_IMAGE'), manifest.images[0].image);
-      assert.equal(env.get('PROXY_IMAGE'), manifest.images[1].image);
-      assert.equal(env.get('INIT_IMAGE'), manifest.images[2].image);
-      assert.equal(env.get('NODE_RED_BOOTSTRAP_IMAGE'), imageRefs[3]);
-      assert.deepEqual(allowedTags.map((tag) => `${nodeRepo}:${tag}`), imageRefs.slice(3));
+      assert.equal(env.get('MANAGER_IMAGE'), roles.manager);
+      assert.equal(env.get('PROXY_IMAGE'), roles.dockerProxy);
+      assert.equal(env.get('NETWORK_IMAGE'), roles.networkIsolation);
+      assert.equal(env.get('INIT_IMAGE'), roles.initData);
+      assert.equal(env.get('NODE_RED_BOOTSTRAP_IMAGE'), roles.nodeRed[0]);
+      assert.deepEqual(allowedTags.map((tag) => `${nodeRepo}:${tag}`), roles.nodeRed);
     });
 
     const composeText = command('docker', [
@@ -362,16 +399,15 @@ export function verifyOfflineBundle(bundleArg, expectedManagerTag, expectedManag
     const compose = JSON.parse(composeText);
     const services = compose.services ?? {};
     check('compose 解析引用 images.tar 同一组 tag', () => {
-      assert.equal(services.manager?.image, manifest.images[0].image);
-      assert.equal(services['docker-proxy']?.image, manifest.images[1].image);
-      assert.equal(services['init-data']?.image, manifest.images[2].image);
-      assert.equal(services['node-red-image']?.image, imageRefs[3]);
-      for (const service of ['manager', 'docker-proxy', 'init-data', 'node-red-image']) {
+      assertComposeImageRoles(manifest, services);
+      assert.deepEqual(services['docker-proxy']?.command, ['node', 'dist/docker-policy-main.js'], 'Docker 执行策略入口必须保留');
+      for (const service of ['manager', 'docker-proxy', 'network-isolation', 'init-data', 'node-red-image']) {
         assert.ok(repoTags.has(services[service]?.image), service);
         assert.equal(services[service]?.pull_policy, 'never', `${service} pull_policy`);
       }
       assert.equal(services.manager?.environment?.NODE_RED_IMAGE_REPO, nodeRepo);
       assert.equal(services.manager?.environment?.ALLOWED_IMAGE_TAGS, allowedTags.join(','));
+      assertNetworkIsolationDeployment(services);
     });
 
     console.log(`\n  ${checks.length}/${checks.length} 通过\n`);
@@ -392,7 +428,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1
       const id = singleConfigId(process.argv[3], process.argv[4]);
       process.stdout.write(`${id}\n`);
     } else {
-      verifyOfflineBundle(process.argv[2], process.argv[3], process.argv[4]);
+      verifyOfflineBundle(process.argv[2], process.argv[3], process.argv[4], process.argv[5]);
     }
   } catch (error) {
     console.error(`verify-offline-bundle failed: ${error.message}`);

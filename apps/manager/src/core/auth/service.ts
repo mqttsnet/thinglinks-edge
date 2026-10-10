@@ -385,6 +385,15 @@ export class AuthService {
 
   /** 会话校验；空闲超时即失效 */
   resolve(sid: string | undefined): SessionUser | undefined {
+    return this.resolveSession(sid, true);
+  }
+
+  /** Background authorization checks must not turn idle WebSockets into permanent sessions. */
+  peek(sid: string | undefined): SessionUser | undefined {
+    return this.resolveSession(sid, false);
+  }
+
+  private resolveSession(sid: string | undefined, touch: boolean): SessionUser | undefined {
     if (!sid) return undefined;
     const s = this.sessions.get(sid);
     if (!s) return undefined;
@@ -393,7 +402,7 @@ export class AuthService {
       this.sessions.delete(sid);
       return undefined;
     }
-    s.lastSeen = Date.now();
+    if (touch) s.lastSeen = Date.now();
     const row = this.db.prepare(
       'SELECT role, must_change_pwd, disabled, pwd_hash, totp_enabled FROM app_user WHERE username = ?',
     ).get(s.username) as

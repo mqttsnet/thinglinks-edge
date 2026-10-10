@@ -8,6 +8,8 @@ import type {
 import { TemplateError } from '../types.ts';
 import { validateParameters } from './parameters.ts';
 import type { TemplateParameter } from './types.ts';
+import { resolvePoints, resolveServiceCode, pointIdentity } from './service-mapping.ts';
+import { resolveControlMappings } from './control-mapping.ts';
 
 type ValueFamily = 'number' | 'boolean' | 'string';
 const numberTypes = new Set([
@@ -73,30 +75,37 @@ export function validateTemplateModelMappings(
   const product = code(parameters['productIdentification']);
   if (model.productIdentification && product && model.productIdentification !== product)
     throw new TemplateError('缓存物模型产品与当前子设备产品不一致');
-  const service = unique<ModelService>(
-    model.services,
-    'serviceCode',
-    code(parameters['serviceCode']),
-    '服务',
-  );
-  const points = records(parameters['points'], '采集点位');
+  const services = new Map<string, ModelService>();
+  const serviceFor = (value: string): ModelService => {
+    const serviceCode = resolveServiceCode(value);
+    let service = services.get(serviceCode);
+    if (!service) {
+      service = unique<ModelService>(model.services, 'serviceCode', serviceCode, '服务');
+      services.set(serviceCode, service);
+    }
+    return service;
+  };
+  const points = resolvePoints(records(parameters['points'], '采集点位'), parameters['serviceCode']);
+  const targets = new Map(points.map(point => [pointIdentity(point.serviceCode, point.property), point]));
   for (const point of points) {
+    const service = serviceFor(point.serviceCode);
     const property = unique<ModelProperty>(
       service.properties,
       'propertyCode',
       code(point['property']),
-      '属性',
+      `服务 ${point.serviceCode} 的属性`,
     );
-    compatible(point['dataType'], property.datatype, `属性 ${property.propertyCode}`);
+    compatible(point['dataType'], property.datatype, `服务 ${point.serviceCode} 的属性 ${property.propertyCode}`);
   }
   if (parameters['downlinkEnabled'] !== true) return;
-  for (const mapping of records(parameters['commands'], '命令映射')) {
-    const command = unique<ModelCommand>(service.commands, 'commandCode', code(mapping['cmd']), '命令');
+  for (const mapping of resolveControlMappings(parameters['commands'], points, parameters['serviceCode'])) {
+    const service = serviceFor(mapping.serviceCode);
+    const command = unique<ModelCommand>(service.commands, 'commandCode', mapping.cmd, `服务 ${mapping.serviceCode} 的命令`);
     const parameter = unique<ModelCommandParameter>(
       command.requests,
       'parameterCode',
-      code(mapping['param']),
-      '命令参数',
+      mapping.param,
+      `服务 ${mapping.serviceCode} 的命令参数`,
     );
     const requests = command.requests!;
     if (
@@ -113,9 +122,9 @@ export function validateTemplateModelMappings(
         );
       }
     }
-    const targets = points.filter((point) => point['property'] === mapping['property']);
-    if (targets.length !== 1) throw new TemplateError(`命令 ${command.commandCode} 的目标点位不存在或重复`);
-    compatible(targets[0]!['dataType'], parameter.datatype, `命令参数 ${parameter.parameterCode}`);
+    const target = targets.get(pointIdentity(mapping.targetServiceCode, mapping.property));
+    if (!target) throw new TemplateError(`命令 ${mapping.serviceCode} / ${command.commandCode} 的目标点位不存在`);
+    compatible(target['dataType'], parameter.datatype, `服务 ${mapping.serviceCode} 的命令参数 ${parameter.parameterCode}`);
   }
 }
 

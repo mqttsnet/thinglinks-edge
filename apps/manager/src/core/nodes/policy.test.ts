@@ -95,8 +95,15 @@ test('版本范围只做字符集校验', () => {
 test('registryEnv 用环境变量而不是 .npmrc —— npm info 读不到 /data/.npmrc', () => {
   const env = registryEnv('http://mgr:19100/x/npm/');
   assert.ok(env.includes('NPM_CONFIG_REGISTRY=http://mgr:19100/x/npm/'));
+  assert.ok(env.includes('NPM_CONFIG_STRICT_SSL=false'));
   // 留空表示不配私有源，此时一个变量都不该注入（沿用镜像默认）
   assert.deepEqual(registryEnv(''), []);
+});
+
+test('HTTPS 节点源默认保留 TLS 证书校验', () => {
+  const env = registryEnv('https://registry.example/npm/');
+  assert.ok(env.includes('NPM_CONFIG_REGISTRY=https://registry.example/npm/'));
+  assert.ok(!env.includes('NPM_CONFIG_STRICT_SSL=false'));
 });
 
 // ── 安装策略两档 ────────────────────────────────────────

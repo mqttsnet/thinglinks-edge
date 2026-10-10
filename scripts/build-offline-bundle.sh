@@ -34,7 +34,10 @@ done
 # 版本号取自 manager 的 package.json —— 与镜像标签同源，避免两处各写一个
 VERSION="$(node -p "require('./apps/manager/package.json').version")"
 MANAGER_IMAGE="${MANAGER_IMAGE:-mqttsnet/thinglinks-edge:${VERSION}}"
-PROXY_IMAGE="${PROXY_IMAGE:-wollomatic/socket-proxy:1.13.1}"
+# Both privileged roles share the release policy image. Manager fallback keeps
+# older single-image releases installable; new releases set POLICY_IMAGE.
+PROXY_IMAGE="${PROXY_IMAGE:-${POLICY_IMAGE:-$MANAGER_IMAGE}}"
+NETWORK_IMAGE="${NETWORK_IMAGE:-${POLICY_IMAGE:-$MANAGER_IMAGE}}"
 INIT_IMAGE="${INIT_IMAGE:-alpine:3.22}"
 NODE_RED_REPO="${NODE_RED_IMAGE_REPO:-nodered/node-red}"
 ALLOWED_IMAGE_TAGS="${ALLOWED_IMAGE_TAGS:-5.0.7-24-minimal,5.0.4-24-minimal,4.1.13-22-minimal}"
@@ -47,14 +50,20 @@ ARCH="$(docker version --format '{{.Server.Arch}}')"
 NAME="thinglinks-edge-offline-${VERSION}-linux-${ARCH}"
 STAGE="${OUT_DIR}/${NAME}"
 
-IMAGES=("$MANAGER_IMAGE" "$PROXY_IMAGE" "$INIT_IMAGE")
+IMAGES=("$MANAGER_IMAGE" "$PROXY_IMAGE" "$NETWORK_IMAGE" "$INIT_IMAGE")
 IFS=',' read -ra TAGS <<< "$ALLOWED_IMAGE_TAGS"
 for t in "${TAGS[@]}"; do IMAGES+=("${NODE_RED_REPO}:$(echo "$t" | xargs)"); done
+ARCHIVE_IMAGES=()
+for img in "${IMAGES[@]}"; do
+  found=0
+  for existing in "${ARCHIVE_IMAGES[@]-}"; do [ "$existing" != "$img" ] || found=1; done
+  [ "$found" = "1" ] || ARCHIVE_IMAGES+=("$img")
+done
 
 # `docker save sha256:<id>` 在当前 Moby 会导出 RepoTags:null。现场 `docker load`
 # 虽然得到镜像层，却恢复不了 compose 要找的名字，最终仍会尝试联网拉取。
 # 离线包里的每个镜像必须用可恢复的 named tag，而不能用裸 ID 或 digest。
-for img in "${IMAGES[@]}"; do
+for img in "${ARCHIVE_IMAGES[@]}"; do
   case "$img" in
     sha256:*|*@sha256:*)
       echo "✗ 离线包镜像必须使用 named tag，不可使用裸 ID/digest：$img" >&2
@@ -67,7 +76,7 @@ echo "── 离线安装包 ${VERSION} · linux/${ARCH} ──"
 echo
 
 # 1) 逐个确认镜像在本机，并核对架构 —— 见约束 1、2
-for img in "${IMAGES[@]}"; do
+for img in "${ARCHIVE_IMAGES[@]}"; do
   if ! docker image inspect "$img" >/dev/null 2>&1; then
     echo "✗ 本机没有镜像 $img" >&2
     echo "  先取到它再打包： docker pull $img" >&2
@@ -88,15 +97,15 @@ mkdir -p "$STAGE"
 # 2) 导出镜像。一个 tar 装全部：现场少一步「按顺序 load 好几个文件」
 echo
 echo "  导出镜像（几百 MB，耐心等）…"
-docker save -o "${STAGE}/images.tar" "${IMAGES[@]}"
+docker save -o "${STAGE}/images.tar" "${ARCHIVE_IMAGES[@]}"
 
 # `docker save` 完成后，tag 已可能被同机其它操作重指。最终清单不再回头
 # inspect 可变 tag，而是从刚写好的 archive 逐个读取 Config bytes：RepoTags 必须
 # 与请求集合精确相等，每个 Config 都是普通成员，其 sha256 就是可信 image ID。
 IMAGE_INDEX="${STAGE}/.image-index.json"
 node apps/manager/scripts/verify-offline-bundle.mjs \
-  --index "${STAGE}/images.tar" "$ARCH" "${IMAGES[@]}" > "$IMAGE_INDEX"
-echo "  ✓ images.tar RepoTags/Config ${#IMAGES[@]}/${#IMAGES[@]} 全部绑定"
+  --index "${STAGE}/images.tar" "$ARCH" "${ARCHIVE_IMAGES[@]}" > "$IMAGE_INDEX"
+echo "  ✓ images.tar RepoTags/Config ${#ARCHIVE_IMAGES[@]}/${#ARCHIVE_IMAGES[@]} 全部绑定"
 
 # 3) 部署文件。compose 主文件原样带走，另加一份 offline 覆盖：
 #    pull_policy: never 让「镜像没 load 进去」当场失败，而不是去连网拉
@@ -120,9 +129,10 @@ upsert_env() {
 }
 upsert_env MANAGER_IMAGE "$MANAGER_IMAGE" "${STAGE}/.env.example"
 upsert_env PROXY_IMAGE "$PROXY_IMAGE" "${STAGE}/.env.example"
+upsert_env NETWORK_IMAGE "$NETWORK_IMAGE" "${STAGE}/.env.example"
 upsert_env INIT_IMAGE "$INIT_IMAGE" "${STAGE}/.env.example"
 upsert_env NODE_RED_IMAGE_REPO "$NODE_RED_REPO" "${STAGE}/.env.example"
-upsert_env NODE_RED_BOOTSTRAP_IMAGE "${IMAGES[3]}" "${STAGE}/.env.example"
+upsert_env NODE_RED_BOOTSTRAP_IMAGE "${IMAGES[4]}" "${STAGE}/.env.example"
 upsert_env ALLOWED_IMAGE_TAGS "$ALLOWED_IMAGE_TAGS" "${STAGE}/.env.example"
 cat > "${STAGE}/docker-compose.offline.yml" <<'YAML'
 # 离线覆盖：任何服务都不许去网上拉镜像。
@@ -131,6 +141,8 @@ cat > "${STAGE}/docker-compose.offline.yml" <<'YAML'
 # 现场表现是「卡在 Pulling 很久然后超时」——
 # 而真正该说的那句话是「这个镜像不在包里」。
 services:
+  network-isolation:
+    pull_policy: never
   docker-proxy:
     pull_policy: never
   init-data:
@@ -142,7 +154,9 @@ services:
 YAML
 
 cp scripts/offline/install.sh "${STAGE}/install.sh"
+cp scripts/offline/image-roles.mjs "${STAGE}/image-roles.mjs"
 cp scripts/offline/README.md "${STAGE}/README.md"
+cp docs/guides/instance-isolation.md "${STAGE}/INSTANCE-ISOLATION.md"
 chmod +x "${STAGE}/install.sh"
 
 # 3b) 预置节点包。放进包里的 node-seed/，由 install.sh 拷进数据目录，
@@ -167,11 +181,13 @@ if [ -n "$NODE_SEED_DIR" ]; then
 fi
 
 # 4) 清单：装了什么、什么架构、什么时候打的。现场核对与售后追溯都靠它
-node -e '
-const { createHash } = require("node:crypto");
-const { readdirSync, readFileSync, existsSync, writeFileSync } = require("node:fs");
-const [stage, version, arch, indexPath, ...images] = process.argv.slice(1);
+node --input-type=module -e '
+import { createHash } from "node:crypto";
+import { readdirSync, readFileSync, existsSync, writeFileSync } from "node:fs";
+import { assertImageRoles } from "./scripts/offline/image-roles.mjs";
+const [stage, version, arch, indexPath, ...roleImages] = process.argv.slice(1);
 const imageIndex = JSON.parse(readFileSync(indexPath, "utf8"));
+const images = [...new Set(roleImages)];
 const seedDir = `${stage}/node-seed`;
 const nodeSeed = existsSync(seedDir)
   ? readdirSync(seedDir).filter((f) => f.endsWith(".tgz")).sort()
@@ -180,23 +196,26 @@ const nodeSeedIntegrity = Object.fromEntries(nodeSeed.map((file) => [
   file,
   `sha512-${createHash("sha512").update(readFileSync(`${seedDir}/${file}`)).digest("base64")}`,
 ]));
-writeFileSync(`${stage}/manifest.json`, JSON.stringify({
+const manifest = {
   product: "thinglinks-edge",
   version, platform: `linux/${arch}`,
   createdAt: new Date().toISOString(),
   images: images.map((image) => ({ image, id: imageIndex[image].id })),
+  imageRoles: { manager: roleImages[0], dockerProxy: roleImages[1], networkIsolation: roleImages[2], initData: roleImages[3], nodeRed: [...new Set(roleImages.slice(4))] },
   // 现场要能回答「这批包里到底带了哪些节点」，而不是去数目录
   nodeSeed,
   // 与 Manager 的固定 SRI 合同可以直接对照；SHA256SUMS 另管整个离线包传输完整性
   nodeSeedIntegrity,
-}, null, 2) + "\n");
+};
+assertImageRoles(manifest);
+writeFileSync(`${stage}/manifest.json`, JSON.stringify(manifest, null, 2) + "\n");
 ' "$STAGE" "$VERSION" "$ARCH" "$IMAGE_INDEX" "${IMAGES[@]}"
 rm -f "$IMAGE_INDEX"
 
 # 5) 校验和 —— 见约束 3。节点包也要进校验：U 盘拷坏一个 tgz，
 #    现场表现是「这个节点导入失败」，同样看不出是文件坏了
 ( cd "$STAGE" && shasum -a 256 images.tar docker-compose.yml docker-compose.offline.yml \
-    install.sh README.md manifest.json .env.example \
+    install.sh image-roles.mjs README.md INSTANCE-ISOLATION.md manifest.json .env.example \
     $(find changelogs -type f 2>/dev/null | sort) \
     $(find node-seed -type f \( -name '*.tgz' -o -name 'protocol-seed-manifest.json' \) 2>/dev/null | sort) \
     > SHA256SUMS )

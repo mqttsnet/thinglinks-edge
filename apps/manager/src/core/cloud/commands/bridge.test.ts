@@ -21,6 +21,70 @@ function fixture(limits = {}) {
     const command = (mid:ProtocolMid = 1, params: unknown = { value: 5 }): DownlinkCommand => ({ topic: '/v1/devices/gateway/command', gatewayId: 'gateway', mid, body: { deviceIdentification: 'device', productIdentification: 'product', msgType: 'cloudReq', serviceCode: 'control', cmd: 'set', params, versionNo: 'version' } });
     return { db, bridge, binding, command, replies, cloud, advance: (ms: number) => { now += ms; }, offline: () => { online = false; }, online: () => { online = true; } };
 }
+test('multi-service declaration routes identical commands and receipts within their own service', async () => {
+    const f = fixture();
+    try {
+        const services = ['A', 'B'].map(serviceCode => ({ serviceCode, commands: [{ cmd: 'set', param: 'value' }] }));
+        assert.deepEqual(f.bridge.registerBindings('a', { consumerId: 'consumer', nodeId: 'device', services }), { accepted: 2 });
+        for (const [index, service] of services.entries()) {
+            const command = f.command(index + 1, { value: index + 10 });
+            await f.bridge.receive({ ...command, body: { ...command.body as object, serviceCode: service.serviceCode } });
+        }
+        for (const [index, service] of services.entries()) {
+            const lease = f.bridge.next('a', { consumerId: 'consumer', nodeId: 'device', serviceCode: service.serviceCode });
+            assert.equal(lease?.serviceCode, service.serviceCode);
+            assert.deepEqual(lease?.params, { value: index + 10 });
+            await f.bridge.complete('a', lease!.id, { leaseToken: lease!.leaseToken, ok: true });
+            assert.equal(f.replies.at(-1)?.body.serviceCode, service.serviceCode);
+        }
+    } finally { await f.bridge.close(); f.db.close(); }
+});
+test('batch declaration retires only the same consumer scope and rolls back all changes on capacity failure', async () => {
+    const f = fixture({ maxBindings: 4 });
+    const service = (serviceCode: string) => ({ serviceCode, commands: [{ cmd: 'set', param: 'value' }] });
+    const batch = (names: string[]) => ({ consumerId: 'consumer', nodeId: 'device', services: names.map(service) });
+    const rows = () => f.db.prepare('SELECT instance_id,consumer_id,node_id,service_code,commands_json,last_seen FROM cloud_command_binding ORDER BY instance_id,consumer_id,node_id,service_code').all();
+    try {
+        f.bridge.registerBindings('a', batch(['A', 'B']));
+        f.bridge.registerBindings('b', { ...f.binding, serviceCode: 'other' });
+        f.bridge.registerBindings('a', { ...f.binding, consumerId: 'other', serviceCode: 'other' });
+        const before = rows();
+        f.advance(100);
+        assert.throws(() => f.bridge.registerBindings('a', batch(['A', 'C', 'D'])), /上限/);
+        assert.deepEqual(rows(), before, 'no partial replacement or heartbeat');
+        f.bridge.registerBindings('a', batch(['B']));
+        assert.deepEqual(rows().map((row: any) => row.service_code), ['B', 'other', 'other']);
+        f.bridge.registerBindings('a', { ...f.binding, serviceCode: 'legacy' });
+        assert.equal(rows().length, 4, 'legacy declaration never removes sibling services');
+        assert.throws(() => f.bridge.registerBindings('a', batch(['B', 'B'])), /重复/);
+        assert.throws(() => f.bridge.registerBindings('a', { ...batch(['B']), serviceCode: 'B' }), /未声明/);
+        assert.throws(() => f.bridge.registerBindings('a', batch(Array.from({ length: 33 }, (_, i) => `s${i}`))), /32/);
+        assert.throws(() => f.bridge.registerBindings('a', { ...batch(['B']), services: [service('A'), { serviceCode: 'B', commands: Array.from({ length: 64 }, (_, i) => ({ cmd: `c${i}`, param: 'value' })) }] }), /64/);
+    } finally { await f.bridge.close(); f.db.close(); }
+});
+test('removed service or changed declaration permanently rejects queued commands before a later re-add', async () => {
+    const f = fixture();
+    const service = (serviceCode: string, param = 'value') => ({ serviceCode, commands: [{ cmd: 'set', param }] });
+    const register = (services: ReturnType<typeof service>[]) => f.bridge.registerBindings('a', { consumerId: 'consumer', nodeId: 'device', services });
+    try {
+        register([service('A'), service('B')]);
+        for (const [i, serviceCode] of ['A', 'B'].entries()) {
+            const command = f.command(i + 1);
+            await f.bridge.receive({ ...command, body: { ...command.body as object, serviceCode } });
+        }
+        register([service('A')]);
+        assert.equal(f.bridge.list().find(record => record.serviceCode === 'B')?.status, 'rejected');
+        assert.equal(f.bridge.list().find(record => record.serviceCode === 'A')?.status, 'queued');
+        register([service('A'), service('B')]);
+        assert.equal(f.bridge.next('a', { consumerId: 'consumer', nodeId: 'device', serviceCode: 'B' }), null);
+        register([service('A', 'target'), service('B')]);
+        register([service('A'), service('B')]);
+        assert.equal(f.bridge.next('a', { consumerId: 'consumer', nodeId: 'device', serviceCode: 'A' }), null);
+        await f.bridge.tick();
+        assert.equal(f.replies.length, 2);
+        assert.ok(f.replies.every(reply => reply.body.errCode === 1));
+    } finally { await f.bridge.close(); f.db.close(); }
+});
 test('SQLite deduplicates adjacent Snowflake mids losslessly and returns their exact values through leases and receipts',async()=>{
   const f=fixture();const mids=['480000000000000001','480000000000000002','9223372036854775807'];
   try {

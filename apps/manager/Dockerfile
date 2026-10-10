@@ -94,7 +94,7 @@ LABEL org.opencontainers.image.title="ThingLinks Edge Manager" \
 # alpine 不自带时区数据库。Node 自己带 ICU，所以**程序写出的时间戳本来就是对的**，
 # 但容器里的 date、ls、日志文件 mtime 这些走 libc 的东西会显示 UTC ——
 # 现场 docker exec 进来排障时，看到 UTC 会误判成时区没生效。装上 2MB 的 tzdata 消除歧义。
-RUN apk add --no-cache tzdata
+RUN apk add --no-cache tzdata iptables iproute2 nftables
 
 # LISTEN_ADDR 在容器内取 0.0.0.0：进程默认只监听回环是宿主部署的安全默认，
 # 容器里那样会让 -p 映射失效，暴露面由端口发布策略控制。

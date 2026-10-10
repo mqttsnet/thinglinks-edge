@@ -1,0 +1,38 @@
+{
+  "artifact": "thinglinks-opcua-native",
+  "revision": "0.6.0-chain.1",
+  "package": "@tier0/opcua-client",
+  "packageVersion": "0.6.0",
+  "packageUrl": "https://registry.npmjs.org/@tier0/opcua-client/-/opcua-client-0.6.0.tgz",
+  "packageIntegrity": "sha512-XR7rYjJvX3dQx1Z9d7OnmSSg4l3UdOPqKGc+px/+9voyXdXIhTXOtAMzN2VenLgloq+y6lXe55e92OC/YngMpg==",
+  "packageSha256": "7f2e9a51c9d43870b6c29993e7a42511755bea0247c8b406768afabb9ee15fc3",
+  "open62541Version": "1.4.16",
+  "vendorSha256": "7768726cdf532de4df1ffb2d5d991e09fe0f98898de6583fee2ad22771c52f2c",
+  "platforms": [
+    "linux-arm64-musl",
+    "linux-x64-musl"
+  ],
+  "addonPath": "/opt/thinglinks/opcua-native/opcua_open62541.node",
+  "upstreamReference": "https://github.com/open62541/open62541/blob/v1.5.8/src/client/ua_client_connect.c",
+  "buildProfiles": {
+    "5.0.4-24-minimal": {
+      "nodeRed": "5.0.4",
+      "nodeMajor": 24,
+      "libc": "musl",
+      "images": {
+        "arm64": "nodered/node-red@sha256:7d57985fde220f7d223e008a2e8f97a46dcd432009fcdfaaaf00ed3e37a540ab",
+        "x64": "nodered/node-red@sha256:f7e3d184b4fb1b971a0426fbfe819f97138d42e9b7c3fed3c5aab2a3de03dd98"
+      },
+      "toolchainFile": "toolchain.apk.lock"
+    },
+    "5.0.7-24-minimal": {
+      "nodeRed": "5.0.7",
+      "nodeMajor": 24,
+      "libc": "musl",
+      "images": {
+        "arm64": "nodered/node-red@sha256:cc5408af21f1a1bb5ad14c330d31d02b533053ddb2c11fc6c2ce15810b360b48"
+      },
+      "toolchainFile": "toolchain-5.0.7.apk.lock"
+    }
+  }
+}

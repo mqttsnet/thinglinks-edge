@@ -102,11 +102,16 @@ test('append preflight rejects duplicate TCP, UDP and HTTP listeners but allows 
 test('every builtin can append with confirmed dependencies and config links remain within the copied graph', async () => {
   const { listBuiltinTemplates, renderBuiltinTemplate } = await import('./templates/catalog.ts');
   for (const template of listBuiltinTemplates()) {
-    const rendered = renderBuiltinTemplate(template.id, { nodeId: 'plc-1', serviceCode: 'telemetry' });
+    const rendered = renderBuiltinTemplate(template.id, {
+      nodeId: 'plc-1', serviceCode: 'telemetry',
+      ...(template.parameters?.some(field => field.key === 'host') ? { host: '192.0.2.10' } : {}),
+      ...(template.parameters?.some(field => field.key === 'url') ? { url: 'http://192.0.2.10/data' } : {}),
+      ...(template.parameters?.some(field => field.key === 'endpoint') ? { endpoint: 'opc.tcp://192.0.2.10:4840' } : {}),
+    });
     assert.ok(rendered);
     const nodeSets = [
       { id: 'node-red/core', module: 'node-red', version: '5.0.4', enabled: true, err: '',
-        types: ['function', 'inject', 'catch', 'debug', 'tcp in', 'udp in', 'http in', 'http response', 'http request'] },
+        types: ['function', 'inject', 'catch', 'debug', 'change', 'status', 'tcp in', 'udp in', 'http in', 'http response', 'http request'] },
       ...(rendered.requirements ?? []).map((requirement) => ({
         id: `${requirement.module}/loaded`, module: requirement.module, version: requirement.version,
         enabled: true, err: '', types: requirement.nodeTypes,
@@ -118,9 +123,12 @@ test('every builtin can append with confirmed dependencies and config links rema
     assert.equal(prepared.resultNodeCount, rendered.nodeCount + 1);
     const copiedIds = new Set(prepared.flowsToDeploy.slice(1).map((node) => node.id));
     for (const node of prepared.flowsToDeploy.slice(1)) {
-      if (node.type === 'modbus-read') assert.ok(copiedIds.has(String(node['server'])));
+      if (node.type === 'modbus-read' || node.type === 'modbus-flex-getter') assert.ok(copiedIds.has(String(node['server'])));
       if (node.type === 'tier0-opcua-read') assert.ok(copiedIds.has(String(node['connection'])));
       if (node.type === 'OpcUa-Client' || node.type === 's7 in') assert.ok(copiedIds.has(String(node['endpoint'])));
+      if (node.type === 'status' || node.type === 'catch') {
+        for (const source of (node['scope'] as string[] | null) ?? []) assert.ok(copiedIds.has(source), `${template.id}: observation scope must be remapped`);
+      }
     }
   }
 });
@@ -138,9 +146,9 @@ test('custom copies with trusted requirements retain strict dependency checks an
 
 test('controlled tier0 append keeps both reader and writer on their newly copied connection', async () => {
   const { renderBuiltinTemplate } = await import('./templates/catalog.ts');
-  const rendered = renderBuiltinTemplate('builtin:opcua-controlled', { nodeId: 'device', serviceCode: 'telemetry', downlinkEnabled: true,
+  const rendered = renderBuiltinTemplate('builtin:opcua-controlled', { nodeId: 'device', serviceCode: 'telemetry', endpoint: 'opc.tcp://192.0.2.10:4840', downlinkEnabled: true,
     commands: [{ cmd: 'setTemperature', param: 'value', property: 'temperature' }] })!;
-  const nodeSets = [{ id: 'node-red/core', module: 'node-red', version: '5.0.4', enabled: true, err: '', types: ['function', 'inject', 'catch', 'debug', 'http request'] },
+  const nodeSets = [{ id: 'node-red/core', module: 'node-red', version: '5.0.4', enabled: true, err: '', types: ['function', 'inject', 'catch', 'debug', 'http request', 'change', 'status'] },
     ...rendered.requirements!.map(requirement => ({ id: `${requirement.module}/loaded`, module: requirement.module, version: requirement.version, enabled: true, err: '', types: requirement.nodeTypes }))];
   const current = [{ id: 'existing', type: 'tab' }, { id: 'connection', type: 'tier0-opcua-connection', endpoint: 'opc.tcp://existing:4840' }];
   const { fetcher } = transport({ current, nodeSets });

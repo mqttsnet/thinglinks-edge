@@ -1,33 +1,56 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, h } from 'vue';
+import { ref, computed, onMounted, onUnmounted, h, watch } from 'vue';
 import {
   NButton, NModal, NForm, NFormItem, NInput, NDropdown,
   NInputNumber, NSelect, NSpace, NSpin, NEmpty, NAlert, NCheckbox,
   useMessage, useDialog,
 } from 'naive-ui';
-import { useRouter } from 'vue-router';
+import { useRouter, useRoute } from 'vue-router';
 import { api, ApiError } from '../../api/client';
 import type { ImageOption, Instance, PortRecord } from '../../api/types';
 import FieldHelp from '../../components/FieldHelp.vue';
+import RefreshButton from '../../components/RefreshButton.vue';
+import { createRefreshTask } from '../../api/refresh-task';
+import EditorAccessDialog from './EditorAccessDialog.vue';
+import DeviceHttpBindingsDialog from './DeviceHttpBindingsDialog.vue';
+import { editorEntryProps } from './editor-entry';
 import { can, canOperate, loadPermissions } from '../../api/permissions';
 
 const router = useRouter();
+const route = useRoute();
+const editorAccess = ref<InstanceType<typeof EditorAccessDialog>>();
+const deviceHttpBindings = ref<InstanceType<typeof DeviceHttpBindingsDialog>>();
 const message = useMessage();
 const dialog = useDialog();
 
 const instances = ref<Instance[]>([]);
 const loading = ref(true);
+const refreshing = ref(false);
+const refreshError = ref('');
+const refreshTask = createRefreshTask();
 let timer: number | undefined;
 
-async function refresh(quiet = false) {
-  if (!quiet) loading.value = true;
-  try {
-    instances.value = (await api.instances()).instances;
-  } catch (e) {
-    if (!quiet) message.error(e instanceof ApiError ? e.message : '加载失败');
-  } finally {
-    loading.value = false;
-  }
+function refresh(quiet = false, replace = false): Promise<void> {
+  return refreshTask.run(async current => {
+    refreshing.value = true;
+    if (!quiet && !instances.value.length) loading.value = true;
+    try {
+      const response = await api.instances();
+      if (!current()) return;
+      instances.value = response.instances;
+      refreshError.value = '';
+      if (typeof route.query.editor === 'string') {
+        const target = instances.value.find(instance => instance.id === route.query.editor);
+        if (target) editorAccess.value?.open(target);
+        const query = { ...route.query }; delete query.editor;
+        void router.replace({ query });
+      }
+    } catch (e) {
+      if (current()) refreshError.value = e instanceof ApiError ? e.message : '实例刷新失败';
+    } finally {
+      if (current()) { loading.value = false; refreshing.value = false; }
+    }
+  }, replace);
 }
 
 onMounted(() => {
@@ -35,7 +58,7 @@ onMounted(() => {
   void refresh();
   timer = window.setInterval(() => void refresh(true), 5000);
 });
-onUnmounted(() => { if (timer) clearInterval(timer); });
+onUnmounted(() => { refreshTask.dispose(); if (timer) clearInterval(timer); });
 
 // ── 搜索 ────────────────────────────────────────────────
 
@@ -96,9 +119,11 @@ const PROTOCOLS = [
 
 const emptyForm = () => ({
   id: '', name: '', imageTag: '',
+  editorPassword: '', confirmEditorPassword: '',
   memoryMb: 512, cpus: 0.5, ports: [] as PortRecord[],
 });
 const form = ref(emptyForm());
+watch(showCreate, visible => { if (!visible) { form.value.editorPassword = ''; form.value.confirmEditorPassword = ''; } });
 const recommended = ref<number[]>([]);
 
 /** 新增一行时给个不与现有行冲突的宿主端口建议 */
@@ -144,6 +169,12 @@ async function openCreate() {
 }
 
 async function submitCreate() {
+  if (form.value.editorPassword.length < 12 || new TextEncoder().encode(form.value.editorPassword).length > 72) {
+    message.error('编辑器口令至少 12 位，最多 72 字节'); return;
+  }
+  if (form.value.editorPassword !== form.value.confirmEditorPassword) {
+    message.error('两次输入的编辑器口令不一致'); return;
+  }
   creating.value = true;
   try {
     await api.createInstance({
@@ -152,11 +183,13 @@ async function submitCreate() {
       imageTag: form.value.imageTag,
       memoryMb: form.value.memoryMb,
       cpus: form.value.cpus,
+      editorPassword: form.value.editorPassword,
       ports: form.value.ports.map((p) => ({ ...p, purpose: p.purpose.trim() })),
     });
     showCreate.value = false;
+    form.value.editorPassword = ''; form.value.confirmEditorPassword = '';
     message.success('实例已创建，正在拉起容器');
-    await refresh();
+    await refresh(false, true);
   } catch (e) {
     message.error(e instanceof ApiError ? e.message : '创建失败');
   } finally {
@@ -167,7 +200,7 @@ async function submitCreate() {
 // ── 操作 ────────────────────────────────────────────────
 
 async function act(fn: () => Promise<void>, ok: string) {
-  try { await fn(); message.success(ok); await refresh(); }
+  try { await fn(); message.success(ok); await refresh(false, true); }
   catch (e) { message.error(e instanceof ApiError ? e.message : '操作失败'); }
 }
 
@@ -176,15 +209,15 @@ function confirmRemove(inst: Instance) {
   dialog.warning({
     title: `删除实例 · ${inst.name}`,
     content: () => h('div', [
-      h('p', `将停止并移除容器，释放 ${inst.ports.length} 个端口。此操作不可撤销。`),
+      h('p', '将停止并移除运行容器。默认保留流程、凭据、实例记录和端口配置；之后点击“启动”可按原配置重建。'),
       h(NCheckbox, {
         checked: removeData.value,
         'onUpdate:checked': (v: boolean) => { removeData.value = v; },
-      }, { default: () => '同时删除数据卷（流程与凭据将永久丢失）' }),
+      }, { default: () => '同时删除实例记录和数据（流程与凭据将永久丢失，释放端口配置）' }),
     ]),
-    positiveText: '删除',
+    positiveText: '确认移除',
     negativeText: '取消',
-    onPositiveClick: () => act(() => api.removeInstance(inst.id, removeData.value), '实例已删除'),
+    onPositiveClick: () => act(() => api.removeInstance(inst.id, removeData.value), removeData.value ? '实例及数据已删除' : '运行资源已移除，数据和实例记录已保留'),
   });
 }
 
@@ -254,7 +287,7 @@ async function upgradeImage(inst: Instance) {
       try {
         const r = await api.upgradeInstanceImage(inst.id, picked.value);
         message.success(`已从 ${r.from} 升级到 ${r.to}`);
-        await refresh();
+        await refresh(false, true);
       } catch (e) {
         // 后端失败时已经回滚并把实例跑起来了，措辞不要让人以为实例没了
         message.error(e instanceof ApiError ? e.message : '升级失败，实例保持原版本运行');
@@ -276,7 +309,7 @@ function resetPassword(inst: Instance) {
           content: () => h('code', { class: 'mono', style: 'word-break:break-all' }, password),
           positiveText: '我已记录',
         });
-        await refresh();
+        await refresh(false, true);
       } catch (e) {
         message.error(e instanceof ApiError ? e.message : '重置失败');
       }
@@ -315,8 +348,9 @@ function moreOptions(inst: Instance) {
   const items: { label: string; key: string; props?: Record<string, string> }[] = [];
   if (canOperate(inst.id)) {
     items.push({ label: '升级版本', key: 'upgrade' });
-    items.push({ label: '重置口令', key: 'reset' });
+    items.push({ label: '设备 HTTP 接入', key: 'device-http' });
   }
+  if (can('instance:credentials')) items.push({ label: '重置编辑器口令', key: 'reset' });
   // 删除是不可逆的，收进菜单后更要保住红色警示 —— 原先它是一个红色按钮
   if (can('instance:delete')) {
     items.push({ label: '删除实例', key: 'remove', props: { style: 'color: var(--error)' } });
@@ -326,6 +360,7 @@ function moreOptions(inst: Instance) {
 
 function onMore(key: string | number, inst: Instance): void {
   if (key === 'upgrade') upgradeImage(inst);
+  if (key === 'device-http') void deviceHttpBindings.value?.open(inst);
   if (key === 'reset') resetPassword(inst);
   if (key === 'remove') confirmRemove(inst);
 }
@@ -336,18 +371,20 @@ function onMore(key: string | number, inst: Instance): void {
     <div class="bar">
       <div class="ttl">
         <h2>实例</h2>
-        <p class="sub">「打开编辑器」直接进入，无需再输实例口令</p>
+        <p class="sub">打开编辑器需验证该实例的独立口令</p>
       </div>
       <div class="tools">
         <NInput v-model:value="keyword" clearable size="small" class="search"
                 placeholder="搜索名称 / ID / 版本 / 端口 / 路径" />
+        <RefreshButton :loading="refreshing" label="刷新实例" @click="refresh()" />
         <NButton v-if="can('instance:create')" type="primary" @click="openCreate">+ 新建实例</NButton>
       </div>
     </div>
 
+    <NAlert v-if="refreshError" type="error" :bordered="false">{{ refreshError }}<template v-if="instances.length">，当前保留上次读取的数据。</template></NAlert>
     <NSpin :show="loading">
       <!-- 空列表有两种成因，说法必须分开：没实例 vs 有实例但没授权给你 -->
-      <NEmpty v-if="!loading && instances.length === 0" style="padding: 60px 0"
+      <NEmpty v-if="!loading && !refreshError && instances.length === 0" style="padding: 60px 0"
               :description="can('instance:create') ? '还没有实例' : '还没有被授权可访问的实例'">
         <template #extra>
           <NButton v-if="can('instance:create')" size="small" @click="openCreate">创建第一个实例</NButton>
@@ -355,7 +392,7 @@ function onMore(key: string | number, inst: Instance): void {
         </template>
       </NEmpty>
 
-      <template v-else>
+      <template v-else-if="instances.length > 0">
         <NEmpty v-if="filtered.length === 0"
                 :description="`没有匹配「${keyword.trim()}」的实例`" style="padding: 48px 0">
           <template #extra><NButton size="small" @click="keyword = ''">清空搜索</NButton></template>
@@ -387,8 +424,7 @@ function onMore(key: string | number, inst: Instance): void {
                 <NButton v-if="!i.running" size="tiny" @click="act(() => api.startInstance(i.id), '已启动')">启动</NButton>
                 <NButton v-else size="tiny" @click="act(() => api.stopInstance(i.id), '已停止')">停止</NButton>
               </template>
-              <NButton size="tiny" type="primary" :disabled="!i.running"
-                       tag="a" :href="i.openUrl" target="_blank">打开编辑器</NButton>
+              <NButton v-bind="editorEntryProps(router, i)" size="tiny" type="primary">打开编辑器</NButton>
               <NButton size="tiny" @click="router.push(`/instances/${i.id}/logs`)">日志</NButton>
               <NDropdown v-if="moreOptions(i).length" trigger="click" :options="moreOptions(i)"
                          @select="(k) => onMore(k, i)">
@@ -404,6 +440,8 @@ function onMore(key: string | number, inst: Instance): void {
       </template>
     </NSpin>
 
+    <EditorAccessDialog ref="editorAccess" />
+    <DeviceHttpBindingsDialog ref="deviceHttpBindings" />
     <NModal v-model:show="showCreate" preset="card" title="新建实例" style="max-width: 780px">
       <NForm label-placement="top">
         <NSpace :size="14">
@@ -453,6 +491,16 @@ function onMore(key: string | number, inst: Instance): void {
           </template>
         </NFormItem>
         <NSpace :size="14">
+          <NFormItem label="编辑器口令" required style="flex:1">
+            <NInput v-model:value="form.editorPassword" type="password" show-password-on="click"
+              autocomplete="new-password" placeholder="至少 12 位，与管理台口令独立" />
+          </NFormItem>
+          <NFormItem label="确认编辑器口令" required style="flex:1">
+            <NInput v-model:value="form.confirmEditorPassword" type="password" show-password-on="click"
+              autocomplete="new-password" placeholder="再次输入" />
+          </NFormItem>
+        </NSpace>
+        <NSpace :size="14">
           <NFormItem style="flex:1">
             <template #label>
               内存上限（MB）
@@ -472,7 +520,7 @@ function onMore(key: string | number, inst: Instance): void {
                 <p>容器最多能用多少个 CPU 核，可填小数：<code>0.5</code> 就是半个核。</p>
                 <p class="fh-warn">填小了<b>不会报错</b>，只是流程变慢、定时任务延迟 ——
                   这种问题现场很难查，宁可给宽一点。</p>
-                <p>整机核数有限，所有实例加起来别超过物理核数太多。</p>
+              <p>平台会检查全部实例的配额总量，并为宿主保留运行余量。</p>
               </FieldHelp>
             </template>
             <NInputNumber v-model:value="form.cpus" :min="0.1" :step="0.1" style="width:100%" />
@@ -484,8 +532,8 @@ function onMore(key: string | number, inst: Instance): void {
             <FieldHelp>
               <p>只有当<b>现场设备要主动连进来</b>时才需要加 —— 比如流程里放了
                 MQTT broker 节点、Modbus TCP 从站、TCP/UDP 监听节点。</p>
-              <p>Node-RED 编辑器和 HTTP/WebSocket 类节点<b>不用加</b>，
-                它们走管理台统一入口，不占宿主端口。</p>
+              <p>Node-RED 编辑器由平台分配独立入口；HTTP/WebSocket 类节点使用已有代理入口，
+                <b>无需在此重复配置端口</b>。</p>
               <p>一行一条，各自独立：协议端口从来不连号（MQTT 1883、Modbus 502、
                 OPC UA 4840），所以逐条填写。</p>
             </FieldHelp>
@@ -545,7 +593,7 @@ function onMore(key: string | number, inst: Instance): void {
             <NSpace align="center" :size="10">
               <NButton dashed size="small" @click="addPort">+ 添加端口映射</NButton>
               <span v-if="!form.ports.length" class="hint">
-                不需要设备直连就留空。编辑器与 HTTP 类节点不占宿主端口。
+              不需要设备直连就留空。编辑器由平台分配入口，HTTP 类节点无需在此重复映射。
               </span>
             </NSpace>
 
@@ -557,7 +605,7 @@ function onMore(key: string | number, inst: Instance): void {
           </NSpace>
         </NFormItem>
         <NAlert type="info" :bordered="false" style="margin-top:4px">
-          实例账号由管理台自动创建，口令加密存储；创建后可在卡片上重置。
+          请妥善保管编辑器口令。管理员重置口令时会重启正在运行的实例。
         </NAlert>
       </NForm>
       <template #footer>
@@ -578,7 +626,7 @@ function onMore(key: string | number, inst: Instance): void {
 .ttl { min-width: 220px; }
 .bar h2 { margin: 0; font-size: 23px; font-weight: 650; letter-spacing: -.02em; color: var(--primary); }
 .bar .sub { margin: 2px 0 0; color: var(--muted); font-size: 12.5px; }
-.tools { display: flex; align-items: center; gap: 10px; margin-left: auto; }
+.tools { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-left: auto; }
 .search { width: 250px; max-width: 100%; }
 .muted { color: var(--muted); }
 .hint { font-size: 12px; color: var(--muted); line-height: 1.6; }

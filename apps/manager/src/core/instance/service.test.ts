@@ -25,6 +25,7 @@ import {
   InstanceService,
   ServiceError,
   type CreateInstanceInput,
+  type InstanceServiceOptions,
 } from './service.ts';
 import type { DockerClient } from './docker-client.ts';
 import {
@@ -107,24 +108,36 @@ function fixture(
       actor: string,
     ): Promise<{ phase: string }>;
   },
+  removalLifecycle?: InstanceServiceOptions['removalLifecycle'],
 ) {
   const db = openDb(':memory:');
   const repo = new InstanceRepo(db, deriveKey('service-gate-test', 'instance'));
   repo.create(record(), [], [{ username: 'admin', password: 'old-password', permissions: '*' }]);
   repo.setIngestToken('line-a', 'ingest-token');
   const calls: string[] = [];
+  let removed = false;
   const docker = {
-    raw: {},
+    raw: {
+      getNetwork: () => ({ inspect: async () => { throw Object.assign(new Error('missing'), { statusCode: 404 }); } }),
+    },
     imageRepo: 'nodered/node-red',
-    assertManaged: async (id: string) => { calls.push(`assertManaged:${id}`); },
+    assertManaged: async (id: string) => {
+      calls.push(`assertManaged:${id}`);
+      if (removed) throw Object.assign(new Error('container missing'), { statusCode: 404 });
+    },
+    assertRestartable: async (id: string) => {
+      calls.push(`assertRestartable:${id}`);
+      return { settingsJs: 'original-settings-bytes', running: true };
+    },
     start: async (id: string) => { calls.push(`start:${id}`); },
     stop: async (id: string) => { calls.push(`stop:${id}`); },
-    remove: async (id: string) => { calls.push(`remove:${id}`); },
+    remove: async (id: string) => { calls.push(`remove:${id}`); removed = true; },
     writeSettings: async (id: string) => { calls.push(`writeSettings:${id}`); },
     restart: async (id: string) => { calls.push(`restart:${id}`); },
     list: async () => [{ id: 'line-a', state: 'running', running: true }],
     assertImagePresent: async (image: string) => { calls.push(`assertImagePresent:${image}`); },
     imageRef: (tag: string) => `nodered/node-red:${tag}`,
+    instanceNetwork: (id: string) => `thinglinks-edge-${id}`,
     inspectMigrationRuntime: async () => ({
       running: true,
       imageId: `sha256:${'a'.repeat(64)}`,
@@ -140,18 +153,20 @@ function fixture(
   const gate = new InstanceOperationGate(
     policySetup?.(repo, db) ?? new InstanceRepositoryOperationPolicy(repo),
   );
+  const adminRuntime: InstanceAdminRuntime = {
+    target: () => ({
+      upstream: 'http://127.0.0.1:1880', adminRoot: '/red/line-a/',
+      username: 'admin', password: 'old-password',
+    }),
+    waitReady: async (id) => { calls.push(`ready:${id}`); },
+  };
   const service = new InstanceService({
     db,
     repo,
     docker,
     gate,
-    adminRuntime: {
-      target: () => ({
-        upstream: 'http://127.0.0.1:1880', adminRoot: '/red/line-a/',
-        username: 'admin', password: 'old-password',
-      }),
-      waitReady: async (id) => { calls.push(`ready:${id}`); },
-    },
+    removalLifecycle,
+    adminRuntime,
     instanceDataRoot: '/tmp/thinglinks-service-test-instances',
     platformPackages: { verifyForInstall: () => ({}) } as never,
     barrier: { reach: async () => undefined },
@@ -178,7 +193,7 @@ function fixture(
       catalogues: [],
     }),
   });
-  return { db, repo, calls, gate, service, docker };
+  return { db, repo, calls, gate, service, docker, adminRuntime };
 }
 
 const newInstance: CreateInstanceInput = {
@@ -241,6 +256,103 @@ test('public start acquires one start lease and its under-lease primitive reuses
   await f.service.start('line-a', 'admin');
   assert.deepEqual(f.calls, ['assertManaged:line-a', 'start:line-a']);
   assert.equal(f.gate.current('line-a'), undefined);
+});
+
+test('credential reset refuses an incompatible instance before any repository or configuration write', async () => {
+  const f = fixture();
+  const original = f.repo.credentials('line-a')[0]!.password;
+  f.docker.assertRestartable = async () => { throw new Error('legacy runtime incompatible'); };
+  await assert.rejects(f.service.resetCredential('line-a', 'admin', 'admin'), /隔离|重建/);
+  assert.equal(f.repo.credentials('line-a')[0]!.password === original, true);
+  assert.deepEqual(f.calls, []);
+});
+
+test('credential reset restores exact original settings and repository password after write or restart failure', async () => {
+  for (const failAt of ['write', 'restart']) {
+    const f = fixture();
+    const original = f.repo.credentials('line-a')[0]!.password;
+    const settings: string[] = [];
+    let writes = 0, restarts = 0;
+    f.docker.writeSettings = async (_id, value) => {
+      settings.push(value); writes++;
+      if (failAt === 'write' && writes === 1) throw new Error('fake write failure');
+    };
+    f.docker.restart = async () => {
+      restarts++;
+      if (failAt === 'restart' && restarts === 1) throw new Error('fake restart failure');
+    };
+    await assert.rejects(f.service.resetCredential('line-a', 'admin', 'admin'), /已恢复/);
+    assert.equal(f.repo.credentials('line-a')[0]!.password === original, true);
+    assert.equal(settings.at(-1) === 'original-settings-bytes', true);
+    assert.equal(restarts, failAt === 'write' ? 1 : 2);
+    const audit = f.db.prepare("SELECT result FROM audit WHERE action = 'reset-instance-credential'").all() as { result: string }[];
+    assert.equal(audit.length, 1); assert.equal(audit[0]!.result, 'fail');
+  }
+});
+
+test('failed credential compensation is explicit and never leaves the new repository password reported as success', async () => {
+  const f = fixture();
+  const original = f.repo.credentials('line-a')[0]!.password;
+  f.docker.writeSettings = async () => { throw new Error('fake write unavailable'); };
+  await assert.rejects(f.service.resetCredential('line-a', 'admin', 'admin'), /人工恢复/);
+  assert.equal(f.repo.credentials('line-a')[0]!.password === original, true);
+  const audit = f.db.prepare("SELECT result, detail FROM audit WHERE action = 'reset-instance-credential'").all() as { result: string; detail: string }[];
+  assert.equal(audit.length, 1); assert.equal(audit[0]!.result, 'fail');
+  assert.equal(audit[0]!.detail.includes(original), false);
+});
+
+test('credential reset returns its new password only after restart and authenticated readiness', async () => {
+  const f = fixture();
+  const result = await f.service.resetCredential('line-a', 'admin', 'admin');
+  assert.equal(f.repo.credentials('line-a')[0]!.password === result, true);
+  assert.deepEqual(f.calls, ['assertRestartable:line-a', 'writeSettings:line-a', 'restart:line-a', 'ready:line-a']);
+});
+
+test('credential reset of a stopped instance stays stopped and takes effect at next start', async () => {
+  const f = fixture();
+  f.docker.assertRestartable = async () => ({ settingsJs: 'original-settings-bytes', running: false });
+  const result = await f.service.resetCredential('line-a', 'admin', 'admin');
+  assert.equal(f.repo.credentials('line-a')[0]!.password === result, true);
+  assert.deepEqual(f.calls, ['writeSettings:line-a']);
+  const audit = f.db.prepare("SELECT detail FROM audit WHERE action = 'reset-instance-credential'").get() as { detail: string };
+  assert.equal(audit.detail.includes('next-start'), true);
+});
+
+test('a running instance whose new credential is rejected restores the old account and rechecks it', async () => {
+  const f = fixture();
+  const original = f.repo.credentials('line-a')[0]!.password;
+  let attempts = 0;
+  f.adminRuntime.waitReady = async (_id, options) => {
+    assert.equal(options.username === 'admin', true);
+    attempts++;
+    if (attempts === 1) throw new Error('fake authentication refused');
+    assert.equal(f.repo.credentials('line-a')[0]!.password === original, true);
+  };
+  await assert.rejects(f.service.resetCredential('line-a', 'admin', 'admin'), /已恢复/);
+  assert.equal(attempts, 2);
+  assert.equal(f.repo.credentials('line-a')[0]!.password === original, true);
+});
+
+test('stopped credential compensation does not accidentally start the instance', async () => {
+  const f = fixture();
+  const original = f.repo.credentials('line-a')[0]!.password;
+  f.docker.assertRestartable = async () => ({ settingsJs: 'original-settings-bytes', running: false });
+  let attempts = 0;
+  f.docker.writeSettings = async () => { if (++attempts === 1) throw new Error('fake write refused'); };
+  await assert.rejects(f.service.resetCredential('line-a', 'admin', 'admin'), /已恢复/);
+  assert.equal(attempts, 2);
+  assert.equal(f.repo.credentials('line-a')[0]!.password === original, true);
+  assert.deepEqual(f.calls, []);
+});
+
+test('credential reset compensates if recording its successful completion fails', async () => {
+  const f = fixture();
+  const original = f.repo.credentials('line-a')[0]!.password;
+  f.db.exec(`CREATE TRIGGER fail_reset_success_audit BEFORE INSERT ON audit
+    WHEN NEW.action = 'reset-instance-credential' AND NEW.result = 'ok'
+    BEGIN SELECT RAISE(FAIL, 'test audit failure'); END;`);
+  await assert.rejects(f.service.resetCredential('line-a', 'admin', 'admin'), /已恢复/);
+  assert.equal(f.repo.credentials('line-a')[0]!.password === original, true);
 });
 
 test('under-lease primitives reject fabricated and wrong-instance leases before Docker', async () => {
@@ -560,6 +672,25 @@ test('pending public start surfaces failed verification and does not report a su
   assert.equal(f.gate.current('line-a'), undefined);
 });
 
+test('start recreates a missing managed container from the persisted instance record', async () => {
+  const f = fixture();
+  f.docker.assertManaged = async () => {
+    throw Object.assign(new Error('container missing'), { statusCode: 404 });
+  };
+  (f.docker.raw as unknown as {
+    getImage: () => { inspect: () => Promise<{ Id: string }> };
+  }).getImage = () => ({ inspect: async () => ({ Id: `sha256:${'b'.repeat(64)}` }) });
+
+  await f.service.start('line-a', 'admin');
+
+  assert.ok(f.calls.some((call) => call.startsWith('recreate:line-a:true:sha256:')));
+  assert.ok(f.calls.includes('ready:line-a'));
+  assert.equal(
+    (f.db.prepare("SELECT COUNT(*) AS n FROM audit WHERE action = 'start-instance' AND result = 'ok'").get() as { n: number }).n,
+    1,
+  );
+});
+
 test('image upgrade and rollback both preserve the explicitly persisted npm runtime mode', async () => {
   const success = fixture();
   success.db.prepare("UPDATE instance SET node_runtime_mode = 'npm' WHERE id = 'line-a'").run();
@@ -861,6 +992,42 @@ test('unexpected image preflight errors never expose raw external details', asyn
   } finally {
     await f.close();
   }
+});
+
+test('new instance accepts an explicit editor password without returning or auditing it', async () => {
+  const f = await bootstrapFixture();
+  const password = 'Fixture-editor-pass-2026';
+  try {
+    const created = await f.service.create({ ...newInstance, editorPassword: password } as CreateInstanceInput);
+    assert.equal(f.repo.credentials('line-new')[0]?.password === password, true);
+    assert.equal(JSON.stringify(created).includes(password), false);
+    assert.equal(JSON.stringify(f.db.prepare('SELECT * FROM audit').all()).includes(password), false);
+  } finally { await f.close(); }
+});
+
+test('invalid explicit editor passwords fail before instance or Docker side effects', async () => {
+  for (const editorPassword of ['', 'short', 'a'.repeat(73), '密'.repeat(25), 123, null]) {
+    const f = await bootstrapFixture();
+    try {
+      await assert.rejects(() => f.service.create({ ...newInstance, editorPassword } as unknown as CreateInstanceInput), /编辑器口令/);
+      assert.equal(f.repo.get('line-new'), undefined);
+      assert.equal(f.events.length, 0);
+    } finally { await f.close(); }
+  }
+});
+
+test('concurrent instance creation cannot double reserve remaining host capacity', async () => {
+  const f = await bootstrapFixture();
+  try {
+    const results = await Promise.allSettled([
+      f.service.create({ ...newInstance, cpus: 2.5 }),
+      f.service.create({ ...newInstance, id: 'line-other', cpus: 2.5 }),
+    ]);
+    assert.equal(results.filter(result => result.status === 'fulfilled').length, 1);
+    const rejected = results.find(result => result.status === 'rejected');
+    assert.ok(rejected?.status === 'rejected' && /CPU 预算/.test(String(rejected.reason)));
+    assert.equal(f.repo.list().length, 1);
+  } finally { await f.close(); }
 });
 
 test('new instance returns only after npm install Admin health and host files are committed', async () => {
@@ -1263,4 +1430,36 @@ test('audit-finalization failure reaches HTTP only as a controlled redacted comp
     await app.close();
     await f.close();
   }
+});
+
+
+test('diagnostic deletion hooks reject retained data before mutation and settle only after successful removal',async()=>{
+ let settled=0;const f=fixture(undefined,undefined,{beforeRemove:(_id,options)=>{if(!options.removeData)throw new ServiceError('先清理或同时删除实例数据');return true;},afterDataRemoved:()=>{assert.ok(f.calls.includes('remove:line-a'));assert.ok(f.repo.get('line-a'));settled++;}});
+ try{await assert.rejects(f.service.remove('line-a',{removeData:false,actor:'admin'}));assert.equal(f.calls.length,0);assert.ok(f.repo.get('line-a'));assert.equal(settled,0);await f.service.remove('line-a',{removeData:true,actor:'admin'});assert.equal(settled,1);assert.equal(f.repo.get('line-a'),undefined);}finally{f.db.close();}
+});
+test('removal or completion-hook failure retains the instance and does not claim a completed cleanup',async()=>{
+ for(const boundary of ['remove','settlement']as const){let settled=0;const f=fixture(undefined,undefined,{beforeRemove:()=>true,afterDataRemoved:()=>{if(boundary==='settlement')throw new Error('cleanup settlement failed');settled++;}});try{if(boundary==='remove')f.docker.remove=async()=>{throw new Error('partial removal');};await assert.rejects(f.service.remove('line-a',{removeData:true,actor:'admin'}));assert.ok(f.repo.get('line-a'));assert.equal(settled,0);}finally{f.db.close();}}
+});
+test('strict removal hook admits missing containers but refuses an ownership failure',async()=>{
+ for(const statusCode of [404,403]){let settled=0;const f=fixture(undefined,undefined,{beforeRemove:()=>true,afterDataRemoved:()=>{settled++;}});try{f.docker.assertManaged=async()=>{throw Object.assign(new Error('inspection failed'),{statusCode});};const removal=f.service.remove('line-a',{removeData:true,actor:'admin'});if(statusCode===404){await removal;assert.equal(settled,1);}else{await assert.rejects(removal);assert.equal(settled,0);assert.equal(f.calls.length,0);assert.ok(f.repo.get('line-a'));}}finally{f.db.close();}}
+});
+
+
+test('retaining data removes runtime resources but preserves data and the instance ledger',async()=>{
+ let settled=0;const f=fixture(undefined,undefined,{beforeRemove:()=>false,afterDataRemoved:()=>{settled++;}});
+ const dataRoot = '/tmp/thinglinks-service-test-instances/line-a';
+ mkdirSync(dataRoot, { recursive: true }); writeFileSync(join(dataRoot, 'flows.json'), '[]');
+ try{await f.service.remove('line-a',{removeData:false,actor:'admin'});assert.equal(settled,0);assert.ok(f.repo.get('line-a'));assert.equal(existsSync(join(dataRoot,'flows.json')),true);assert.ok(f.calls.includes('remove:line-a'));}
+ finally{rmSync('/tmp/thinglinks-service-test-instances',{recursive:true,force:true});f.db.close();}
+});
+
+test('public DELETE never returns success from a purge flag alone; completion proof is required',async()=>{
+ let verified=false;let settled=0;
+ const f=fixture(undefined,undefined,{beforeRemove:(_id,options)=>{if(!options.removeData)throw new ServiceError('请先清理或同时删除实例数据');return true;},afterDataRemoved:()=>{if(!verified)throw new Error('resource remains');settled++;}});
+ const app=Fastify({logger:false});registerInstances(app,{config:{basePath:''},service:f.service,guard:()=>({username:'admin',role:'admin'}),users:{grantFor:()=>undefined},fail:badRequest} as unknown as HttpContext);
+ try{
+  const retained=await app.inject({method:'DELETE',url:'/api/instances/line-a'});assert.equal(retained.statusCode,400);assert.match(retained.json().error,/同时删除实例数据|保留数据脱离实例台账/);assert.equal(f.calls.length,0);
+  const incomplete=await app.inject({method:'DELETE',url:'/api/instances/line-a?removeData=true'});assert.equal(incomplete.statusCode,400);assert.equal(settled,0);assert.ok(f.repo.get('line-a'));assert.doesNotMatch(incomplete.body,/resource remains/);
+  verified=true;const done=await app.inject({method:'DELETE',url:'/api/instances/line-a?removeData=true'});assert.equal(done.statusCode,204);assert.equal(settled,1);assert.equal(f.repo.get('line-a'),undefined);
+ }finally{await app.close();f.db.close();}
 });

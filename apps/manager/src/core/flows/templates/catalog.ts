@@ -1,3 +1,4 @@
+import { DEVICE_ID_PATTERN } from '../../edge/device-identity.ts';
 import { TemplateError, type FlowTemplate, type FlowTemplateWithContent } from '../types.ts';
 import { summarize } from '../parse.ts';
 import { parameterDefaults, validateParameters } from './parameters.ts';
@@ -11,6 +12,7 @@ import { s7Recipe } from './builtin/s7.ts';
 import { binaryTypes, scalarTypes } from './builtin/common.ts';
 import type { TemplateRecipe } from './types.ts';
 import { controlParameters, attachControlFlow, controlRequirements } from './control-flow.ts';
+import { resolvePoints, resolveServiceCode } from './service-mapping.ts';
 
 const recipes: TemplateRecipe[] = [
   tcpRecipe,
@@ -72,7 +74,10 @@ function materialize(
 
 export function getBuiltinTemplate(id: string): FlowTemplateWithContent | undefined {
   const recipe = byId.get(id);
-  return recipe ? materialize(recipe, parameterDefaults(recipe.parameters), true) : undefined;
+  return recipe ? materialize(recipe, {
+    ...parameterDefaults(recipe.parameters), nodeId: 'example-device', serviceCode: 'telemetry',
+    ...structuredClone(recipe.previewParameters ?? {}),
+  }, true) : undefined;
 }
 
 export function listBuiltinTemplates(): FlowTemplate[] {
@@ -86,20 +91,11 @@ export function renderBuiltinTemplate(id: string, input: unknown): FlowTemplateW
   const recipe = byId.get(id);
   if (!recipe) return undefined;
   const p = validateParameters(recipe.parameters, input);
-  if (!/^[a-zA-Z0-9_][a-zA-Z0-9_.:-]{0,127}$/.test(String(p.nodeId)))
+  if (!DEVICE_ID_PATTERN.test(String(p.nodeId)))
     throw new TemplateError('子设备标识格式不合法');
-  if (!/^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$/.test(String(p.serviceCode)))
-    throw new TemplateError('服务编码格式不合法');
-  const properties = new Set<string>();
+  if (String(p.serviceCode ?? '').trim()) resolveServiceCode(p.serviceCode);
+  resolvePoints(p.points as Record<string, unknown>[], p.serviceCode);
   for (const point of p.points as Record<string, unknown>[]) {
-    const property = String(point.property);
-    if (
-      !/^[a-zA-Z_][a-zA-Z0-9_]{0,63}$/.test(property) ||
-      ['__proto__', 'prototype', 'constructor'].includes(property)
-    )
-      throw new TemplateError('物模型属性编码格式不合法');
-    if (properties.has(property)) throw new TemplateError(`物模型属性编码重复：${property}`);
-    properties.add(property);
     if (
       String(point.source)
         .split('.')

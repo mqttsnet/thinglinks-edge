@@ -31,6 +31,8 @@ export interface EdgeConfig {
   instanceDataRoot: string;
   /** 实例宿主端口可分配范围 */
   portRange: { min: number; max: number };
+  /** Separate browser origins for instance editors; never share management storage. */
+  editorPortRange: { min: number; max: number };
   /**
    * 实例容器时区。
    *
@@ -126,6 +128,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): EdgeConfig {
   if (portMin >= portMax) {
     throw new ConfigError(`INSTANCE_PORT_MIN(${portMin}) 必须小于 INSTANCE_PORT_MAX(${portMax})`);
   }
+  const listenPort = parsePort(env['LISTEN_PORT'], 19100, 'LISTEN_PORT');
+  const editorMin = parsePort(env['EDITOR_PORT_MIN'], 19200, 'EDITOR_PORT_MIN');
+  const editorMax = parsePort(env['EDITOR_PORT_MAX'], 19263, 'EDITOR_PORT_MAX');
+  const externalPort = Number(url.port || (url.protocol === 'https:' ? 443 : 80));
+  if (editorMin > editorMax || editorMax - editorMin >= 256
+    || [listenPort, externalPort].some(port => port >= editorMin && port <= editorMax)
+    || (editorMin <= portMax && editorMax >= portMin)) {
+    throw new ConfigError('编辑器独立端口范围须为 1..256 个端口，且不能与管理端口或协议映射范围重叠');
+  }
 
   const dataRoot = assertDataPath(
     env['EDGE_DATA_ROOT']?.trim() || '/data01/mqttsnet/thinglinks-edge',
@@ -143,7 +154,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): EdgeConfig {
     cookieSecure: url.protocol === 'https:',
     allowedOrigins: [url.origin, ...extraOrigins],
     listenAddr: env['LISTEN_ADDR']?.trim() || '127.0.0.1',
-    listenPort: parsePort(env['LISTEN_PORT'], 19100, 'LISTEN_PORT'),
+    listenPort,
     dataRoot,
     dataDir: assertDataPath(env['DATA_DIR']?.trim() || `${dataRoot}/manager`, 'DATA_DIR'),
     instanceDataRoot: assertDataPath(
@@ -151,6 +162,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): EdgeConfig {
       'INSTANCE_DATA_ROOT',
     ),
     portRange: { min: portMin, max: portMax },
+    editorPortRange: { min: editorMin, max: editorMax },
     timezone: env['TZ']?.trim() || 'Asia/Shanghai',
     updateCheckUrl: env['UPDATE_CHECK_URL']?.trim() || '',
   };

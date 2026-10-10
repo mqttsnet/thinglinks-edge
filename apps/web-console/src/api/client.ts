@@ -16,10 +16,13 @@ import type {
   EdgeMetrics, ReplayResult,
   DiagProbeResponse,
   FlowTemplate, FlowTemplateDetail, TemplateMetadataInput, TemplateApplyOptions, ApplyPreview, ApplyResult,
+  ModbusReadConnection, ProtocolDiagnosticTask,
   CatalogEntry, StoreListResult, ImportResult, InstanceInventory, ApplyPolicyResult,
   PlatformNodeMigration, ProtocolComponentStatus, InstanceProtocolStatus, CloudModelQuery, CloudModelQueryResult, EdgeCommandRecord,
+  DeviceHttpBinding,
 } from './types';
 import { filenameFrom } from './filename';
+import { fieldQuery } from './field-query';
 import type { ProductMetadata, ProductReleaseResult } from '../product/types';
 
 /**
@@ -88,9 +91,30 @@ export const api = {
   setupState: () => request<SetupState>('/api/setup'),
 
   /** 首次设置。成功即登录，直接回会话 */
-  setup: (username: string, password: string) =>
+  setup: (username: string, password: string, installToken?: string) =>
     request<{ user: SessionUser }>('/api/setup', {
-      method: 'POST', body: JSON.stringify({ username, password }),
+      method: 'POST', body: JSON.stringify({ username, password, ...(installToken ? { installToken } : {}) }),
+    }),
+
+  deviceHttpBindings: (instanceId: string) =>
+    request<{ bindings: DeviceHttpBinding[] }>(`/api/instances/${encodeURIComponent(instanceId)}/device-http-bindings`),
+  createDeviceHttpBinding: (instanceId: string, input: {
+    id: string; targetPath: string; deviceId: string; maxBodyBytes?: number; rateLimitPerMinute?: number;
+  }) => request<{ binding: DeviceHttpBinding; secret: string }>(
+    `/api/instances/${encodeURIComponent(instanceId)}/device-http-bindings`,
+    { method: 'POST', body: JSON.stringify(input) },
+  ),
+  rotateDeviceHttpBinding: (instanceId: string, bindingId: string) =>
+    request<{ secret: string }>(`/api/instances/${encodeURIComponent(instanceId)}/device-http-bindings/${encodeURIComponent(bindingId)}/rotate`, {
+      method: 'POST', body: '{}',
+    }),
+  revalidateDeviceHttpBinding: (instanceId: string, bindingId: string) =>
+    request<void>(`/api/instances/${encodeURIComponent(instanceId)}/device-http-bindings/${encodeURIComponent(bindingId)}/revalidate`, {
+      method: 'POST', body: '{}',
+    }),
+  deleteDeviceHttpBinding: (instanceId: string, bindingId: string) =>
+    request<void>(`/api/instances/${encodeURIComponent(instanceId)}/device-http-bindings/${encodeURIComponent(bindingId)}`, {
+      method: 'DELETE', body: '{}',
     }),
 
   login: (username: string, password: string) =>
@@ -150,6 +174,12 @@ export const api = {
       method: 'POST', body: JSON.stringify(body),
     }),
 
+  unlockEditor: (id: string, password: string) =>
+    request<{ editorUrl: string; expiresAt: number }>(
+      `/api/instances/${encodeURIComponent(id)}/editor-access`, {
+        method: 'POST', body: JSON.stringify({ password }),
+      }),
+
   startInstance: (id: string) => request<void>(`/api/instances/${id}/start`, { method: 'POST' }),
   stopInstance: (id: string) => request<void>(`/api/instances/${id}/stop`, { method: 'POST' }),
 
@@ -180,10 +210,9 @@ export const api = {
    * 刻意做成**按需单点位查**而不是展开设备就把所有点位的历史都拉下来：
    * 一台设备可能有几十个点位，那样一次就是几十个查询打在跑着采集的边缘盒子上。
    */
-  tagHistory: (instanceId: string, nodeId: string, tagId: string, limit = 300) =>
+  tagHistory: (instanceId: string, nodeId: string, tagId: string, limit = 300, serviceCode?: string) =>
     request<TagHistory>(
-      `/api/field/history?instanceId=${encodeURIComponent(instanceId)}`
-      + `&nodeId=${encodeURIComponent(nodeId)}&tagId=${encodeURIComponent(tagId)}&limit=${limit}`),
+      `/api/field/history${fieldQuery({ instanceId, nodeId, tagId, limit: String(limit), serviceCode })}`),
 
   images: () => request<{ images: ImageOption[] }>('/api/images'),
 
@@ -247,8 +276,8 @@ export const api = {
     request<{ devices: FieldDeviceRecord[] }>(`/api/field/devices${qs({ instanceId })}`),
 
   /** 点位按设备懒加载：现场一台实例几千个点，全量拉会把首屏拖垮 */
-  fieldTags: (instanceId?: string, nodeId?: string) =>
-    request<{ tags: FieldTagRecord[] }>(`/api/field/tags${qs({ instanceId, nodeId })}`),
+  fieldTags: (instanceId?: string, nodeId?: string, serviceCode?: string) =>
+    request<{ tags: FieldTagRecord[] }>(`/api/field/tags${fieldQuery({ instanceId, nodeId, serviceCode })}`),
 
   /** 南向探测**必须**指名实例：读的是那台的 flows.json，比台账更敏感 */
   southbound: (instanceId: string) =>
@@ -327,6 +356,19 @@ export const api = {
   diagProbe: (targets: string[], timeoutMs = 5000) =>
     request<DiagProbeResponse>('/api/diag/probe', {
       method: 'POST', body: JSON.stringify({ targets, timeoutMs }),
+    }),
+
+  startModbusDiagnostic: (instanceId: string, connection: ModbusReadConnection, signal?: AbortSignal) =>
+    request<{ task: ProtocolDiagnosticTask }>(`/api/instances/${encodeURIComponent(instanceId)}/protocol-diagnostics/modbus-tcp`, {
+      method: 'POST', body: JSON.stringify(connection), ...(signal ? { signal } : {}),
+    }),
+  protocolDiagnostics: (instanceId: string, signal?: AbortSignal) =>
+    request<{ tasks: ProtocolDiagnosticTask[] }>(`/api/instances/${encodeURIComponent(instanceId)}/protocol-diagnostics`, signal ? { signal } : {}),
+  protocolDiagnostic: (instanceId: string, taskId: string, signal?: AbortSignal) =>
+    request<{ task: ProtocolDiagnosticTask }>(`/api/instances/${encodeURIComponent(instanceId)}/protocol-diagnostics/${encodeURIComponent(taskId)}`, signal ? { signal } : {}),
+  cancelProtocolDiagnostic: (instanceId: string, taskId: string, signal?: AbortSignal) =>
+    request<{ task: ProtocolDiagnosticTask }>(`/api/instances/${encodeURIComponent(instanceId)}/protocol-diagnostics/${encodeURIComponent(taskId)}`, {
+      method: 'DELETE', ...(signal ? { signal } : {}),
     }),
 
   /**

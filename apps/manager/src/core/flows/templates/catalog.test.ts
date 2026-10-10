@@ -3,6 +3,14 @@ import assert from 'node:assert/strict';
 import { listBuiltinTemplates, getBuiltinTemplate, renderBuiltinTemplate } from './catalog.ts';
 import { parameterDefaults } from './parameters.ts';
 
+test('disabled catalogue examples do not become configured device defaults', () => {
+  const template = getBuiltinTemplate('builtin:modbus-tcp')!;
+  assert.equal(template.parameters?.find(field => field.key === 'host')?.default, '');
+  assert.equal(template.flows.find(node => node.type === 'modbus-client')?.tcpHost, '192.0.2.1');
+  assert.equal(template.flows.find(node => node.type === 'tab')?.disabled, true);
+  assert.throws(() => renderBuiltinTemplate(template.id, { nodeId: 'meter', serviceCode: 'telemetry' }), /设备地址/);
+});
+
 test('categorized recipes preserve the first seven and add an independent controlled OPC UA template', () => {
   const list = listBuiltinTemplates();
   assert.equal(list.length, 8);
@@ -28,10 +36,17 @@ test('all recipes render cloud identity and actual upstream node configuration',
       serviceCode: 'telemetry',
     };
     if ('host' in parameters) Object.assign(parameters, { host: '192.168.1.10' });
+    if ('url' in parameters) Object.assign(parameters, { url: 'http://192.0.2.10/data' });
+    if ('endpoint' in parameters) Object.assign(parameters, { endpoint: 'opc.tcp://192.0.2.10:4840' });
     const result = renderBuiltinTemplate(t.id, parameters)!;
     assert.equal(result.flows.find((n) => n.type === 'tab')!.disabled, false);
-    assert.equal(result.flows.find((n) => n.type === 'tl-uplink')!.deviceId, 'plc-1');
-    assert.equal(result.flows.find((n) => n.type === 'tl-uplink')!.serviceId, 'telemetry');
+    if (t.id === 'builtin:http-receive') {
+      assert.equal(result.flows.find(n => n.type === 'tl-device')!.deviceId, 'plc-1');
+      assert.ok(result.flows.find(n => n.id === 'presence-uplink-http'));
+    } else {
+      assert.equal(result.flows.find((n) => n.type === 'tl-uplink')!.deviceId, 'plc-1');
+      assert.equal(result.flows.find((n) => n.type === 'tl-uplink')!.serviceId, 'telemetry');
+    }
     const ids = new Set(result.flows.map((n) => n.id));
     assert.equal(ids.size, result.flows.length);
     for (const n of result.flows)
@@ -61,7 +76,7 @@ test('configured renders expose an isolated normalized parameter archive includi
   assert.equal(rendered.parameterValues?.nodeId, 'saved-device');
   assert.equal(rendered.parameterValues?.port, 15001);
   assert.equal(rendered.parameterValues?.downlinkEnabled, true);
-  assert.deepEqual(rendered.parameterValues?.commands, input.commands);
+  assert.deepEqual(rendered.parameterValues?.commands, input.commands.map(command => ({ ...command, serviceCode: '', targetServiceCode: '' })));
   input.commands[0]!.cmd = 'changed-outside';
   assert.equal((rendered.parameterValues?.commands as { cmd: string }[])[0]?.cmd, 'setTemperature');
 });

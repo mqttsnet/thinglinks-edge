@@ -45,9 +45,12 @@ export function validateParameters(
   const result: Record<string, unknown> = {};
   for (const field of fields) {
     const name = `${label} / ${field.label}`;
+    const condition = field.visibleWhen;
+    const selected = condition ? values[condition.key] ?? fields.find(f => f.key === condition.key)?.default : undefined;
+    const required = field.required && (!condition || selected === condition.value);
     const value = values[field.key] === undefined ? structuredClone(field.default) : values[field.key];
     if (value === undefined || (field.type === 'text' && value === '')) {
-      if (field.required) throw new TemplateError(`${name}不能为空`);
+      if (required) throw new TemplateError(`${name}不能为空`);
       result[field.key] = value ?? (field.type === 'text' ? '' : undefined);
       continue;
     }
@@ -56,8 +59,8 @@ export function validateParameters(
         if (typeof value !== 'string' || value.length > (field.max ?? 2048)) {
           throw new TemplateError(`${name}必须是长度不超过 ${field.max ?? 2048} 的文本`);
         }
-        const text = value.trim();
-        if (field.required && !text) throw new TemplateError(`${name}不能为空`);
+        const text = field.preserveWhitespace ? value : value.trim();
+        if (required && !text.trim()) throw new TemplateError(`${name}不能为空`);
         result[field.key] = text;
         break;
       }

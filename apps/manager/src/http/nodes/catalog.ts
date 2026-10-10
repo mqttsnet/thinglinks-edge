@@ -13,10 +13,11 @@
  * 否则「有节点查看权」就成了枚举全部实例的旁路。
  */
 import type { FastifyInstance } from 'fastify';
+import { setImmediate as yieldToRequests } from 'node:timers/promises';
 import { recordAudit } from '../../core/db.ts';
 import { NodePolicyError } from '../../core/nodes/policy.ts';
-import { closureReport, type NodeStore } from '../../core/nodes/store.ts';
-import { inventoryOf } from '../../core/nodes/inventory.ts';
+import { closureReport, NodeStoreChangedError, type NodeStore } from '../../core/nodes/store.ts';
+import { inventoryOf, inventoryBatch } from '../../core/nodes/inventory.ts';
 import { installModule, AdminApiError } from '../../core/flows/admin-client.ts';
 import { assertValidId } from '../../core/instance/container-spec.ts';
 import {
@@ -126,16 +127,19 @@ export function registerNodeCatalog(
     if (!guard(req, reply, { csrf: false, need: 'node:view' })) return;
     const entries = catalog.list();
     return reply.send({
-      entries: entries.map((e) => ({
-        ...e,
-        /*
-         * 顺带回「这个包在离线库里有没有」。批了但库里没有，
-         * 在无外网现场就等于批了个装不上的东西 —— 界面要能一眼看出来，
-         * 而不是等现场点了安装才发现。
-         */
-        inStore: store.versions(e.module).length > 0,
-        storeVersions: store.versions(e.module),
-      })),
+      entries: entries.map((e) => {
+        const storeVersions = store.versions(e.module);
+        return {
+          ...e,
+          /*
+           * 顺带回「这个包在离线库里有没有」。批了但库里没有，
+           * 在无外网现场就等于批了个装不上的东西 —— 界面要能一眼看出来，
+           * 而不是等现场点了安装才发现。
+           */
+          inStore: storeVersions.length > 0,
+          storeVersions,
+        };
+      }),
     });
   });
 
@@ -309,37 +313,46 @@ export function registerNodeCatalog(
 
   api.get(`${config.basePath}/api/nodes/store`, async (req, reply) => {
     if (!guard(req, reply, { csrf: false, need: 'node:view' })) return;
-    const approved = catalog.names();
-    const packages = [];
-    for (const m of store.modules()) {
-      const versions = store.versions(m);
-      const latest = versions[versions.length - 1];
-      if (latest === undefined) continue;
-      const meta = store.meta(m, latest);
-      if (!meta) continue;
-      // 一次算完两种缺口：这一步要把闭包里每个包的 tgz 都读一遍，不便算两次
-      const gaps = closureReport(store, m, latest);
-      packages.push({
-        module: m,
-        versions,
-        latest,
-        description: meta.description,
-        types: meta.types,
-        isNodeRedNode: meta.isNodeRedNode,
-        size: meta.size,
-        updatedAt: meta.updatedAt,
-        approved: approved.has(m),
-        // 依赖没配齐的包在离线现场装不上，这里直接把缺口点出来
-        missingDeps: gaps.missing,
-        /*
-         * 可选依赖的缺口分开报：缺了**不会**让安装失败，所以界面上
-         * 不能和「装不上」同样对待；但也不能不说 —— modbus 的串口（RTU）
-         * 支持就在 optionalDependencies 里，缺了是「装上了却少一半功能」。
-         */
-        missingOptionalDeps: gaps.missingOptional,
-      });
+    try {
+      const approved = catalog.names();
+      const view = await store.latestSnapshot();
+      const packages = [];
+      for (const m of view.modules()) {
+        const versions = view.versions(m);
+        const latest = versions[versions.length - 1];
+        if (latest === undefined) continue;
+        const meta = view.meta(m, latest);
+        if (!meta) continue;
+        // 一次算完两种缺口：这一步要把闭包里每个包的 tgz 都读一遍，不便算两次
+        const gaps = closureReport(view, m, latest);
+        packages.push({
+          module: m,
+          versions,
+          latest,
+          description: meta.description,
+          types: meta.types,
+          isNodeRedNode: meta.isNodeRedNode,
+          size: meta.size,
+          updatedAt: meta.updatedAt,
+          approved: approved.has(m),
+          // 依赖没配齐的包在离线现场装不上，这里直接把缺口点出来
+          missingDeps: gaps.missing,
+          /*
+           * 可选依赖的缺口分开报：缺了**不会**让安装失败，所以界面上
+           * 不能和「装不上」同样对待；但也不能不说 —— modbus 的串口（RTU）
+           * 支持就在 optionalDependencies 里，缺了是「装上了却少一半功能」。
+           */
+          missingOptionalDeps: gaps.missingOptional,
+        });
+        await yieldToRequests();
+      }
+      return reply.send({ packages, root: store.root });
+    } catch (error) {
+      if (error instanceof NodeStoreChangedError) return reply.code(409).send({ error: error.message });
+      if (error instanceof NodePolicyError) return fail(reply, error);
+      req.log.error({ err: error }, 'Failed to read node package store');
+      return reply.code(500).send({ error: '离线包库读取失败，请稍后刷新' });
     }
-    return reply.send({ packages, root: store.root });
   });
 
   /**
@@ -440,16 +453,15 @@ export function registerNodeCatalog(
       user, ctx.repo.list().map((r) => ({ instanceId: r.id })),
     ).map((x) => x.instanceId);
 
-    const out = [];
-    for (const id of ids) {
-      const t = targetFor(ctx, id);
-      if ('error' in t) {
-        out.push({ instanceId: id, ok: false, reason: t.error, modules: [], unapproved: 0 });
-        continue;
-      }
-      out.push(inventoryEvidence(await inventoryOf(id, t, approved)));
-    }
-    return reply.send({ instances: out });
+    const out = await inventoryBatch(ids, {
+      list: signal => ctx.service.list(signal),
+      read: (id, signal) => {
+        const t = targetFor(ctx, id);
+        if ('error' in t) return Promise.resolve({ instanceId: id, ok: false, reason: t.error, modules: [], unapproved: 0 });
+        return inventoryOf(id, t, approved, fetch, { signal });
+      },
+    });
+    return reply.send({ instances: out.map(inventoryEvidence) });
   });
 
   /**
@@ -509,7 +521,11 @@ export function registerNodeCatalog(
     if (!guard(req, reply, { csrf: false, need: 'instance:view', instance: id })) return;
     const t = targetFor(ctx, id);
     if ('error' in t) return reply.code(t.code).send({ error: t.error });
-    return reply.send(inventoryEvidence(await inventoryOf(id, t, catalog.names())));
+    const out = await inventoryBatch([id], {
+      list: signal => ctx.service.list(signal),
+      read: (_id, signal) => inventoryOf(id, t, catalog.names(), fetch, { signal }),
+    });
+    return reply.send(inventoryEvidence(out[0]!));
   });
 
   // ── 平台节点包迁移 ──────────────────────────────────

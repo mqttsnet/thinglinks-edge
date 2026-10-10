@@ -20,6 +20,8 @@ const REPO = resolve(SCRIPT_DIR, '../../..');
 const IMMUTABLE_RUNTIME = `sha256:${'a'.repeat(64)}`;
 const IMMUTABLE_BUILDER = `sha256:${'b'.repeat(64)}`;
 const IMMUTABLE_CONFIG = `sha256:${'e'.repeat(64)}`;
+const IMMUTABLE_POLICY = `sha256:${'9'.repeat(64)}`;
+const POLICY_CONFIG = `sha256:${'8'.repeat(64)}`;
 const IMMUTABLE_FOREIGN = `sha256:${'d'.repeat(64)}`;
 const GIT_HEAD = 'f'.repeat(40);
 
@@ -84,6 +86,7 @@ case "$1:$2" in
         ;;
     esac
     case "$last" in
+      *policy*) image_id="$FAKE_POLICY_ID"; tag_kind=policy ;;
       *builder*) image_id="$FAKE_BUILDER_ID"; tag_kind=builder ;;
       *offline*) image_id="$FAKE_RUNTIME_ID"; tag_kind=offline ;;
       *) image_id="$FAKE_RUNTIME_ID"; tag_kind=runtime ;;
@@ -181,6 +184,7 @@ case "$*" in
     echo '# fail 0'
     echo "# skipped $FAKE_ARTIFACT_SKIPPED"
     ;;
+  *'--single-config-id'*'policy-by-id.tar'*) echo "$FAKE_POLICY_CONFIG_ID" ;;
   *'--single-config-id'*) echo "$FAKE_CONFIG_ID" ;;
   *scripts/verify-offline-bundle.mjs*) echo "$FAKE_BUNDLE_CONTRACT_MARKER" ;;
   *) echo '1/1 通过' ;;
@@ -188,7 +192,7 @@ esac
 `);
 
   executable(join(bin, 'bash'), String.raw`
-printf '%s|%s\n' "$MANAGER_IMAGE" "$*" >> "$FAKE_LOG/bash"
+printf '%s|%s|%s|%s\n' "$MANAGER_IMAGE" "$PROXY_IMAGE" "$NETWORK_IMAGE" "$*" >> "$FAKE_LOG/bash"
 out=''
 while [ "$#" -gt 0 ]; do
   if [ "$1" = --out ]; then shift; out="$1"; fi
@@ -219,6 +223,8 @@ fi
     FAKE_BUILDER_ID: IMMUTABLE_BUILDER,
     FAKE_FOREIGN_ID: IMMUTABLE_FOREIGN,
     FAKE_CONFIG_ID: IMMUTABLE_CONFIG,
+    FAKE_POLICY_ID: IMMUTABLE_POLICY,
+    FAKE_POLICY_CONFIG_ID: POLICY_CONFIG,
     FAKE_INSPECT_FAIL: '0',
     FAKE_RUNTIME_ID_INSPECT_FAIL_ONCE: '0',
     FAKE_MANAGER_TEST_FAIL: '0',
@@ -242,6 +248,9 @@ fi
     TLE_VERIFY_RUN_ID: options.runId ?? 'entry-test-001',
   };
   delete env.MANAGER_IMAGE;
+  delete env.POLICY_IMAGE;
+  delete env.PROXY_IMAGE;
+  delete env.NETWORK_IMAGE;
   delete env.TLE_PLATFORM_BUILDER_IMAGE;
   delete env.TLE_PLATFORM_RUNTIME_IMAGE;
   delete env.TLE_PLATFORM_OFFLINE_BUNDLE;
@@ -343,7 +352,7 @@ test('缺省入口只构建一次 runtime、准备同 checkout builder/离线包
       && !line.includes('--single-config-id'));
     assert.equal(contract.length, 1, contract.join('\n'));
     assert.match(contract[0], new RegExp(
-      `scripts/verify-offline-bundle\\.mjs .* thinglinks-edge-manager-verify:entry-test-001 ${IMMUTABLE_CONFIG}$`));
+      `scripts/verify-offline-bundle\\.mjs .* thinglinks-edge-manager-verify:entry-test-001 ${IMMUTABLE_CONFIG} ${IMMUTABLE_CONFIG}$`));
     for (const testScript of [
       'scripts/verify-temp-parent.test.mjs',
       'scripts/build-offline-bundle.test.mjs',
@@ -387,12 +396,26 @@ test('clean checkout 的显式 MANAGER_IMAGE revision 匹配 HEAD 时复用', ()
       .filter((line) => line.includes('scripts/verify-offline-bundle.mjs')
         && !line.includes('--single-config-id'));
     assert.equal(contract.length, 1, contract.join('\n'));
-    assert.ok(contract[0].endsWith(`reviewed/manager:pr-17 ${IMMUTABLE_CONFIG}`), contract[0]);
+    assert.ok(contract[0].endsWith(`reviewed/manager:pr-17 ${IMMUTABLE_CONFIG} ${IMMUTABLE_CONFIG}`), contract[0]);
     assert.equal(docker.some((line) => line.includes('image rm reviewed/manager:pr-17')), false,
       docker.join('\n'));
   } finally {
     bed.cleanup();
   }
+});
+
+test('separate policy image is captured by immutable descriptor before bundle validation', () => {
+  const bed = fakeBed({ env: { POLICY_IMAGE: 'reviewed/policy:1' } });
+  try {
+    const result = bed.run();
+    assert.equal(result.status, 0, result.stderr);
+    const saves = bed.commands('docker').filter(line => line.startsWith('save -o '));
+    assert.equal(saves.length, 2);
+    assert.ok(saves.some(line => line.endsWith(` ${IMMUTABLE_POLICY}`)));
+    const contract = bed.commands('node').find(line => line.includes('scripts/verify-offline-bundle.mjs') && !line.includes('--single-config-id'));
+    assert.ok(contract.endsWith(` ${IMMUTABLE_CONFIG} ${POLICY_CONFIG}`), contract);
+    assert.ok(bed.commands('bash').every(line => line.includes('|reviewed/policy:1|reviewed/policy:1|')));
+  } finally { bed.cleanup(); }
 });
 
 test('默认构建允许 dirty checkout 并仍构建当前工作树', () => {

@@ -37,7 +37,7 @@ function envRecord(text) {
     }));
 }
 
-function bed({ nullRepoTags = false, manager = MANAGER } = {}) {
+function bed({ nullRepoTags = false, manager = MANAGER, proxy = PROXY, network = '', policy = '', distinctImages = false } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'tle-offline-build-test-'));
   const bin = join(root, 'bin');
   const out = join(root, 'out');
@@ -53,16 +53,19 @@ function bed({ nullRepoTags = false, manager = MANAGER } = {}) {
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-const [out, nullTags, ...images] = process.argv.slice(2);
+const [out, nullTags, distinctImages, ...images] = process.argv.slice(2);
 const dir = mkdtempSync(join(tmpdir(), 'tle-docker-save-fixture-'));
 try {
-	  const config = Buffer.from(JSON.stringify({ architecture: 'amd64', os: 'linux' }));
-	  const configName = createHash('sha256').update(config).digest('hex') + '.json';
-	  writeFileSync(join(dir, 'manifest.json'), JSON.stringify([{
-	    Config: configName, RepoTags: nullTags === '1' ? null : images, Layers: [],
-	  }]));
-	  writeFileSync(join(dir, configName), config);
-	  const result = spawnSync('/usr/bin/tar', ['-cf', out, '-C', dir, '--', 'manifest.json', configName]);
+      const groups = new Map();
+      for (const image of images) {
+        const config = Buffer.from(JSON.stringify({ architecture: 'amd64', os: 'linux', ...(distinctImages === '1' ? { image } : {}) }));
+        const name = createHash('sha256').update(config).digest('hex') + '.json';
+        if (!groups.has(name)) groups.set(name, { Config: name, RepoTags: nullTags === '1' ? null : [], Layers: [] });
+        groups.get(name).RepoTags?.push(image);
+        writeFileSync(join(dir, name), config);
+      }
+      writeFileSync(join(dir, 'manifest.json'), JSON.stringify([...groups.values()]));
+      const result = spawnSync('/usr/bin/tar', ['-cf', out, '-C', dir, '--', 'manifest.json', ...groups.keys()]);
   if (result.status !== 0) process.exit(result.status ?? 1);
 } finally {
   rmSync(dir, { recursive: true, force: true });
@@ -81,7 +84,7 @@ case "$1:$2" in
   save:-o)
     output="$3"
     shift 3
-    "$REAL_NODE" "$FAKE_ARCHIVE_HELPER" "$output" "$FAKE_NULL_REPO_TAGS" "$@"
+    "$REAL_NODE" "$FAKE_ARCHIVE_HELPER" "$output" "$FAKE_NULL_REPO_TAGS" "$FAKE_DISTINCT_IMAGES" "$@"
     ;;
   *) echo "unexpected docker command: $*" >&2; exit 91 ;;
 esac
@@ -102,9 +105,12 @@ cp -R "$2/$5/." "$FAKE_CAPTURE/"
     REAL_NODE: process.execPath,
     FAKE_ARCHIVE_HELPER: archiveHelper,
     FAKE_NULL_REPO_TAGS: nullRepoTags ? '1' : '0',
+    FAKE_DISTINCT_IMAGES: distinctImages ? '1' : '0',
     FAKE_CAPTURE: capture,
     MANAGER_IMAGE: manager,
-    PROXY_IMAGE: PROXY,
+    POLICY_IMAGE: policy,
+    PROXY_IMAGE: proxy,
+    NETWORK_IMAGE: network,
     INIT_IMAGE: INIT,
     NODE_RED_IMAGE_REPO: NODE_REPO,
     ALLOWED_IMAGE_TAGS: TAGS,
@@ -131,6 +137,7 @@ test('bundle 写入实际镜像配置且 images.tar RepoTags 可供 compose 寻�
     assert.deepEqual({
       MANAGER_IMAGE: env.MANAGER_IMAGE,
       PROXY_IMAGE: env.PROXY_IMAGE,
+      NETWORK_IMAGE: env.NETWORK_IMAGE,
       INIT_IMAGE: env.INIT_IMAGE,
       NODE_RED_IMAGE_REPO: env.NODE_RED_IMAGE_REPO,
       NODE_RED_BOOTSTRAP_IMAGE: env.NODE_RED_BOOTSTRAP_IMAGE,
@@ -138,6 +145,7 @@ test('bundle 写入实际镜像配置且 images.tar RepoTags 可供 compose 寻�
     }, {
       MANAGER_IMAGE: MANAGER,
       PROXY_IMAGE: PROXY,
+      NETWORK_IMAGE: MANAGER,
       INIT_IMAGE: INIT,
       NODE_RED_IMAGE_REPO: NODE_REPO,
       NODE_RED_BOOTSTRAP_IMAGE: `${NODE_REPO}:${TAGS}`,
@@ -184,4 +192,53 @@ test('裸 sha256 MANAGER_IMAGE 在 docker save 前即被拒绝', () => {
   } finally {
     fixture.cleanup();
   }
+});
+
+test('Manager and Docker policy roles share one release image by default and archive tags are deduplicated', () => {
+  const fixture = bed({ proxy: '' });
+  try {
+    const result = fixture.run();
+    assert.equal(result.status, 0, result.stderr);
+    const env = envRecord(readFileSync(join(fixture.capture, '.env.example'), 'utf8'));
+    assert.equal(env.PROXY_IMAGE, MANAGER);
+    const manifest = JSON.parse(readFileSync(join(fixture.capture, 'manifest.json'), 'utf8'));
+    assert.deepEqual(manifest.imageRoles, { manager: MANAGER, dockerProxy: MANAGER, networkIsolation: MANAGER, initData: INIT, nodeRed: [`${NODE_REPO}:${TAGS}`] });
+    assert.equal(manifest.images.length, 3);
+    assert.equal(new Set(manifest.images.map(item => item.image)).size, 3);
+  } finally { fixture.cleanup(); }
+});
+
+test('an explicit same-image proxy override exports only one tag for the two roles', () => {
+  const fixture = bed({ proxy: MANAGER });
+  try {
+    const result = fixture.run();
+    assert.equal(result.status, 0, result.stderr);
+    const manifest = JSON.parse(readFileSync(join(fixture.capture, 'manifest.json'), 'utf8'));
+    assert.equal(manifest.images.filter(item => item.image === MANAGER).length, 1);
+  } finally { fixture.cleanup(); }
+});
+
+test('POLICY_IMAGE delivers one separate image for both privileged roles', () => {
+  const policy = 'fixture/edge-policy:1';
+  const f = bed({ policy, proxy: '', distinctImages: true });
+  try {
+    const result = f.run();
+    assert.equal(result.status, 0, result.stderr);
+    const env = envRecord(readFileSync(join(f.capture, '.env.example'), 'utf8'));
+    const manifest = JSON.parse(readFileSync(join(f.capture, 'manifest.json'), 'utf8'));
+    assert.equal(env.PROXY_IMAGE, policy); assert.equal(env.NETWORK_IMAGE, policy);
+    assert.equal(manifest.imageRoles.dockerProxy, policy); assert.equal(manifest.imageRoles.networkIsolation, policy);
+    assert.equal(manifest.images.length, 4);
+    assert.notEqual(manifest.images.find(i => i.image === policy).id, manifest.images.find(i => i.image === MANAGER).id);
+    assert.match(readFileSync(join(f.capture, 'SHA256SUMS'), 'utf8'), /image-roles\.mjs/);
+  } finally { f.cleanup(); }
+});
+
+test('mismatched proxy and network image Config IDs cannot be delivered as a policy pair', () => {
+  const f = bed({ proxy: 'fixture/edge-policy:1', network: MANAGER, distinctImages: true });
+  try {
+    const result = f.run();
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /策略.*网络隔离.*Config ID/);
+  } finally { f.cleanup(); }
 });

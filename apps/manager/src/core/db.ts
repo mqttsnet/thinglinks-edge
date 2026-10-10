@@ -1,3 +1,4 @@
+import { PROTOCOL_DIAGNOSTIC_SCHEMA } from './protocols/diagnostics/schema.ts';
 /**
  * SQLite —— 只承担平台元数据。
  *
@@ -10,6 +11,8 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { COMMAND_SCHEMA } from './cloud/commands/schema.ts';
 import { PRESENCE_SCHEMA } from './cloud/presence/schema.ts';
+import { PRESENCE_OBSERVERS_SCHEMA } from './edge/presence-observers/schema.ts';
+import { SERVICE_SCOPED_FIELDS_SCHEMA } from './edge/service-schema.ts';
 
 export type Db = Database.Database;
 
@@ -418,6 +421,55 @@ const MIGRATIONS: string[] = [
   COMMAND_SCHEMA,
   // v17 — confirmed child presence sources, isolated by gateway.
   PRESENCE_SCHEMA,
+  // v18 — never recycle a browser origin across instance generations: storage and
+  // service workers can survive an instance deletion in users' browsers.
+  `CREATE TABLE editor_origin (
+    instance_id TEXT NOT NULL,
+    generation TEXT NOT NULL,
+    port INTEGER NOT NULL UNIQUE CHECK (port BETWEEN 1 AND 65535),
+    PRIMARY KEY (instance_id, generation)
+  );`,
+  // v19 — durable single-read cleanup intents; never replay after restart.
+  PROTOCOL_DIAGNOSTIC_SCHEMA,
+  // v20 — observer identity and persistent generation/sequence fences for live device presence.
+  PRESENCE_OBSERVERS_SCHEMA,
+  // v21 — service-qualified point identities; preserve ambiguous legacy history separately.
+  SERVICE_SCOPED_FIELDS_SCHEMA,
+  // v22 —— device HTTP ingress bindings and durable replay/rate-limit state.
+  `
+  CREATE TABLE device_http_binding (
+    id                    TEXT PRIMARY KEY,
+    instance_id           TEXT NOT NULL REFERENCES instance(id) ON DELETE CASCADE,
+    target_path           TEXT NOT NULL,
+    device_id             TEXT NOT NULL,
+    secret_enc            TEXT NOT NULL,
+    enabled               INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+    max_body_bytes        INTEGER NOT NULL DEFAULT 1048576 CHECK (max_body_bytes BETWEEN 1024 AND 8388608),
+    rate_limit_per_minute INTEGER NOT NULL DEFAULT 60 CHECK (rate_limit_per_minute BETWEEN 1 AND 6000),
+    created_by            TEXT NOT NULL DEFAULT '',
+    created_at            TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at            TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (instance_id, target_path, device_id)
+  );
+  CREATE INDEX idx_device_http_binding_instance ON device_http_binding(instance_id);
+
+  CREATE TABLE device_http_nonce (
+    binding_id TEXT NOT NULL REFERENCES device_http_binding(id) ON DELETE CASCADE,
+    nonce      TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (binding_id, nonce)
+  );
+  CREATE INDEX idx_device_http_nonce_expiry ON device_http_nonce(expires_at);
+
+  CREATE TABLE device_http_rate (
+    binding_id    TEXT PRIMARY KEY REFERENCES device_http_binding(id) ON DELETE CASCADE,
+    window_start  INTEGER NOT NULL,
+    request_count INTEGER NOT NULL
+  );
+  `,
+  // v23 — existing URL-only bindings fail closed until explicitly recreated.
+  `ALTER TABLE device_http_binding ADD COLUMN flow_revision TEXT NOT NULL DEFAULT '';`,
 ];
 export function openDb(file: string): Db {
   if (file !== ':memory:') mkdirSync(dirname(file), { recursive: true });

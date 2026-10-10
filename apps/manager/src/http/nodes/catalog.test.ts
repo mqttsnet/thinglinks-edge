@@ -1,7 +1,11 @@
 import { test } from 'node:test';
+import { loadConfig } from '../../core/config.ts';
+import { ProxySessionRegistry } from '../../core/instance/proxy-session-registry.ts';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { gzipSync } from 'node:zlib';
+import { tarArchive } from '../../core/archive/tar.ts';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Fastify from 'fastify';
@@ -267,6 +271,7 @@ test('inventory response preserves Manager-observed source, health, and determin
   const app = Fastify({ logger: false });
   registerNodeCatalog(app, {
     config: { basePath: '' }, db, repo,
+    service: { list: async () => [{ id: instance.id, state: 'running', running: true }] },
     operationGate: new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repo)),
     adminRuntime: { target: () => ({
       upstream: `http://127.0.0.1:${address.port}`,
@@ -332,11 +337,11 @@ test('migration routes enforce real session grants and CSRF without route-side o
   const app = Fastify({ logger: false });
   await app.register(cookie);
   const context = createContext({
-    config: { basePath: '', cookieSecure: false },
+    config: loadConfig({ EXTERNAL_URL: 'http://127.0.0.1:19100' }),
     db, auth, repo,
     service: {}, adminRuntime: {},
     operationGate: new InstanceOperationGate(new InstanceRepositoryOperationPolicy(repo)),
-    migrationService, proxySessions: {}, platformPackages: {},
+    migrationService, proxySessions: new ProxySessionRegistry(), platformPackages: {},
   } as unknown as ServerDeps);
   registerNodeCatalog(app, context, {
     store: new NodeStore(root), catalog: new NodeCatalog(db), migrationService,
@@ -397,5 +402,131 @@ test('migration routes enforce real session grants and CSRF without route-side o
   } finally {
     await app.close();
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('catalogue is independently readable while an offline-store snapshot is loading', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tle-node-store-responsive-'));
+  const db = openDb(':memory:');
+  const store = new NodeStore(root);
+  const catalog = new NodeCatalog(db);
+  catalog.approve({ module: 'node-red-contrib-test', actor: 'admin' });
+  let release!: () => void;
+  let started!: () => void;
+  const loading = new Promise<void>(resolve => { started = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const original = store.latestSnapshot.bind(store);
+  store.latestSnapshot = async () => { started(); await gate; return original(); };
+  const app = Fastify({ logger: false });
+  registerNodeCatalog(app, {
+    config: { basePath: '' }, db,
+    guard: () => ({ username: 'admin', role: 'admin' }),
+  } as unknown as HttpContext, { store, catalog, migrationService: {} as PlatformMigrationService });
+  try {
+    const slow = app.inject({ method: 'GET', url: '/api/nodes/store' });
+    // LightMyRequest's thenable starts only once consumed.
+    const slowResult = Promise.resolve(slow);
+    await loading;
+    const fast = await app.inject({ method: 'GET', url: '/api/nodes/catalog' });
+    assert.equal(fast.statusCode, 200);
+    const approved = fast.json().entries.find((entry: { module: string }) => entry.module === 'node-red-contrib-test');
+    assert.ok(approved);
+    assert.equal(approved.inStore, false);
+    assert.deepEqual(approved.storeVersions, []);
+    release();
+    assert.equal((await slowResult).statusCode, 200);
+  } finally {
+    release();
+    await app.close(); db.close(); rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('inventory authorizes before snapshot and does not probe invisible or stopped instances', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tle-node-inventory-visible-'));
+  const db = openDb(':memory:');
+  const repo = new InstanceRepo(db, deriveKey('catalog-inventory-visible', 'instance'));
+  const users = [{ username: 'admin', password: 'test-only-password', permissions: '*' as const }];
+  repo.create(instance, [], users);
+  repo.create({ ...instance, id: 'hidden', adminRoot: '/red/hidden/' }, [], users);
+  let authorized = false;
+  let snapshots = 0;
+  let targets = 0;
+  const app = Fastify({ logger: false });
+  registerNodeCatalog(app, {
+    config: { basePath: '' }, db, repo,
+    guard: ((_request, reply) => {
+      if (!authorized) { reply.code(403).send({ error: 'forbidden' }); return undefined; }
+      return { username: 'operator', role: 'operator' };
+    }) as HttpContext['guard'],
+    visibleOnly: ((_user, items) => items.filter(item => item.instanceId === instance.id)) as HttpContext['visibleOnly'],
+    adminRuntime: { target: () => { targets++; throw new Error('should not probe'); } },
+    service: { list: async () => { snapshots++; return [
+      { id: instance.id, state: 'exited', running: false },
+      { id: 'hidden', state: 'running', running: true },
+    ]; } },
+  } as unknown as HttpContext, {
+    store: new NodeStore(root), catalog: new NodeCatalog(db), migrationService: {} as PlatformMigrationService,
+  });
+  try {
+    const denied = await app.inject({ method: 'GET', url: '/api/nodes/inventory' });
+    assert.equal(denied.statusCode, 403);
+    assert.equal(snapshots, 0);
+    authorized = true;
+    const response = await app.inject({ method: 'GET', url: '/api/nodes/inventory' });
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(response.json().instances.map((item: { instanceId: string }) => item.instanceId), [instance.id]);
+    assert.match(response.json().instances[0].reason, /未运行/);
+    assert.equal(snapshots, 1);
+    assert.equal(targets, 0);
+  } finally {
+    await app.close(); db.close(); rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('store GET maps a disappearing archive to refreshable conflict and preserves validation errors', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tle-node-store-race-'));
+  const db = openDb(':memory:');
+  const store = new NodeStore(root);
+  const pack = (pkg: Record<string, unknown>) => gzipSync(tarArchive([
+    { name: 'package/package.json', content: JSON.stringify(pkg) },
+  ]));
+  store.add(pack({ name: 'a-root', version: '1.0.0', dependencies: { 'z-dependency': '*' } }));
+  store.add(pack({ name: 'z-dependency', version: '1.0.0' }));
+  const read = store.metaAsync.bind(store);
+  let removed = false;
+  store.metaAsync = async (module, version) => {
+    if (!removed) {
+      removed = true;
+      rmSync(join(root, 'z-dependency', '1.0.0.tgz'));
+    }
+    return read(module, version);
+  };
+  const app = Fastify({ logger: false });
+  registerNodeCatalog(app, {
+    config: { basePath: '' }, db,
+    guard: () => ({ username: 'admin', role: 'admin' }),
+  } as unknown as HttpContext, {
+    store, catalog: new NodeCatalog(db), migrationService: {} as PlatformMigrationService,
+  });
+  try {
+    const conflict = await app.inject({ method: 'GET', url: '/api/nodes/store' });
+    assert.equal(conflict.statusCode, 409);
+    assert.match(conflict.json().error, /包库.*变化.*刷新/);
+    assert.equal(conflict.json().packages, undefined);
+    const refreshed = await app.inject({ method: 'GET', url: '/api/nodes/store' });
+    assert.equal(refreshed.statusCode, 200);
+    assert.deepEqual(refreshed.json().packages[0].missingDeps, ['z-dependency']);
+    writeFileSync(join(root, 'a-root', '1.0.0.tgz'), Buffer.from('invalid gzip'));
+    const corrupt = await app.inject({ method: 'GET', url: '/api/nodes/store' });
+    assert.equal(corrupt.statusCode, 400);
+    assert.match(corrupt.json().error, /不是有效的 gzip/);
+    assert.equal(corrupt.json().packages, undefined);
+    store.latestSnapshot = async () => { throw new Error('sensitive internal filesystem path'); };
+    const failure = await app.inject({ method: 'GET', url: '/api/nodes/store' });
+    assert.equal(failure.statusCode, 500);
+    assert.match(failure.json().error, /读取失败.*刷新/);
+    assert.doesNotMatch(failure.body, /sensitive internal/);
+  } finally {
+    await app.close(); db.close(); rmSync(root, { recursive: true, force: true });
   }
 });

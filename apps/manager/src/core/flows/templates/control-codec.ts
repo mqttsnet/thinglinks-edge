@@ -1,8 +1,11 @@
+import { MAX_TEMPLATE_POINTS } from './limits.ts';
+import type { ControlMapping } from './control-mapping.ts';
+
 export interface ControlWriteOptions {
   nodeId: string;
   serviceCode: string;
   points: Record<string, unknown>[];
-  mappings: { cmd: string; param: string; property: string }[];
+  mappings: ControlMapping[];
   unitId?: number;
   address?: number;
   commandUrl?: string;
@@ -32,9 +35,13 @@ try {
     'proxy','tls','rejectUnauthorized','requestTimeout','followRedirects','qs','_session','socketid',
     'host','hostname','ip','port','server','endpoint','action','variable','topic','datatype']) delete msg[key];
   delete msg.payload;
+  const service=(value,fallback)=>{
+    const result=typeof value==='string'&&value.trim()?value.trim():typeof fallback==='string'?fallback.trim():'';
+    if(!/^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$/.test(result)||blocked.has(result))throw new Error('控制服务编码无效');
+    return result;
+  };
   if (typeof config.nodeId !== 'string' || config.nodeId.length === 0 || config.nodeId.length > 128
-    || typeof config.serviceCode !== 'string' || config.serviceCode.length === 0 || config.serviceCode.length > 128
-    || command.deviceIdentification !== config.nodeId || command.serviceCode !== config.serviceCode) {
+    || command.deviceIdentification !== config.nodeId || service(command.serviceCode)!==command.serviceCode) {
     throw new Error('命令设备或服务与配置不匹配');
   }
   if (typeof command.cmd !== 'string' || command.cmd.length === 0 || command.cmd.length > 128
@@ -42,14 +49,17 @@ try {
   const keys = Object.keys(command.params);
   if (keys.length !== 1 || blocked.has(keys[0])) throw new Error('命令必须只包含一个已声明参数');
   if (!Array.isArray(config.mappings) || config.mappings.length > 64
-    || !Array.isArray(config.points) || config.points.length > 64) throw new Error('控制映射配置无效');
+    || !Array.isArray(config.points) || config.points.length > ${MAX_TEMPLATE_POINTS}) throw new Error('控制映射配置无效');
   const matches = config.mappings.filter((mapping) => record(mapping)
+    && service(mapping.serviceCode,config.serviceCode) === command.serviceCode
     && mapping.cmd === command.cmd && mapping.param === keys[0]);
   if (matches.length !== 1) throw new Error('命令参数没有唯一的控制映射');
   const mapping = matches[0];
   if (typeof mapping.property !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(mapping.property)
     || blocked.has(mapping.property)) throw new Error('控制属性编码无效');
-  const points = config.points.filter((point) => record(point) && point.property === mapping.property);
+  const targetServiceCode=service(mapping.targetServiceCode,command.serviceCode);
+  const points = config.points.filter((point) => record(point) && point.property === mapping.property
+    && service(point.serviceCode,config.serviceCode) === targetServiceCode);
   if (points.length !== 1) throw new Error('控制属性没有唯一的点位');
   const point = points[0];
   if (typeof point.source !== 'string' || point.source.length === 0 || point.source.length > 256
@@ -160,7 +170,8 @@ try {
       }
     }
     if (!Number.isSafeInteger(byte) || byte < 0 || byte + width > 65536) throw new Error('S7 控制字节地址越界');
-    msg.variable = point.property;
+    // Generated S7 readers use stable raw aliases. Legacy direct codec inputs retain their property alias.
+    msg.variable = typeof point.rawAlias==='string'&&/^raw_\\d+$/.test(point.rawAlias)?point.rawAlias:point.property;
     msg.payload = raw;
   } else if (config.protocol === 'http') {
     const url = new URL(config.commandUrl);

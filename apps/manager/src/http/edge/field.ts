@@ -10,15 +10,22 @@
  * 而那种错误不会报错 —— 只会让某个接口悄悄变成谁都能调。
  */
 import type { FastifyInstance } from 'fastify';
-import { FieldRegistry } from '../../core/edge/registry.ts';
+import { FieldRegistry, fieldServiceCode } from '../../core/edge/registry.ts';
 import { probeFlows } from '../../core/edge/southbound.ts';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { HttpContext } from '../context.ts';
+import { PresenceObservers } from '../../core/edge/presence-observers/index.ts';
 
 export function registerField(api: FastifyInstance, ctx: HttpContext): void {
   const { config, db, guard, visibleOnly } = ctx;
   const registry = new FieldRegistry(db);
+  const observers = ctx.presenceObservers ?? new PresenceObservers(db);
+  const devices = (instanceId?: string) => registry.devices(instanceId).map(device => {
+    if (!observers.hasObservers(device.instanceId, device.nodeId)) return device;
+    const state = observers.aggregate(device.instanceId, device.nodeId);
+    return { ...device, online: state === true, presenceState: state === undefined ? 'unknown' : state ? 'online' : 'offline' };
+  });
 
   /**
    * 读台账的鉴权。
@@ -36,14 +43,15 @@ export function registerField(api: FastifyInstance, ctx: HttpContext): void {
     const { instanceId } = req.query as { instanceId?: string };
     const user = fieldGuard(req, reply, instanceId);
     if (!user) return;
-    return reply.send({ devices: visibleOnly(user, registry.devices(instanceId)) });
+    return reply.send({ devices: visibleOnly(user, devices(instanceId)) });
   });
 
   api.get(`${config.basePath}/api/field/tags`, async (req, reply) => {
-    const { instanceId, nodeId } = req.query as { instanceId?: string; nodeId?: string };
+    const { instanceId, nodeId, serviceCode } = req.query as { instanceId?: string; nodeId?: string; serviceCode?: string };
     const user = fieldGuard(req, reply, instanceId);
     if (!user) return;
-    return reply.send({ tags: visibleOnly(user, registry.tags(instanceId, nodeId)) });
+    try { return reply.send({ tags: visibleOnly(user, registry.tags(instanceId, nodeId, serviceCode)) }); }
+    catch (error) { return reply.code(400).send({ error: (error as Error).message }); }
   });
 
   /*
@@ -65,26 +73,29 @@ export function registerField(api: FastifyInstance, ctx: HttpContext): void {
    */
   api.get(`${config.basePath}/api/field/history`, async (req, reply) => {
     const q = req.query as {
-      instanceId?: string; nodeId?: string; tagId?: string;
+      instanceId?: string; nodeId?: string; tagId?: string; serviceCode?: string;
       since?: string; until?: string; limit?: string;
     };
     if (!q.instanceId || !q.nodeId || !q.tagId) {
       return reply.code(400).send({ error: '必须同时给出 instanceId、nodeId、tagId' });
     }
     if (!guard(req, reply, { csrf: false, need: 'instance:view', instance: q.instanceId })) return;
+    let serviceCode: string;
+    try { serviceCode = fieldServiceCode(q.serviceCode); }
+    catch (error) { return reply.code(400).send({ error: (error as Error).message }); }
 
     const history = ctx.valueHistory;
     if (!history?.enabled) {
       return reply.send({
-        enabled: false, points: [], oldest: null, rows: 0, maxRows: 0,
+        enabled: false, serviceCode, points: [], oldest: null, rows: 0, maxRows: 0,
         reason: '本部署未启用点位历史（EDGE_HISTORY_MAX_ROWS=0）',
       });
     }
     const limit = Number(q.limit ?? '500');
     return reply.send({
-      enabled: true,
+      enabled: true, serviceCode,
       ...history.series({
-        instanceId: q.instanceId, nodeId: q.nodeId, tagId: q.tagId,
+        instanceId: q.instanceId, nodeId: q.nodeId, tagId: q.tagId, serviceCode,
         since: q.since, until: q.until,
         limit: Number.isFinite(limit) ? limit : 500,
       }),
@@ -125,12 +136,12 @@ export function registerField(api: FastifyInstance, ctx: HttpContext): void {
      * 加在一起显示会让用户以为那是同一种东西。
      */
     // 汇总数字同样只能覆盖看得见的实例，否则「全厂多少台设备」会被越权读出来
-    const devices = visibleOnly(user, registry.devices(instanceId));
+    const visibleDevices = visibleOnly(user, devices(instanceId));
     const tags = visibleOnly(user, registry.tags(instanceId));
     return reply.send({
       managed: {
-        devices: devices.length,
-        online: devices.filter((d) => d.online).length,
+        devices: visibleDevices.length,
+        online: visibleDevices.filter((d) => d.online).length,
         tags: tags.length,
       },
       note: '「已纳管」来自 @thinglinks 节点主动回报，含当前值与质量码；'

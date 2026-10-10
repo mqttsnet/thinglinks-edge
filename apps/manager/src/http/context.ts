@@ -1,3 +1,4 @@
+import type { ProtocolDiagnosticService } from '../core/protocols/diagnostics/service.ts';
 /**
  * HTTP 层共享上下文。
  *
@@ -5,8 +6,11 @@
  * 这三件事必须全站一致，散在各处迟早会出现某条路由漏掉 CSRF 的情况。
  */
 import type { FastifyInstance } from 'fastify';
+import { createHash } from 'node:crypto';
 import type { EdgeConfig } from '../core/config.ts';
 import { AuthService } from '../core/auth/service.ts';
+import { EditorAccessStore } from '../core/auth/editor-access.ts';
+import { EditorOrigins } from '../core/instance/editor-origins.ts';
 import { InstanceRepo } from '../core/instance/repo.ts';
 import type { InstanceService } from '../core/instance/service.ts';
 import { containerName } from '../core/instance/container-spec.ts';
@@ -17,6 +21,7 @@ import type { OutageLog } from '../core/cloud/outage.ts';
 import type { CloudRuntime } from '../core/cloud/runtime.ts';
 import type { CommandBridge } from '../core/cloud/commands/bridge.ts';
 import type { PresenceSynchronizer } from '../core/cloud/presence/synchronizer.ts';
+import { PresenceObservers } from '../core/edge/presence-observers/index.ts';
 import type { CloudConfigRepo } from '../core/cloud/config-repo.ts';
 import { UserRepo } from '../core/auth/user-repo.ts';
 import { can, canInstance, isInstanceScoped, type Action } from '../core/auth/authz.ts';
@@ -66,7 +71,9 @@ export interface ServerDeps {
    */
   cloud?: CloudRuntime | undefined;
   commandBridge?: CommandBridge | undefined;
+  protocolDiagnostics?: ProtocolDiagnosticService | undefined;
   presence?: PresenceSynchronizer | undefined;
+  presenceObservers?: PresenceObservers | undefined;
   /** 云对接参数仓储。留空表示这个部署不提供云配置界面（如单测装配） */
   cloudConfig?: CloudConfigRepo | undefined;
   /**
@@ -113,10 +120,15 @@ export interface ServerDeps {
 const defaultUpstream = (id: string) => `http://${containerName(id)}:1880`;
 
 export interface HttpContext {
+  editorAccess: EditorAccessStore;
+  editorOrigins: EditorOrigins;
+  disposeEditorSessions: () => void;
   config: EdgeConfig;
   cloudSink: ((payload: unknown) => Promise<void>) | undefined;
   cloud: CloudRuntime | undefined;
   presence: PresenceSynchronizer | undefined;
+  presenceObservers: PresenceObservers;
+  protocolDiagnostics: ProtocolDiagnosticService | undefined;
   cloudConfig: CloudConfigRepo | undefined;
   spool: Spool | undefined;
   drainer: SpoolDrainer | undefined;
@@ -179,8 +191,31 @@ export function createContext(deps: ServerDeps): HttpContext {
   const settings = new SettingsRepo(deps.db);
   const currentUser = (req: { cookies: Record<string, string | undefined> }) =>
     auth.resolve(req.cookies[SID]);
+  const editorAccess = new EditorAccessStore({ credentialFor: id => {
+    const credential = deps.repo.credentials(id)[0];
+    const instance = deps.repo.get(id);
+    return credential && instance ? { ...credential, revision: instance.credSecret } : undefined;
+  } });
+  const editorOrigins = new EditorOrigins(deps.db, {
+    externalUrl: config.externalUrl, basePath: config.basePath,
+    portRange: config.editorPortRange, allowedMainOrigins: config.allowedOrigins,
+    generationFor: id => {
+      const instance = deps.repo.get(id);
+      return instance ? createHash('sha256').update(instance.credSecret).digest('hex') : undefined;
+    },
+  });
+  const disposeEditorSessions = deps.proxySessions.onRevoked(event => {
+    if ('username' in event) {
+      editorAccess.revokeUser(event.username, event.instanceId);
+      editorOrigins.revokeUser(event.username, event.instanceId);
+    } else {
+      editorAccess.revokeSession(event.sessionId, event.instanceId);
+      editorOrigins.revokeSession(event.sessionId, event.instanceId);
+    }
+  });
 
   return {
+    editorAccess, editorOrigins, disposeEditorSessions,
     config,
     users,
     settings,
@@ -188,6 +223,8 @@ export function createContext(deps: ServerDeps): HttpContext {
     cloudSink: deps.cloudSink,
     cloud: deps.cloud,
     presence: deps.presence,
+    presenceObservers: deps.presenceObservers ?? new PresenceObservers(deps.db),
+    protocolDiagnostics: deps.protocolDiagnostics,
     cloudConfig: deps.cloudConfig,
     spool: deps.spool,
     drainer: deps.drainer,

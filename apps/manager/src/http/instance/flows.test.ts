@@ -246,7 +246,7 @@ test('cached-model mismatches stop builtin preview and deployment before contact
 
 const tcpNodeSets = [
   { id: 'node-red/core', module: 'node-red', version: '5.0.4', enabled: true, err: '',
-    types: ['tcp in', 'tcp request', 'function', 'inject', 'catch', 'debug', 'http request'] },
+    types: ['tcp in', 'tcp request', 'function', 'inject', 'catch', 'debug', 'change', 'status', 'http request'] },
   { id: 'platform/nodes', module: PLATFORM_NODE_PACKAGE.name, version: PLATFORM_NODE_PACKAGE.version,
     enabled: true, err: '', types: ['tl-device', 'tl-uplink'] },
 ];

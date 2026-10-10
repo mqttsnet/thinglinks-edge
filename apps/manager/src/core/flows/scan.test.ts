@@ -42,6 +42,7 @@ test('真实内置模板含TCP控制和HTTP轮询的运行期令牌不误报固�
     if('host' in parameters)parameters.host='protocol-simulator';
     if('commandHost' in parameters)parameters.commandHost='protocol-simulator';
     if('url' in parameters)parameters.url='http://protocol-simulator:18080/data';
+    if('endpoint' in parameters)parameters.endpoint='opc.tcp://protocol-simulator:4840';
     if('commandUrl' in parameters)parameters.commandUrl='http://protocol-simulator:18080/control';
     const rendered=renderBuiltinTemplate(id,parameters)!;
     assert.deepEqual(scanInlineSecrets(rendered.flows),[],id);

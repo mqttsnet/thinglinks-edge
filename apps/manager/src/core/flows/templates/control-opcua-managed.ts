@@ -26,7 +26,8 @@ const rows=msg.payload,meta=msg.opcua;
 if(typeof expected==='string'&&allowed.includes(expected)&&Array.isArray(rows)&&rows.length===1&&rows[0]?.nodeId===expected&&meta?.operation==='write'&&meta.total===1){
  const status=rows[0].statusCode;
  if(status==='Good'&&meta.good===1){msg.payload={value:0};delete msg.error;return [msg,null];}
- const rejected=['BadNotWritable','BadTypeMismatch','BadUserAccessDenied','BadNodeIdUnknown','BadOutOfRange','BadNotSupported','BadAttributeIdInvalid'];
+ // OPC 10000-4 5.11.4: Bad_WriteNotSupported forbids any write on this Node.
+ const rejected=['BadNotWritable','BadWriteNotSupported','BadTypeMismatch','BadUserAccessDenied','BadNodeIdUnknown','BadOutOfRange','BadNotSupported','BadAttributeIdInvalid'];
  if(meta.good===0&&rejected.includes(status)){msg._tleExplicitRejection=true;msg.error={message:'OPC UA 服务器拒绝写入：'+status};return [null,msg];}
 }
 msg.error={message:'OPC UA 写入未取得目标点位明确 Good 确认'};return [null,msg];`;

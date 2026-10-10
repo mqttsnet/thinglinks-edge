@@ -17,15 +17,15 @@
  * 因此下发是一个显式按钮，而不是「批准」的副作用 —— 后端也是这么设计的
  * （批准接口恒回 applied:false）。
  */
-import { ref, computed, onMounted } from 'vue';
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue';
 import {
   NButton, NCard, NModal, NForm, NFormItem, NInput, NSelect, NSpin, NAlert, NTag, NSpace,
   NPopconfirm, NEmpty, NCheckbox, NRadioGroup, NRadioButton, useMessage,
 } from 'naive-ui';
 import { api, ApiError } from '../../api/client';
 import type {
-  CatalogEntry, StorePackage, InstanceInventory, InventoryItem, Instance, NodeCompliance,
-  NpmSource, NodeSearchHit, PlatformNodeMigration, PlatformMigrationPhase,
+  StorePackage, InstanceInventory, InventoryItem, NodeCompliance,
+  NpmSource, NodeSearchHit, PlatformMigrationPhase,
   PlatformMigrationErrorCode, NodeInventoryHealth, NodeInventorySource,
 } from '../../api/types';
 import { can, canOperate, loadPermissions } from '../../api/permissions';
@@ -33,10 +33,13 @@ import { can, canOperate, loadPermissions } from '../../api/permissions';
 // 直接 new Date() 会按本地解析，东八区差 8 小时（见 api/datetime.ts）
 import { localTime } from '../../api/datetime';
 import FieldHelp from '../../components/FieldHelp.vue';
+import RefreshButton from '../../components/RefreshButton.vue';
+import { createNodePageData } from './node-page-data';
+import type { NodeSection } from './node-page-data';
 
 const message = useMessage();
 
-type Section = 'platform' | 'catalog' | 'store' | 'inventory' | 'sources';
+type Section = NodeSection;
 const SECTIONS: Array<{ value: Section; label: string }> = [
   { value: 'platform', label: '平台节点迁移' },
   { value: 'catalog', label: '批准清单' },
@@ -46,16 +49,22 @@ const SECTIONS: Array<{ value: Section; label: string }> = [
 ];
 const section = ref<Section>('catalog');
 
-const entries = ref<CatalogEntry[]>([]);
-const packages = ref<StorePackage[]>([]);
-const storeRoot = ref('');
-const inventory = ref<InstanceInventory[]>([]);
-const instances = ref<Instance[]>([]);
-const loading = ref(true);
-const loadError = ref('');
-const migrations = ref<Record<string, PlatformNodeMigration>>({});
-const migrationLoadErrors = ref<Record<string, string>>({});
-const migrationLoading = ref(false);
+const pageData = createNodePageData(api);
+const entries = computed(() => pageData.catalog.data.value.entries);
+const packages = computed(() => pageData.store.data.value.packages);
+const storeRoot = computed(() => pageData.store.data.value.root);
+const inventory = computed(() => pageData.inventory.data.value.instances);
+const instances = computed(() => pageData.instances.data.value.instances);
+const sources = computed(() => pageData.sources.data.value.sources);
+const sectionStatus = computed(() => pageData.status(section.value));
+const loading = computed(() => sectionStatus.value.loading);
+const loadError = computed(() => sectionStatus.value.error);
+const sectionLabel = computed(() => SECTIONS.find((item) => item.value === section.value)!.label);
+const lastUpdated = computed(() => sectionStatus.value.updatedAt
+  ? new Date(sectionStatus.value.updatedAt).toLocaleTimeString() : '');
+const migrations = computed(() => pageData.migrations.data.value.statuses);
+const migrationLoadErrors = computed(() => pageData.migrations.data.value.errors);
+const migrationLoading = computed(() => pageData.migrations.state.loading);
 const migrationBusy = ref<Record<string, boolean>>({});
 const migrationActionErrors = ref<Record<string, string>>({});
 
@@ -64,47 +73,13 @@ const manage = computed(() => can('node:manage'));
 /** 实例 id → 名字。台账里只有 id，光看 id 认不出是哪条产线 */
 const nameOf = (id: string) => instances.value.find((i) => i.id === id)?.name ?? id;
 
-async function refresh() {
-  void loadSources();
-  loading.value = true;
-  loadError.value = '';
-  /*
-   * 四个请求地位不同，所以不用 `Promise.all` 一荣俱荣：
-   * 前三个各自撑起一段，某一段挂了不该让另外两段也空白 ——
-   * 台账要去逐台实例现问，是四个里最容易超时的那个，
-   * 而它挂掉时批准清单和包库仍然完全可用。
-   */
-  const [c, s, inv, ins] = await Promise.allSettled([
-    api.nodeCatalog(), api.nodeStore(), api.nodeInventory(), api.instances(),
-  ]);
-  if (c.status === 'fulfilled') entries.value = c.value.entries;
-  else loadError.value = c.reason instanceof ApiError ? c.reason.message : '加载批准清单失败';
-  if (s.status === 'fulfilled') {
-    packages.value = s.value.packages;
-    storeRoot.value = s.value.root;
-  }
-  if (inv.status === 'fulfilled') inventory.value = inv.value.instances;
-  if (ins.status === 'fulfilled') {
-    instances.value = ins.value.instances;
-    await refreshMigrationStatuses(ins.value.instances);
-  }
-  loading.value = false;
+/** Read only the selected section. After a mutation, supersede any older read. */
+function refresh(replace = false) {
+  return pageData.loadSection(section.value, replace);
 }
 
-/** 状态读取是只读请求；不复用搜索、批准或刷新结果来推断迁移是否已经发生。 */
-async function refreshMigrationStatuses(current: Instance[]) {
-  migrationLoading.value = true;
-  const settled = await Promise.allSettled(current.map((item) => api.platformNodeMigration(item.id)));
-  const next: Record<string, PlatformNodeMigration> = {};
-  const errors: Record<string, string> = {};
-  settled.forEach((result, index) => {
-    const id = current[index]!.id;
-    if (result.status === 'fulfilled') next[id] = result.value;
-    else errors[id] = result.reason instanceof ApiError ? result.reason.message : '迁移状态读取失败';
-  });
-  migrations.value = next;
-  migrationLoadErrors.value = errors;
-  migrationLoading.value = false;
+function resourceReady(resource: typeof pageData.catalog | typeof pageData.store | typeof pageData.inventory) {
+  return resource.state.loaded && !resource.state.loading && !resource.state.error;
 }
 
 const MIGRATION_PHASE: Record<PlatformMigrationPhase, string> = {
@@ -129,8 +104,10 @@ function platformState(instanceId: string) {
     p.module === PLATFORM_MODULE && p.versions.includes(PLATFORM_VERSION));
   const approved = entries.value.some((e) =>
     e.module === PLATFORM_MODULE && e.version === PLATFORM_VERSION);
-  const observed = inventory.value.find((item) => item.instanceId === instanceId)?.modules
-    .find((item) => item.module === PLATFORM_MODULE && item.version === PLATFORM_VERSION);
+  const observed = pageData.inventoryEvidence(instanceId).available
+    ? inventory.value.find((item) => item.instanceId === instanceId)?.modules
+      .find((item) => item.module === PLATFORM_MODULE && item.version === PLATFORM_VERSION)
+    : undefined;
   return {
     cached,
     approved,
@@ -144,7 +121,8 @@ function platformState(instanceId: string) {
 
 function canStartMigration(instanceId: string): boolean {
   const phase = migrations.value[instanceId]?.phase;
-  return phase === 'idle' || phase === 'rolled_back';
+  return pageData.migrationReady(instanceId)
+    && (phase === 'idle' || phase === 'rolled_back');
 }
 
 async function startPlatformMigration(instanceId: string) {
@@ -152,8 +130,7 @@ async function startPlatformMigration(instanceId: string) {
   migrationActionErrors.value = { ...migrationActionErrors.value, [instanceId]: '' };
   try {
     const result = await api.migratePlatformNodes(instanceId);
-    migrations.value = { ...migrations.value, [instanceId]: result };
-    await refresh();
+    await refresh(true);
     message.success(`已收到 ${nameOf(instanceId)} 的迁移请求：${MIGRATION_PHASE[result.phase]}`);
   } catch (error) {
     migrationActionErrors.value = {
@@ -168,12 +145,11 @@ async function startPlatformMigration(instanceId: string) {
 // ── 批准清单 ────────────────────────────────────────────
 
 // ── 节点源 ──────────────────────────────────────────────
-const sources = ref<NpmSource[]>([]);
 const newSource = ref({ name: '', url: '' });
 const sourceBusy = ref(false);
 
-async function loadSources() {
-  try { sources.value = (await api.nodeSources()).sources; } catch { sources.value = []; }
+function loadSources() {
+  return pageData.sources.refresh(true);
 }
 async function addSource() {
   sourceBusy.value = true;
@@ -283,11 +259,12 @@ const installOptions = computed(() =>
     value: e.module,
   })));
 
-function openInstall(instanceId: string) {
+async function openInstall(instanceId: string) {
   installTo.value = instanceId;
   installForm.value = { module: '', version: null };
   installErr.value = '';
   showInstall.value = true;
+  await pageData.catalog.refresh(true);
 }
 
 async function submitInstall() {
@@ -300,7 +277,7 @@ async function submitInstall() {
       installForm.value.version?.trim() || undefined,
     );
     showInstall.value = false;
-    await refresh();
+    await refresh(true);
     message.success(
       `已装到 ${nameOf(installTo.value)}：${r.module}@${r.version}`
       + (r.types.length ? ` · 新增节点类型 ${r.types.join('、')}` : '')
@@ -348,7 +325,7 @@ async function submitApprove(download: boolean) {
       download,
     );
     showApprove.value = false;
-    await refresh();
+    await refresh(true);
     /*
      * 三种结果分别说清楚。最容易产生误解的是「批准了 ≠ 已生效」——
      * 不明说的话，现场会去实例里找，找不到就以为坏了。
@@ -378,7 +355,7 @@ async function submitApprove(download: boolean) {
 async function revoke(module: string) {
   try {
     await api.revokeNode(module);
-    await refresh();
+    await refresh(true);
     message.warning(`已撤销 ${module}，还需「下发到实例」才会生效`, { duration: 8000 });
   } catch (e) {
     message.error(e instanceof ApiError ? e.message : '撤销失败');
@@ -422,7 +399,7 @@ async function pickFiles(e: Event) {
     }
   }
   importing.value = false;
-  await refresh();
+  await refresh(true);
 
   const bad = importReport.value.filter((r) => !r.ok).length;
   if (bad === 0) message.success(`导入了 ${files.length} 个包`);
@@ -432,7 +409,7 @@ async function pickFiles(e: Event) {
 async function removePackage(p: StorePackage, version: string) {
   try {
     await api.removeNodePackage(p.module, version);
-    await refresh();
+    await refresh(true);
     message.success(`已删除 ${p.module}@${version}`);
   } catch (e) {
     message.error(e instanceof ApiError ? e.message : '删除失败');
@@ -458,11 +435,23 @@ const applying = ref(false);
 const applyErr = ref('');
 const applyTargets = ref<string[]>([]);
 
-function openApply() {
-  // 默认全选：漏掉一台的后果是那台的白名单和别处不一样，而且没人会发现
-  applyTargets.value = instances.value.map((i) => i.id);
+const applyTargetsLoading = ref(false);
+let applyLoadGeneration = 0;
+async function loadApplyTargets() {
+  const ticket = ++applyLoadGeneration;
+  applyTargetsLoading.value = true;
   applyErr.value = '';
+  const loaded = await pageData.instances.refresh(true);
+  if (ticket !== applyLoadGeneration) return;
+  if (loaded) applyTargets.value = instances.value.map((i) => i.id);
+  else applyErr.value = pageData.instances.state.error;
+  applyTargetsLoading.value = false;
+}
+
+function openApply() {
+  applyTargets.value = [];
   showApply.value = true;
+  void loadApplyTargets();
 }
 
 function toggleTarget(id: string, checked: boolean) {
@@ -477,7 +466,7 @@ async function confirmApply() {
   try {
     const { results } = await api.applyNodePolicy(applyTargets.value);
     showApply.value = false;
-    await refresh();
+    await refresh(true);
     const failed = results.filter((r) => !r.ok);
     const restarted = results.filter((r) => r.ok && r.restarted).length;
     if (failed.length === 0) {
@@ -528,9 +517,15 @@ function sortedModules(inv: InstanceInventory): InventoryItem[] {
 const totalUnapproved = computed(() =>
   inventory.value.reduce((n, i) => n + i.unapproved, 0));
 
-onMounted(async () => {
-  await loadPermissions();
-  await refresh();
+watch(section, () => { void refresh(); });
+onMounted(() => {
+  void loadPermissions();
+  void refresh();
+});
+onUnmounted(() => {
+  pageData.dispose();
+  ++applyLoadGeneration;
+  if (searchTimer) clearTimeout(searchTimer);
 });
 </script>
 
@@ -541,13 +536,19 @@ onMounted(async () => {
         <h2>节点管理</h2>
         <p class="sub">管住实例能装哪些第三方节点，并让离线现场也装得上</p>
       </div>
-      <NButton v-if="manage" type="primary" size="small"
-               :disabled="instances.length === 0" @click="openApply">下发到实例</NButton>
+      <NSpace>
+        <RefreshButton :loading="loading" :label="`刷新${sectionLabel}`" @click="refresh()" />
+        <NButton v-if="manage" type="primary" size="small"
+                 :loading="applyTargetsLoading" @click="openApply">下发到实例</NButton>
+      </NSpace>
     </div>
 
-    <NAlert v-if="loadError" type="error" :bordered="false">{{ loadError }}</NAlert>
+    <NAlert v-if="loadError" type="error" :bordered="false">
+      {{ loadError }}。{{ sectionStatus.loaded ? '保留上次读取的数据，请刷新重试。' : '请刷新重试。' }}
+      <span class="retry"><RefreshButton size="tiny" label="重试" :loading="loading" @click="refresh()" /></span>
+    </NAlert>
 
-    <NAlert v-if="totalUnapproved > 0" type="warning" :bordered="false" class="drift">
+    <NAlert v-if="(section === 'inventory' || section === 'platform') && totalUnapproved > 0" type="warning" :bordered="false" class="drift">
       <b>有 {{ totalUnapproved }} 个已装节点不在批准清单里。</b>
       多半是白名单生效之前装的，也可能是有人绕过平台在实例里手工装的。
       到「已装台账」逐条确认：该留的补批准，不该留的去实例里卸载。
@@ -557,9 +558,16 @@ onMounted(async () => {
       <NRadioButton v-for="s in SECTIONS" :key="s.value" :value="s.value" :label="s.label" />
     </NRadioGroup>
 
-    <NSpin :show="loading">
+    <p class="refresh-status" role="status" aria-live="polite">
+      <template v-if="loading">正在{{ sectionStatus.loaded ? '刷新' : '加载' }}{{ sectionLabel }}…</template>
+      <template v-else-if="loadError">{{ sectionLabel }}读取未完成</template>
+      <template v-else-if="lastUpdated">{{ sectionLabel }}更新于 {{ lastUpdated }}</template>
+      <span v-if="lastUpdated && (loading || loadError)"> · 上次读取 {{ lastUpdated }}</span>
+    </p>
+
+    <NSpin :show="loading && !sectionStatus.loaded">
       <!-- ── 平台节点迁移 ───────────────────────────────── -->
-      <section v-show="section === 'platform'" class="sec">
+      <section v-if="section === 'platform'" class="sec">
         <div class="sh">
           <p class="lead">
             将实例从镜像中的 legacy 平台节点切换到受信任的发布包。
@@ -578,14 +586,14 @@ onMounted(async () => {
           仅供在浏览器中独立核验；它们不代表本 Manager 已搜索、已缓存或可安装。
         </NAlert>
 
-        <NEmpty v-if="instances.length === 0 && !loading" class="empty" description="没有可查看的实例" />
+        <NEmpty v-if="instances.length === 0 && sectionStatus.ready" class="empty" description="没有可查看的实例" />
 
         <NCard v-for="item in instances" :key="item.id" class="card" :bordered="false">
           <div class="th">
             <div class="tn">
               <span class="name">{{ item.name }}</span>
               <NTag size="small" :bordered="false" class="mono">{{ item.id }}</NTag>
-              <NTag v-if="migrations[item.id]" size="small" :bordered="false"
+              <NTag v-if="migrations[item.id] && !migrationLoading && !migrationLoadErrors[item.id] && !pageData.migrations.state.error" size="small" :bordered="false"
                     :type="migrations[item.id]!.phase === 'committed' ? 'success'
                       : ['manual_required', 'rolled_back_dirty'].includes(migrations[item.id]!.phase)
                         ? 'warning' : 'info'">
@@ -622,13 +630,17 @@ onMounted(async () => {
           </NAlert>
 
           <div class="platform-state">
-            <span><b>Manager 缓存：</b>{{ platformState(item.id).cached ? '已缓存精确包 0.0.1' : '未见精确包 0.0.1' }}</span>
-            <span><b>平台批准：</b>{{ platformState(item.id).approved ? '已批准精确版本' : '未批准精确版本' }}</span>
-            <span><b>实例安装：</b>{{ platformState(item.id).installed ? '台账已观察到精确版本' : '台账未观察到精确版本' }}</span>
-            <span><b>实例激活：</b>{{ platformState(item.id).active ? '已启用且无已知加载冲突' : '尚无健康激活证据' }}</span>
+            <span><b>Manager 缓存：</b>{{ !resourceReady(pageData.store) ? '尚待读取确认' : platformState(item.id).cached ? '已缓存精确包 0.0.1' : '未见精确包 0.0.1' }}</span>
+            <span><b>平台批准：</b>{{ !resourceReady(pageData.catalog) ? '尚待读取确认' : platformState(item.id).approved ? '已批准精确版本' : '未批准精确版本' }}</span>
+            <span><b>实例安装：</b>{{ !pageData.inventoryEvidence(item.id).available ? '台账未确认，状态未知' : platformState(item.id).installed ? '台账已观察到精确版本' : '台账未观察到精确版本' }}</span>
+            <span><b>实例激活：</b>{{ !pageData.inventoryEvidence(item.id).available ? '台账未确认，状态未知' : platformState(item.id).active ? '已启用且无已知加载冲突' : '尚无健康激活证据' }}</span>
           </div>
-          <div v-if="platformState(item.id).source || platformState(item.id).health
-                       || platformState(item.id).errors.length || instanceInventory(item.id)?.health" class="meta">
+          <NAlert v-if="!pageData.inventory.state.loading && !pageData.inventoryEvidence(item.id).available"
+                  type="warning" :bordered="false" class="warn">
+            {{ pageData.inventoryEvidence(item.id).reason }}
+          </NAlert>
+          <div v-if="pageData.inventoryEvidence(item.id).available && (platformState(item.id).source || platformState(item.id).health
+                       || platformState(item.id).errors.length || instanceInventory(item.id)?.health)" class="meta">
             <span v-if="platformState(item.id).source">
               平台模块来源：{{ INVENTORY_SOURCE[platformState(item.id).source!] }}
             </span>
@@ -638,21 +650,21 @@ onMounted(async () => {
             </span>
             <span v-if="platformState(item.id).errors.length">加载/冲突证据：{{ platformState(item.id).errors.join('；') }}</span>
           </div>
-          <NAlert v-if="instanceInventory(item.id)?.conflicts?.length" type="warning" :bordered="false" class="warn">
+          <NAlert v-if="pageData.inventoryEvidence(item.id).available && instanceInventory(item.id)?.conflicts?.length" type="warning" :bordered="false" class="warn">
             <b>Manager 观察到的类型冲突：</b>
             <span v-for="conflict in instanceInventory(item.id)!.conflicts!" :key="conflict.type" class="conflict">
               {{ conflict.type }}：{{ conflict.owners.join('、') }}
             </span>
           </NAlert>
           <p v-if="migrations[item.id]" class="meta">
-            运行模式：{{ migrations[item.id]!.runtimeMode === 'npm' ? 'npm 发布包' : 'legacy 镜像节点' }}
+            {{ migrationLoading || migrationLoadErrors[item.id] || pageData.migrations.state.error ? '上次读取的运行模式：' : '运行模式：' }}{{ migrations[item.id]!.runtimeMode === 'npm' ? 'npm 发布包' : 'legacy 镜像节点' }}
             <template v-if="migrations[item.id]!.platformVersion"> · 平台版本：{{ migrations[item.id]!.platformVersion }}</template>
           </p>
         </NCard>
       </section>
 
       <!-- ── 批准清单 ─────────────────────────────────── -->
-      <section v-show="section === 'catalog'" class="sec">
+      <section v-if="section === 'catalog'" class="sec">
         <div class="sh">
           <p class="lead">
             这张表决定实例<b>允许安装</b>哪些节点包。它会被写进每台实例的配置，
@@ -661,7 +673,7 @@ onMounted(async () => {
           <NButton v-if="manage" size="tiny" secondary @click="openApprove()">批准新节点包</NButton>
         </div>
 
-        <NEmpty v-if="entries.length === 0" class="empty" description="批准清单是空的">
+        <NEmpty v-if="entries.length === 0 && sectionStatus.ready" class="empty" description="批准清单是空的">
           <template #extra>
             <p class="hint" style="max-width:460px">
               空清单意味着实例<b>一个第三方节点都装不了</b>（内置节点不受影响）。
@@ -707,7 +719,7 @@ onMounted(async () => {
       </section>
 
       <!-- ── 离线包库 ─────────────────────────────────── -->
-      <section v-show="section === 'store'" class="sec">
+      <section v-if="section === 'store'" class="sec">
         <div class="sh">
           <p class="lead">
             Manager 自带的私有 npm 源。无外网现场只能从这里装 ——
@@ -737,7 +749,7 @@ onMounted(async () => {
         </NSpin>
         <NAlert v-if="importErr" type="error" :bordered="false">{{ importErr }}</NAlert>
 
-        <NEmpty v-if="packages.length === 0 && !importing" class="empty" description="包库是空的">
+        <NEmpty v-if="packages.length === 0 && !importing && sectionStatus.ready" class="empty" description="包库是空的">
           <template #extra>
             <p class="hint" style="max-width:460px">
               有外网的现场用不上它（直接从公网装）。<b>无外网的现场必须先把包导进来</b>：
@@ -808,14 +820,13 @@ onMounted(async () => {
       </section>
 
       <!-- ── 已装台账 ─────────────────────────────────── -->
-      <section v-show="section === 'inventory'" class="sec">
+      <section v-if="section === 'inventory'" class="sec">
         <p class="lead">
-          各实例<b>此刻实际装着</b>什么，逐台现问、不缓存 ——
-          缓存一份「上次看到的」只会在有人手工装过之后骗人，
-          而这一页恰恰是用来发现那种偏差的。
+          查看各实例实际安装的节点。进入此页或点击刷新会重新读取实例；
+          读取失败时保留上次结果，并提示失败原因。
         </p>
 
-        <NEmpty v-if="inventory.length === 0" class="empty" description="没有可查看的实例" />
+        <NEmpty v-if="inventory.length === 0 && sectionStatus.ready" class="empty" description="没有可查看的实例" />
 
         <NCard v-for="inv in inventory" :key="inv.instanceId" class="card" :bordered="false">
           <div class="th">
@@ -867,7 +878,7 @@ onMounted(async () => {
       </section>
 
       <!-- ── 节点源 ─────────────────────────────────── -->
-      <section v-show="section === 'sources'" class="sec">
+      <section v-if="section === 'sources'" class="sec">
         <p class="lead">
           搜索与在线安装都走这里配置的源，<b>从上到下依次尝试</b>。
           源在这里增删即可生效，<b>不需要改配置或重启</b>。
@@ -882,7 +893,7 @@ onMounted(async () => {
                    :disabled="!newSource.url.trim()" @click="addSource">加入</NButton>
         </div>
 
-        <NEmpty v-if="sources.length === 0"
+        <NEmpty v-if="sources.length === 0 && sectionStatus.ready"
                 description="还没有配置任何节点源" style="padding: 28px 0">
           <template #extra>
             <span class="muted">
@@ -892,7 +903,7 @@ onMounted(async () => {
           </template>
         </NEmpty>
 
-        <table v-else class="tbl">
+        <table v-if="sources.length" class="tbl">
           <thead>
             <tr><th>名称</th><th>地址</th><th>状态</th><th>加入</th><th v-if="manage"></th></tr>
           </thead>
@@ -932,6 +943,11 @@ onMounted(async () => {
         <b>白名单照样管用</b>，没批准的包在这里也装不上。装完立即生效，不用重启实例。
       </NAlert>
 
+      <NAlert v-if="pageData.catalog.state.error" type="error" :bordered="false">
+        {{ pageData.catalog.state.error }}
+        <span class="retry"><RefreshButton label="重试" :loading="pageData.catalog.state.loading"
+                                         @click="pageData.catalog.refresh()" /></span>
+      </NAlert>
       <NForm label-placement="top">
         <NFormItem>
           <template #label>
@@ -941,8 +957,8 @@ onMounted(async () => {
               <p>标着「本地库已有」的那些<b>离线也装得上</b>；其余的要现场能连上节点源。</p>
             </FieldHelp>
           </template>
-          <NSelect v-model:value="installForm.module" :options="installOptions"
-                   filterable tag clearable placeholder="选一个已批准的包" />
+          <NSelect v-model:value="installForm.module" :options="installOptions" :loading="pageData.catalog.state.loading"
+                   :disabled="!resourceReady(pageData.catalog)" filterable tag clearable placeholder="选一个已批准的包" />
         </NFormItem>
 
         <NFormItem>
@@ -964,7 +980,7 @@ onMounted(async () => {
         <NSpace justify="end">
           <NButton size="small" @click="showInstall = false">取消</NButton>
           <NButton size="small" type="primary" :loading="installing"
-                   :disabled="!installForm.module || !installForm.module.trim()"
+                   :disabled="!resourceReady(pageData.catalog) || !installForm.module || !installForm.module.trim()"
                    @click="submitInstall">安装</NButton>
         </NSpace>
       </template>
@@ -1082,7 +1098,9 @@ onMounted(async () => {
         而这种不一致平时看不出来，只有下一次有人在那台上装节点时才会暴露。
       </p>
 
-      <div class="picks">
+      <p v-if="applyTargetsLoading" class="hint" role="status">正在读取可下发的实例…</p>
+      <NEmpty v-else-if="!applyErr && !instances.length" description="没有可下发的实例" />
+      <div v-if="!applyTargetsLoading && !applyErr" class="picks">
         <div v-for="i in instances" :key="i.id" class="pick">
           <NCheckbox :checked="applyTargets.includes(i.id)"
                      @update:checked="(v: boolean) => toggleTarget(i.id, v)">
@@ -1095,6 +1113,7 @@ onMounted(async () => {
 
       <NAlert v-if="applyErr" type="error" :bordered="false" style="margin-top:12px">
         {{ applyErr }}
+        <span class="retry"><RefreshButton label="重试" :loading="applyTargetsLoading" @click="loadApplyTargets" /></span>
       </NAlert>
 
       <template #footer>
@@ -1103,7 +1122,7 @@ onMounted(async () => {
           <NPopconfirm @positive-click="confirmApply">
             <template #trigger>
               <NButton size="small" type="primary" :loading="applying"
-                       :disabled="applyTargets.length === 0">
+                       :disabled="applyTargetsLoading || !!applyErr || applyTargets.length === 0">
                 下发到 {{ applyTargets.length }} 台
               </NButton>
             </template>
@@ -1117,8 +1136,10 @@ onMounted(async () => {
 
 <style scoped>
 .page { display: flex; flex-direction: column; gap: 18px; }
-.bar { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.bar { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
 h2 { margin: 0 0 4px; font-size: 20px; }
+.retry { display: inline-flex; margin-left: 12px; }
+.refresh-status { margin: -6px 0; font-size: 12px; color: var(--muted); min-height: 20px; }
 .sub { margin: 0; font-size: 12.5px; color: var(--muted); }
 
 .sec { display: flex; flex-direction: column; gap: 14px; padding-top: 4px; }

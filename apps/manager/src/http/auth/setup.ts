@@ -1,32 +1,30 @@
 /**
- * 首次设置 —— 全新部署上由**用户自己**定第一个管理员账号。
- *
- * 取代了原先「随机生成口令、打进启动日志、让用户去 docker logs 里翻」那一套。
- * 日志那套的毛病不是不好用，是**口令会跟着日志跑**：进日志聚合、进备份、
- * 进随手截的一张图。诊断包的脱敏模块里专门为它留了一条规则，就是这个原因。
- *
- * 这条路是匿名的（还没有账号，也就无从鉴权），闸只有一道：
- * **只在一个账号都没有时放行**。有任何账号存在就一律拒绝 ——
- * 「重新认领」不是这条路该干的事，那是 `reset-admin` 的活。
- *
- * 曾经还有第二道「只在启动后 N 分钟内放行」，**默认已经去掉**，理由是它算错了账：
- *
- *   · 默认 `BIND_ADDR=127.0.0.1`，开箱只有宿主本机够得到。而能碰到宿主的人
- *     本来就能跑 `reset-admin`，限时挡不住他 —— 默认部署下这道闸几乎不保护任何东西。
- *   · 代价却是实打实的：装完机被叫走、回来窗口过了，人就进不去，
- *     还得找个有 shell 权限的人重启容器。现场装机被打断是常态，不是意外。
- *
- * 只有**主动把控制台暴露到厂区网或公网**的部署才真的面对「谁先打开谁是管理员」，
- * 那种情况下用 `SETUP_WINDOW_MIN` 显式开启限时。默认 0 = 不限时。
+ * 首次管理员认领仅在零账号时可用。浏览器模式必须额外提交部署方配置的
+ * SETUP_INSTALL_TOKEN，包括回环请求：回环也可能是转发外网请求的本机代理。
+ * Compose 默认 password 模式不走认领；已有账号不能通过此接口重置。
+ * SETUP_WINDOW_MIN 可额外限制认领时长，0 表示不设时间窗口。
  */
 import type { FastifyInstance } from 'fastify';
 import { recordAudit } from '../../core/db.ts';
 import { AuthError } from '../../core/auth/service.ts';
 import { SID, CSRF, type HttpContext } from '../context.ts';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
+
+/** No address is an installation credential. */
+export function setupAccessAllowed(
+  _remoteAddress: string | undefined, installToken: string | undefined, presentedToken: string | undefined,
+): boolean {
+  // 配置了安装口令后，所有来源（包括回环和反向代理）都必须提交它。
+  // 否则反向代理落到 127.0.0.1 时会把“本机免口令”变成远程绕过。
+  if (!installToken || !presentedToken || Buffer.byteLength(presentedToken, 'utf8') > 256) return false;
+  const expected = Buffer.from(installToken, 'utf8');
+  if (expected.length < 16 || expected.length > 256) return false;
+  const actual = Buffer.from(presentedToken, 'utf8');
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
+}
 
 /**
- * 认领窗口，分钟。**默认 0 = 不限时**。
+ * 认领窗口，分钟。**默认 0 = 不限时**；来源门禁仍然始终生效。
  *
  * 只有把控制台暴露到宿主之外的部署才需要它 —— 见文件头。
  */
@@ -46,6 +44,10 @@ function windowMs(): number {
 
 export function registerSetup(api: FastifyInstance, ctx: HttpContext): void {
   const { config, db, auth } = ctx;
+  const installToken = process.env['SETUP_INSTALL_TOKEN']?.trim() || undefined;
+  if (installToken && (Buffer.byteLength(installToken) < 16 || Buffer.byteLength(installToken) > 256)) {
+    throw new Error('SETUP_INSTALL_TOKEN 需为 16–256 字节，请配置随机安装口令');
+  }
   const startedAt = Date.now();
   const limit = windowMs();
   /** 0 = 不限时 */
@@ -64,6 +66,8 @@ export function registerSetup(api: FastifyInstance, ctx: HttpContext): void {
     return reply.send({
       needed,
       expired: needed && expired(),
+      requiresInstallToken: needed,
+      installTokenConfigured: needed && Boolean(installToken),
       /** 剩余秒数；0 表示不限时。界面用它提示「请在 x 分钟内完成」 */
       expiresInSec: expiresAt === 0 ? 0 : Math.max(0, Math.round((expiresAt - Date.now()) / 1000)),
     });
@@ -85,7 +89,13 @@ export function registerSetup(api: FastifyInstance, ctx: HttpContext): void {
       });
     }
 
-    const { username, password } = (req.body ?? {}) as { username?: string; password?: string };
+    const body = (req.body ?? {}) as { username?: string; password?: string; installToken?: unknown };
+    const presentedToken = typeof body.installToken === 'string' ? body.installToken : undefined;
+    if (!setupAccessAllowed(req.raw.socket.remoteAddress, installToken, presentedToken)) {
+      return reply.code(403).send({ error: installToken ? '首次设置需要正确的安装口令' : '未配置安装口令。请由部署人员设置 SETUP_INSTALL_TOKEN，或使用初始管理员密码模式', code: 'SETUP_TRUST_REQUIRED' });
+    }
+    if (typeof body.username !== 'string' || typeof body.password !== 'string') return reply.code(400).send({ error: '用户名和口令必须是文本' });
+    const { username, password } = body;
     try {
       auth.createFirstAdmin((username ?? '').trim(), password ?? '');
     } catch (e) {

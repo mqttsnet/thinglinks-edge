@@ -43,6 +43,7 @@ const setup = ref<SetupState | null>(null);
 const setupName = ref('admin');
 const setupPw = ref('');
 const setupPw2 = ref('');
+const setupInstallToken = ref('');
 const needSetup = computed(() => setup.value?.needed === true);
 /** 窗口剩余分钟。0 表示不限时，界面就不提这回事 */
 const setupLeftMin = computed(() =>
@@ -71,7 +72,7 @@ async function submitSetup() {
   busy.value = true;
   try {
     // 设置成功即已登录，不必再输一遍刚定好的口令
-    await api.setup(setupName.value.trim(), setupPw.value);
+    await api.setup(setupName.value.trim(), setupPw.value, setupInstallToken.value || undefined);
     message.success('管理员账号已创建');
     await router.replace('/instances');
   } catch (e) {
@@ -170,6 +171,9 @@ async function submitChange() {
           首次设置窗口已过期（这台部署开启了 <code>SETUP_WINDOW_MIN</code> 限时）。
           请重启 Manager 容器后重新设置。
         </NAlert>
+        <NAlert v-else-if="setup?.installTokenConfigured === false" type="warning" :bordered="false" style="margin: 16px 0">
+          尚未配置安装口令，请联系部署人员完成首次设置配置。配置好后刷新此页；已有账号的升级不受影响。
+        </NAlert>
         <NAlert v-else type="info" :bordered="false" style="margin: 16px 0">
           这台设备还没有账号，请设置管理员账号与口令。
           <!-- 限时是可选加固，默认关着，开了才提这回事 -->
@@ -177,7 +181,7 @@ async function submitChange() {
             请在 <b>{{ setupLeftMin }}</b> 分钟内完成。
           </template>
         </NAlert>
-        <NForm v-if="!setup?.expired" class="form" @submit.prevent="submitSetup">
+        <NForm v-if="!setup?.expired && setup?.installTokenConfigured !== false" class="form" @submit.prevent="submitSetup">
           <NFormItem label="管理员用户名">
             <NInput v-model:value="setupName" placeholder="admin" />
           </NFormItem>
@@ -188,6 +192,10 @@ async function submitChange() {
           <NFormItem label="确认口令">
             <NInput v-model:value="setupPw2" type="password"
                     @keyup.enter="submitSetup" />
+          </NFormItem>
+          <NFormItem v-if="setup?.requiresInstallToken" label="安装口令">
+            <NInput v-model:value="setupInstallToken" type="password" show-password-on="click"
+                    placeholder="由部署人员提供" @keyup.enter="submitSetup" />
           </NFormItem>
           <NButton type="primary" block :loading="busy" @click="submitSetup">创建并进入</NButton>
         </NForm>

@@ -26,8 +26,9 @@ const emit = defineEmits<{ query: [] }>();
       · {{ result.model.services?.length ?? 0 }} 个服务。读取结果用于配置核对，设备绑定版本和实际收发仍需验证。
     </p>
     <NAlert v-if="issues.length" type="warning" :bordered="false" class="model-alert">
-      当前配置与本次读取的模型存在差异，已暂停预览、部署和保存副本。请修正以下映射：
-      <ul><li v-for="issue in issues" :key="issue">{{ issue }}</li></ul>
+      当前服务或属性映射需要核对，已暂停预览、部署和保存副本。请修正以下配置：
+      <ul><li v-for="issue in issues.slice(0, 10)" :key="issue">{{ issue }}</li></ul>
+      <p v-if="issues.length > 10">共 {{ issues.length }} 项问题，先列出前 10 项；修改默认服务可一起解决继承该服务的点位。</p>
     </NAlert>
   </div>
 </template>

@@ -6,7 +6,8 @@
  */
 import bcrypt from 'bcryptjs';
 import { randomUUID } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { lstat, readFile, rm } from 'node:fs/promises';
+import { join } from 'node:path';
 import type { Db } from '../db.ts';
 import { recordAudit } from '../db.ts';
 import { adminRootFor } from '../config.ts';
@@ -39,6 +40,7 @@ import {
 import { installModule } from '../flows/admin-client.ts';
 import { assertHealthyPlatformModule } from '../nodes/inventory.ts';
 import { verifyInstalledPlatformFiles } from '../nodes/installed-files.ts';
+import { assertInstanceResourceBudget } from './resource-budget.ts';
 import {
   type PlatformNodeOperationBarrier,
 } from '../nodes/platform-operation-barrier.ts';
@@ -115,6 +117,8 @@ export interface CreateInstanceInput {
   imageTag: string;
   memoryMb: number;
   cpus: number;
+  /** Omission preserves generated credentials for automation; explicit values are validated. */
+  editorPassword?: string | undefined;
   /**
    * 端口映射表，一行一条，空数组表示不映射。
    *
@@ -138,7 +142,15 @@ export interface InstanceView {
   running: boolean;
 }
 
+export interface InstanceRemovalLifecycle {
+  /** True requires verified data purge and completion before removing the repository record. */
+  beforeRemove(instanceId: string, options: { removeData: boolean }): boolean | Promise<boolean>;
+  /** Runs under remove-instance only after deletion; must independently verify resource absence. */
+  afterDataRemoved(instanceId: string): void | Promise<void>;
+}
+
 export interface InstanceServiceOptions {
+  removalLifecycle?: InstanceRemovalLifecycle | undefined;
   db: Db;
   repo: InstanceRepo;
   docker: DockerClient;
@@ -256,6 +268,11 @@ export class InstanceService {
     lease: InstanceOperationLease,
   ): Promise<InstanceView> {
     this.o.gate.assertLease(lease, input.id, ['create-instance']);
+    if (input.editorPassword !== undefined && (
+      typeof input.editorPassword !== 'string' || input.editorPassword.length < 12
+      || !input.editorPassword.trim() || Buffer.byteLength(input.editorPassword, 'utf8') > 72
+      || input.editorPassword.includes('\0')
+    )) throw new ServiceError('编辑器口令至少 12 位，UTF-8 编码最多 72 字节，不能全为空白或包含空字符');
     assertValidId(input.id);
     if (!input.name.trim()) throw new ServiceError('实例名称不能为空');
     if (!this.o.allowedImageTags.includes(input.imageTag)) {
@@ -266,7 +283,8 @@ export class InstanceService {
     if (this.o.repo.get(input.id)) throw new ServiceError(`实例 ${input.id} 已存在`);
 
     // 宿主资源逼近上限时阻止创建，而不是等它把机器压垮
-    const exhausted = isExhausted(await (this.o.readHostStats?.() ?? readHostStats()));
+    const host = await (this.o.readHostStats?.() ?? readHostStats());
+    const exhausted = isExhausted(host);
     if (exhausted.exhausted) {
       throw new ServiceError(`${exhausted.reason}，已阻止创建新实例`);
     }
@@ -296,7 +314,7 @@ export class InstanceService {
     }
 
     const adminRoot = adminRootFor(this.o.basePath, input.id);
-    const password = generatePassword();
+    const password = input.editorPassword ?? generatePassword();
     const credSecret = generatePassword(24);
     // 接入令牌：给实例里的 @thinglinks 节点回报台账用，与管理口令分开
     const ingestToken = generatePassword(32);
@@ -319,7 +337,11 @@ export class InstanceService {
     }
 
     const txId = `bootstrap-${randomUUID()}`;
-    this.o.repo.createWithNodeMigration(
+    // Recheck under the SQLite write transaction: concurrent creates on different
+    // instance gates must not each reserve the same remaining host capacity.
+    this.o.db.transaction(() => {
+      assertInstanceResourceBudget(host, this.o.repo.list(), input);
+      this.o.repo.createWithNodeMigration(
       {
         id: input.id, name: input.name, imageTag: input.imageTag,
         memLimit: input.memoryMb, cpuLimit: input.cpus,
@@ -342,6 +364,7 @@ export class InstanceService {
         actor: input.actor,
       },
     );
+    })();
 
     let failureCode: NodeMigrationErrorCode = 'preflight';
     let failureBoundary: BootstrapFailureBoundary = 'persist-barrier';
@@ -540,6 +563,51 @@ export class InstanceService {
     if (!this.o.repo.get(id)) throw new ServiceError(`实例 ${id} 不存在`);
   }
 
+  /** Deletion is successful only after every managed runtime resource is observed absent. */
+  private async assertRuntimeRemoved(id: string): Promise<void> {
+    try {
+      await this.o.docker.assertManaged(id);
+      throw new ServiceError(`实例 ${id} 的受管容器仍存在，未完成删除`);
+    } catch (error) {
+      if ((error as { statusCode?: number }).statusCode !== 404) throw error;
+    }
+    try {
+      await this.o.docker.raw.getNetwork(this.o.docker.instanceNetwork(id)).inspect();
+      throw new ServiceError(`实例 ${id} 的受管网络仍存在，未完成删除`);
+    } catch (error) {
+      if ((error as { statusCode?: number }).statusCode !== 404) throw error;
+    }
+  }
+
+  private async removeDataDirectory(id: string): Promise<void> {
+    const path = join(this.o.instanceDataRoot, id);
+    try {
+      const stat = await lstat(path);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) {
+        throw new ServiceError(`实例 ${id} 的数据目录不是受管普通目录，拒绝删除`);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw error;
+    }
+    await rm(path, { recursive: true, force: false });
+    try {
+      await lstat(path);
+      throw new ServiceError(`实例 ${id} 的数据目录仍存在，未完成删除`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+
+  private async assertRetainedDataDirectory(id: string): Promise<void> {
+    const path = join(this.o.instanceDataRoot, id);
+    let stat;
+    try { stat = await lstat(path); } catch { throw new ServiceError(`实例 ${id} 的数据目录不存在，不能保留数据删除`); }
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new ServiceError(`实例 ${id} 的数据目录不是受管普通目录，不能保留数据删除`);
+    }
+  }
+
   async start(id: string, actor: string): Promise<void> {
     return this.o.gate.run(id, 'start-instance',
       async (lease) => this.startUnderLease(id, lease, actor));
@@ -565,8 +633,30 @@ export class InstanceService {
       recordAudit(this.o.db, { actor, action: 'start-instance', target: id, result: 'ok' });
       return;
     }
-    await this.o.docker.assertManaged(id);
-    await this.o.docker.start(id);
+    try {
+      await this.o.docker.assertManaged(id);
+      await this.o.docker.start(id);
+    } catch (error) {
+      if ((error as { statusCode?: number }).statusCode !== 404) throw error;
+      const inst = this.o.repo.get(id);
+      if (!inst) throw new ServiceError(`实例 ${id} 不存在`);
+      const image = await this.o.docker.raw.getImage(this.o.docker.imageRef(inst.imageTag)).inspect() as { Id?: unknown };
+      if (typeof image.Id !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(image.Id)) {
+        throw new ServiceError(`实例 ${id} 容器缺失，且本机没有可验证的原镜像；请先恢复镜像后重试`);
+      }
+      await this.o.docker.recreateInstance({
+        spec: {
+          id, imageTag: inst.imageTag, memoryMb: inst.memLimit, cpus: inst.cpuLimit,
+          ports: this.o.repo.ports(id), adminRoot: inst.adminRoot,
+          ingestToken: this.o.repo.ingestToken(id),
+        },
+        settingsJs: this.#renderFor(id),
+        runtimeMode: inst.nodeRuntimeMode ?? 'legacy',
+        imageId: image.Id,
+        running: true,
+      });
+      await this.o.adminRuntime.waitReady(id, { timeoutMs: 30_000, intervalMs: 250 });
+    }
     recordAudit(this.o.db, { actor, action: 'start-instance', target: id, result: 'ok' });
   }
 
@@ -600,16 +690,40 @@ export class InstanceService {
   ): Promise<void> {
     this.o.gate.assertLease(lease, id, ['remove-instance']);
     this.assertExists(id);
-    await this.o.docker.assertManaged(id).catch(() => undefined);
-    await this.o.docker.remove(id, { removeData: opts.removeData }).catch(() => undefined);
-    this.o.repo.remove(id);
+    const needsSettlement = await this.o.removalLifecycle?.beforeRemove(id, { removeData: opts.removeData });
+    if (needsSettlement) {
+      if (!opts.removeData) throw new ServiceError('请先清理诊断任务，或选择同时删除实例数据。');
+      try {
+        await this.o.docker.assertManaged(id).catch(error => {
+          if ((error as { statusCode?: number }).statusCode !== 404) throw error;
+        });
+        await this.o.docker.remove(id, { removeData: false });
+        await this.assertRuntimeRemoved(id);
+        if (opts.removeData) {
+          await this.removeDataDirectory(id);
+          await this.o.removalLifecycle!.afterDataRemoved(id);
+        } else await this.assertRetainedDataDirectory(id);
+      } catch {
+        throw new ServiceError('实例资源或诊断记录尚未确认全部清理，已保留实例记录，请修复后重试删除。');
+      }
+    } else {
+      // Without a diagnostic settlement hook, Docker cleanup is still fail-closed.
+      await this.o.docker.assertManaged(id).catch((error) => {
+        if ((error as { statusCode?: number }).statusCode !== 404) throw error;
+      });
+      await this.o.docker.remove(id, { removeData: false });
+      await this.assertRuntimeRemoved(id);
+      if (opts.removeData) await this.removeDataDirectory(id);
+      else await this.assertRetainedDataDirectory(id);
+    }
+    if (opts.removeData) this.o.repo.remove(id);
     recordAudit(this.o.db, {
       actor: opts.actor, action: 'remove-instance', target: id,
-      detail: opts.removeData ? '含数据卷' : '保留数据卷', result: 'ok',
+      detail: opts.removeData ? '含数据卷' : '仅清理运行资源，保留实例数据与台账', result: 'ok',
     });
   }
 
-  /** 重置实例账号口令：改仓储 → 重写 settings.js → 重启实例 */
+  /** Preflight first, compensate failures, and return the credential only after runtime acceptance. */
   async resetCredential(id: string, username: string, actor: string): Promise<string> {
     return this.o.gate.run(id, 'reset-credential',
       async (lease) => this.resetCredentialUnderLease(id, lease, username, actor));
@@ -624,15 +738,53 @@ export class InstanceService {
     this.o.gate.assertLease(lease, id, ['reset-credential']);
     const inst = this.o.repo.get(id);
     if (!inst) throw new ServiceError(`实例 ${id} 不存在`);
-
+    const originalCredential = this.o.repo.credentials(id).find(entry => entry.username === username);
+    if (!originalCredential) throw new ServiceError(`实例 ${id} 下没有指定账号`);
+    let before: Awaited<ReturnType<DockerClient['assertRestartable']>>;
+    try { before = await this.o.docker.assertRestartable(id); }
+    catch {
+      throw new ServiceError(`实例 ${id} 不满足安全重启要求，尚未修改口令；请核对运行环境并先完成隔离配置重建`);
+    }
     const password = generatePassword();
-    this.o.repo.resetCredential(id, username, password);
-
-    const settings = this.#renderFor(id);
-    await this.o.docker.writeSettings(id, settings);
-    await this.o.docker.restart(id);
-
-    recordAudit(this.o.db, { actor, action: 'reset-instance-credential', target: `${id}/${username}`, result: 'ok' });
+    const readiness = { timeoutMs: 30_000, intervalMs: 250, username };
+    try {
+      this.o.repo.resetCredential(id, username, password);
+      await this.o.docker.writeSettings(id, this.#renderFor(id));
+      if (before.running) {
+        await this.o.docker.restart(id);
+        await this.o.adminRuntime.waitReady(id, readiness);
+      }
+      recordAudit(this.o.db, {
+        actor, action: 'reset-instance-credential', target: `${id}/${username}`, result: 'ok',
+        detail: JSON.stringify({ applied: before.running ? 'verified-running' : 'next-start' }),
+      });
+    } catch {
+      let recovered = true;
+      // Attempt both parts even if one fails; never leave the new repository
+      // password solely because writing the old settings also failed.
+      try { this.o.repo.resetCredential(id, username, originalCredential.password); }
+      catch { recovered = false; }
+      try {
+        await this.o.docker.writeSettings(id, before.settingsJs);
+        if (before.running) {
+          await this.o.docker.restart(id);
+          await this.o.adminRuntime.waitReady(id, readiness);
+        }
+      } catch { recovered = false; }
+      try {
+        recordAudit(this.o.db, {
+          actor, action: 'reset-instance-credential', target: `${id}/${username}`, result: 'fail',
+          detail: JSON.stringify({ code: recovered ? 'restored-original' : 'manual-recovery-required', originallyRunning: before.running }),
+        });
+      } catch {
+        throw new ServiceError(recovered
+          ? `实例 ${id} 口令重置失败，已恢复原口令和配置，但审计记录无法写入，需要人工核对`
+          : `实例 ${id} 口令重置和自动恢复均未完成，且审计记录无法写入，需要立即人工恢复`);
+      }
+      throw new ServiceError(recovered
+        ? `实例 ${id} 口令重置失败，已恢复原口令、配置和运行状态`
+        : `实例 ${id} 口令重置失败且自动恢复未完成，需要人工恢复；新口令未确认生效`);
+    }
     return password;
   }
 

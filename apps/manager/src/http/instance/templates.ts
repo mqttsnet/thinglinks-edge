@@ -18,6 +18,7 @@ import { checkCachedTemplateModelMappings } from '../../core/flows/templates/mod
 import type { FlowTemplateWithContent } from '../../core/flows/types.ts';
 import type { HttpContext } from '../context.ts';
 import { targetFor, failTemplate as fail } from './flows-target.ts';
+import { InstanceBusyError } from '../../core/instance/operation-gate.ts';
 
 export function registerTemplates(api: FastifyInstance, ctx: HttpContext): void {
   const { config, db, guard } = ctx;
@@ -123,7 +124,14 @@ export function registerTemplates(api: FastifyInstance, ctx: HttpContext): void 
         if (!guard(req, reply, { csrf: true, need: 'instance:view', instance: instanceId })) return;
         const t = targetFor(ctx, instanceId);
         if ('error' in t) return reply.code(t.code).send({ error: t.error });
-        content = await getFlows(t);
+        content = ctx.protocolDiagnostics
+          ? await ctx.operationGate.run(instanceId, 'template-export', async () => {
+            if (ctx.protocolDiagnostics!.list(instanceId).some(task => task.cleanup !== 'done')) {
+              throw new InstanceBusyError(instanceId, 'protocol-read', 'template-export');
+            }
+            return getFlows(t);
+          })
+          : await getFlows(t);
         source = instanceId;
       }
       if (content === undefined && !configured) {
@@ -141,7 +149,12 @@ export function registerTemplates(api: FastifyInstance, ctx: HttpContext): void 
         result: 'ok',
       });
       return reply.code(201).send({ template: saved, modelChecked });
-    } catch (e) { return fail(reply, e); }
+    } catch (e) {
+      if (e instanceof InstanceBusyError) return reply.code(409).send({ error: e.activeOperation === 'protocol-read'
+        ? '实例正在试读或临时连接尚未清理，请清理完成后再保存实例模板。'
+        : '实例正在执行其他操作，请稍后再保存实例模板。' });
+      return fail(reply, e);
+    }
   });
 
   api.patch(`${config.basePath}/api/templates/:tid`, async (req, reply) => {

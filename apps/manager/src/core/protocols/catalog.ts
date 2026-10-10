@@ -5,7 +5,7 @@ import type { NodeRequirement, ProtocolComponentStatus, ProtocolDefinition, Prot
 export const PROTOCOL_PACKAGE_PINS = [
   { module: 'node-red-contrib-modbus', version: '5.60.2',
     integrity: 'sha512-CaYWEUMUx0meGt58SJoMSvPQA0iAd9zT+EdFQbo5cjNjnZ+5Z5U/0RR1TMrJ65Edoqk+UavC4sxd34wW19LtCQ==',
-    nodeTypes: ['modbus-client', 'modbus-read'] },
+    nodeTypes: ['modbus-client', 'modbus-flex-getter'] },
   { module: 'node-red-contrib-opcua', version: '0.2.355',
     integrity: 'sha512-QUCiOhl7EYeR9FNDNUd/3OsnWD3Ytib7+FuWA5UQKCViSl/0ZyR5FJlC8KT5pjFIoAnLi4bQ9nGSgXq6vYD+Fw==',
     nodeTypes: ['OpcUa-Endpoint', 'OpcUa-Client', 'OpcUa-Item'] },

@@ -27,6 +27,21 @@ function collector() {
   };
 }
 
+test('a multi-service observation is rejected as a whole before any queue mutation', async () => {
+  const timers = manualTimers(); const c = collector();
+  const b = new MicroBatcher({ flush: c.flush, setTimer: timers.setTimer, clearTimer: timers.clearTimer,
+    limits: { maxPoints: 2, maxQueuedBatches: 1 } });
+  b.add(pt({ serviceCode: 'old' }));
+  assert.throws(() => b.addMany([pt({ serviceCode: 'A' }), pt({ serviceCode: 'B' })]), BatchOverflowError);
+  assert.equal(b.pending, 1); assert.equal(b.queued, 0);
+  assert.equal(b.rejected, 2);
+  await b.flushNow();
+  assert.deepEqual(c.batches[0]!.points.map(p => p.serviceCode), ['old']);
+  b.addMany([pt({ serviceCode: 'A' }), pt({ serviceCode: 'B' })]);
+  await b.close();
+  assert.deepEqual(c.batches[1]!.payload.devices[0]!.services.map(p => p.serviceCode), ['A', 'B']);
+});
+
 test('默认阈值就是 08 号文定的三个数，外加一条队列水位上限', () => {
   assert.deepEqual(DEFAULT_LIMITS, {
     /*

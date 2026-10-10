@@ -6,7 +6,10 @@ import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { createHash } from 'node:crypto';
 import { tarArchive } from '../archive/tar.ts';
-import { NodeStore, readPackage, compareVersions, closureGaps, closureReport } from './store.ts';
+import {
+  NodeStore, readPackage, compareVersions, closureGaps, closureReport,
+  MAX_PACKAGE_TGZ_BYTES, MAX_PACKAGE_TAR_BYTES, MAX_PACKAGE_ENTRIES,
+} from './store.ts';
 import { NodePolicyError } from './policy.ts';
 import { PLATFORM_COMMON_PACKAGE, PLATFORM_NODE_PACKAGE } from './platform-contract.ts';
 
@@ -260,6 +263,25 @@ test('安装生命周期、bin 与平台约束从原始包安全保留', () => {
   assert.equal(absent.os, undefined);
 });
 
+test('压缩包本身超过上限时拒绝，不进入解析器', () => {
+  assert.throws(() => readPackage(Buffer.alloc(MAX_PACKAGE_TGZ_BYTES + 1)), /压缩包大小/);
+});
+
+test('gzip 解压后的 tar 超过上限时拒绝', () => {
+  const payload = Buffer.alloc(MAX_PACKAGE_TAR_BYTES + 1, 0x41);
+  const compressed = gzipSync(payload, { level: 9 });
+  assert.ok(compressed.length < MAX_PACKAGE_TGZ_BYTES);
+  assert.throws(() => readPackage(compressed), /解压后.*大小|超过.*tar/);
+});
+
+test('tar 条目数量超过上限时拒绝', () => {
+  const entries = Array.from({ length: MAX_PACKAGE_ENTRIES + 1 }, (_, index) => ({
+    name: `package/files/${index}.txt`, content: 'x',
+  }));
+  entries.push({ name: 'package/package.json', content: JSON.stringify({ name: 'many-files', version: '1.0.0' }) });
+  assert.throws(() => readPackage(gzipSync(tarArchive(entries))), /条目数量/);
+});
+
 test('可选依赖的缺口单独报，不和必需依赖混在一起', () => {
   const dir = tmp();
   try {
@@ -312,5 +334,64 @@ test('同一个包既是必需又是可选时按必需算 —— 那是更该先
     }));
     assert.deepEqual(closureReport(store, 'root2', '1.0.0'),
       { missing: ['both'], missingOptional: [] });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('request-local store snapshot parses each latest package once and preserves closure gaps', async () => {
+  const dir = tmp();
+  try {
+    const store = new NodeStore(dir);
+    store.add(pack(nodePkg('root-a', '1.0.0', { shared: '*' })));
+    store.add(pack(nodePkg('root-b', '1.0.0', { shared: '*' })));
+    store.add(pack({ name: 'shared', version: '1.0.0', dependencies: { absent: '*' }, optionalDependencies: { optional: '*' } }));
+    let reads = 0;
+    const original = store.metaAsync.bind(store);
+    store.metaAsync = async (...args) => { reads += 1; return original(...args); };
+    const view = await store.latestSnapshot();
+    for (const module of view.modules()) {
+      assert.deepEqual(closureReport(view, module, '1.0.0'), closureReport(store, module, '1.0.0'));
+      assert.deepEqual(view.meta(module, '1.0.0'), store.meta(module, '1.0.0'));
+    }
+    assert.equal(reads, 3);
+    store.add(pack({ name: 'shared', version: '1.0.0', dependencies: { changed: '*' } }));
+    assert.deepEqual(closureReport(view, 'root-a', '1.0.0').missing, ['absent']);
+    assert.deepEqual(closureReport(await store.latestSnapshot(), 'root-a', '1.0.0').missing, ['changed']);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('async store metadata keeps integrity validation and yields to other requests', async () => {
+  const dir = tmp();
+  try {
+    const store = new NodeStore(dir);
+    store.add(pack(nodePkg('valid', '1.0.0')));
+    let yielded = false;
+    setImmediate(() => { yielded = true; });
+    assert.deepEqual(await store.metaAsync('valid', '1.0.0'), store.meta('valid', '1.0.0'));
+    assert.equal(yielded, true);
+    assert.equal(await store.metaAsync('missing', '1.0.0'), undefined);
+    const { writeFileSync } = await import('node:fs');
+    writeFileSync(join(dir, 'valid', '1.0.0.tgz'), Buffer.from('broken archive'));
+    await assert.rejects(store.latestSnapshot(), /不是有效的 gzip/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('snapshot fails if an enumerated dependency disappears before its metadata is read', async () => {
+  const dir = tmp();
+  try {
+    const store = new NodeStore(dir);
+    store.add(pack(nodePkg('a-root', '1.0.0', { 'z-dependency': '*' })));
+    store.add(pack({ name: 'z-dependency', version: '1.0.0' }));
+    const read = store.metaAsync.bind(store);
+    let removed = false;
+    store.metaAsync = async (module, version) => {
+      if (!removed) {
+        removed = true;
+        rmSync(join(dir, 'z-dependency', '1.0.0.tgz'));
+      }
+      return read(module, version);
+    };
+    await assert.rejects(store.latestSnapshot(), /包库.*变化.*刷新/);
+    // A new request must read the current directory and report the real gap.
+    assert.deepEqual(closureReport(await store.latestSnapshot(), 'a-root', '1.0.0').missing, ['z-dependency']);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

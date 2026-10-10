@@ -29,6 +29,7 @@ const config = (): EdgeConfig => ({
   dataDir: '/data01/edge/manager',
   instanceDataRoot: '/data01/edge/instances',
   portRange: { min: 30000, max: 30999 },
+  editorPortRange: { min: 19200, max: 19263 },
   timezone: 'Asia/Shanghai',
   updateCheckUrl: 'https://api.github.com/repos/x/y/releases/latest',
 });

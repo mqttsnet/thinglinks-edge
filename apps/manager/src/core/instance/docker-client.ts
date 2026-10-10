@@ -8,6 +8,7 @@
  * 所有创建请求都必须经 assertSafeCreateOptions 二次校验后才下发。
  */
 import { createHash } from 'node:crypto';
+import { constants } from 'node:fs';
 import { mkdir, rm, cp, lstat, open, readFile, rename, chmod } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import Docker from 'dockerode';
@@ -22,6 +23,11 @@ import {
 import { tarFile } from '../archive/tar.ts';
 import { dockerLogToText } from './log-stream.ts';
 import type { NodeRuntimeMode } from './repo.ts';
+import { assertContainerRuntimeIsolation } from './container-isolation.ts';
+import { assertOwnedDirectory } from '../docker-policy/ownership.ts';
+import { deploymentRealm } from '../docker-policy/config.ts';
+import { NETWORK_POLICY_REALM_LABEL } from '../docker-policy/network-intents.ts';
+import { isIP } from 'node:net';
 
 /** 平台管理的容器统一打这个标签，列举与操作一律按标签过滤 */
 export const MANAGED_LABEL = 'com.mqttsnet.thinglinks-edge.managed';
@@ -192,6 +198,17 @@ export class DockerClient {
     this.docker = new Docker(opts.connection ?? {});
   }
 
+  /** docker-modem otherwise duplicates every option (including Env secrets) into the URL. */
+  private createContainer(options: Record<string, unknown>): Promise<Docker.Container> {
+    return this.docker.createContainer({
+      _query: { name: options['name'] }, _body: options,
+    } as unknown as Docker.ContainerCreateOptions);
+  }
+
+  private createNetwork(options: Docker.NetworkCreateOptions): Promise<Docker.Network> {
+    return this.docker.createNetwork({ _query: {}, _body: options } as unknown as Docker.NetworkCreateOptions);
+  }
+
   /** Non-secret deployment identity expected in every migratable instance container. */
   expectedMigrationEnvironment(): { managerUrl: string; npmRegistry: string } {
     return {
@@ -251,9 +268,10 @@ export class DockerClient {
     if (found.some((n) => n.Name === name)) {
       return (await this.assertOwnedNetwork(instanceId)).Id;
     }
-    const created = await this.docker.createNetwork({
+    const created = await this.createNetwork({
       Name: name,
       Driver: 'bridge',
+      EnableIPv6: false,
       Labels: { [MANAGED_LABEL]: 'true', [INSTANCE_LABEL]: instanceId },
     });
     return created.id;
@@ -695,9 +713,10 @@ export class DockerClient {
   }
 
   private async createBootstrapNetwork(instanceId: string, txId: string): Promise<string> {
-    const created = await this.docker.createNetwork({
+    const created = await this.createNetwork({
       Name: this.instanceNetwork(instanceId),
       Driver: 'bridge',
+      EnableIPv6: false,
       Labels: {
         [MANAGED_LABEL]: 'true',
         [INSTANCE_LABEL]: instanceId,
@@ -742,12 +761,12 @@ export class DockerClient {
         proxyEnv: this.opts.proxyEnv ?? [],
         bootstrapTxId: txId,
       });
-      assertSafeCreateOptions(value, { instanceDataRoot: this.opts.instanceDataRoot });
+      assertSafeCreateOptions(value, { instanceDataRoot: this.opts.instanceDataRoot, expectedNetwork: networkId, portRange: this.opts.portRange });
       return value;
     });
     const container = await bootstrapContainerStep(
       'container-create',
-      () => this.docker.createContainer(options as Docker.ContainerCreateOptions),
+      () => this.createContainer(options),
     );
     await bootstrapContainerStep(
       'manager-attach',
@@ -781,10 +800,10 @@ export class DockerClient {
       timezone: this.opts.timezone,
       proxyEnv: this.opts.proxyEnv ?? [],
     });
-    assertSafeCreateOptions(options, { instanceDataRoot: this.opts.instanceDataRoot });
+    assertSafeCreateOptions(options, { instanceDataRoot: this.opts.instanceDataRoot, expectedNetwork: networkId, portRange: this.opts.portRange });
     await this.ensureDataDir(spec.id, runtimeMode);
 
-    const container = await this.docker.createContainer(options as Docker.ContainerCreateOptions);
+    const container = await this.createContainer(options);
     await this.attachManager(spec.id);
     await container.putArchive(
       tarFile('settings.js', settingsJs, { uid: NODE_RED_UID, gid: NODE_RED_UID, mode: 0o644 }),
@@ -816,9 +835,9 @@ export class DockerClient {
       proxyEnv: this.opts.proxyEnv ?? [],
       imageIdOverride: input.imageId,
     });
-    assertSafeCreateOptions(options, { instanceDataRoot: this.opts.instanceDataRoot });
+    assertSafeCreateOptions(options, { instanceDataRoot: this.opts.instanceDataRoot, expectedNetwork: networkId, portRange: this.opts.portRange });
     await this.ensureDataDir(spec.id, input.runtimeMode);
-    const container = await this.docker.createContainer(options as Docker.ContainerCreateOptions);
+    const container = await this.createContainer(options);
     await this.attachManager(spec.id);
     await container.putArchive(
       tarFile('settings.js', input.settingsJs, {
@@ -967,9 +986,10 @@ export class DockerClient {
     const dataRoot = await this.restoreProbeWorkRoot(input);
     const networkName = migrationProbeNetworkName(spec.id, input.txId);
     const labels = this.probeLabels(spec.id, input.txId);
-    const createdNetwork = await this.docker.createNetwork({
+    const createdNetwork = await this.createNetwork({
       Name: networkName,
       Driver: 'bridge',
+      EnableIPv6: false,
       Internal: true,
       Labels: labels,
     });
@@ -987,8 +1007,9 @@ export class DockerClient {
       instanceDataRoot: this.opts.instanceDataRoot,
       instanceId: spec.id,
       txId: input.txId,
+      expectedNetwork: networkId,
     });
-    const container = await this.docker.createContainer(options as Docker.ContainerCreateOptions);
+    const container = await this.createContainer(options);
     if (this.opts.managerContainer) {
       const network = await this.docker.getNetwork(networkId).inspect();
       this.assertProbeLabels(network.Labels, spec.id, input.txId);
@@ -1200,6 +1221,58 @@ export class DockerClient {
     );
   }
 
+  /** Read-only credential-change preflight; it must run before any repository or settings mutation. */
+  async assertRestartable(instanceId: string): Promise<{ settingsJs: string; running: boolean }> {
+    assertValidId(instanceId);
+    const info = await this.docker.getContainer(containerName(instanceId)).inspect();
+    if (info.Config.Labels?.[MANAGED_LABEL] !== 'true' || info.Config.Labels[INSTANCE_LABEL] !== instanceId) {
+      throw new Error('实例运行归属不匹配，不能更新运行配置');
+    }
+    const network = await this.assertOwnedNetwork(instanceId);
+    const dataDirectory = instanceDataDir(this.opts.instanceDataRoot, instanceId);
+    const realm = deploymentRealm({ dataRoot: this.opts.instanceDataRoot, networkPrefix: this.opts.network });
+    const gateway = network.IPAM?.Config?.[0]?.Gateway;
+    if (network.Labels?.[NETWORK_POLICY_REALM_LABEL] !== realm || network.EnableIPv6 !== false
+      || network.IPAM?.Config?.length !== 1 || typeof gateway !== 'string' || isIP(gateway) !== 4) {
+      throw new Error('实例网络尚未通过本部署网络保护配置，不能修改运行凭据');
+    }
+    const environment = info.Config.Env ?? [];
+    for (const expected of [`TLE_NETWORK_GUARD_ID=${network.Id}`, `TLE_NETWORK_GUARD_GATEWAY=${gateway}`]) {
+      const prefix = expected.slice(0, expected.indexOf('=') + 1);
+      const values = environment.filter(value => value.startsWith(prefix));
+      if (values.length !== 1 || values[0] !== expected) throw new Error('实例启动门禁与实际网络不一致');
+    }
+    const ports = environment.filter(value => value.startsWith('TLE_NETWORK_GUARD_PORT='));
+    const port = Number(ports[0]?.split('=')[1]);
+    if (ports.length !== 1 || !Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('实例网络门禁端口不可用');
+    assertContainerRuntimeIsolation(info as unknown as Record<string, unknown>, {
+      containerName: containerName(instanceId), dataDirectory, network: network.Id,
+      networkName: this.instanceNetwork(instanceId), restartPolicy: 'unless-stopped', portRange: this.opts.portRange,
+    });
+    // With the independent execution proxy, this inspect also proves the immutable image is approved.
+    await this.assertImagePresent(info.Image);
+    await assertOwnedDirectory(this.opts.instanceDataRoot, dataDirectory);
+    const handle = await open(join(dataDirectory, 'settings.js'), constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const stat = await handle.stat();
+      const maxBytes = 4 * 1024 ** 2;
+      if (!stat.isFile() || stat.nlink !== 1 || stat.size > maxBytes) throw new Error('实例配置文件不符合安全读取要求');
+      // Bound the read itself; checking readFile().length afterwards would allow a
+      // concurrent writer to grow the file and allocate unbounded Manager memory.
+      const contents = Buffer.alloc(maxBytes + 1);
+      let size = 0;
+      while (size < contents.length) {
+        const { bytesRead } = await handle.read(contents, size, contents.length - size, size);
+        if (bytesRead === 0) break;
+        size += bytesRead;
+      }
+      if (size > maxBytes) throw new Error('实例配置文件过大');
+      const settingsJs = contents.toString('utf8', 0, size);
+      if (!Buffer.from(settingsJs).equals(contents.subarray(0, size))) throw new Error('实例配置文件必须是有效 UTF-8');
+      return { settingsJs, running: info.State.Running === true };
+    } finally { await handle.close(); }
+  }
+
   async stop(instanceId: string): Promise<void> {
     await this.docker.getContainer(containerName(instanceId)).stop({ t: 10 });
   }
@@ -1218,79 +1291,106 @@ export class DockerClient {
   private async detachManager(networkRef: Docker.Network, instanceId: string): Promise<void> {
     const mgr = this.opts.managerContainer;
     if (!mgr) return;
+    let managerId: string | undefined;
     try {
       const manager = await this.docker.getContainer(mgr).inspect();
-      await networkRef.disconnect({ Container: manager.Id, Force: true });
+      managerId = manager.Id;
+      if (!DockerClient.hasContainer(await networkRef.inspect(), managerId)) return;
+      await networkRef.disconnect({ Container: managerId, Force: true });
     } catch (e) {
-      const error = e as Error & { statusCode?: number };
-      if (error.statusCode !== 404) {
-        console.warn(`[warn] 实例网络 ${this.instanceNetwork(instanceId)} 未能摘除 Manager：${error.message}`);
+      // A concurrent detach can produce a daemon error even though the endpoint
+      // is already gone. Decide from a fresh inspect, never from error text.
+      if (managerId) {
+        try {
+          if (!DockerClient.hasContainer(await networkRef.inspect(), managerId)) return;
+        } catch (inspectionError) {
+          if ((inspectionError as { statusCode?: number }).statusCode === 404) return;
+        }
+      } else if ((e as { statusCode?: number }).statusCode === 404) {
+        return;
       }
+      throw new Error(`实例网络 ${this.instanceNetwork(instanceId)} 未能摘除 Manager`, { cause: e });
     }
   }
 
   /**
    * 拆除实例。
    *
-   * 三步各自独立：容器、网络、数据目录。**不要**改回「前一步抛错就中断」的写法 ——
-   * 曾经因为容器已被手工删掉，第一步抛错，数据目录那步压根没执行，
-   * 用户以为连数据一起删了，其实还躺在盘上，且没有任何提示。
-   * 容器删除的真实失败仍会在最后抛出，只是不再连累后面的清理。
+   * 先完成容器与网络的归属核验和删除，再按调用方选择清理数据目录。
+   * 任一资源无法核验、删除或确认消失时立即失败，数据目录保持不动；
+   * 容器已经被手工删除（404）仍允许继续清理受管网络和数据。
    */
   async remove(instanceId: string, opts: { removeData: boolean }): Promise<void> {
-    let containerError: Error | null = null;
+    assertValidId(instanceId);
+    let ownedContainer: Docker.ContainerInspectInfo | undefined;
     try {
       const container = await this.docker.getContainer(containerName(instanceId)).inspect();
       const labels = container.Config.Labels ?? {};
-      if (labels[MANAGED_LABEL] !== 'true' || labels[INSTANCE_LABEL] !== instanceId) {
-        console.warn(
-          `[warn] 容器 ${containerName(instanceId)} 归属不匹配，保留不动：` +
-          `需要 ${MANAGED_LABEL}=true 且 ${INSTANCE_LABEL}=${instanceId}`,
+      if (labels[MANAGED_LABEL] !== 'true' || labels[INSTANCE_LABEL] !== instanceId
+        || container.Name !== `/${containerName(instanceId)}` || !/^[a-f0-9]{64}$/.test(container.Id)) {
+        throw new Error(
+          `容器 ${containerName(instanceId)} 归属不匹配，拒绝删除或清理实例数据`,
         );
-      } else {
-        await this.docker.getContainer(container.Id).remove({ force: true });
       }
+      ownedContainer = container;
     } catch (e) {
-      const error = e as Error & { statusCode?: number };
-      // 404 = 已经不在了，属于期望结果而非失败
-      if (error.statusCode !== 404) {
-        containerError = error;
-        console.warn(`[warn] 容器 ${containerName(instanceId)} 未能核验或删除，保留不动：${error.message}`);
-      }
+      if ((e as { statusCode?: number }).statusCode !== 404) throw e;
     }
 
-    // 网络名不是权限边界。只有核验过标签归属的 network ID 才允许摘端点或删除。
+    // Preflight both resources before the first mutation. A foreign network
+    // sharing this name must not cause a partially removed instance.
     let ownedNetwork: Docker.NetworkInspectInfo | undefined;
     try {
       ownedNetwork = await this.assertOwnedNetwork(instanceId);
-    } catch (e) {
-      if ((e as { statusCode?: number }).statusCode !== 404) {
-        console.warn(`[warn] 实例网络 ${this.instanceNetwork(instanceId)} 未能核验归属，保留不动：${(e as Error).message}`);
+      if (ownedNetwork.Name !== this.instanceNetwork(instanceId) || !/^[a-f0-9]{64}$/.test(ownedNetwork.Id)) {
+        throw new Error(`实例网络 ${this.instanceNetwork(instanceId)} 标识不可信，拒绝删除`);
       }
+    } catch (e) {
+      if ((e as { statusCode?: number }).statusCode !== 404) throw e;
     }
+
+    const assertAbsent = async (inspect: () => Promise<unknown>, description: string): Promise<void> => {
+      try { await inspect(); }
+      catch (e) {
+        if ((e as { statusCode?: number }).statusCode === 404) return;
+        throw e;
+      }
+      throw new Error(`${description}删除后仍可见，拒绝清理实例数据`);
+    };
+    if (ownedContainer) {
+      const ref = this.docker.getContainer(ownedContainer.Id);
+      try { await ref.remove({ force: true }); }
+      catch (e) {
+        if ((e as { statusCode?: number }).statusCode !== 404) throw e;
+      }
+      // DELETE 404 is not proof of absence (a proxy may reject an operation).
+      await assertAbsent(() => ref.inspect(), '容器');
+    }
+    await assertAbsent(() => this.docker.getContainer(containerName(instanceId)).inspect(), '实例容器');
+
     if (ownedNetwork) {
       const networkRef = this.docker.getNetwork(ownedNetwork.Id);
       await this.detachManager(networkRef, instanceId);
-      await networkRef.remove()
-        .catch((e: Error & { statusCode?: number }) => {
-          if (e.statusCode !== 404) {
-            console.warn(`[warn] 实例网络 ${this.instanceNetwork(instanceId)} 未能回收：${e.message}`);
-          }
-        });
+      try {
+        await networkRef.remove();
+      } catch (e) {
+        if ((e as { statusCode?: number }).statusCode !== 404) throw e;
+      }
+      await assertAbsent(() => networkRef.inspect(), '网络');
     }
+    await assertAbsent(() => this.docker.getNetwork(this.instanceNetwork(instanceId)).inspect(), '实例网络');
 
     if (opts.removeData) {
+      // Network detach/delete awaits can give an external actor time to create
+      // a new container using this instance name. Never erase its data blindly.
+      await assertAbsent(() => this.docker.getContainer(containerName(instanceId)).inspect(), '实例容器');
       // 目录是我们自己建的宿主路径，直接删。不要指望 docker 帮忙回收 ——
       // 具名卷那套语义在 bind 上不成立，实测 volume rm 根本不动宿主目录内容。
       await rm(instanceDataDir(this.opts.instanceDataRoot, instanceId), {
         recursive: true,
         force: true,
-      }).catch((e: Error) =>
-        console.warn(`[warn] 实例数据目录未能删除：${e.message}`),
-      );
+      });
     }
-
-    if (containerError) throw containerError;
   }
 
   /**
